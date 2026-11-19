@@ -1,0 +1,7 @@
+CREATE TABLE closing_settings(
+  company_id INTEGER PRIMARY KEY REFERENCES companies(id),
+  transfer_to_retained INTEGER NOT NULL DEFAULT 1 CHECK(transfer_to_retained IN (0,1)),
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+INSERT INTO closing_settings(company_id,transfer_to_retained)
+SELECT id,1 FROM companies;

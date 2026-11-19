@@ -1,0 +1,462 @@
+"""العملاء والموردون: كل طرف = كيان + حساب تفصيلي تحت الحساب الرقابي (Customer → Control Account → Subledger).
+لا يوجد رصيد مخزَّن ولا تعديل يدوي للرصيد: الرصيد يُحسب دائما من القيود المرحّلة عبر Balance Engine."""
+from datetime import date
+from decimal import ROUND_HALF_UP, Decimal
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.accounting import balance_engine as be, ledger_engine as le, journal_engine as je, rates as fxr
+from alhisabat.audit import audit
+from alhisabat.business import branch_scope
+from alhisabat.business import chart_of_accounts as coa, numbering
+from alhisabat.database.tx import transaction
+from alhisabat.security import permissions
+
+KINDS = {"customer": ("customers", "asset", "C", "عميل"), "supplier": ("suppliers", "liability", "S", "مورد"),
+         "employee": ("employees", "liability", "E", "موظف")}
+
+
+def _party(conn, party_id, company_id=None):
+    p = conn.execute("SELECT * FROM parties WHERE id=?", (party_id,)).fetchone()
+    if not p or (company_id is not None and p["company_id"] != company_id):
+        raise AccountingError("العميل/المورد غير موجود في هذه الشركة")
+    return p
+
+
+def latest_day(conn, company_id):
+    d = conn.execute("SELECT MAX(end_date) FROM fiscal_years WHERE company_id=?", (company_id,)).fetchone()[0]
+    if not d:
+        raise AccountingError("لا توجد سنة مالية معرّفة")
+    return d
+
+
+def _sign(kind):
+    return 1 if kind == "customer" else -1      # الرصيد الموجب: العميل مدين لنا / نحن مدينون للمورد أو الموظف
+
+
+def balances(conn, company_id, parties, as_of):
+    """{party_id: رصيد أساسي بطبيعة الطرف} لمجموعة أطراف (استعلام واحد عبر Balance Engine)."""
+    ys = be.year_start(conn, company_id, as_of)
+    mov = be.movements(conn, company_id, ys, as_of, ys, None, None, [p["account_id"] for p in parties])
+    out = {}
+    for p in parties:
+        o, pd, pc = mov.get(p["account_id"], [0, 0, 0])
+        out[p["id"]] = _sign(p["kind"]) * (o + pd - pc)
+    return out
+
+
+def _fields(name, phone, email, address, tax_no, notes):
+    if not name or not name.strip():
+        raise AccountingError("الاسم مطلوب")
+    return name.strip(), phone or "", email or "", address or "", tax_no or "", notes or ""
+
+
+def _assert_control_separate(conn, company_id, kind, control):
+    """الحساب الرقابي لكل نوع (عملاء/موردين/موظفين) مستقل: لا يكون هو أو أحد أبنائه رقابيًا لنوع آخر (وإلا فشل فحص الإقفال)."""
+    mine = set(be.subtree_ids(conn, control, include_merged=False))
+    for other, (key, _t, _p, label) in KINDS.items():
+        if other == kind:
+            continue
+        r = conn.execute("SELECT account_id FROM account_mappings WHERE company_id=? AND map_key=?", (company_id, key)).fetchone()
+        if r and r[0] in mine:
+            raise AccountingError(f"الحساب الرقابي لـ{KINDS[kind][3]}ين مربوط بحساب يقع ضمن رقابي {label}ين: "
+                                  "اضبط «ربط الحسابات» ليكون لكل نوع حساب رقابي مستقل")
+
+
+def create_party(conn, actor_id, company_id, kind, name, *, phone="", email="", address="", tax_no="", notes="",
+                 default_currency=None, credit_limit=None, payment_terms_days=None, branch_id=None, group_id=None,
+                 id_type="", id_number="", id_issuer="", id_issue_date=""):
+    if kind not in KINDS:
+        raise AccountingError("نوع غير معروف")
+    map_key, acc_type, prefix, label = KINDS[kind]
+    permissions.require(conn, actor_id, company_id, "party.create", check_branch=False)
+    name, phone, email, address, tax_no, notes = _fields(name, phone, email, address, tax_no, notes)
+    base = conn.execute("SELECT base_currency FROM companies WHERE id=?", (company_id,)).fetchone()[0]
+    control = coa.get_mapping(conn, company_id, map_key)
+    ctl = coa._acc(conn, control)
+    if not ctl["is_group"] or not ctl["is_control"] or not ctl["is_active"]:
+        raise AccountingError(f"الحساب الرقابي لـ{label}ين غير صالح: يجب أن يكون تجميعيا رقابيا نشطا")
+    _assert_control_separate(conn, company_id, kind, control)
+    if group_id is not None:
+        g = conn.execute(
+            "SELECT pg.*, a.is_active FROM party_groups pg "
+            "JOIN accounts a ON a.id=pg.account_id "
+            "WHERE pg.id=? AND pg.company_id=?", (group_id, company_id)).fetchone()
+        if not g or g["kind"] != kind:
+            raise AccountingError("مجموعة الأطراف غير صالحة")
+        if not g["is_active"]:
+            raise AccountingError("مجموعة الأطراف معطّلة")
+        parent_account = g["account_id"]
+        if credit_limit is None:
+            credit_limit = Decimal(g["default_credit_limit"]) / 100
+        if payment_terms_days is None:
+            payment_terms_days = g["default_payment_terms_days"]
+    else:
+        parent_account = control
+        if credit_limit is None:
+            credit_limit = 0
+        if payment_terms_days is None:
+            payment_terms_days = 0
+    limit = je._minor(credit_limit)
+    if limit < 0 or int(payment_terms_days) < 0:
+        raise AccountingError("الحد الائتماني ومدة السداد لا تقبلان قيما سالبة")
+    if kind != "customer" and limit:
+        raise AccountingError("الحد الائتماني خاص بالعملاء")
+    branch_id = branch_scope.default_master_branch(conn, company_id, branch_id)
+    with transaction(conn):
+        seq = conn.execute("SELECT COALESCE(MAX(seq),0)+1 FROM parties WHERE company_id=? AND kind=?", (company_id, kind)).fetchone()[0]
+        code = f"{prefix}{seq:05d}"
+        acc_code = numbering.next_code(conn, company_id, parent_account)
+        aid = coa.add_account(conn, actor_id, company_id, name, acc_type, parent_account, code=acc_code, _via_party=True)
+        conn.execute("UPDATE accounts SET revalue_fx=1 WHERE id=?", (aid,))
+        pid = conn.execute(
+            "INSERT INTO parties(company_id,kind,seq,code,name,phone,email,address,tax_no,notes,account_id,default_currency,"
+            "credit_limit,payment_terms_days,created_by,branch_id,id_type,id_number,id_issuer,id_issue_date) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (company_id, kind, seq, code, name, phone, email, address, tax_no, notes, aid, default_currency or _default_cur(conn, company_id, base), limit,
+             int(payment_terms_days), actor_id, branch_id, (id_type or "").strip(), (id_number or "").strip(),
+             (id_issuer or "").strip(), (id_issue_date or "").strip())).lastrowid
+        audit.log(conn, actor_id, "create_party", "parties", pid, after={"code": code, "name": name, "account": acc_code})
+    return pid
+
+
+def edit_party(conn, actor_id, party_id, *, name=None, phone=None, email=None, address=None, tax_no=None, notes=None,
+               default_currency=None, credit_limit=None, payment_terms_days=None,
+               id_type=None, id_number=None, id_issuer=None, id_issue_date=None):
+    p = _party(conn, party_id)
+    permissions.require(conn, actor_id, p["company_id"], "party.edit", check_branch=False)
+    new = {"name": p["name"] if name is None else name, "phone": p["phone"] if phone is None else phone,
+           "email": p["email"] if email is None else email, "address": p["address"] if address is None else address,
+           "tax_no": p["tax_no"] if tax_no is None else tax_no, "notes": p["notes"] if notes is None else notes,
+           "default_currency": p["default_currency"] if default_currency is None else default_currency,
+           "credit_limit": p["credit_limit"] if credit_limit is None else je._minor(credit_limit),
+           "payment_terms_days": p["payment_terms_days"] if payment_terms_days is None else int(payment_terms_days)}
+    for _k, _v in (("id_type", id_type), ("id_number", id_number), ("id_issuer", id_issuer), ("id_issue_date", id_issue_date)):
+        new[_k] = p[_k] if _v is None else str(_v).strip()
+    new["name"] = _fields(new["name"], "", "", "", "", "")[0]
+    if new["credit_limit"] < 0 or new["payment_terms_days"] < 0:
+        raise AccountingError("الحد الائتماني ومدة السداد لا تقبلان قيما سالبة")
+    if p["kind"] != "customer" and new["credit_limit"]:
+        raise AccountingError("الحد الائتماني خاص بالعملاء")
+    old = {k: p[k] for k in new}
+    with transaction(conn):
+        if new["name"] != p["name"]:
+            coa.edit_account(conn, actor_id, p["account_id"], name=new["name"], _via_party=True)
+        conn.execute("UPDATE parties SET name=?,phone=?,email=?,address=?,tax_no=?,notes=?,default_currency=?,credit_limit=?,"
+                     "payment_terms_days=?,id_type=?,id_number=?,id_issuer=?,id_issue_date=? WHERE id=?",
+                     (new["name"], new["phone"], new["email"], new["address"], new["tax_no"], new["notes"],
+                      new["default_currency"], new["credit_limit"], new["payment_terms_days"], new["id_type"],
+                      new["id_number"], new["id_issuer"], new["id_issue_date"], party_id))
+        audit.log(conn, actor_id, "edit_party", "parties", party_id, old, new)
+
+
+def set_active(conn, actor_id, party_id, active: bool, reason=""):
+    p = _party(conn, party_id)
+    permissions.require(conn, actor_id, p["company_id"], "party.deactivate", check_branch=False)
+    if not active:
+        bal = balances(conn, p["company_id"], [p], latest_day(conn, p["company_id"]))[p["id"]]
+        if bal != 0:
+            raise AccountingError("لا يمكن تعطيل طرف رصيده غير صفري")
+        if conn.execute("SELECT 1 FROM journal_lines l JOIN journal_entries e ON e.id=l.entry_id "
+                        "WHERE l.account_id=? AND e.status='draft' LIMIT 1", (p["account_id"],)).fetchone():
+            raise AccountingError("توجد قيود مسودة على هذا الطرف: عالجها أولا")
+    with transaction(conn):
+        coa.set_active(conn, actor_id, p["account_id"], active, reason, _via_party=True)
+        conn.execute("UPDATE parties SET is_active=? WHERE id=?", (int(active), party_id))
+        audit.log(conn, actor_id, "party_activate" if active else "party_deactivate", "parties", party_id,
+                  {"is_active": p["is_active"]}, {"is_active": int(active)}, reason)
+
+
+def delete_party(conn, actor_id, party_id):
+    p = _party(conn, party_id)
+    permissions.require(conn, actor_id, p["company_id"], "party.delete", check_branch=False)
+    if conn.execute("SELECT 1 FROM journal_lines WHERE account_id=? LIMIT 1", (p["account_id"],)).fetchone():
+        raise AccountingError("لا يمكن حذف طرف له حركات (حتى المسودات): استخدم التعطيل")
+    with transaction(conn):
+        conn.execute("DELETE FROM parties WHERE id=?", (party_id,))
+        coa.delete_account(conn, actor_id, p["account_id"], _via_party=True)
+        audit.log(conn, actor_id, "delete_party", "parties", party_id, {"code": p["code"], "name": p["name"]})
+
+
+def get_party(conn, user_id, company_id, party_id, as_of=None):
+    permissions.require(conn, user_id, company_id, "party.view", check_branch=False)
+    p = conn.execute(
+        "SELECT p.*, g.id AS group_id, ga.name AS group_name "
+        "FROM parties p "
+        "JOIN accounts a ON a.id=p.account_id "
+        "LEFT JOIN party_groups g ON g.account_id=a.parent_id "
+        "LEFT JOIN accounts ga ON ga.id=g.account_id "
+        "WHERE p.id=?", (party_id,)).fetchone()
+    if not p or (company_id is not None and p["company_id"] != company_id):
+        raise AccountingError("العميل/المورد غير موجود في هذه الشركة")
+    as_of = as_of or latest_day(conn, company_id)
+    bal = balances(conn, company_id, [p], as_of)[p["id"]]
+    d = dict(p); d["balance"] = bal; d["as_of"] = as_of
+    return d
+
+
+def list_parties(conn, user_id, company_id, kind, *, search=None, active_only=False, as_of=None, limit=50, offset=0, branch_id=None, group_id=None):
+    permissions.require(conn, user_id, company_id, "party.view", check_branch=False)
+    q = ("SELECT p.*, g.id AS group_id, ga.name AS group_name "
+         "FROM parties p "
+         "JOIN accounts a ON a.id=p.account_id "
+         "LEFT JOIN party_groups g ON g.account_id=a.parent_id "
+         "LEFT JOIN accounts ga ON ga.id=g.account_id "
+         "WHERE p.company_id=? AND p.kind=?")
+    args = [company_id, kind]
+    if group_id in (0, "0", "none", "None"):
+        q += " AND g.id IS NULL"
+    elif group_id is not None:
+        q += " AND g.id=?"
+        args.append(int(group_id))
+    if search:
+        q += " AND (p.name LIKE ? OR p.code LIKE ? OR p.phone LIKE ? OR p.tax_no LIKE ?)"
+        args += [f"%{search}%"] * 4
+    if active_only:
+        q += " AND p.is_active=1"
+    f, fa = branch_scope.master_clause(conn, company_id, branch_id, col="p.branch_id")
+    q += f; args += fa
+    total = conn.execute(f"SELECT COUNT(*) FROM ({q})", args).fetchone()[0]
+    rows = conn.execute(q + " ORDER BY p.code LIMIT ? OFFSET ?", (*args, min(int(limit), 500), int(offset))).fetchall()
+    as_of = as_of or latest_day(conn, company_id)
+    bal = balances(conn, company_id, rows, as_of) if rows else {}
+    return {"total": total, "as_of": as_of, "rows": [{**dict(r), "balance": bal[r["id"]]} for r in rows]}
+
+
+def party_statement(conn, user_id, company_id, party_id, date_from, date_to, **kw):
+    """كشف حساب العميل/المورد: أستاذ حسابه التفصيلي برصيد جارٍ بطبيعة الطرف (موجب = مستحق لنا للعميل / علينا للمورد)."""
+    permissions.require(conn, user_id, company_id, "party.view", check_branch=False)
+    p = _party(conn, party_id, company_id)
+    r = le.ledger(conn, user_id, company_id, p["account_id"], date_from, date_to, include_children=False, **kw)
+    return {"party": {"id": p["id"], "code": p["code"], "name": p["name"], "kind": p["kind"]}, **r}
+
+
+def balance_by_currency(conn, user_id, company_id, party_id, as_of=None):
+    permissions.require(conn, user_id, company_id, "party.view", check_branch=False)
+    p = _party(conn, party_id, company_id)
+    as_of = as_of or latest_day(conn, company_id)
+    ys = be.year_start(conn, company_id, as_of)
+    return be.account_summary(conn, user_id, company_id, p["account_id"], ys, as_of)["by_currency"]
+
+
+def credit_status(conn, user_id, company_id, customer_id, additional=0, as_of=None):
+    """للفواتير الآجلة (Gate 10): هل يتجاوز الرصيد + المبلغ الإضافي الحد الائتماني؟ حد 0 = بلا حد."""
+    permissions.require(conn, user_id, company_id, "party.view", check_branch=False)
+    p = _party(conn, customer_id, company_id)
+    if p["kind"] != "customer":
+        raise AccountingError("الحد الائتماني خاص بالعملاء")
+    bal = balances(conn, company_id, [p], as_of or latest_day(conn, company_id))[p["id"]]
+    add = je._minor(additional)
+    limit = p["credit_limit"]
+    return {"limit": limit, "balance": bal, "additional": add, "available": (limit - bal) if limit else None,
+            "exceeds": bool(limit) and bal + add > limit}
+
+
+def post_opening_balance(conn, actor_id, company_id, party_id, amount, *, as_of=None, note="", currency=None, rate=None):
+    """رصيد افتتاحي لطرف واحد بعملة واحدة (الأساسية إن لم تُحدَّد). amount موجب = الرصيد الطبيعي للطرف (مدين للعميل / دائن للمورد)،
+    وسالب = العكس. للأطراف التي عندها أرصدة بعدة عملات استعمل post_opening_balances (قيد واحد بسطر لكل عملة)."""
+    return post_opening_balances(conn, actor_id, company_id, party_id,
+                                 [{"amount": amount, "currency": currency, "rate": rate}], as_of=as_of, note=note)
+
+
+def post_opening_balances(conn, actor_id, company_id, party_id, items, *, as_of=None, note=""):
+    """أرصدة افتتاحية لطرف واحد بعدة عملات في قيد يومية **مسودة واحد**: سطر على حساب الطرف لكل عملة بمبلغها الأصلي وسعرها،
+    وسطر موازنة واحد بالعملة الأساسية على «الأرصدة الافتتاحية المعلّق» (opening_suspense) بمجموع المعادل الأساسي.
+    items: [{amount, currency?, rate?}] — currency فارغة = الأساسية؛ rate فارغ = سعر الجدول بتاريخ as_of (لا افتراض 1 أبدًا)،
+    وسعر يخالف الجدول يحتاج صلاحية currency.override_rate كأي قيد. عملة واحدة لا تتكرر. المبالغ الصفرية تُتجاهل؛ كلها صفر ← None."""
+    p = _party(conn, party_id, company_id)
+    permissions.require(conn, actor_id, company_id, "opening.manage", check_branch=False)
+    base = conn.execute("SELECT base_currency FROM companies WHERE id=?", (company_id,)).fetchone()[0]
+    as_of = as_of or date.today().isoformat()
+    lines, seen, net_base = [], set(), 0
+    for it in items or []:
+        amt = Decimal(str(it.get("amount") or 0))
+        if amt == 0:
+            continue
+        cur = (it.get("currency") or "").strip().upper() or base
+        if cur in seen:
+            raise AccountingError(f"العملة {cur} مكررة: ادمج مبالغها في سطر واحد")
+        seen.add(cur)
+        if cur == base:
+            r = Decimal(1)
+        else:
+            if not fxr.currency_enabled(conn, company_id, cur):
+                raise AccountingError(f"العملة {cur} غير مفعّلة لهذه الشركة")
+            r = fxr._dec(it["rate"]) if it.get("rate") not in (None, "") else fxr.get_rate(conn, company_id, cur, as_of)
+        if r <= 0:
+            raise AccountingError("سعر الصرف يجب أن يكون أكبر من صفر")
+        ln = opening_lines(conn, company_id, [{"party_id": party_id, "amount": amt, "currency": cur, "rate": r}])[0]
+        lines.append(ln)
+        d, c = je._minor(ln["debit"]), je._minor(ln["credit"])
+        net_base += int((Decimal(d - c) * r).quantize(Decimal(1), ROUND_HALF_UP))      # نفس تقريب محرك القيود تمامًا
+    if not lines:
+        return None
+    suspense = coa.get_mapping(conn, company_id, "opening_suspense")
+    sus = Decimal(abs(net_base)) / 100
+    lines.append({"account_id": suspense, "debit": sus if net_base < 0 else 0, "credit": sus if net_base > 0 else 0, "currency": base})
+    desc = (note or "").strip() or f"رصيد افتتاحي — {p['name']}"
+    with transaction(conn):
+        eid = je.create_draft(conn, company_id, actor_id, as_of, lines, desc, entry_type="adjustment",
+                              source_type="party_opening", source_id=party_id)
+        audit.log(conn, actor_id, "party_opening_balance", "parties", party_id,
+                  after={"items": [{"currency": ln["currency"], "debit": str(ln["debit"]), "credit": str(ln["credit"])} for ln in lines[:-1]],
+                         "entry_id": eid, "as_of": as_of})
+    return eid
+
+
+def opening_lines(conn, company_id, items):
+    """يحوّل أرصدة افتتاحية للأطراف إلى سطور قيد افتتاح (المبلغ الموجب = الرصيد الطبيعي للطرف).
+    items: [{party_id, amount, currency?, rate?}] — الرصيد الافتتاحي له مسار مستقل: قيد افتتاح فقط."""
+    lines = []
+    for it in items:
+        p = _party(conn, it["party_id"], company_id)
+        amt = it["amount"]
+        normal_debit = (p["kind"] == "customer") == (amt >= 0)
+        base = conn.execute("SELECT base_currency FROM companies WHERE id=?", (company_id,)).fetchone()[0]
+        cur = it.get("currency", None) or base
+        lines.append({"account_id": p["account_id"], "debit": abs(amt) if normal_debit else 0,
+                      "credit": 0 if normal_debit else abs(amt), "currency": cur,
+                      "rate": 1 if cur == base else it.get("rate")})            # الأجنبية: سعر صريح أو (None) سعر الجدول؛ لا افتراض 1
+    return lines
+
+
+# ---------------- مجموعات الأطراف ----------------
+def create_group(conn, actor_id, company_id, kind, name, *, default_credit_limit=0, default_payment_terms_days=0):
+    if kind not in ("customer", "supplier"):
+        raise AccountingError("نوع غير معروف")
+    permissions.require(conn, actor_id, company_id, "party.create", check_branch=False)
+    name = (name or "").strip()
+    if not name:
+        raise AccountingError("الاسم مطلوب")
+    limit = je._minor(default_credit_limit)
+    terms = int(default_payment_terms_days)
+    if limit < 0 or terms < 0 or terms > 3650:
+        raise AccountingError("الحد الائتماني ومدة السداد لا تقبلان قيما سالبة")
+    if kind != "customer" and limit:
+        raise AccountingError("الحد الائتماني خاص بالعملاء")
+    map_key, acc_type, _, label = KINDS[kind]
+    control = coa.get_mapping(conn, company_id, map_key)
+    ctl = coa._acc(conn, control)
+    if not ctl["is_group"] or not ctl["is_control"] or not ctl["is_active"]:
+        raise AccountingError(f"الحساب الرقابي لـ{label}ين غير صالح: يجب أن يكون تجميعيا رقابيا نشطا")
+    with transaction(conn):
+        acc_code = numbering.next_code(conn, company_id, control)
+        aid = coa.add_account(conn, actor_id, company_id, name, acc_type, control, code=acc_code, is_group=True, _via_party=True)
+        gid = conn.execute(
+            "INSERT INTO party_groups(company_id, kind, account_id, default_credit_limit, default_payment_terms_days, created_by) "
+            "VALUES(?,?,?,?,?,?)",
+            (company_id, kind, aid, limit, terms, actor_id)
+        ).lastrowid
+        audit.log(conn, actor_id, "create_party_group", "party_groups", gid, after={"name": name, "kind": kind, "account_id": aid, "code": acc_code})
+    return gid
+
+
+def edit_group(conn, actor_id, group_id, *, name=None, default_credit_limit=None, default_payment_terms_days=None):
+    g = conn.execute(
+        "SELECT pg.*, a.name, a.company_id FROM party_groups pg "
+        "JOIN accounts a ON a.id=pg.account_id WHERE pg.id=?", (group_id,)).fetchone()
+    if not g:
+        raise AccountingError("مجموعة الأطراف غير موجودة")
+    permissions.require(conn, actor_id, g["company_id"], "party.edit", check_branch=False)
+    new_name = g["name"] if name is None else (name or "").strip()
+    if not new_name:
+        raise AccountingError("الاسم مطلوب")
+    new_limit = g["default_credit_limit"] if default_credit_limit is None else je._minor(default_credit_limit)
+    new_terms = g["default_payment_terms_days"] if default_payment_terms_days is None else int(default_payment_terms_days)
+    if new_limit < 0 or new_terms < 0 or new_terms > 3650:
+        raise AccountingError("الحد الائتماني ومدة السداد لا تقبلان قيما سالبة")
+    if g["kind"] != "customer" and new_limit:
+        raise AccountingError("الحد الائتماني خاص بالعملاء")
+    old = {"name": g["name"], "default_credit_limit": g["default_credit_limit"], "default_payment_terms_days": g["default_payment_terms_days"]}
+    new = {"name": new_name, "default_credit_limit": new_limit, "default_payment_terms_days": new_terms}
+    with transaction(conn):
+        if new_name != g["name"]:
+            coa.edit_account(conn, actor_id, g["account_id"], name=new_name, _via_party=True)
+        conn.execute("UPDATE party_groups SET default_credit_limit=?, default_payment_terms_days=? WHERE id=?",
+                     (new_limit, new_terms, group_id))
+        audit.log(conn, actor_id, "edit_party_group", "party_groups", group_id, old, new)
+
+
+def set_group_active(conn, actor_id, group_id, active: bool, reason=""):
+    g = conn.execute(
+        "SELECT pg.*, a.company_id FROM party_groups pg "
+        "JOIN accounts a ON a.id=pg.account_id WHERE pg.id=?", (group_id,)).fetchone()
+    if not g:
+        raise AccountingError("مجموعة الأطراف غير موجودة")
+    permissions.require(conn, actor_id, g["company_id"], "party.deactivate", check_branch=False)
+    with transaction(conn):
+        coa.set_active(conn, actor_id, g["account_id"], active, reason=reason, _via_party=True)
+
+
+def delete_group(conn, actor_id, group_id):
+    g = conn.execute(
+        "SELECT pg.*, a.name, a.code, a.company_id FROM party_groups pg "
+        "JOIN accounts a ON a.id=pg.account_id WHERE pg.id=?", (group_id,)).fetchone()
+    if not g:
+        raise AccountingError("مجموعة الأطراف غير موجودة")
+    permissions.require(conn, actor_id, g["company_id"], "party.delete", check_branch=False)
+    if conn.execute("SELECT 1 FROM accounts WHERE parent_id=? LIMIT 1", (g["account_id"],)).fetchone():
+        raise AccountingError("لا يمكن حذف مجموعة تحتوي على حسابات: انقل الأطراف أو احذفها أولا")
+    with transaction(conn):
+        conn.execute("DELETE FROM party_groups WHERE id=?", (group_id,))
+        coa.delete_account(conn, actor_id, g["account_id"], _via_party=True)
+        audit.log(conn, actor_id, "delete_party_group", "party_groups", group_id, {"code": g["code"], "name": g["name"]})
+
+
+def list_groups(conn, user_id, company_id, kind):
+    permissions.require(conn, user_id, company_id, "party.view", check_branch=False)
+    q = ("SELECT pg.id, pg.account_id, a.code, a.name, a.is_active, "
+         "pg.default_credit_limit, pg.default_payment_terms_days, "
+         "(SELECT COUNT(*) FROM accounts child JOIN parties p ON p.account_id=child.id WHERE child.parent_id=pg.account_id) AS party_count "
+         "FROM party_groups pg "
+         "JOIN accounts a ON a.id=pg.account_id "
+         "WHERE pg.company_id=? AND pg.kind=? "
+         "ORDER BY a.code")
+    rows = conn.execute(q, (company_id, kind)).fetchall()
+    return [{"id": r["id"], "account_id": r["account_id"], "code": r["code"], "name": r["name"],
+             "is_active": bool(r["is_active"]), "party_count": r["party_count"],
+             "default_credit_limit": r["default_credit_limit"],
+             "default_payment_terms_days": r["default_payment_terms_days"]} for r in rows]
+
+
+def move_party_to_group(conn, actor_id, party_id, group_id_or_None):
+    p = _party(conn, party_id)
+    permissions.require(conn, actor_id, p["company_id"], "party.edit", check_branch=False)
+    permissions.require(conn, actor_id, p["company_id"], "account.move", check_branch=False)
+    acc = coa._acc(conn, p["account_id"])
+    if group_id_or_None is None:
+        map_key = "customers" if p["kind"] == "customer" else "suppliers"
+        target_parent = coa.get_mapping(conn, p["company_id"], map_key)
+    else:
+        g = conn.execute(
+            "SELECT pg.*, a.is_active FROM party_groups pg "
+            "JOIN accounts a ON a.id=pg.account_id "
+            "WHERE pg.id=? AND pg.company_id=?", (group_id_or_None, p["company_id"])).fetchone()
+        if not g:
+            raise AccountingError("مجموعة الأطراف غير موجودة")
+        if g["kind"] != p["kind"]:
+            raise AccountingError("مجموعة الأطراف من نوع مختلف")
+        if not g["is_active"]:
+            raise AccountingError("مجموعة الأطراف معطّلة")
+        target_parent = g["account_id"]
+    if acc["parent_id"] == target_parent:
+        raise AccountingError("الطرف موجود بالفعل في هذه المجموعة")
+    target_p = coa._acc(conn, target_parent)
+    new_level = target_p["level"] + 1
+    with transaction(conn):
+        code = numbering.next_code(conn, p["company_id"], target_parent)
+        conn.execute("UPDATE accounts SET code='tmp:'||id WHERE id=?", (p["account_id"],))
+        conn.execute("UPDATE accounts SET code=?, parent_id=?, level=? WHERE id=?",
+                     (code, target_parent, new_level, p["account_id"]))
+        audit.log(conn, actor_id, "move_party_group", "parties", party_id,
+                  {"parent_id": acc["parent_id"], "code": acc["code"]},
+                  {"parent_id": target_parent, "code": code})
+        return {"party_id": party_id, "old_code": acc["code"], "new_code": code,
+                "old_parent": acc["parent_id"], "new_parent": target_parent}
+
+
+def _default_cur(conn, company_id, base):
+    """عملة الطرف الجديد الافتراضية = عملة الإدخال الافتراضية للشركة (وإلا الأساسية)."""
+    try:
+        from alhisabat.accounting import rates
+        return rates.default_currency(conn, company_id)
+    except Exception:  # noqa: BLE001
+        return base
+

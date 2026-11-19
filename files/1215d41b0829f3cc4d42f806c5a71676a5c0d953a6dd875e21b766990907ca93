@@ -1,0 +1,98 @@
+"""إدخال بنود الجرد: كل صنف (وكل لون كصنف مستقل) بجانب رصيد النظام، تُكتب الكمية المعدودة ويظهر الفرق فورًا."""
+from decimal import Decimal, InvalidOperation
+
+from alhisabat.ui.design.color_swatch import set_swatch
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QAbstractItemView, QCheckBox, QDialog, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QTableWidget,
+    QTableWidgetItem, QVBoxLayout)
+
+COLS = ['الكود', 'الصنف', 'الأم', 'اللون', 'الدرجة', 'رصيد النظام', 'المعدود', 'الفرق']
+C_SYS, C_CNT, C_DIFF = 5, 6, 7
+
+
+def _d(m): return Decimal(m or 0) / 1000
+def _fmt(x): return f"{x:,.3f}".rstrip('0').rstrip('.') if x else '0'
+
+
+class CountEntryDialog(QDialog):
+    def __init__(self, page, count):
+        super().__init__(page); self.page, self.count = page, count
+        self.setWindowTitle(f"إدخال بنود الجرد #{count['id']} — {count.get('warehouse', '')}")
+        self.setLayoutDirection(Qt.RightToLeft); self.resize(980, 560)
+        lay = QVBoxLayout(self)
+        top = QHBoxLayout()
+        self.search = QLineEdit(); self.search.setPlaceholderText('بحث بالكود أو الاسم أو اللون…'); self.search.setClearButtonEnabled(True)
+        self.only_colors = QCheckBox('الألوان فقط'); self.only_entered = QCheckBox('المُدخَل فقط')
+        for w in (self.search, self.only_colors, self.only_entered): top.addWidget(w)
+        lay.addLayout(top)
+        self.tbl = QTableWidget(0, len(COLS)); self.tbl.setHorizontalHeaderLabels(COLS)
+        self.tbl.horizontalHeader().setStretchLastSection(True)
+        self.tbl.setSelectionBehavior(QAbstractItemView.SelectRows); lay.addWidget(self.tbl, 1)
+        self.info = QLabel(); lay.addWidget(self.info)
+        row = QHBoxLayout()
+        self.b_save = QPushButton('حفظ البنود'); self.b_save.clicked.connect(self._save); row.addWidget(self.b_save)
+        row.addStretch(1)
+        c = QPushButton('إغلاق'); c.clicked.connect(self.reject); row.addWidget(c)
+        lay.addLayout(row)
+        self._items = []; self._loading = True
+        self._load()
+        self.search.textChanged.connect(self._filter); self.only_colors.toggled.connect(self._filter); self.only_entered.toggled.connect(self._filter)
+        self.tbl.itemChanged.connect(self._changed); self._loading = False
+
+    def _load(self):
+        try: status, self._items = self.page.svc.count_sheet(self.count['id'])
+        except Exception as exc: self.page.show_error(exc); self._items, status = [], 'draft'
+        self.b_save.setEnabled(status == 'draft')
+        self.tbl.setRowCount(len(self._items))
+        for r, it in enumerate(self._items):
+            vals = [it['code'], it['name'], it['parent_name'], it['color_name'], it['shade_code'], _fmt(_d(it['system_qty_milli'])),
+                    '' if it['counted_qty_milli'] is None else _fmt(_d(it['counted_qty_milli'])), '']
+            for c, v in enumerate(vals):
+                x = QTableWidgetItem(v)
+                if c != C_CNT: x.setFlags(x.flags() & ~Qt.ItemIsEditable)
+                if c == 3 and it['color_name']: set_swatch(x, it.get('color_hex', ''))      # معاينة لون الصنف
+                self.tbl.setItem(r, c, x)
+            self._diff(r)
+        self.tbl.resizeColumnsToContents(); self._filter()
+
+    def _entered(self, r):
+        t = self.tbl.item(r, C_CNT).text().strip().replace(',', '')
+        if not t: return None
+        try: return Decimal(t)
+        except InvalidOperation: return 'bad'
+
+    def _diff(self, r):
+        q = self._entered(r); x = self.tbl.item(r, C_DIFF)
+        if q is None: x.setText('')
+        elif q == 'bad': x.setText('قيمة غير صالحة')
+        else: x.setText(_fmt(q - _d(self._items[r]['system_qty_milli'])))
+
+    def _changed(self, item):
+        if not self._loading and item.column() == C_CNT:
+            self._diff(item.row()); self._summary()
+
+    def _filter(self):
+        t = self.search.text().strip().lower()
+        for r, it in enumerate(self._items):
+            hay = ' '.join((it['code'], it['name'], it['parent_name'], it['color_name'], it['shade_code'])).lower()
+            hide = (t and t not in hay) or (self.only_colors.isChecked() and not it['color_name']) \
+                or (self.only_entered.isChecked() and self._entered(r) is None)
+            self.tbl.setRowHidden(r, bool(hide))
+        self._summary()
+
+    def _summary(self):
+        n = sum(1 for r in range(len(self._items)) if self._entered(r) not in (None, 'bad'))
+        self.info.setText(f"المُدخَل: {n} من {len(self._items)} صنف. الأصناف غير المُدخلة لا تتغير أرصدتها (ما لم يكن الجرد كاملًا).")
+
+    def _save(self):
+        qtys = {}
+        for r, it in enumerate(self._items):
+            q = self._entered(r)
+            if q == 'bad':
+                return QMessageBox.warning(self, 'الجرد', f"قيمة غير صالحة للصنف: {it['name']}")
+            if q is not None: qtys[it['item_id']] = q
+        if not qtys:
+            return QMessageBox.information(self, 'الجرد', 'لم تُدخل أي كمية')
+        ok, _ = self.page.guarded(self.page.svc.save_count_lines, self.count['id'], qtys, reload=False)
+        if ok: self.accept()

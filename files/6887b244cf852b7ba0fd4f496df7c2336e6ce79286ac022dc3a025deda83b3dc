@@ -1,0 +1,215 @@
+"""دفتر الملاحظات: ملاحظات غنية النص لكل مستخدم مع وسوم وألوان وتثبيت وأرشفة وتذكير ومشاركة للقراءة.
+
+- كل مستخدم يرى ملاحظاته + الملاحظات المشتركة (shared=1) من زملائه؛ التعديل والحذف لصاحب الملاحظة فقط.
+- لا صلاحية خاصة: أي مستخدم داخل الشركة. لا يمسّ هذا الدفتر أي قيد محاسبي.
+"""
+import html as _html
+import re
+from datetime import date, datetime
+
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.database.tx import transaction
+
+COLORS = ('', 'yellow', 'green', 'blue', 'red', 'purple', 'gray')
+COLOR_LABELS = {'': 'بلا لون', 'yellow': 'أصفر', 'green': 'أخضر', 'blue': 'أزرق', 'red': 'أحمر', 'purple': 'بنفسجي', 'gray': 'رمادي'}
+MODES = ('active', 'pinned', 'reminders', 'shared', 'archived', 'all')
+MAX_TITLE, MAX_BODY, MAX_TAGS, MAX_TAG_LEN = 200, 1_000_000, 12, 30
+
+_BLOCK_END = re.compile(r'</(p|div|li|h[1-6]|tr|blockquote)>|<br\s*/?>', re.I)
+_TAGS = re.compile(r'<[^>]+>')
+_HEAD = re.compile(r'<head.*?</head>|<style.*?</style>', re.I | re.S)
+_SPACES = re.compile(r'[ \t\u00a0]+')
+_AR_FOLD = str.maketrans({'أ': 'ا', 'إ': 'ا', 'آ': 'ا', 'ى': 'ي', 'ة': 'ه', 'ؤ': 'و', 'ئ': 'ي'})
+_DIACRITICS = re.compile(r'[\u064b-\u065f\u0670\u0640]')
+
+
+def fold(text):
+    """تطبيع عربي للبحث: يتجاهل التشكيل والتطويل والهمزات والياء/الألف المقصورة والتاء المربوطة، وحالة الأحرف."""
+    return _DIACRITICS.sub('', (text or '').translate(_AR_FOLD)).lower()
+
+
+def html_to_plain(body):
+    """نص صرف من HTML المحرر: فواصل الأسطر محفوظة، الوسوم والأنماط محذوفة، الكيانات محوَّلة."""
+    t = _HEAD.sub('', body or '')
+    t = _BLOCK_END.sub('\n', t)
+    t = _html.unescape(_TAGS.sub('', t))
+    lines = [_SPACES.sub(' ', ln).strip() for ln in t.splitlines()]
+    return re.sub(r'\n{3,}', '\n\n', '\n'.join(lines)).strip()
+
+
+def normalize_tags(raw):
+    """وسوم مفصولة بـ , أو ، أو ; أو سطر جديد → قائمة بلا تكرار (بصرف النظر عن الحالة)."""
+    if isinstance(raw, str):
+        parts = re.split(r'[,،;\n]+', raw)
+    else:
+        parts = list(raw or [])
+    out, seen = [], set()
+    for p in parts:
+        t = _SPACES.sub(' ', str(p)).strip().lstrip('#').strip()
+        if not t:
+            continue
+        if len(t) > MAX_TAG_LEN:
+            raise AccountingError(f'الوسم «{t[:20]}…» أطول من {MAX_TAG_LEN} حرفًا')
+        k = fold(t)
+        if k not in seen:
+            seen.add(k)
+            out.append(t)
+    if len(out) > MAX_TAGS:
+        raise AccountingError(f'الحد الأقصى {MAX_TAGS} وسمًا للملاحظة')
+    return out
+
+
+def _now():
+    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+
+def _row(r, with_body=False):
+    d = dict(r)
+    d['tags_list'] = [t for t in (d.get('tags') or '').split('،') if t]
+    d['snippet'] = (d.get('plain') or '').replace('\n', ' ')[:140]
+    if not with_body:
+        d.pop('body', None)
+    return d
+
+
+def _visible(conn, company_id, user_id, note_id):
+    r = conn.execute("SELECT * FROM notes WHERE id=? AND company_id=? AND (owner_id=? OR shared=1)", (int(note_id), company_id, user_id)).fetchone()
+    if r is None:
+        raise AccountingError('الملاحظة غير موجودة أو غير متاحة لك')
+    return r
+
+
+def _owned(conn, company_id, user_id, note_id):
+    r = _visible(conn, company_id, user_id, note_id)
+    if r['owner_id'] != user_id:
+        raise AccountingError('هذه ملاحظة مشتركة من زميل: التعديل والحذف لصاحبها فقط')
+    return r
+
+
+def list_notes(conn, company_id, user_id, *, mode='active', search='', tag='', color='', today=None):
+    """قائمة الملاحظات (بلا نص كامل): المثبتة أولًا ثم الأحدث تعديلًا. mode: active|pinned|reminders|shared|archived|all."""
+    if mode not in MODES:
+        raise AccountingError('عرض غير معروف')
+    today = today or date.today().isoformat()
+    where, args = ["n.company_id=?", "(n.owner_id=? OR n.shared=1)"], [company_id, user_id]
+    if mode == 'active':
+        where.append('n.archived=0')
+    elif mode == 'pinned':
+        where.append('n.archived=0 AND n.pinned=1')
+    elif mode == 'reminders':
+        where.append("n.archived=0 AND n.remind_on<>''")
+    elif mode == 'shared':
+        where.append('n.shared=1 AND n.owner_id<>? AND n.archived=0'); args.append(user_id)
+    elif mode == 'archived':
+        where.append('n.archived=1')
+    if color:
+        where.append('n.color=?'); args.append(color)
+    rows = conn.execute(
+        "SELECT n.id,n.owner_id,n.title,n.plain,n.tags,n.color,n.pinned,n.archived,n.shared,n.remind_on,n.created_at,n.updated_at,"
+        "COALESCE(u.full_name,u.username,'') owner_name FROM notes n LEFT JOIN users u ON u.id=n.owner_id WHERE " + ' AND '.join(where) +
+        (" ORDER BY n.remind_on ASC, n.updated_at DESC" if mode == 'reminders' else " ORDER BY n.pinned DESC, n.updated_at DESC, n.id DESC"), args).fetchall()
+    out = [_row(r) for r in rows]
+    for d in out:
+        d['mine'] = d['owner_id'] == user_id
+        d['due'] = bool(d['remind_on']) and d['remind_on'] <= today and not d['archived']
+    if tag:
+        k = fold(tag)
+        out = [d for d in out if any(fold(t) == k for t in d['tags_list'])]
+    terms = [fold(t) for t in (search or '').split() if t.strip()]
+    if terms:                                   # كل كلمة يجب أن توجد في العنوان أو النص أو الوسوم أو اسم صاحبها
+        out = [d for d in out if all(any(t in fold(f) for f in (d['title'], d['plain'], d['tags'], d['owner_name'])) for t in terms)]
+    return out
+
+
+def get_note(conn, company_id, user_id, note_id):
+    d = _row(_visible(conn, company_id, user_id, note_id), with_body=True)
+    d['mine'] = d['owner_id'] == user_id
+    d['owner_name'] = conn.execute("SELECT COALESCE(full_name,username,'') FROM users WHERE id=?", (d['owner_id'],)).fetchone()[0]
+    return d
+
+
+def save_note(conn, company_id, user_id, note_id, v):
+    """ينشئ (note_id=None) أو يعدّل ملاحظة المستخدم. v: title, body(HTML), tags(نص/قائمة), color, remind_on, shared, pinned, archived (الغائب لا يتغيّر في التعديل). يرجع الملاحظة."""
+    if user_id is None:
+        raise AccountingError('سجّل الدخول أولًا')
+    cur = _owned(conn, company_id, user_id, note_id) if note_id else None
+    body = v['body'] if 'body' in v else (cur['body'] if cur else '')
+    if len(body) > MAX_BODY:
+        raise AccountingError('الملاحظة كبيرة جدًا؛ قسّمها إلى ملاحظات')
+    plain = html_to_plain(body)
+    title = (v['title'] if 'title' in v else (cur['title'] if cur else '')).strip()
+    if len(title) > MAX_TITLE:
+        raise AccountingError(f'العنوان أطول من {MAX_TITLE} حرفًا')
+    if not title:
+        first = next((ln for ln in plain.splitlines() if ln.strip()), '')
+        title = first[:60] or 'ملاحظة بلا عنوان'
+    tags = '،'.join(normalize_tags(v['tags'])) if 'tags' in v else (cur['tags'] if cur else '')
+    color = v['color'] if 'color' in v else (cur['color'] if cur else '')
+    if color not in COLORS:
+        raise AccountingError('لون غير معروف')
+    remind = (v['remind_on'] if 'remind_on' in v else (cur['remind_on'] if cur else '')) or ''
+    if remind:
+        try:
+            remind = date.fromisoformat(str(remind)[:10]).isoformat()
+        except ValueError:
+            raise AccountingError('تاريخ التذكير غير صالح')
+    flag = lambda k: int(bool(v[k])) if k in v else (int(cur[k]) if cur else 0)   # noqa: E731
+    pinned, archived, shared = flag('pinned'), flag('archived'), flag('shared')
+    with transaction(conn):
+        if cur is None:
+            nid = conn.execute(
+                "INSERT INTO notes(company_id,owner_id,title,body,plain,tags,color,pinned,archived,shared,remind_on,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (company_id, user_id, title, body, plain, tags, color, pinned, archived, shared, remind, _now(), _now())).lastrowid
+        else:
+            nid = cur['id']
+            conn.execute("UPDATE notes SET title=?,body=?,plain=?,tags=?,color=?,pinned=?,archived=?,shared=?,remind_on=?,updated_at=? WHERE id=?",
+                         (title, body, plain, tags, color, pinned, archived, shared, remind, _now(), nid))
+    return get_note(conn, company_id, user_id, nid)
+
+
+def set_flags(conn, company_id, user_id, note_id, **flags):
+    """تثبيت/أرشفة/مشاركة دون لمس النص."""
+    bad = set(flags) - {'pinned', 'archived', 'shared'}
+    if bad:
+        raise AccountingError('حقل غير مسموح')
+    return save_note(conn, company_id, user_id, note_id, flags)
+
+
+def delete_note(conn, company_id, user_id, note_id):
+    _owned(conn, company_id, user_id, note_id)
+    with transaction(conn):
+        conn.execute("DELETE FROM notes WHERE id=?", (int(note_id),))
+
+
+def tag_counts(conn, company_id, user_id):
+    """[(وسم, عدد)] للملاحظات غير المؤرشفة المتاحة للمستخدم، الأكثر استعمالًا أولًا."""
+    counts, names = {}, {}
+    for r in conn.execute("SELECT tags FROM notes WHERE company_id=? AND archived=0 AND (owner_id=? OR shared=1)", (company_id, user_id)):
+        for t in (r['tags'] or '').split('،'):
+            if t:
+                k = fold(t)
+                counts[k] = counts.get(k, 0) + 1
+                names.setdefault(k, t)
+    return sorted(((names[k], c) for k, c in counts.items()), key=lambda x: (-x[1], x[0]))
+
+
+def counts(conn, company_id, user_id, today=None):
+    """أعداد الشريط الجانبي: {active,pinned,reminders,due,shared,archived}."""
+    today = today or date.today().isoformat()
+    r = conn.execute(
+        "SELECT SUM(archived=0) active, SUM(archived=0 AND pinned=1) pinned, SUM(archived=0 AND remind_on<>'') reminders,"
+        "SUM(archived=0 AND remind_on<>'' AND remind_on<=? AND owner_id=?) due, SUM(archived=0 AND shared=1 AND owner_id<>?) shared, SUM(archived=1) archived "
+        "FROM notes WHERE company_id=? AND (owner_id=? OR shared=1)", (today, user_id, user_id, company_id, user_id)).fetchone()
+    return {k: int(r[k] or 0) for k in r.keys()}
+
+
+def export_text(note):
+    """نص ملاحظة للتصدير (ملف .txt) أو النسخ."""
+    head = [note['title'], '=' * min(40, max(8, len(note['title'])))]
+    meta = []
+    if note.get('tags_list'):
+        meta.append('الوسوم: ' + '، '.join(note['tags_list']))
+    if note.get('remind_on'):
+        meta.append('التذكير: ' + note['remind_on'])
+    meta.append('آخر تعديل: ' + (note.get('updated_at') or ''))
+    return '\n'.join(head + meta + ['', note.get('plain') or '']) + '\n'

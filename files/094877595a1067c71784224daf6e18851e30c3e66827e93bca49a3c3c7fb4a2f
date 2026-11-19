@@ -1,0 +1,25 @@
+-- 0036: تتبع الصلاحية (تاريخ الانتهاء) على مستوى الدفعات (Lots).
+-- إضافي فقط: لا يغيّر بيانات أو حركات قائمة. الأصناف الحالية track_expiry=0 فلا يتغير سلوكها.
+-- الحركة المخزنية تبقى غير قابلة للتعديل؛ الدفعات وتوزيع الحركة عليها جداول مستقلة يحدّثها المحرك.
+ALTER TABLE items ADD COLUMN track_expiry INTEGER NOT NULL DEFAULT 0 CHECK(track_expiry IN (0,1));
+ALTER TABLE items ADD COLUMN expiry_alert_days INTEGER NOT NULL DEFAULT 30 CHECK(expiry_alert_days BETWEEN 0 AND 3650);
+
+CREATE TABLE stock_lots(
+  id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id),
+  item_id INTEGER NOT NULL REFERENCES items(id), warehouse_id INTEGER NOT NULL REFERENCES warehouses(id),
+  lot_no TEXT NOT NULL DEFAULT '', expiry_date TEXT NOT NULL DEFAULT '',          -- '' = دفعة بلا تاريخ انتهاء
+  qty_milli INTEGER NOT NULL CHECK(qty_milli>=0), received_qty_milli INTEGER NOT NULL CHECK(received_qty_milli>0),
+  source_movement_id INTEGER REFERENCES stock_movements(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CHECK(expiry_date='' OR expiry_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'));
+CREATE INDEX ix_lots_fefo ON stock_lots(item_id,warehouse_id,expiry_date,id);
+CREATE INDEX ix_lots_company_exp ON stock_lots(company_id,expiry_date) WHERE qty_milli>0;
+
+-- أي حركة (واردة: أنشأت الدفعة / صادرة: استهلكت منها) وكم كمية؛ لتمكين العكس والمرتجعات بدقة.
+CREATE TABLE stock_lot_alloc(
+  movement_id INTEGER NOT NULL REFERENCES stock_movements(id), lot_id INTEGER NOT NULL REFERENCES stock_lots(id),
+  qty_milli INTEGER NOT NULL CHECK(qty_milli>0), PRIMARY KEY(movement_id,lot_id));
+CREATE INDEX ix_lot_alloc_lot ON stock_lot_alloc(lot_id);
+
+-- فواتير الشراء: تاريخ انتهاء ورقم دفعة لكل بند.
+ALTER TABLE purchase_invoice_lines ADD COLUMN expiry_date TEXT NOT NULL DEFAULT '';
+ALTER TABLE purchase_invoice_lines ADD COLUMN lot_no TEXT NOT NULL DEFAULT '';

@@ -1,0 +1,47 @@
+"""نوافذ «معلومات الصنف»: البيانات الإضافية (اسم أجنبي/ماركة/وصف/سعر بيع مرجعي) والباركود الإضافي."""
+from decimal import Decimal
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLineEdit, QPlainTextEdit, QVBoxLayout
+
+from alhisabat.ui.components.basic import MoneyEdit
+
+
+class ItemExtrasDialog(QDialog):
+    """البيانات الإضافية: الاسم الأجنبي، الماركة، الوصف، وسعر البيع المرجعي (للوحدة الأساسية، بالعملة الأساسية)."""
+
+    def __init__(self, page, info, base_code):
+        super().__init__(page)
+        self.setWindowTitle(f"بيانات إضافية — {info['name']}"); self.setLayoutDirection(Qt.RightToLeft); self.setMinimumWidth(460)
+        lay = QVBoxLayout(self); f = QFormLayout(); f.setLabelAlignment(Qt.AlignRight); lay.addLayout(f)
+        self.name_en = QLineEdit(info.get('name_en') or ''); self.name_en.setLayoutDirection(Qt.LeftToRight); self.name_en.setPlaceholderText('الاسم بالإنجليزية')
+        self.brand = QLineEdit(info.get('brand') or ''); self.brand.setPlaceholderText('الماركة / العلامة التجارية')
+        self.price = MoneyEdit(places=2); self.price.setPlaceholderText('0 = بلا سعر مرجعي (يُستخدم آخر سعر بيع)')
+        if info.get('sale_price_minor'): self.price.set_value(Decimal(info['sale_price_minor']) / 100)
+        self.notes = QPlainTextEdit(info.get('notes') or ''); self.notes.setFixedHeight(80); self.notes.setPlaceholderText('وصف الصنف')
+        f.addRow('الاسم الأجنبي', self.name_en); f.addRow('الماركة', self.brand)
+        f.addRow(f'سعر البيع المرجعي ({base_code}) لكل {info["unit"]}', self.price); f.addRow('وصف الصنف', self.notes)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setText('حفظ'); bb.button(QDialogButtonBox.Cancel).setText('إلغاء')
+        bb.accepted.connect(self.accept); bb.rejected.connect(self.reject); lay.addWidget(bb)
+
+    def values(self):
+        v = self.price.value() if hasattr(self.price, 'value') else Decimal(0)
+        return {'name_en': self.name_en.text(), 'brand': self.brand.text(), 'notes': self.notes.toPlainText(), 'sale_price': v or Decimal(0)}
+
+
+class BarcodeDialog(QDialog):
+    def __init__(self, page, info):
+        super().__init__(page)
+        self.setWindowTitle(f"باركود إضافي — {info['name']}"); self.setLayoutDirection(Qt.RightToLeft); self.setMinimumWidth(400)
+        lay = QVBoxLayout(self); f = QFormLayout(); lay.addLayout(f)
+        self.code = QLineEdit(); self.code.setLayoutDirection(Qt.LeftToRight); self.code.setPlaceholderText('امسح الباركود أو اكتبه')
+        self.unit = QComboBox(); self.unit.addItem('— الوحدة الأساسية —', None)
+        for u in info['units']:
+            if not u['is_base']: self.unit.addItem(u['name'], u['id'])
+        self.note = QLineEdit(); self.note.setPlaceholderText('ملاحظة (اختياري)')
+        f.addRow('الباركود', self.code); f.addRow('الوحدة', self.unit); f.addRow('ملاحظة', self.note)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setText('إضافة'); bb.button(QDialogButtonBox.Cancel).setText('إلغاء')
+        bb.accepted.connect(self.accept); bb.rejected.connect(self.reject); lay.addWidget(bb); self.code.setFocus()
+        self.code.returnPressed.connect(self.accept)

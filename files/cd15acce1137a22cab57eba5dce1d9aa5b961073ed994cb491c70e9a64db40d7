@@ -1,0 +1,57 @@
+"""أزرار ألوان الأصناف في صفحة «الأصناف والأرصدة» (مفصولة لإبقاء الصفحة ضمن حد الحجم)."""
+from alhisabat.ui.core.actions import Action, ActionGroup
+from alhisabat.ui.core.permissions import ActionState
+
+COLOR_KEYS = ('colors', 'color_catalog', 'color_stock')
+
+
+class ColorActionsMixin:
+    def color_group(self):
+        def a(k, lab, icon, tip):
+            return Action(k, lab, icon, state_fn=lambda kk=k: self.color_state(kk), handler=lambda kk=k: self.color_do(kk), tip=tip)
+        return ActionGroup('الألوان', [
+            a('colors', 'ألوان الصنف', 'palette', 'تفعيل الألوان وإضافتها للصنف الأم وعرض رصيد كل لون'),
+            a('color_catalog', 'دليل الألوان', 'list', 'تعريف الألوان والدرجات اللونية مرة واحدة'),
+            a('color_stock', 'أرصدة حسب اللون', 'box', 'رصيد وقيمة كل لون، أو درجة/عائلة لونية عبر كل الأصناف')])
+
+    def color_state(self, k):
+        if k == 'color_stock': return ActionState(True)
+        if k == 'color_catalog': return self.access.state('inventory.manage')
+        sel = getattr(self, '_sel', None)
+        if not sel or sel.get('kind') != 'stock': return ActionState(False, 'حدد صنفًا مخزنيًا أولًا')
+        return self.access.state('inventory.manage')
+
+    def color_do(self, k):
+        st = self.color_state(k)
+        if not st.enabled:
+            from PySide6.QtWidgets import QMessageBox
+            return QMessageBox.information(self, self.title, st.reason)
+        from alhisabat.ui.app_dialogs import variants as V
+        if k == 'colors': return V.ItemColorsDialog(self, self._sel).exec()
+        if k == 'color_catalog': return V.ColorsCatalogDialog(self).exec()
+        return V.StockByColorDialog(self, getattr(self, '_sel', None)).exec()
+
+
+def with_colors(cls):
+    """مُزخرِف: يضيف أزرار وإجراءات الألوان لصفحة الأصناف دون تغيير سطر تعريف الصنف (حفاظًا على اكتشاف الصفحات بالنص)."""
+    for n in ('color_group', 'color_state', 'color_do'):
+        setattr(cls, n, getattr(ColorActionsMixin, n))
+    return cls
+
+
+def with_count_entry(cls):
+    """يضيف زر «إدخال بنود الجرد» لصفحة عمليات المخزون (للجرد المسودة المحدد) دون تغيير تعريف الصنف."""
+    from alhisabat.ui.core.actions import Action
+    orig = cls.ribbon_groups
+
+    def _enter(self):
+        from alhisabat.ui.app_dialogs.count_entry import CountEntryDialog
+        if CountEntryDialog(self, self._count_sel).exec(): self.notify('تم حفظ بنود الجرد'); self.refresh()
+
+    def ribbon_groups(self):
+        groups = orig(self)
+        groups[0].actions.insert(6, Action('count_lines', 'إدخال بنود الجرد', 'edit', state_fn=lambda: self._count_action_state('lines'),
+                                           handler=lambda: _enter(self), tip='أدخل الكميات المعدودة لكل صنف ولون ثم رحّل الجرد'))
+        return groups
+    cls.ribbon_groups = ribbon_groups
+    return cls

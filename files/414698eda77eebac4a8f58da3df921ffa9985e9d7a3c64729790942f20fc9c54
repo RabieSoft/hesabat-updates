@@ -1,0 +1,159 @@
+"""مجموعات الصلاحيات (الأدوار): يتحكم المدير بما يُمنح للمستخدمين.
+
+- مجموعة مخصّصة: إنشاء/تعديل الاسم والصلاحيات/حذف (إن لم تُسنَد لأحد).
+- المجموعات النظامية (مدير مالي، محاسب، مراجع…): تُعدَّل صلاحياتها دون اسمها ولا تُحذف. «مدير النظام» ثابتة (كل الصلاحيات) لا تُعدَّل ولا تُحذف.
+- لا يمنح أحد صلاحية لا يملكها (منع رفع الامتياز)، ولا يُترك النظام بلا مدير فعّال يملك user.manage، ولا يسحب المدير هذه الصلاحية عن نفسه.
+- كل تغيير في معاملة واحدة ويُسجَّل في التدقيق.
+"""
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.audit import audit
+from alhisabat.database.tx import transaction
+from alhisabat.security import permissions
+
+ADMIN_ROLE_ID = 1
+
+
+def list_permissions(conn):
+    return [dict(r) for r in conn.execute("SELECT code,name_ar,is_sensitive FROM permissions ORDER BY code")]
+
+
+def list_roles(conn, company_id):
+    return [dict(r) for r in conn.execute(
+        "SELECT r.id,r.name_ar,r.is_system,"
+        "(SELECT COUNT(*) FROM role_permissions rp WHERE rp.role_id=r.id) perm_count,"
+        "(SELECT COUNT(DISTINCT ur.user_id) FROM user_roles ur WHERE ur.role_id=r.id AND ur.company_id=?) user_count "
+        "FROM roles r ORDER BY r.id", (company_id,))]
+
+
+def role_permissions(conn, role_id):
+    return {r[0] for r in conn.execute("SELECT permission_code FROM role_permissions WHERE role_id=?", (role_id,))}
+
+
+def user_role_ids(conn, company_id, user_id):
+    return [r[0] for r in conn.execute("SELECT role_id FROM user_roles WHERE user_id=? AND company_id=? ORDER BY role_id", (user_id, company_id))]
+
+
+def _actor_perms(conn, actor_id, company_id):
+    return {r[0] for r in conn.execute(
+        "SELECT DISTINCT rp.permission_code FROM users u JOIN user_roles ur ON ur.user_id=u.id AND ur.company_id=? "
+        "JOIN role_permissions rp ON rp.role_id=ur.role_id WHERE u.id=? AND u.is_active=1", (company_id, actor_id))}
+
+
+def _role(conn, role_id):
+    r = conn.execute("SELECT * FROM roles WHERE id=?", (role_id,)).fetchone()
+    if not r:
+        raise AccountingError("المجموعة غير موجودة")
+    return r
+
+
+def _clean(conn, name, codes):
+    name = (name or "").strip()
+    if not name:
+        raise AccountingError("اسم المجموعة مطلوب")
+    codes = sorted({str(c) for c in (codes or [])})
+    if not codes:
+        raise AccountingError("اختر صلاحية واحدة على الأقل للمجموعة")
+    known = {r[0] for r in conn.execute("SELECT code FROM permissions")}
+    bad = [c for c in codes if c not in known]
+    if bad:
+        raise AccountingError("صلاحيات غير معروفة: " + "، ".join(bad))
+    return name, codes
+
+
+def _assert_can_grant(conn, actor_id, company_id, codes):
+    missing = sorted(set(codes) - _actor_perms(conn, actor_id, company_id))
+    if missing:
+        names = {r[0]: r[1] for r in conn.execute("SELECT code,name_ar FROM permissions")}
+        raise AccountingError("لا يمكنك منح صلاحية لا تملكها: " + "، ".join(names.get(c, c) for c in missing))
+
+
+def _assert_still_managed(conn, actor_id, company_id):
+    """بعد أي تغيير: المنفِّذ يحتفظ بإدارة المستخدمين، ويبقى مدير فعّال واحد على الأقل."""
+    if not permissions.has(conn, actor_id, company_id, "user.manage"):
+        raise AccountingError("لا يمكنك سحب صلاحية «إدارة المستخدمين والصلاحيات» من نفسك")
+    n = conn.execute(
+        "SELECT COUNT(DISTINCT u.id) FROM users u JOIN user_roles ur ON ur.user_id=u.id AND ur.company_id=? "
+        "JOIN role_permissions rp ON rp.role_id=ur.role_id AND rp.permission_code='user.manage' WHERE u.is_active=1", (company_id,)).fetchone()[0]
+    if not n:
+        raise AccountingError("يجب أن يبقى في النظام مدير فعّال واحد على الأقل يملك إدارة المستخدمين")
+
+
+def _name_free(conn, name, exclude_id=None):
+    if conn.execute("SELECT 1 FROM roles WHERE name_ar=? AND id<>?", (name, exclude_id or 0)).fetchone():
+        raise AccountingError("يوجد مجموعة بهذا الاسم")
+
+
+def create_role(conn, actor_id, company_id, name, codes):
+    permissions.require(conn, actor_id, company_id, "user.manage", check_branch=False)
+    name, codes = _clean(conn, name, codes)
+    _assert_can_grant(conn, actor_id, company_id, codes)
+    _name_free(conn, name)
+    with transaction(conn):
+        rid = conn.execute("INSERT INTO roles(name_ar,is_system) VALUES(?,0)", (name,)).lastrowid
+        conn.executemany("INSERT INTO role_permissions(role_id,permission_code) VALUES(?,?)", [(rid, c) for c in codes])
+        audit.log(conn, actor_id, "create_role", "roles", rid, after={"name": name, "permissions": codes})
+    return rid
+
+
+def update_role(conn, actor_id, company_id, role_id, name, codes):
+    permissions.require(conn, actor_id, company_id, "user.manage", check_branch=False)
+    r = _role(conn, role_id)
+    if role_id == ADMIN_ROLE_ID:
+        raise AccountingError("مجموعة «مدير النظام» ثابتة بكل الصلاحيات ولا تُعدَّل")
+    name, codes = _clean(conn, name, codes)
+    if r["is_system"] and name != r["name_ar"]:
+        raise AccountingError("لا يُغيَّر اسم المجموعة النظامية؛ يمكنك تعديل صلاحياتها فقط")
+    before = sorted(role_permissions(conn, role_id))
+    _assert_can_grant(conn, actor_id, company_id, set(codes) - set(before))        # الجديد فقط: ما سبق منحه لا يُعاد التحقق منه
+    _name_free(conn, name, role_id)
+    with transaction(conn):
+        conn.execute("UPDATE roles SET name_ar=? WHERE id=?", (name, role_id))
+        conn.execute("DELETE FROM role_permissions WHERE role_id=?", (role_id,))
+        conn.executemany("INSERT INTO role_permissions(role_id,permission_code) VALUES(?,?)", [(role_id, c) for c in codes])
+        _assert_still_managed(conn, actor_id, company_id)
+        audit.log(conn, actor_id, "update_role", "roles", role_id, {"name": r["name_ar"], "permissions": before},
+                  {"name": name, "permissions": codes, "added": sorted(set(codes) - set(before)), "removed": sorted(set(before) - set(codes))})
+    return role_id
+
+
+def delete_role(conn, actor_id, company_id, role_id):
+    permissions.require(conn, actor_id, company_id, "user.manage", check_branch=False)
+    r = _role(conn, role_id)
+    if r["is_system"] or role_id == ADMIN_ROLE_ID:
+        raise AccountingError("المجموعات النظامية لا تُحذف")
+    n = conn.execute("SELECT COUNT(DISTINCT user_id) FROM user_roles WHERE role_id=?", (role_id,)).fetchone()[0]
+    if n:
+        raise AccountingError(f"المجموعة مسندة إلى {n} مستخدم: انقلهم إلى مجموعة أخرى أولًا")
+    with transaction(conn):
+        conn.execute("DELETE FROM role_permissions WHERE role_id=?", (role_id,))
+        conn.execute("DELETE FROM roles WHERE id=?", (role_id,))
+        audit.log(conn, actor_id, "delete_role", "roles", role_id, {"name": r["name_ar"]})
+
+
+def set_user_roles(conn, actor_id, company_id, user_id, role_ids):
+    """يستبدل مجموعات المستخدم في الشركة بالقائمة المحددة (لا الإضافة فقط)."""
+    permissions.require(conn, actor_id, company_id, "user.manage", check_branch=False)
+    ids = sorted({int(x) for x in (role_ids or [])})
+    if not ids:
+        raise AccountingError("اختر مجموعة صلاحيات واحدة على الأقل للمستخدم")
+    if not conn.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone():
+        raise AccountingError("المستخدم غير موجود")
+    granted = set()
+    for rid in ids:
+        _role(conn, rid)
+        granted |= role_permissions(conn, rid)
+    old = user_role_ids(conn, company_id, user_id)
+    _assert_can_grant(conn, actor_id, company_id, granted - _perms_of_roles(conn, old))   # لا يرفع أحدًا فوق ما يملكه هو
+    with transaction(conn):
+        conn.execute("DELETE FROM user_roles WHERE user_id=? AND company_id=?", (user_id, company_id))
+        conn.executemany("INSERT INTO user_roles(user_id,company_id,role_id) VALUES(?,?,?)", [(user_id, company_id, i) for i in ids])
+        _assert_still_managed(conn, actor_id, company_id)
+        audit.log(conn, actor_id, "set_user_roles", "user_roles", user_id, {"roles": old}, {"roles": ids, "company": company_id})
+    return ids
+
+
+def _perms_of_roles(conn, role_ids):
+    out = set()
+    for i in role_ids:
+        out |= role_permissions(conn, i)
+    return out

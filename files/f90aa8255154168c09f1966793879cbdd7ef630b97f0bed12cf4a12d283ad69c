@@ -1,0 +1,504 @@
+"""نوافذ المخزون: صنف، مستودع، تحويل، تسوية، جرد.
+"""
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+                               QPushButton, QSpinBox, QTableWidgetItem, QVBoxLayout)
+
+from alhisabat.ui.components.basic import DialogGuardMixin
+from alhisabat.ui.components.basic import CompactForm, DateField, ModeRadio, compact_rows, make_resizable
+from alhisabat.ui.core import strings_ar as S
+
+class ItemDialog(DialogGuardMixin, QDialog):
+    """صنف جديد/تعديل (v1.6): أقسام واضحة، تحقق لحظي (الاسم/الكود/الوحدة/الحد الأدنى/الباركود)، تنبيه من تكرار الاسم أو الباركود،
+    Enter ينقل للحقل التالي، Ctrl+S يحفظ، و«حفظ وإضافة آخر». الوحدة الأساسية والتصنيف من دليلي الوحدات والتصنيفات (مع إضافة سريعة).
+    المنطق في core/entry_logic.py والمحرك هو الحَكَم النهائي."""
+    guard_save_stay = False             # الحفظ يتم في الصفحة بعد القبول
+    nonmodal_exec = True                # تصغير «–» والعمل في شاشات أخرى
+    center_on_show = True
+
+    def __init__(self, page, existing=None):
+        super().__init__(page); self.page = page; self.existing = existing; self.add_another = False
+        from decimal import Decimal
+        from PySide6.QtGui import QKeySequence, QShortcut
+        from PySide6.QtWidgets import QGroupBox, QHBoxLayout, QLabel, QPushButton, QVBoxLayout
+        from alhisabat.ui.components.basic import MoneyEdit
+        ex = existing or {}
+        self.setWindowTitle('تعديل صنف' if existing else 'صنف جديد'); self.setLayoutDirection(Qt.RightToLeft); make_resizable(self, 740, 600, min_size=(640, 360))
+        root = QVBoxLayout(self); root.setSpacing(6)
+
+        def section(title, per_row=2):                      # حقول بصفوف أفقية مضغوطة بدل عمود طويل
+            gb = QGroupBox(title); f = CompactForm(gb, per_row); f.setContentsMargins(10, 4, 10, 8)
+            root.addWidget(gb); return f
+
+        f1 = section('البيانات الأساسية', 3)
+        self.name = QLineEdit(ex.get('name', '')); self.name.setPlaceholderText('اسم الصنف (مطلوب)')
+        self.code = QLineEdit(ex.get('code', '')); self.code.setEnabled(not existing); self.code.setPlaceholderText('فارغ = ترقيم تلقائي')
+        self.code.setLayoutDirection(Qt.LeftToRight)
+        self.barcode = QLineEdit(ex.get('barcode') or ''); self.barcode.setPlaceholderText('اختياري — امسح الباركود هنا')
+        self.barcode.setLayoutDirection(Qt.LeftToRight)
+        self.kind = QComboBox(); self.kind.addItems(['مخزون', 'خدمة'])
+        if ex.get('kind') == 'service': self.kind.setCurrentIndex(1)
+        if existing and ex.get('has_moves'):
+            self.kind.setEnabled(False); self.kind.setToolTip('لا يتغيّر نوع الصنف بعد وجود حركات مخزنية له.')
+        lbl = QLabel('الاسم *'); lbl.setStyleSheet('color: var(--color-danger);')
+        f1.addWide('الاسم *', self.name); f1.addRow('الكود', self.code); f1.addRow('الباركود', self.barcode); f1.addRow('النوع', self.kind)
+
+        f2 = section('الوحدة والتصنيف')
+        self.unit = QComboBox(); self.category = QComboBox()
+        self._fill_units(ex.get('unit_id')); self._fill_categories(ex.get('category_id'))
+        if existing: self.unit.setEnabled(False); self.unit.setToolTip('الوحدة الأساسية لا تتغير بعد الإنشاء؛ أضف وحدات تحويل من زر «وحدات التحويل».')
+        ub = QPushButton('+ وحدة'); ub.clicked.connect(self._quick_unit); ub.setEnabled(not existing); ub.setAutoDefault(False)
+        cb = QPushButton('+ تصنيف'); cb.clicked.connect(self._quick_category); cb.setAutoDefault(False)
+        ur = QHBoxLayout(); ur.addWidget(self.unit, 1); ur.addWidget(ub)
+        cr = QHBoxLayout(); cr.addWidget(self.category, 1); cr.addWidget(cb)
+        f2.addRow('الوحدة الأساسية *', ur); f2.addRow('التصنيف', cr)
+
+        f3 = section('إعدادات المخزون')
+        self.minqty = MoneyEdit(places=3); self.minqty.setPlaceholderText('0 = بلا تنبيه')
+        if ex.get('min_qty_milli'): self.minqty.set_value(Decimal(ex['min_qty_milli']) / 1000)
+        from alhisabat.ui.core import strings_ar as S
+        self.method = QComboBox(); self.method.addItem('حسب التصنيف (الافتراضي: المتوسط المرجّح)', '')
+        for k, lab in S.COST_METHOD_LABELS.items(): self.method.addItem(lab, k)
+        self.method.setCurrentIndex(max(self.method.findData(ex.get('cost_method') or ''), 0))
+        if existing and ex.get('has_moves'):
+            self.method.setEnabled(False); self.method.setToolTip('لا يمكن تغيير طريقة التقييم بعد وجود حركات مخزنية للصنف.')
+        else: self.method.setToolTip(S.COST_METHOD_NOTE)
+        f3.addRow('الحد الأدنى للتنبيه', self.minqty); f3.addRow('طريقة تقييم المخزون', self.method)
+        from PySide6.QtWidgets import QSpinBox
+        self.track = QCheckBox('تتبع تاريخ الانتهاء (دفعات) — يلزم تاريخ انتهاء عند كل شراء/رصيد افتتاحي ويُصرف الأقدم أولًا')
+        self.track.setChecked(bool(ex.get('track_expiry')))
+        self.alert_days = QSpinBox(); self.alert_days.setRange(0, 3650); self.alert_days.setSuffix(' يومًا'); self.alert_days.setValue(int(ex.get('expiry_alert_days') or 30))
+        self.alert_days.setToolTip('يظهر تنبيه «قريب الانتهاء» قبل التاريخ بهذه المدة')
+        self.track.toggled.connect(self.alert_days.setEnabled); self.alert_days.setEnabled(self.track.isChecked())
+        f3.addWide('الصلاحية', self.track); f3.addRow('التنبيه قبل الانتهاء بـ', self.alert_days)
+        self.has_colors = QCheckBox('هذا الصنف له ألوان (ملابس / أقمشة) — اختر ألوانه من القائمة أدناه')
+        is_color_child = bool(ex.get('parent_item_id'))
+        already = bool(ex.get('has_variants'))
+        self.has_colors.setChecked(already)
+        if already:
+            self.has_colors.setEnabled(False); self.has_colors.setToolTip('الألوان مفعّلة لهذا الصنف؛ تُدار من زر «ألوان الصنف».')
+        elif is_color_child:
+            self.has_colors.setEnabled(False); self.has_colors.setToolTip('هذا الصنف لون تابع لصنف أم.')
+        elif existing and ex.get('has_moves'):
+            self.has_colors.setEnabled(False); self.has_colors.setToolTip('لا يمكن تفعيل الألوان لصنف له حركات؛ أنشئ صنفًا أمًّا جديدًا ثم اربط الأصناف بلا حركات أو انقل الرصيد بتسوية.')
+        f3.addWide('الألوان', self.has_colors)
+        from PySide6.QtWidgets import QGroupBox, QListWidget
+        self.colors_box = QGroupBox('اختر الألوان (علّم ما يتوفر من هذا الصنف)'); cb_l = QVBoxLayout(self.colors_box)
+        self.color_list = QListWidget(); self.color_list.setMinimumHeight(130); cb_l.addWidget(self.color_list)
+        nb = QPushButton('+ لون جديد'); nb.setAutoDefault(False); nb.clicked.connect(self._new_color); cb_l.addWidget(nb, 0, Qt.AlignLeft)
+        root.addWidget(self.colors_box)
+        self._have_colors = set()
+        if already:
+            try: self._have_colors = {r['color_id'] for r in self.page.svc.item_variants(ex['id'])}
+            except Exception: pass
+        self._fill_colors()
+        self.colors_box.setVisible(self.has_colors.isChecked())
+        self.has_colors.toggled.connect(self.colors_box.setVisible)
+        self._stock_widgets = (self.minqty, self.method, self.track)
+        self._color_locked = not self.has_colors.isEnabled()
+        self.kind.currentIndexChanged.connect(self._sync_kind)
+
+        self.warn = QLabel(''); self.warn.setWordWrap(True); self.warn.setStyleSheet('color: var(--color-warning);'); self.warn.setVisible(False)
+        self.err = QLabel(''); self.err.setWordWrap(True); self.err.setStyleSheet('color: var(--color-danger); font-weight: bold;'); self.err.setVisible(False)
+        root.addWidget(self.warn); root.addWidget(self.err)
+
+        bb = QDialogButtonBox()
+        self.ok = bb.addButton('حفظ التعديل' if existing else 'حفظ', QDialogButtonBox.AcceptRole); self.ok.setProperty('primary', True); self.ok.setAutoDefault(False)
+        self.btn_more = None
+        if not existing:
+            self.btn_more = bb.addButton('حفظ وإضافة آخر', QDialogButtonBox.ActionRole); self.btn_more.setAutoDefault(False)
+            self.btn_more.clicked.connect(self._save_and_new)
+        cancel = bb.addButton(S.ACTION['cancel'], QDialogButtonBox.RejectRole); cancel.setAutoDefault(False)
+        bb.accepted.connect(self._accept); bb.rejected.connect(self.reject); root.addWidget(bb)
+
+        for w in (self.name, self.code, self.barcode): w.returnPressed.connect(self.focusNextChild)
+        QShortcut(QKeySequence('Ctrl+S'), self, activated=self._accept)
+        # أسماء وباركودات الأصناف الموجودة (من قائمة الصفحة المحمّلة أصلًا: لا استعلام إضافي)
+        rows = [r for r in (getattr(page, '_items', None) or []) if not existing or r.get('id') != ex.get('id')]
+        self._names = [r.get('name') or '' for r in rows]
+        self._barcodes = {(r.get('barcode') or '').strip(): r.get('name') for r in rows if (r.get('barcode') or '').strip()}
+        for w in (self.name, self.code, self.barcode, self.minqty): w.textChanged.connect(self._validate)
+        self.unit.currentIndexChanged.connect(self._validate)
+        self._sync_kind(); self._validate()
+        self.name.setFocus()
+
+    def _fill_colors(self, check_id=None):
+        from PySide6.QtWidgets import QListWidgetItem
+        from alhisabat.ui.design.color_swatch import set_swatch
+        keep = {self.color_list.item(i).data(Qt.UserRole) for i in range(self.color_list.count()) if self.color_list.item(i).checkState() == Qt.Checked}
+        if check_id: keep.add(check_id)
+        self.color_list.clear()
+        try: cols = self.page.svc.colors()
+        except Exception as exc: self.page.show_error(exc); cols = []
+        for c in cols:
+            if c['id'] in self._have_colors: continue
+            it = QListWidgetItem(f"{c['name']} {c['shade_code']}".strip()); it.setData(Qt.UserRole, c['id'])
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable); it.setCheckState(Qt.Checked if c['id'] in keep else Qt.Unchecked)
+            set_swatch(it, c.get('hex', '')); self.color_list.addItem(it)
+
+    def _new_color(self):
+        from alhisabat.ui.app_dialogs.variants import add_color_flow
+        cid = add_color_flow(self.page, self)
+        if cid: self._fill_colors(check_id=cid)
+
+    def _sync_kind(self, *_):
+        service = self.kind.currentIndex() == 1
+        for w in self._stock_widgets:
+            w.setEnabled(not service and not (self.existing and w is self.method and self.existing.get('has_moves')))
+        if service: self.minqty.setToolTip('الخدمة لا مخزون لها.')
+        if service: self.has_colors.setChecked(False)
+        self.has_colors.setEnabled(not service and not self._color_locked)
+
+    def _raw(self):
+        return {'name': self.name.text(), 'code': self.code.text(), 'unit_id': self.unit.currentData(), 'barcode': self.barcode.text(),
+                'min_qty': self.minqty.text()}
+
+    def _validate(self, *_):
+        from alhisabat.ui.components.basic import repolish
+        from alhisabat.ui.core import entry_logic as EL
+        self._errs = EL.item_errors(self._raw())
+        for key, w in (('name', self.name), ('code', self.code), ('barcode', self.barcode), ('min_qty', self.minqty)):
+            bad = key in self._errs and bool(w.text().strip())
+            w.setProperty('invalid', bad); w.setToolTip(self._errs.get(key, '') if bad else ''); repolish(w)
+        shown = [m for k, m in self._errs.items() if not (k == 'name' and not self.name.text().strip())]
+        self.err.setText('\n'.join(shown)); self.err.setVisible(bool(shown))
+        notes = []
+        dup = EL.find_similar_name(self.name.text(), self._names)
+        if dup: notes.append(f'⚠ يوجد صنف بنفس الاسم مسبقًا: «{dup}».')
+        bc = self.barcode.text().strip()
+        if bc and bc in self._barcodes: notes.append(f'⚠ الباركود مستخدم للصنف «{self._barcodes[bc]}».')
+        self.warn.setText('\n'.join(notes)); self.warn.setVisible(bool(notes))
+        self.ok.setEnabled(not self._errs)
+        if self.btn_more is not None: self.btn_more.setEnabled(not self._errs)
+
+    def _fill_units(self, select_id=None):
+        self.unit.clear()
+        try:
+            for u in self.page.svc.units(): self.unit.addItem(f"{u['name']}", u['id'])
+        except Exception as exc: self.page.show_error(exc)
+        if select_id is not None:
+            idx = self.unit.findData(select_id)
+            if idx < 0 and self.existing:      # وحدة الصنف معطّلة الآن: تبقى ظاهرة لهذا الصنف
+                self.unit.addItem(self.existing.get('unit') or '', select_id); idx = self.unit.count() - 1
+            self.unit.setCurrentIndex(max(idx, 0))
+    def _fill_categories(self, select_id=None):
+        self.category.clear(); self.category.addItem('— بدون تصنيف —', None)
+        try:
+            for c in self.page.svc.category_tree(False): self.category.addItem(('    ' * c['depth']) + c['name'], c['id'])
+        except Exception as exc: self.page.show_error(exc)
+        if select_id is not None:
+            idx = self.category.findData(select_id)
+            if idx >= 0: self.category.setCurrentIndex(idx)
+    def _quick_unit(self):
+        from alhisabat.ui.app_dialogs.catalog import UnitDialog
+        d = UnitDialog(self.page)
+        if d.exec():
+            v = d.values(); ok, uid = self.page.guarded(self.page.svc.create_unit, v['name'], v['code'] or None, v['notes'], reload=False)
+            if ok: self._fill_units(uid)
+    def _quick_category(self):
+        from alhisabat.ui.app_dialogs.catalog import CategoryDialog
+        cur = self.category.currentData(); parent = next((c for c in self.page.svc.category_tree(False) if c['id'] == cur), None)
+        d = CategoryDialog(self.page, parent_id=cur, parent_path=parent['path'] if parent else '')
+        if d.exec():
+            ok, cid = self.page.guarded(self.page.svc.create_category, d.values(), reload=False)
+            if ok: self._fill_categories(cid)
+    def _save_and_new(self):
+        self.add_another = True; self._accept()
+    def _accept(self):
+        if self._errs:
+            self.add_another = False
+            return QMessageBox.warning(self, 'بيانات ناقصة', '\n'.join(self._errs.values()))
+        self.accept()
+    def values(self):
+        from alhisabat.ui.core import entry_logic as EL
+        v = EL.clean_item_values(self._raw()); service = self.kind.currentIndex() == 1
+        return {'name': v['name'], 'code': v['code'], 'unit_id': v['unit_id'], 'category_id': self.category.currentData(), 'barcode': v['barcode'],
+                'min_qty': '0' if service else v['min_qty'], 'kind': 'service' if service else 'stock', 'cost_method': self.method.currentData() or '',
+                'track_expiry': (not service) and self.track.isChecked(), 'expiry_alert_days': self.alert_days.value(),
+                'has_colors': (not service) and self.has_colors.isChecked(),
+                'color_ids': [self.color_list.item(i).data(Qt.UserRole) for i in range(self.color_list.count())
+                              if self.color_list.item(i).checkState() == Qt.Checked] if (not service and self.has_colors.isChecked()) else []}
+
+class WarehouseDialog(QDialog):
+    def __init__(self, page):
+        super().__init__(page); self.setWindowTitle('مستودع جديد'); self.setLayoutDirection(Qt.RightToLeft); self.setMinimumWidth(560); form=CompactForm(self, 2)
+        self.name=QLineEdit(); self.code=QLineEdit(); form.addRow('الاسم *', self.name); form.addRow('الكود (فارغ=تلقائي)', self.code)
+        bb=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel); bb.accepted.connect(self._accept); bb.rejected.connect(self.reject); form.addRow(bb)
+    def _accept(self):
+        if not self.name.text().strip(): return QMessageBox.warning(self,'خطأ','الاسم مطلوب')
+        self.accept()
+    def values(self): return {'name':self.name.text().strip(),'code':self.code.text().strip() or None}
+
+class TransferDialog(QDialog):
+    def __init__(self, page):
+        super().__init__(page); self.setWindowTitle('تحويل بين المستودعات'); self.setLayoutDirection(Qt.RightToLeft); make_resizable(self, 760, 250, (640, 230)); form=QVBoxLayout(self); form.setSpacing(6); form.setContentsMargins(12, 8, 12, 8)
+        self.item=QComboBox(); self.item.setEditable(True); self.item.setInsertPolicy(QComboBox.NoInsert)      # بحث بالكتابة
+        try:
+            for it in page.svc.items(limit=500):
+                if it.get('has_variants'): continue          # الأم المجمِّعة للألوان لا تُنقل؛ تُنقل ألوانها
+                self.item.addItem(f"{it['code']} — {it['name']}", it['id'])
+        except Exception: pass
+        self.frm=QComboBox(); self.to=QComboBox()
+        try:
+            for w in page.svc.warehouses():
+                self.frm.addItem(w['name'], w['id']); self.to.addItem(w['name'], w['id'])
+        except Exception: pass
+        self.qty=QLineEdit(); self.qty.setPlaceholderText('0'); self.date=DateField(); self.note=QLineEdit()
+        self.item.setCurrentIndex(-1); self.item.lineEdit().setPlaceholderText('ابحث بالكود أو الاسم…')
+        # صفان مضغوطان: (الصنف · الكمية) ثم (من · إلى · التاريخ · ملاحظة)
+        self.date.setMinimumWidth(128)
+        compact_rows(form, [[('الصنف', self.item, 4), ('الكمية *', self.qty, 1)],
+                            [('من مستودع', self.frm, 2), ('إلى مستودع', self.to, 2), ('التاريخ', self.date, 0), ('ملاحظة', self.note, 3)]])
+        bb=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel); bb.accepted.connect(self._accept); bb.rejected.connect(self.reject); form.addWidget(bb)
+        self.item.setFocus()
+    def _accept(self):
+        if self.item.currentData() is None: return QMessageBox.warning(self,'خطأ','اختر الصنف من القائمة')
+        if self.frm.currentData()==self.to.currentData(): return QMessageBox.warning(self,'خطأ','اختر مستودعين مختلفين')
+        if not self.qty.text().strip(): return QMessageBox.warning(self,'خطأ','الكمية مطلوبة')
+        self.accept()
+    def values(self): return {'item_id':self.item.currentData(),'from_wh':self.frm.currentData(),'to_wh':self.to.currentData(),'qty':self.qty.text().strip().replace(',', ''),'date':self.date.iso(),'note':self.note.text().strip()}
+
+class AdjustDialog(QDialog):
+    """تسوية مخزنية. للصنف المتتبَّع الصلاحية: الزيادة تطلب تاريخ انتهاء/دفعة، والنقص يصرف الأقدم تلقائيًا أو دفعة تختارها
+    (ومنها المنتهية: هذا مسار الإتلاف). تكلفة وحدة الزيادة اختيارية (بلا تكلفة تُستنتج من المتوسط)."""
+    def __init__(self, page, preset=None):
+        super().__init__(page); self.page = page; self.setWindowTitle('تسوية مخزنية'); self.setLayoutDirection(Qt.RightToLeft)
+        make_resizable(self, 780, 320, (660, 280)); form = QVBoxLayout(self); form.setSpacing(6); form.setContentsMargins(12, 8, 12, 8)
+        self.item = QComboBox(); self.item.setEditable(True); self._items = {}
+        try:
+            for it in page.svc.items(limit=5000):
+                if it.get('kind') == 'stock' and it.get('is_active') and not it.get('has_variants'):
+                    self._items[it['id']] = it; self.item.addItem(f"{it['code']} — {it['name']}", it['id'])
+        except Exception: pass
+        self.item.setCurrentIndex(-1)
+        self.wh = QComboBox()
+        try:
+            for w in page.svc.warehouses():
+                if w.get('is_active'): self.wh.addItem(w['name'], w['id'])
+        except Exception: pass
+        self.dir = ModeRadio([('زيادة', 'in'), ('نقص', 'out')])         # خياران فقط: راديو بنقرة واحدة
+        self.qty = QLineEdit(); self.qty.setPlaceholderText('0'); self.reason = QLineEdit(); self.date = DateField()
+        self.cost = QLineEdit(); self.cost.setPlaceholderText('اختياري — تكلفة الوحدة للزيادة')
+        self.expiry = QLineEdit(); self.expiry.setPlaceholderText('اكتب بأي ترتيب: 31/05/2027 أو 05/2027'); self.lot_no = QLineEdit()
+        self.lot = QComboBox()
+        self.date.setMinimumWidth(128)
+        blocks = compact_rows(form, [
+            [('الصنف', self.item, 4), ('المستودع', self.wh, 2)],
+            [('الاتجاه', self.dir, 0), ('الكمية *', self.qty, 1), ('تكلفة الوحدة', self.cost, 1), ('التاريخ', self.date, 0)],
+            [('تاريخ الانتهاء *', self.expiry, 1), ('رقم الدفعة', self.lot_no, 1), ('الدفعة المصروفة', self.lot, 2)],     # تظهر عند الحاجة فقط (صنف بصلاحية)
+            [('السبب', self.reason, 1)],
+        ])
+        self._b_exp, self._b_lotno, self._b_lot = blocks[id(self.expiry)], blocks[id(self.lot_no)], blocks[id(self.lot)]
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel); bb.accepted.connect(self._accept); bb.rejected.connect(self.reject); form.addWidget(bb)
+        for sig in (self.item.currentIndexChanged, self.wh.currentIndexChanged, self.dir.currentIndexChanged): sig.connect(self._sync)
+        self._sync()
+        if preset:                                   # إتلاف دفعة محددة من تبويب الصلاحية
+            self.item.setCurrentIndex(max(self.item.findData(preset.get('item_id')), 0)); self.wh.setCurrentIndex(max(self.wh.findData(preset.get('warehouse_id')), 0))
+            self.dir.setCurrentIndex(1); self._sync()
+            self.lot.setCurrentIndex(max(self.lot.findData(preset.get('lot_id')), 0)); self.qty.setText(str(preset.get('qty', ''))); self.reason.setText(preset.get('reason', ''))
+
+    def _tracked(self):
+        it = self._items.get(self.item.currentData()); return bool(it and it.get('track_expiry'))
+
+    def _sync(self, *_):
+        tr, inc = self._tracked(), self.dir.currentIndex() == 0
+        self._b_exp.setVisible(tr and inc); self._b_lotno.setVisible(tr and inc); self._b_lot.setVisible(tr and not inc)
+        if tr and not inc:
+            self.lot.clear(); self.lot.addItem('تلقائي — الأقدم انتهاءً أولًا', None)
+            try:
+                from decimal import Decimal as _D
+                for l in self.page.svc.item_lots(self.item.currentData(), self.wh.currentData()):
+                    lbl = f"{l['expiry_date'] or 'بلا تاريخ'} — دفعة {l['lot_no'] or '—'} — كمية {_D(l['qty_milli']) / 1000:g}"
+                    self.lot.addItem(lbl, l['id'])
+            except Exception: pass
+
+    def _accept(self):
+        from alhisabat.ui.core import calc_logic as CL
+        if self.item.currentData() is None: return QMessageBox.warning(self, 'خطأ', 'اختر الصنف من القائمة')
+        if not self.qty.text().strip(): return QMessageBox.warning(self, 'خطأ', 'الكمية مطلوبة')
+        if self._tracked() and self.dir.currentIndex() == 0:
+            try:
+                if not CL.parse_expiry_input(self.expiry.text()): return QMessageBox.warning(self, 'خطأ', 'تاريخ الانتهاء مطلوب لهذا الصنف')
+            except ValueError as e: return QMessageBox.warning(self, 'تاريخ غير صالح', str(e))
+        self.accept()
+
+    def values(self):
+        from alhisabat.ui.core import calc_logic as CL
+        inc = self.dir.currentIndex() == 0; exp = ''
+        if self._tracked() and inc:
+            try: exp = CL.parse_expiry_input(self.expiry.text())
+            except ValueError: exp = ''
+        return {'item_id': self.item.currentData(), 'warehouse_id': self.wh.currentData(), 'direction': 'in' if inc else 'out',
+                'qty': self.qty.text().strip().replace(',', ''), 'reason': self.reason.text().strip(), 'date': self.date.iso(),
+                'unit_cost': self.cost.text().strip().replace(',', '') if inc else '', 'expiry_date': exp, 'lot_no': self.lot_no.text().strip() if inc else '',
+                'lot_id': None if inc else self.lot.currentData()}
+
+
+class AssignExpiryDialog(QDialog):
+    """تأريخ رصيد قديم بلا دفعات (مخزون موجود قبل تفعيل تتبع الصلاحية): ينشئ دفعة بتاريخ انتهاء دون أي حركة أو قيد."""
+    def __init__(self, page):
+        super().__init__(page); self.page = page; self.setWindowTitle('تأريخ رصيد قديم (تحديد تاريخ انتهاء)'); self.setLayoutDirection(Qt.RightToLeft)
+        make_resizable(self, 780, 280, (660, 260)); form = CompactForm(self, 3)
+        self.item = QComboBox(); self.item.setEditable(True); self._items = {}
+        try:
+            for it in page.svc.items(limit=5000):
+                if it.get('kind') == 'stock' and it.get('is_active') and it.get('track_expiry'):
+                    self._items[it['id']] = it; self.item.addItem(f"{it['code']} — {it['name']}", it['id'])
+        except Exception: pass
+        self.wh = QComboBox()
+        try:
+            for w in page.svc.warehouses():
+                if w.get('is_active'): self.wh.addItem(w['name'], w['id'])
+        except Exception: pass
+        self.avail = QLabel(''); self.qty = QLineEdit(); self.qty.setPlaceholderText('فارغ = كل الكمية غير المؤرَّخة')
+        self.expiry = QLineEdit(); self.expiry.setPlaceholderText('اكتب بأي ترتيب: 31/05/2027 أو 05/2027'); self.lot_no = QLineEdit()
+        note = QLabel('يظهر هنا الأصناف المفعَّل عليها تتبع الصلاحية فقط (فعّله من «تعديل صنف»).'); note.setWordWrap(True); note.setObjectName('ctxKey')
+        form.addRow(note); form.addWide('الصنف', self.item); form.addRow('المستودع', self.wh); form.addRow('الكمية غير المؤرَّخة', self.avail)
+        form.addRow('الكمية المراد تأريخها', self.qty); form.addRow('تاريخ الانتهاء *', self.expiry); form.addRow('رقم الدفعة', self.lot_no)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel); bb.accepted.connect(self._accept); bb.rejected.connect(self.reject); form.addRow(bb)
+        self.item.currentIndexChanged.connect(self._sync); self.wh.currentIndexChanged.connect(self._sync); self._sync()
+
+    def _sync(self, *_):
+        from decimal import Decimal as _D
+        try:
+            n = self.page.svc.untracked_qty_milli(self.item.currentData(), self.wh.currentData()) if self.item.currentData() else 0
+            self.avail.setText(f'{_D(n) / 1000:g}')
+        except Exception: self.avail.setText('—')
+
+    def _accept(self):
+        from alhisabat.ui.core import calc_logic as CL
+        if self.item.currentData() is None: return QMessageBox.warning(self, 'خطأ', 'اختر الصنف من القائمة')
+        try:
+            if not CL.parse_expiry_input(self.expiry.text()): return QMessageBox.warning(self, 'خطأ', 'تاريخ الانتهاء مطلوب')
+        except ValueError as e: return QMessageBox.warning(self, 'تاريخ غير صالح', str(e))
+        self.accept()
+
+    def values(self):
+        from alhisabat.ui.core import calc_logic as CL
+        return {'item_id': self.item.currentData(), 'warehouse_id': self.wh.currentData(), 'expiry_date': CL.parse_expiry_input(self.expiry.text()),
+                'lot_no': self.lot_no.text().strip(), 'qty': self.qty.text().strip().replace(',', '') or None}
+
+
+class CountDialog(QDialog):
+    def __init__(self, page):
+        super().__init__(page); self.setWindowTitle('جرد جديد'); self.setLayoutDirection(Qt.RightToLeft); make_resizable(self, 720, 200, (620, 190)); form=CompactForm(self, 3)
+        self.wh=QComboBox()
+        try:
+            for w in page.svc.warehouses():
+                if w.get('is_active'): self.wh.addItem(w['name'], w['id'])
+        except Exception: pass
+        self.date=DateField(); self.is_full=QCheckBox('جرد كامل (كل الأصناف)'); self.note=QLineEdit()
+        form.addRow('المستودع', self.wh); form.addRow('التاريخ', self.date); form.addRow('نوع الجرد', self.is_full); form.addWide('ملاحظة', self.note)
+        bb=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel); bb.accepted.connect(self.accept); bb.rejected.connect(self.reject); form.addRow(bb)
+    def values(self): return {'warehouse_id':self.wh.currentData(),'date':self.date.iso(),'is_full':self.is_full.isChecked(),'note':self.note.text().strip()}
+
+class ItemCardDialog(QDialog):
+    """كارت الصنف: عرض حركات الصنف في مستودع محدد مع إمكانية عكس حركة (void_movement)."""
+    def __init__(self, page, item):
+        super().__init__(page)
+        self.page = page
+        self.item = item
+        self.setWindowTitle(f"كارت وحركات الصنف — {item.get('name', '')} ({item.get('code', '')})")
+        self.setLayoutDirection(Qt.RightToLeft)
+        make_resizable(self, 900, 560, (640, 380))
+
+        from PySide6.QtWidgets import QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox
+        from alhisabat.ui.components.basic import DateField, ask_reason
+        from alhisabat.ui.components.datagrid import format_minor
+
+        lay = QVBoxLayout(self)
+        bar = QHBoxLayout()
+        self.wh_cb = QComboBox()
+        try:
+            for w in page.svc.warehouses():
+                self.wh_cb.addItem(w['name'], w['id'])
+        except Exception: pass
+        self.d_from = DateField()
+        self.d_to = DateField()
+        btn_filter = QPushButton("عرض")
+        btn_filter.clicked.connect(self._load)
+
+        bar.addWidget(QLabel("المستودع:"))
+        bar.addWidget(self.wh_cb)
+        bar.addWidget(QLabel("من:"))
+        bar.addWidget(self.d_from)
+        bar.addWidget(QLabel("إلى:"))
+        bar.addWidget(self.d_to)
+        bar.addWidget(btn_filter)
+        bar.addStretch(1)
+        lay.addLayout(bar)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(8)
+        self.table.setHorizontalHeaderLabels(["المعرف", "التاريخ", "النوع", "الاتجاه", "الكمية", "القيمة", "الرصيد الجاري", "ملاحظة"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)      # أعمدة قابلة للسحب
+        self.table.horizontalHeader().setStretchLastSection(True)
+        for _i, _w in enumerate((70, 100, 90, 70, 90, 110, 110)):
+            self.table.setColumnWidth(_i, _w)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        lay.addWidget(self.table, 1)
+
+        bottom = QHBoxLayout()
+        self.lbl_summary = QLabel("")
+        self.btn_void = QPushButton("عكس الحركة المحددة (تسوية عكسية)")
+        self.btn_void.setProperty("danger", True)
+        self.btn_void.clicked.connect(self._void_selected)
+        close_btn = QPushButton("إغلاق")
+        close_btn.clicked.connect(self.accept)
+
+        bottom.addWidget(self.lbl_summary)
+        bottom.addStretch(1)
+        bottom.addWidget(self.btn_void)
+        bottom.addWidget(close_btn)
+        lay.addLayout(bottom)
+
+        self._movements = []
+        self._load()
+
+    def _load(self):
+        wid = self.wh_cb.currentData()
+        if not wid:
+            return
+        df = self.d_from.iso()
+        dt = self.d_to.iso()
+        from alhisabat.ui.components.datagrid import format_minor
+        from decimal import Decimal
+        try:
+            res = self.page.svc.item_card(self.item['id'], wid, df, dt)
+            rows = res.get('rows', [])
+            self._movements = rows
+            self.table.setRowCount(len(rows))
+            for i, r in enumerate(rows):
+                self.table.setItem(i, 0, QTableWidgetItem(str(r.get('id', ''))))
+                self.table.setItem(i, 1, QTableWidgetItem(str(r.get('movement_date', ''))))
+                self.table.setItem(i, 2, QTableWidgetItem(str(r.get('movement_type', ''))))
+                self.table.setItem(i, 3, QTableWidgetItem('وارد' if r.get('direction') == 'in' else 'صادر'))
+                qty_val = (Decimal(r.get('qty_milli') or 0) / Decimal(1000))
+                self.table.setItem(i, 4, QTableWidgetItem(f"{qty_val:g}"))
+                self.table.setItem(i, 5, QTableWidgetItem(format_minor(r.get('value_base', 0))))
+                run_qty = (Decimal(r.get('run_qty') or 0) / Decimal(1000))
+                self.table.setItem(i, 6, QTableWidgetItem(f"{run_qty:g}"))
+                self.table.setItem(i, 7, QTableWidgetItem(str(r.get('note') or '')))
+            op_qty = (Decimal(res.get('opening_qty_milli') or 0) / Decimal(1000))
+            self.lbl_summary.setText(f"رصيد أول الفترة: {op_qty:g} | عدد الحركات: {len(rows)}")
+        except Exception as e:
+            self.page.show_error(e)
+
+    def _void_selected(self):
+        sr = self.table.currentRow()
+        if sr < 0 or sr >= len(self._movements):
+            from PySide6.QtWidgets import QMessageBox
+            return QMessageBox.information(self, "عكس حركة", "حدد حركة من الجدول أولًا.")
+        m = self._movements[sr]
+        from alhisabat.ui.components.basic import ask_reason
+        reason = ask_reason(self, "عكس حركة المخزون", [f"هل تريد عكس الحركة رقم {m['id']}؟", "سيتم إنشاء حركة معاكسة بالكمية والقيمة الأصلية."], need_reason=True, confirm_text="عكس الحركة", danger=True)
+        if not reason:
+            return
+        ok, _ = self.page.guarded(self.page.svc.void_movement, m['id'], reason, reverse_entry=True, reload=False)
+        if ok:
+            self.page.notify("تم عكس الحركة بنجاح")
+            self._load()
+            self.page.refresh()
+
+
+from .opening_stock import OpeningStockDialog  # noqa: E402,F401 — النافذة انتقلت لملف مستقل (v1.7) وتبقى متاحة من هنا

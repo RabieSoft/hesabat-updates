@@ -1,0 +1,199 @@
+"""نافذة معاينة PDF: صفحات المستند كما ستُحفظ تمامًا (نفس QTextDocument الذي يُكتب منه PDF والطباعة)،
+مع تنقل بين الصفحات («صفحة ن من م»)، تكبير/ملاءمة، وأزرار «حفظ PDF» و«طباعة». يتطلب PySide6."""
+import os
+
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtWidgets import (
+    QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QMessageBox, QPushButton, QScrollArea, QSpinBox, QVBoxLayout
+)
+
+from alhisabat.ui.core import strings_ar as S
+
+from . import print_service as PS
+from .basic import make_resizable
+from .document_html import paper_px
+from .document_model import PAPER_LABELS, PAPERS
+from .document_sheet import GAP, PAD, SHADOW, PaperCanvas
+
+
+class PdfPreviewDialog(QDialog):
+    """معاينة قبل الحفظ/الطباعة. `saved_path` يحمل مسار آخر PDF حُفظ (أو None)."""
+
+    def __init__(self, parent, spec, paper='A4', default_name=None):
+        super().__init__(parent)
+        self.setWindowTitle(f'معاينة PDF — {spec.title}')
+        self.setLayoutDirection(Qt.RightToLeft)
+        make_resizable(self, 1000, 780, (720, 520))
+        self._spec, self._paper, self._default_name, self.saved_path = spec, paper, default_name, None
+        self._fitted = False
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        bar = QFrame()
+        bar.setObjectName('paperToolbar')
+        bl = QHBoxLayout(bar)
+        bl.setContentsMargins(8, 6, 8, 6)
+
+        self.btn_save = QPushButton('حفظ PDF')
+        self.btn_save.setProperty('primary', True)
+        self.btn_save.clicked.connect(self.save_pdf)
+        self.btn_print = QPushButton('طباعة')
+        self.btn_print.clicked.connect(self.print_doc)
+        for b in (self.btn_save, self.btn_print):
+            bl.addWidget(b)
+        bl.addSpacing(16)
+
+        self.btn_first, self.btn_prev = QPushButton('«'), QPushButton('السابق')
+        self.btn_next, self.btn_last = QPushButton('التالي'), QPushButton('»')
+        self.page_spin = QSpinBox()
+        self.page_spin.setMinimum(1)
+        self.page_spin.setPrefix('صفحة ')
+        self.page_spin.setMinimumWidth(110)
+        self.total_lbl = QLabel('')
+        for w in (self.btn_first, self.btn_prev, self.page_spin, self.total_lbl, self.btn_next, self.btn_last):
+            bl.addWidget(w)
+        for b in (self.btn_first, self.btn_last):
+            b.setProperty('compact', True)
+            b.setMinimumWidth(34)
+        self.btn_first.clicked.connect(lambda: self.go_to(1))
+        self.btn_prev.clicked.connect(lambda: self.go_to(self.page_spin.value() - 1))
+        self.btn_next.clicked.connect(lambda: self.go_to(self.page_spin.value() + 1))
+        self.btn_last.clicked.connect(lambda: self.go_to(self.canvas.page_count()))
+        self.page_spin.editingFinished.connect(lambda: self.go_to(self.page_spin.value()))
+
+        bl.addSpacing(16)
+        bl.addWidget(QLabel('الورق:'))
+        self.paper_cb = QComboBox()
+        for k in PAPERS:
+            self.paper_cb.addItem(PAPER_LABELS[k], k)
+        self.paper_cb.setMinimumWidth(120)
+        self.paper_cb.setCurrentIndex(list(PAPERS).index(paper))
+        self.paper_cb.currentIndexChanged.connect(self._on_paper)
+        bl.addWidget(self.paper_cb)
+        self.zoom_out, self.zoom_in, self.zoom_fit = QPushButton('−'), QPushButton('+'), QPushButton('ملاءمة العرض')
+        self.zoom_lbl = QLabel('100%')
+        for b in (self.zoom_out, self.zoom_in):
+            b.setProperty('compact', True)                  # بلا حشوة أفقية كبيرة وإلا اختفى الرمز («−»/«+»)
+            b.setMinimumWidth(34)
+        self.zoom_out.clicked.connect(lambda: self._zoom(-0.1))
+        self.zoom_in.clicked.connect(lambda: self._zoom(+0.1))
+        self.zoom_fit.clicked.connect(self.fit_width)
+        for w in (self.zoom_out, self.zoom_lbl, self.zoom_in, self.zoom_fit):
+            bl.addWidget(w)
+        bl.addStretch(1)
+        self.btn_close = QPushButton('إغلاق')
+        self.btn_close.clicked.connect(self.accept)
+        bl.addWidget(self.btn_close)
+        lay.addWidget(bar)
+
+        self.canvas = PaperCanvas()
+        self.canvas.setObjectName('paperHost')
+        self.area = QScrollArea()
+        self.area.setObjectName('paperArea')
+        self.area.setWidgetResizable(True)
+        self.area.setWidget(self.canvas)
+        self.area.verticalScrollBar().valueChanged.connect(self._sync_page)
+        lay.addWidget(self.area, 1)
+
+        self.status = QLabel('')
+        self.status.setObjectName('ctxKey')
+        self.status.setContentsMargins(10, 4, 10, 4)
+        lay.addWidget(self.status)
+
+        QShortcut(QKeySequence('Ctrl+P'), self, activated=self.print_doc)
+        QShortcut(QKeySequence('Ctrl+S'), self, activated=self.save_pdf)
+        QShortcut(QKeySequence('PgDown'), self, activated=lambda: self.go_to(self.page_spin.value() + 1))
+        QShortcut(QKeySequence('PgUp'), self, activated=lambda: self.go_to(self.page_spin.value() - 1))
+        self._render()
+
+    # ------------------------------------------------------------------ عرض وتنقل
+    def _render(self):
+        self.canvas.set_content(self._spec, self._paper)
+        n = max(self.canvas.page_count(), 1)
+        self.page_spin.setMaximum(n)
+        self.total_lbl.setText(f'من {n}')
+        self._sync_zoom()
+        self._sync_page()
+
+    def showEvent(self, ev):
+        super().showEvent(ev)
+        if not self._fitted:
+            self._fitted = True
+            QTimer.singleShot(0, self.fit_width)
+
+    def _page_height(self):
+        _w, h, _m = self.canvas._geom()
+        return h
+
+    def go_to(self, page):
+        n = max(self.canvas.page_count(), 1)
+        page = max(1, min(int(page), n))
+        y = PAD + int((page - 1) * (self._page_height() + GAP) * self.canvas.zoom()) - PAD // 2
+        self.area.verticalScrollBar().setValue(max(y, 0))
+        self._set_spin(page)
+
+    def _set_spin(self, page):
+        self.page_spin.blockSignals(True)
+        self.page_spin.setValue(page)
+        self.page_spin.blockSignals(False)
+        n = max(self.canvas.page_count(), 1)
+        self.btn_first.setEnabled(page > 1)
+        self.btn_prev.setEnabled(page > 1)
+        self.btn_next.setEnabled(page < n)
+        self.btn_last.setEnabled(page < n)
+
+    def _sync_page(self, *_):
+        step = max(self._page_height() + GAP, 1) * self.canvas.zoom()
+        probe = self.area.verticalScrollBar().value() + self.area.viewport().height() / 3 - PAD
+        n = max(self.canvas.page_count(), 1)
+        self._set_spin(max(1, min(int(probe // step) + 1, n)))
+
+    def _zoom(self, delta):
+        self.canvas.set_zoom(self.canvas.zoom() + delta)
+        self._sync_zoom()
+        self._sync_page()
+
+    def _sync_zoom(self):
+        self.zoom_lbl.setText(f'{int(round(self.canvas.zoom() * 100))}%')
+
+    def fit_width(self):
+        w, _h, _m = paper_px(self._paper, PS.DPI)
+        self.canvas.set_zoom((self.area.viewport().width() - 2 * PAD - SHADOW) / w)
+        self._sync_zoom()
+        self._sync_page()
+
+    def _on_paper(self, _i):
+        self._paper = self.paper_cb.currentData()
+        self._render()
+        self.fit_width()
+
+    # ------------------------------------------------------------------ حفظ وطباعة
+    def save_pdf(self):
+        name = self._default_name or f'{self._spec.title}-{self._spec.number or "مسودة"}.pdf'
+        path, _ = QFileDialog.getSaveFileName(self, 'حفظ PDF', name, 'PDF (*.pdf)')
+        if not path:
+            return False
+        if not path.lower().endswith('.pdf'):
+            path += '.pdf'
+        try:
+            n = PS.export_pdf(self._spec, self._paper, path)
+        except Exception as exc:  # noqa: BLE001 — فشل الكتابة (ملف مفتوح/صلاحية): رسالة واضحة والنافذة تبقى
+            QMessageBox.warning(self, S.APP_NAME, f'تعذّر حفظ الملف:\n{exc}')
+            return False
+        self.saved_path = path
+        self.status.setText(f'تم حفظ الملف ({n} صفحة): {os.path.basename(path)}')
+        return True
+
+    def print_doc(self):
+        if PS.print_dialog(self, self._spec, self._paper):
+            self.status.setText('أُرسل المستند إلى الطابعة.')
+
+
+def show_pdf_preview(parent, spec, paper='A4', default_name=None):
+    """يفتح نافذة المعاينة ويُرجع مسار آخر PDF حُفظ منها (أو None)."""
+    dlg = PdfPreviewDialog(parent, spec, paper, default_name)
+    dlg.exec()
+    return dlg.saved_path

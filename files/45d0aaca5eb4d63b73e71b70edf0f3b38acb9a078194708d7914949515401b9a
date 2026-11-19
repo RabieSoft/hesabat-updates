@@ -1,0 +1,45 @@
+"""خدمات مجموعات الأطراف: واجهة رفيعة فوق AppSession/business.parties (لا SQL مباشر).
+
+بلا PySide6، بلا float.
+"""
+from decimal import Decimal
+from alhisabat.business import parties
+
+
+class PartyGroupsService:
+    def __init__(self, session):
+        self.s = session
+
+    def list(self, kind):
+        self.s.require('party.view')
+        return parties.list_groups(self.s.conn, self.s.user_id, self.s.company_id, kind)
+
+    def create(self, kind, v):
+        self.s.require('party.create')
+        limit = Decimal(str(v.get('default_credit_limit') or 0)) if kind == 'customer' else Decimal(0)
+        terms = int(v.get('default_payment_terms_days') or 0)
+        return parties.create_group(
+            self.s.conn, self.s.user_id, self.s.company_id, kind, v['name'],
+            default_credit_limit=limit, default_payment_terms_days=terms
+        )
+
+    def edit(self, group_id, v):
+        self.s.require('party.edit')
+        kw = {}
+        if 'name' in v:
+            kw['name'] = v['name']
+        if v.get('default_credit_limit') is not None:   # صفر مقبول (إلغاء الحد الافتراضي)
+            kw['default_credit_limit'] = Decimal(str(v['default_credit_limit']))
+        if v.get('default_payment_terms_days') is not None:
+            kw['default_payment_terms_days'] = int(v['default_payment_terms_days'])
+        return parties.edit_group(self.s.conn, self.s.user_id, int(group_id), **kw)
+
+    def set_active(self, group_id, active, reason=''):
+        return parties.set_group_active(self.s.conn, self.s.user_id, int(group_id), bool(active), reason)
+
+    def delete(self, group_id):
+        return parties.delete_group(self.s.conn, self.s.user_id, int(group_id))
+
+    def move_party(self, party_id, group_id_or_None):
+        return parties.move_party_to_group(self.s.conn, self.s.user_id, int(party_id),
+                                           int(group_id_or_None) if group_id_or_None is not None else None)

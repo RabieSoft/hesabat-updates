@@ -1,0 +1,343 @@
+"""إدارة طابور رسائل واتساب والعمليات المرتبطة بها في قاعدة البيانات.
+
+منطق أعمال مستقل (Business Logic) بلا كود واجهة مستخدم، متوافق مع عزل الفروع.
+"""
+import sqlite3
+from datetime import date, datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+from alhisabat.messaging.phone import normalize_phone
+from alhisabat.messaging.policy import (
+    HARD_MAX_DAILY_CAP,
+    HARD_MAX_HOURLY_CAP,
+    make_idempotency_key,
+)
+
+
+# إخفاقات سببها بيانات الرسالة لا حالة الحساب أو الجلسة؛ لا تُحتسب في إيقاف الأمان التلقائي
+_NEUTRAL_FAILURES = ("not_on_whatsapp", "interrupted")
+
+
+def get_settings(conn: sqlite3.Connection, branch_id: Optional[int]) -> Dict[str, Any]:
+    """جلب إعدادات واتساب للفرع أو الإعدادات الافتراضية."""
+    row = conn.execute(
+        "SELECT branch_id, mode, country_code, min_delay, max_delay, daily_cap, hourly_cap, "
+        "window_start, window_end, warmup_start_date FROM wa_settings WHERE branch_id IS ? LIMIT 1",
+        (branch_id,),
+    ).fetchone()
+    if row:
+        return {
+            "branch_id": row[0],
+            "mode": row[1],
+            "country_code": row[2],
+            "min_delay": row[3],
+            "max_delay": row[4],
+            "daily_cap": row[5],
+            "hourly_cap": row[6],
+            "window_start": row[7],
+            "window_end": row[8],
+            "warmup_start_date": row[9] or "",
+        }
+    return {
+        "branch_id": branch_id,
+        "mode": "web",
+        "country_code": "+967",
+        "min_delay": 12,
+        "max_delay": 35,
+        "daily_cap": 150,
+        "hourly_cap": 40,
+        "window_start": "08:00",
+        "window_end": "21:00",
+        "warmup_start_date": "",
+    }
+
+
+def save_settings(conn: sqlite3.Connection, branch_id: Optional[int], settings: Dict[str, Any]) -> None:
+    """حفظ إعدادات واتساب للفرع مع حصر السقوف ضمن الحدود القصوى للأمان."""
+    daily_cap = min(max(1, int(settings.get("daily_cap", 150))), HARD_MAX_DAILY_CAP)
+    hourly_cap = min(max(1, int(settings.get("hourly_cap", 40))), HARD_MAX_HOURLY_CAP)
+    min_delay = max(5, int(settings.get("min_delay", 12)))
+    max_delay = max(min_delay, int(settings.get("max_delay", 35)))
+
+    conn.execute(
+        "INSERT INTO wa_settings(branch_id, mode, country_code, min_delay, max_delay, daily_cap, hourly_cap, window_start, window_end, warmup_start_date) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(branch_id) DO UPDATE SET "
+        "mode=excluded.mode, country_code=excluded.country_code, min_delay=excluded.min_delay, max_delay=excluded.max_delay, "
+        "daily_cap=excluded.daily_cap, hourly_cap=excluded.hourly_cap, window_start=excluded.window_start, window_end=excluded.window_end, "
+        "warmup_start_date=excluded.warmup_start_date",
+        (
+            branch_id,
+            settings.get("mode", "web"),
+            settings.get("country_code", "+967"),
+            min_delay,
+            max_delay,
+            daily_cap,
+            hourly_cap,
+            settings.get("window_start", "08:00"),
+            settings.get("window_end", "21:00"),
+            settings.get("warmup_start_date", ""),
+        ),
+    )
+
+
+def is_opted_out(conn: sqlite3.Connection, branch_id: Optional[int], phone: str) -> bool:
+    """التحقق مما إذا كان الرقم مسجلًا في قائمة إلغاء الاشتراك للفرع أو عامًا."""
+    r = conn.execute(
+        "SELECT 1 FROM wa_optout WHERE (branch_id IS ? OR branch_id IS NULL) AND phone=? LIMIT 1",
+        (branch_id, phone),
+    ).fetchone()
+    return r is not None
+
+
+def add_optout(conn: sqlite3.Connection, branch_id: Optional[int], phone: str, reason: str = "") -> None:
+    """إضافة رقم إلى قائمة إلغاء الاشتراك وإلغاء رسائله المنتظرة."""
+    conn.execute(
+        "INSERT OR REPLACE INTO wa_optout(branch_id, phone, reason, created_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+        (branch_id, phone, reason),
+    )
+    conn.execute(
+        "UPDATE wa_outbox SET status='cancelled', error_code='opted_out' WHERE phone=? AND status='queued' AND (branch_id IS ? OR branch_id IS NULL)",
+        (phone, branch_id),
+    )
+
+
+def remove_optout(conn: sqlite3.Connection, branch_id: Optional[int], phone: str) -> None:
+    """إزالة رقم من قائمة إلغاء الاشتراك."""
+    conn.execute(
+        "DELETE FROM wa_optout WHERE phone=? AND (branch_id IS ? OR branch_id IS NULL)",
+        (phone, branch_id),
+    )
+
+
+def enqueue_message(
+    conn: sqlite3.Connection,
+    branch_id: Optional[int],
+    phone: str,
+    body: str,
+    party_id: Optional[int] = None,
+    kind: str = "text",
+    ref_type: str = "",
+    ref_id: Optional[int] = None,
+    attachment_path: str = "",
+    created_by: Optional[int] = None,
+    bypass_idempotency: bool = False,
+    default_country_code: str = "+967",
+) -> int:
+    """إدراج رسالة في طابور الإرسال مع التحقق الصارم من الأمان والتطبيع.
+
+    يرفع ValueError في الحالات التالية:
+    - رقم غير صالح
+    - الرقم مسجل في قائمة opt-out
+    - الطرف لا يملك موافقة wa_consent
+    - الرسالة مكررة لنفس المستند والرقم خلال 24 ساعة (ما لم يتم التجاوز الصريح)
+    """
+    norm_phone = normalize_phone(phone, default_country_code)
+
+    if is_opted_out(conn, branch_id, norm_phone):
+        raise ValueError(f"الرقم {norm_phone} مسجل في قائمة إلغاء الاشتراك (Opt-out)")
+
+    # التحقق من الطرف إن وجد
+    if party_id is not None:
+        p_row = conn.execute(
+            "SELECT is_active, wa_consent, name FROM parties WHERE id=? LIMIT 1",
+            (party_id,),
+        ).fetchone()
+        if not p_row:
+            raise ValueError(f"الطرف رقم {party_id} غير موجود في النظام")
+        if not p_row[0]:
+            raise ValueError(f"الطرف '{p_row[2]}' معطّل في النظام")
+        if not p_row[1]:
+            raise ValueError(f"الطرف '{p_row[2]}' لم يُبدِ موافقة على استلام رسائل واتساب (wa_consent=0)")
+
+    # مفتاح منع التكرار لـ 24 ساعة
+    today_str = date.today().isoformat()
+    idemp_key = None if bypass_idempotency else make_idempotency_key(kind, ref_type, ref_id, norm_phone, today_str)
+
+    if idemp_key:
+        existing = conn.execute(
+            "SELECT id, status FROM wa_outbox WHERE idempotency_key=? AND status NOT IN ('cancelled', 'failed') LIMIT 1",
+            (idemp_key,),
+        ).fetchone()
+        if existing:
+            raise ValueError(f"تم إرسال هذا المستند لنفس الرقم اليوم مسبقًا (رقم الرسالة: {existing[0]}، الحالة: {existing[1]})")
+
+    cur = conn.execute(
+        "INSERT INTO wa_outbox(branch_id, party_id, phone, kind, ref_type, ref_id, body, attachment_path, status, idempotency_key, created_by, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, CURRENT_TIMESTAMP)",
+        (
+            branch_id,
+            party_id,
+            norm_phone,
+            kind,
+            ref_type,
+            ref_id,
+            body,
+            attachment_path,
+            idemp_key,
+            created_by,
+        ),
+    )
+    outbox_id = cur.lastrowid
+    conn.execute(
+        "INSERT INTO wa_log(outbox_id, event, detail, at) VALUES (?, 'enqueued', 'تم إدراج الرسالة في الطابور', CURRENT_TIMESTAMP)",
+        (outbox_id,),
+    )
+    return outbox_id
+
+
+def get_next_queued(conn: sqlite3.Connection, branch_id: Optional[int]) -> Optional[Dict[str, Any]]:
+    """استرجاع أول رسالة بانتظار الإرسال للفرع."""
+    row = conn.execute(
+        "SELECT id, branch_id, party_id, phone, kind, ref_type, ref_id, body, attachment_path, status, attempts "
+        "FROM wa_outbox "
+        "WHERE status='queued' AND (branch_id IS ? OR branch_id IS NULL) "
+        "ORDER BY scheduled_at ASC, id ASC LIMIT 1",
+        (branch_id,),
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "branch_id": row[1],
+        "party_id": row[2],
+        "phone": row[3],
+        "kind": row[4],
+        "ref_type": row[5],
+        "ref_id": row[6],
+        "body": row[7],
+        "attachment_path": row[8],
+        "status": row[9],
+        "attempts": row[10],
+    }
+
+
+def update_message_status(
+    conn: sqlite3.Connection,
+    outbox_id: int,
+    status: str,
+    error_code: str = "",
+    detail: str = "",
+) -> None:
+    """تحديث حالة رسالة في الطابور وتسجيل الحدث في السجل."""
+    sent_at_sql = "CURRENT_TIMESTAMP" if status in ("sent", "handed") else "NULL"
+    conn.execute(
+        f"UPDATE wa_outbox SET status=?, error_code=?, attempts=attempts+1, "
+        f"sent_at=(CASE WHEN ? IN ('sent', 'handed') THEN CURRENT_TIMESTAMP ELSE sent_at END) "
+        f"WHERE id=?",
+        (status, error_code, status, outbox_id),
+    )
+    conn.execute(
+        "INSERT INTO wa_log(outbox_id, event, detail, at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+        (outbox_id, status, detail or error_code),
+    )
+
+
+def get_safety_metrics(
+    conn: sqlite3.Connection, branch_id: Optional[int], ignore_failures_up_to_id: int = 0
+) -> Tuple[int, int, int]:
+    """إرجاع (daily_sent, hourly_sent, consecutive_failures) لقياس سقف الأمان.
+
+    ignore_failures_up_to_id: الإخفاقات ذات المعرّف <= هذه القيمة لا تُحتسب (بعد أن يستأنف المستخدم الخدمة عمدًا).
+    """
+    today_start = date.today().isoformat() + " 00:00:00"
+    daily_sent = conn.execute(
+        "SELECT COUNT(*) FROM wa_outbox WHERE status IN ('sent', 'handed') AND sent_at >= ? "
+        "AND (branch_id IS ? OR branch_id IS NULL)",
+        (today_start, branch_id),
+    ).fetchone()[0]
+
+    # آخر ساعة (SQLite datetime('now', '-1 hour'))
+    hourly_sent = conn.execute(
+        "SELECT COUNT(*) FROM wa_outbox WHERE status IN ('sent', 'handed') AND sent_at >= datetime('now', '-1 hour') "
+        "AND (branch_id IS ? OR branch_id IS NULL)",
+        (branch_id,),
+    ).fetchone()[0]
+
+    # عدد الإخفاقات المتتالية الأخيرة
+    recent_rows = conn.execute(
+        "SELECT status, error_code FROM wa_outbox WHERE status IN ('sent', 'handed', 'failed', 'blocked') "
+        "AND id > ? AND (branch_id IS ? OR branch_id IS NULL) ORDER BY id DESC LIMIT 10",
+        (int(ignore_failures_up_to_id or 0), branch_id),
+    ).fetchall()
+
+    consecutive_failures = 0
+    for r in recent_rows:
+        if r[0] == "failed" and (r[1] or "") in _NEUTRAL_FAILURES:
+            continue            # رقم غير مسجل/إرسال منقطع: ليس عطلًا في الحساب فلا يوقف الطابور
+        if r[0] in ("failed", "blocked"):
+            consecutive_failures += 1
+        else:
+            break
+
+    return daily_sent, hourly_sent, consecutive_failures
+
+
+def list_outbox_messages(
+    conn: sqlite3.Connection,
+    branch_id: Optional[int],
+    status: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    """عرض قائمة رسائل الطابور لواجهة العرض."""
+    params = []
+    where = ["(o.branch_id IS ? OR o.branch_id IS NULL)"]
+    params.append(branch_id)
+    if status and status != "all":
+        where.append("o.status = ?")
+        params.append(status)
+
+    where_clause = " AND ".join(where)
+    params.extend([limit, offset])
+
+    rows = conn.execute(
+        f"SELECT o.id, o.phone, p.name, o.kind, o.ref_type, o.status, o.error_code, o.attempts, o.created_at, o.sent_at, o.body, o.attachment_path "
+        f"FROM wa_outbox o LEFT JOIN parties p ON p.id = o.party_id "
+        f"WHERE {where_clause} ORDER BY o.id DESC LIMIT ? OFFSET ?",
+        params,
+    ).fetchall()
+
+    return [
+        {
+            "id": r[0],
+            "phone": r[1],
+            "party_name": r[2] or "—",
+            "kind": r[3],
+            "ref_type": r[4],
+            "status": r[5],
+            "error_code": r[6],
+            "attempts": r[7],
+            "created_at": r[8],
+            "sent_at": r[9] or "—",
+            "body": r[10],
+            "attachment_path": r[11],
+        }
+        for r in rows
+    ]
+
+
+def latest_terminal_id(conn: sqlite3.Connection, branch_id: Optional[int]) -> int:
+    """أكبر معرّف لرسالة منتهية (أُرسلت/فشلت/حُظرت) — يُستعمل كخط أساس عند استئناف الخدمة."""
+    r = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM wa_outbox WHERE status IN ('sent', 'handed', 'failed', 'blocked') "
+        "AND (branch_id IS ? OR branch_id IS NULL)",
+        (branch_id,),
+    ).fetchone()
+    return int(r[0] or 0)
+
+
+def recover_interrupted(conn: sqlite3.Connection, branch_id: Optional[int]) -> int:
+    """الرسائل العالقة بحالة 'sending' (أُغلق البرنامج أثناء الإرسال) تُعلَّم فاشلة لا مُعاد إرسالها تلقائيًا،
+    لأنها قد تكون وصلت فعلًا؛ يقرر المستخدم إعادتها يدويًا من الطابور."""
+    rows = conn.execute(
+        "SELECT id FROM wa_outbox WHERE status='sending' AND (branch_id IS ? OR branch_id IS NULL)", (branch_id,)
+    ).fetchall()
+    for (oid,) in rows:
+        conn.execute("UPDATE wa_outbox SET status='failed', error_code='interrupted' WHERE id=?", (oid,))
+        conn.execute(
+            "INSERT INTO wa_log(outbox_id, event, detail, at) VALUES (?, 'failed', "
+            "'انقطع الإرسال (إغلاق البرنامج أو الخدمة) — تحقق من المحادثة ثم أعد المحاولة يدويًا', CURRENT_TIMESTAMP)",
+            (oid,),
+        )
+    return len(rows)

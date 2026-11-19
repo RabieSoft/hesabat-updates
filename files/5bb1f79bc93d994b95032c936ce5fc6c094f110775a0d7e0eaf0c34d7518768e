@@ -1,0 +1,138 @@
+"""ترخيص الملفين: لا يعمل البرنامج إلا بوجود ملفين بجوار البرنامج.
+
+- license.key : بيانات الترخيص (بصمة الجهاز HWID، النوع trial/permanent، تاريخ الانتهاء، اسم العميل).
+- license.sig : توقيع Ed25519 لمحتوى license.key، يصدره المطوّر بمفتاحه الخاص (لا يُسلَّم لأحد).
+البرنامج يحمل المفتاح العام فقط: لا يمكن تزوير ترخيص أو تعديل تاريخه/جهازه دون إبطال التوقيع.
+أي نقص أو عبث => INVALID_KEY. جهاز مختلف => DEVICE_NOT_REGISTERED. نسخة تجريبية منتهية => TRIAL_EXPIRED.
+بلا PySide6.
+"""
+import base64
+import json
+import sys
+from dataclasses import dataclass
+from datetime import date
+from pathlib import Path
+
+from .core import _machine_bytes, _b32, _group, _unb32
+
+KEY_NAME, SIG_NAME = 'license.key', 'license.sig'
+INVALID_KEY = 'مفتاح غير صالح (Invalid key)'
+DEVICE_NOT_REGISTERED = 'هذا الجهاز غير مسجَّل (Device not registered)'
+TRIAL_EXPIRED = 'انتهت صلاحية النسخة التجريبية (Trial expired)'
+LICENSE_EXPIRED = 'انتهت صلاحية الترخيص (License expired)'
+_TYPES = ('trial', 'permanent')
+
+
+class KeyFileError(Exception):
+    def __init__(self, message, code):
+        super().__init__(message)
+        self.code = code
+
+
+@dataclass(frozen=True)
+class FileLicense:
+    kind: str
+    customer: str
+    expires: object                    # date | None
+
+
+def hwid():
+    """بصمة الجهاز Hw id بصيغة XXXX-XXXX-XXXX-XXXX (يرسلها العميل للمطوّر)."""
+    return _group(_b32(_machine_bytes()), 4)
+
+
+def app_dir():
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[2]
+
+
+def user_dir():
+    """مجلد ترخيص العميل: %APPDATA%/AlhisabatPro/license (قابل للكتابة دون صلاحيات مدير، حتى لو ثُبّت البرنامج في Program Files)."""
+    import os
+    return Path(os.getenv('APPDATA') or Path.home()) / 'AlhisabatPro' / 'license'
+
+
+def search_dirs():
+    """أماكن البحث عن الملفين بالترتيب: مجلد الترخيص في AppData ثم بجوار البرنامج."""
+    return [user_dir(), app_dir()]
+
+
+def install_files(key_path, sig_path, *, public_key=None, machine=None, today=None):
+    """يتحقق من الملفين المختارَين (توقيع + جهاز + انتهاء) ثم ينسخهما إلى user_dir(). يرفع KeyFileError ولا ينسخ شيئًا إن فشل."""
+    import shutil
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            shutil.copyfile(key_path, Path(tmp) / KEY_NAME)
+            shutil.copyfile(sig_path, Path(tmp) / SIG_NAME)
+        except OSError as e:
+            raise KeyFileError(INVALID_KEY, 'invalid_key') from e
+        lic = _verify_dir(Path(tmp), public_key=public_key, machine=machine, today=today)
+    dest = user_dir()
+    dest.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(key_path, dest / KEY_NAME)
+    shutil.copyfile(sig_path, dest / SIG_NAME)
+    return lic
+
+
+def build_files(private_key, machine, *, kind='permanent', expires=None, customer=''):
+    """للمطوّر فقط: يُرجع (bytes لـ license.key, bytes لـ license.sig)."""
+    if kind not in _TYPES:
+        raise ValueError('نوع الترخيص: trial أو permanent')
+    if kind == 'trial' and not expires:
+        raise ValueError('النسخة التجريبية تحتاج تاريخ انتهاء.')
+    try:
+        fp = _unb32(machine)
+    except Exception as e:  # noqa: BLE001
+        raise ValueError('بصمة الجهاز غير صحيحة.') from e
+    if len(fp) != 10:
+        raise ValueError('بصمة الجهاز غير صحيحة (يجب أن تكون 16 رمزًا).')
+    body = {'v': 1, 'hwid': _group(_b32(fp), 4), 'type': kind, 'customer': customer,
+            'expires': expires.isoformat() if expires else ''}
+    payload = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    return payload, base64.b64encode(private_key.sign(payload))
+
+
+def verify(folder=None, *, public_key=None, machine=None, today=None):
+    """يتحقق من الملفين. يرفع KeyFileError. يُرجع FileLicense.
+    بلا folder: يبحث في search_dirs() ويقبل أول مجلد فيه ترخيص صالح؛ وإن لم يصلح أيّ منها يرفع خطأ أول مجلد وُجد فيه ملف."""
+    if folder:
+        return _verify_dir(Path(folder), public_key=public_key, machine=machine, today=today)
+    first_err = None
+    for d in search_dirs():
+        if not ((d / KEY_NAME).exists() or (d / SIG_NAME).exists()):
+            continue
+        try:
+            return _verify_dir(d, public_key=public_key, machine=machine, today=today)
+        except KeyFileError as e:
+            first_err = first_err or e
+    raise first_err or KeyFileError(INVALID_KEY, 'invalid_key')
+
+
+def _verify_dir(folder, *, public_key=None, machine=None, today=None):
+    try:
+        payload = (folder / KEY_NAME).read_bytes()
+        sig = base64.b64decode((folder / SIG_NAME).read_bytes(), validate=True)
+    except Exception as e:  # noqa: BLE001  (ملف ناقص أو تالف)
+        raise KeyFileError(INVALID_KEY, 'invalid_key') from e
+    try:
+        if public_key is None:
+            from .core import _public_key
+            public_key = _public_key()
+        public_key.verify(sig, payload)
+        body = json.loads(payload.decode('utf-8'))
+        kind = body['type']
+        if body.get('v') != 1 or kind not in _TYPES:
+            raise ValueError
+        expires = date.fromisoformat(body['expires']) if body.get('expires') else None
+        fp = _unb32(body['hwid'])
+    except Exception as e:  # noqa: BLE001  (توقيع خاطئ، محتوى معدَّل، مفتاح عام غير مضبوط)
+        raise KeyFileError(INVALID_KEY, 'invalid_key') from e
+    if fp != (machine if machine is not None else _machine_bytes()):
+        raise KeyFileError(DEVICE_NOT_REGISTERED, 'device_not_registered')
+    if expires and (today or date.today()) > expires:
+        raise KeyFileError(TRIAL_EXPIRED if kind == 'trial' else LICENSE_EXPIRED, 'expired')
+    if kind == 'trial' and not expires:
+        raise KeyFileError(INVALID_KEY, 'invalid_key')
+    return FileLicense(kind, body.get('customer', ''), expires)

@@ -1,0 +1,51 @@
+"""نموذج الإشعارات (مركز الإشعارات): عناصر خالصة تُبنى من حالة النظام. بلا PySide6."""
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Notification:
+    key: str
+    text: str
+    severity: str = 'info'          # info | warning | error
+    target: str = ''                # مفتاح الصفحة التي يفتحها النقر (navigation.PAGE_KEYS)
+    count: int = 0
+
+
+SEVERITY_ORDER = {'error': 0, 'warning': 1, 'info': 2}
+
+
+def sort_notifications(items):
+    return sorted(items, key=lambda n: (SEVERITY_ORDER.get(n.severity, 9), n.key))
+
+
+def build(pending_journals, drafts, low_stock_count, unmatched_bank, wf, read_only_reason='', backup_age_days=None,
+          integrity_failed=0, expiry=None):
+    """يبني قائمة الإشعارات من عدّادات جاهزة (دالة خالصة قابلة للاختبار)."""
+    out = []
+    if wf.require_review and pending_journals.get('draft'):
+        out.append(Notification('journal_review', f"{pending_journals['draft']} قيد بانتظار المراجعة", 'warning', 'journal', pending_journals['draft']))
+    if wf.require_approval and pending_journals.get('reviewed'):
+        out.append(Notification('journal_approve', f"{pending_journals['reviewed']} قيد بانتظار الاعتماد", 'warning', 'journal', pending_journals['reviewed']))
+    if pending_journals.get('approved'):
+        out.append(Notification('journal_post', f"{pending_journals['approved']} قيد معتمد بانتظار الترحيل", 'info', 'journal', pending_journals['approved']))
+    for k, label, page in (('sales', 'فاتورة مبيعات', 'sales'), ('purchases', 'فاتورة مشتريات', 'purchases'), ('vouchers', 'سند', 'cash')):
+        if drafts.get(k):
+            out.append(Notification(f'draft_{k}', f'{drafts[k]} {label} مسودة لم تُرحَّل', 'info', page, drafts[k]))
+    if low_stock_count:
+        out.append(Notification('low_stock', f'{low_stock_count} صنف تحت الحد الأدنى للمخزون', 'warning', 'stock', low_stock_count))
+    expiry = expiry or {}
+    if expiry.get('expired_lots'):
+        out.append(Notification('expired_stock', f"{expiry['expired_lots']} دفعة منتهية الصلاحية في المخزون ({expiry.get('expired_items', 0)} صنف)", 'error', 'stock_ops', expiry['expired_lots']))
+    if expiry.get('near_lots'):
+        out.append(Notification('near_expiry', f"{expiry['near_lots']} دفعة تقترب من الانتهاء ({expiry.get('near_items', 0)} صنف)", 'warning', 'stock_ops', expiry['near_lots']))
+    if unmatched_bank:
+        out.append(Notification('bank_unmatched', f'{unmatched_bank} بند في كشف البنك غير مطابَق', 'info', 'bank_recon', unmatched_bank))
+    if read_only_reason:
+        out.append(Notification('read_only', read_only_reason, 'warning', 'period_end'))
+    if backup_age_days is None:
+        out.append(Notification('backup_none', 'لا توجد نسخة احتياطية مسجّلة', 'warning', 'backup'))
+    elif backup_age_days >= 7:
+        out.append(Notification('backup_old', f'آخر نسخة احتياطية قبل {backup_age_days} يومًا', 'warning', 'backup'))
+    if integrity_failed:
+        out.append(Notification('integrity', f'فحص السلامة المالية: {integrity_failed} ضابط فاشل', 'error', 'period_end', integrity_failed))
+    return sort_notifications(out)

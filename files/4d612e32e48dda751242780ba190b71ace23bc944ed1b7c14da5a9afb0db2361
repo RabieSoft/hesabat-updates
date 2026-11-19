@@ -1,0 +1,79 @@
+"""منع تشغيل البرنامج أكثر من مرة على نفس قاعدة البيانات.
+
+- النسخة الأولى تفتح خادمًا محليًا باسم مشتق من مسار القاعدة والمستخدم؛ أي نسخة ثانية تتصل به فتجده يعمل،
+  فتُظهر إشعار «النظام قيد التشغيل» ثم تنتهي، بينما النسخة الأولى تُظهر نافذتها وتُحضرها للمقدمة.
+- فتح أرشيف سنة أو قاعدة أخرى (--db / --archive) له اسم مختلف فلا يتعارض.
+- اسم الخادم دالة صرفة (بلا Qt) كي تُختبر.
+"""
+import getpass
+import hashlib
+import os
+
+
+def instance_key(db_path) -> str:
+    try:
+        who = getpass.getuser()
+    except Exception:  # noqa: BLE001
+        who = os.environ.get('USERNAME') or os.environ.get('USER') or 'user'
+    norm = os.path.normcase(os.path.abspath(str(db_path)))
+    return 'AlhisabatPro_' + hashlib.md5(f'{who}|{norm}'.encode('utf-8')).hexdigest()[:16]
+
+
+class SingleInstance:
+    """استعمال: guard = SingleInstance(db_path); if not guard.acquire(): (إشعار) ثم خروج؛ guard.set_window(w) لكل نافذة رئيسية."""
+
+    def __init__(self, db_path):
+        self.name = instance_key(db_path)
+        self._server = None
+        self._window = None
+
+    def acquire(self) -> bool:
+        """True = هذه هي النسخة الأولى (تابِع). False = نسخة أخرى تعمل (وقد طُلب منها الظهور)."""
+        from PySide6.QtNetwork import QLocalServer, QLocalSocket
+        probe = QLocalSocket()
+        probe.connectToServer(self.name)
+        if probe.waitForConnected(400):
+            try:
+                probe.write(b'show')
+                probe.flush()
+                probe.waitForBytesWritten(300)
+            finally:
+                probe.disconnectFromServer()
+            return False
+        QLocalServer.removeServer(self.name)         # ملف قديم من انهيار سابق
+        srv = QLocalServer()
+        srv.setSocketOptions(QLocalServer.UserAccessOption)
+        if not srv.listen(self.name):
+            return True                              # تعذر الحجز لسبب غير متوقع: لا نمنع المستخدم من العمل
+        srv.newConnection.connect(self._on_connection)
+        self._server = srv
+        return True
+
+    def set_window(self, window) -> None:
+        self._window = window
+
+    def _on_connection(self) -> None:
+        while self._server is not None and self._server.hasPendingConnections():
+            sock = self._server.nextPendingConnection()
+            if sock is not None:
+                sock.waitForReadyRead(100)
+                sock.disconnectFromServer()
+        self.bring_to_front()
+
+    def bring_to_front(self) -> None:
+        w = self._window
+        if w is None:
+            return
+        try:
+            from PySide6.QtCore import Qt
+            w.setWindowState((w.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
+            w.show()
+            w.raise_()
+            w.activateWindow()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def release(self) -> None:
+        if self._server is not None:
+            self._server.close()
+            self._server = None

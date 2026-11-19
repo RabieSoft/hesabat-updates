@@ -1,0 +1,267 @@
+"""خدمة القيود للواجهة الجديدة: كل شيء عبر journal_engine وbusiness.journal_extras (لا SQL ولا float).
+
+الصفحات تستدعي هذه الخدمة فقط. المبالغ Decimal؛ تُمرَّر للمحرك نصوصًا فلا تمر بأي float. المحرك هو الحَكَم على كل قاعدة.
+بلا PySide6.
+"""
+from datetime import date
+from decimal import Decimal
+from pathlib import Path
+
+from alhisabat.accounting import journal_engine as je, rates
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.business import journal_extras as extras
+from alhisabat.reporting import printing
+
+from . import readmodel
+from .workflow import WorkflowSettings
+
+ACTIONS = ('review', 'approve', 'post', 'delete', 'return_to_draft', 'reverse')
+ENTRY_TYPES = {'general': 'قيد عام', 'opening': 'افتتاحي', 'closing': 'إقفال', 'adjustment': 'تسوية', 'reversal': 'عكسي', 'auto': 'آلي'}
+
+
+def _dec(v):
+    if v in (None, ''):
+        return Decimal(0)
+    return v if isinstance(v, Decimal) else Decimal(str(v))
+
+
+def _engine_lines(lines):
+    """سطور الواجهة ← سطور المحرك (نصوص). يُسقط الأسطر الفارغة تمامًا؛ ما سواها يُترك للمحرك ليتحقق منه."""
+    out = []
+    for n, ln in enumerate(lines, 1):
+        d, c = _dec(ln.get('debit')), _dec(ln.get('credit'))
+        if not ln.get('account_id') and d == 0 and c == 0 and not (ln.get('memo') or '').strip():
+            continue
+        if not ln.get('account_id'):
+            raise AccountingError(f'السطر {n}: اختر الحساب')
+        row = {'account_id': int(ln['account_id']), 'debit': str(d), 'credit': str(c), 'memo': ln.get('memo') or ''}
+        if ln.get('cost_center_id'):
+            row['cost_center_id'] = int(ln['cost_center_id'])
+        if ln.get('currency'):
+            row['currency'] = ln['currency']
+        if ln.get('rate') not in (None, ''):
+            row['rate'] = str(ln['rate'])
+        out.append(row)
+    return out
+
+
+def balance_of(lines):
+    """(مدين، دائن، فرق) بـDecimal من سطور الواجهة — للعرض اللحظي فقط؛ المحرك يتحقق عند الحفظ."""
+    d = sum((_dec(x.get('debit')) for x in lines), Decimal(0))
+    c = sum((_dec(x.get('credit')) for x in lines), Decimal(0))
+    return d, c, d - c
+
+
+def simple_to_lines(from_account_id, to_account_id, amount, memo=''):
+    """قيد بسيط (من حساب ← إلى حساب بمبلغ واحد) ← سطران: مدين المصدر ودائن الوجهة. يرمي AccountingError عند نقص/خطأ."""
+    amt = _dec(amount)
+    if not from_account_id:
+        raise AccountingError('اختر الحساب المدين («من حساب»)')
+    if not to_account_id:
+        raise AccountingError('اختر الحساب الدائن («إلى حساب»)')
+    if int(from_account_id) == int(to_account_id):
+        raise AccountingError('الحساب المدين والدائن متطابقان: اختر حسابين مختلفين')
+    if amt <= 0:
+        raise AccountingError('أدخل مبلغًا أكبر من صفر')
+    memo = (memo or '').strip()
+    return [{'account_id': int(from_account_id), 'debit': amt, 'credit': None, 'memo': memo},
+            {'account_id': int(to_account_id), 'debit': None, 'credit': amt, 'memo': memo}]
+
+
+def account_name_only(label):
+    """نص القائمة «الكود — الاسم» ← الاسم فقط (وإن لم يوجد فاصل يُعاد النص كما هو)."""
+    t = (label or '').strip()
+    return t.split(' — ', 1)[1].strip() if ' — ' in t else t
+
+
+def simple_auto_description(from_label, to_label):
+    """البيان التلقائي للقيد البسيط عند ترك البيان فارغًا: «قيد بسيط ــ من حساب X الى حساب Y» (أسماء الحسابات)."""
+    return f'قيد بسيط ــ من حساب {account_name_only(from_label)} الى حساب {account_name_only(to_label)}'
+
+
+def lines_to_simple(lines):
+    """سطور ← قيد بسيط إن كانت سطرين فقط (مدين واحد ودائن واحد بالمبلغ نفسه وحسابان مختلفان)، وإلا None (قيد مركب)."""
+    rows = [x for x in lines if x.get('account_id') or _dec(x.get('debit')) or _dec(x.get('credit'))]
+    if len(rows) != 2:
+        return None
+    dr = [x for x in rows if _dec(x.get('debit')) > 0 and _dec(x.get('credit')) == 0]
+    cr = [x for x in rows if _dec(x.get('credit')) > 0 and _dec(x.get('debit')) == 0]
+    if len(dr) != 1 or len(cr) != 1 or _dec(dr[0]['debit']) != _dec(cr[0]['credit']):
+        return None
+    if not dr[0].get('account_id') or not cr[0].get('account_id') or dr[0]['account_id'] == cr[0]['account_id']:
+        return None
+    return {'from_account_id': dr[0]['account_id'], 'to_account_id': cr[0]['account_id'], 'amount': _dec(dr[0]['debit']),
+            'memo': (dr[0].get('memo') or cr[0].get('memo') or '')}
+
+
+class JournalService:
+    def __init__(self, session):
+        self.s = session
+
+    # ------------------------------------------------------------ قراءة
+    @property
+    def _base(self):
+        return Path(self.s.db_path).resolve().parent
+
+    def settings(self):
+        return WorkflowSettings.from_row(je.get_settings(self.s.conn, self.s.company_id))
+
+    def list(self, status=None, workflow_state=None, date_from=None, date_to=None, source_type=None, limit=200, offset=0,
+             currency=None, no_from=None, no_to=None, text=None):
+        rows = je.list_entries(self.s.conn, self.s.user_id, self.s.company_id, status=status, workflow_state=workflow_state,
+                               date_from=date_from, date_to=date_to, source_type=source_type, limit=limit, offset=offset,
+                               branch_id=self.s.branch_id, currency=currency, no_from=no_from, no_to=no_to, text=text)
+        extra = readmodel.journal_list_extras(self.s.conn, [r['id'] for r in rows])
+        counters = readmodel.journal_counterparties(self.s.conn, rows)       # من/إلى الطرف المقابل لقيود السندات
+        notes = readmodel.journal_voucher_notes(self.s.conn, rows)          # بيان السند = البيان والمرجع في قائمة القيود
+        sides = readmodel.journal_sides(self.s.conn, rows)                  # عمودا «مدين» و«دائن»: من: … / إلى: …
+        out = []
+        for r in rows:
+            x = extra.get(r['id'], {})
+            link = (f"يعكس القيد رقم {x['reverses_no']}" if x.get('reverses_no') is not None
+                    else f"عُكس بالقيد رقم {x['reversed_by_no']}" if x.get('reversed_by_no') is not None else '')
+            out.append({**r, 'entry_no': x.get('label_no') if x.get('label_no') is not None else r.get('entry_no'),
+                        'total_minor': x.get('total_minor', 0), 'attachment_count': x.get('attachments', 0), 'link': link,
+                        'currency': x.get('currency', ''), 'total_orig_minor': x.get('total_orig_minor'),
+                        'counter_label': counters.get(r['id'], ''), 'ref': notes.get(r['id'], ''),
+                        'debit_label': sides.get(r['id'], ('', ''))[0], 'credit_label': sides.get(r['id'], ('', ''))[1],
+                        'description': notes.get(r['id']) or r.get('description'),
+                        'state': 'reviewed' if (r['status'] == 'draft' and r.get('workflow_state') == 'reviewed')
+                        else 'approved' if (r['status'] == 'draft' and r.get('workflow_state') == 'approved') else r['status']})
+        return out
+
+    def get(self, entry_id):
+        e = je.get_entry(self.s.conn, self.s.user_id, int(entry_id))
+        e['lines'] = [{'account_id': ln['account_id'], 'account_code': ln.get('account_code'), 'account_name': ln.get('account_name'),
+                       'debit': Decimal(ln['debit_base'] or 0) / 100, 'credit': Decimal(ln['credit_base'] or 0) / 100,
+                       'debit_orig': Decimal(ln['debit_orig'] or 0) / 100, 'credit_orig': Decimal(ln['credit_orig'] or 0) / 100,
+                       'memo': ln.get('memo') or '', 'currency': ln.get('currency'), 'cost_center_id': ln.get('cost_center_id')}
+                      for ln in e.get('lines') or []]
+        return e
+
+    # ------------------------------------------------------------ عملة القيد والقوالب الجاهزة
+    def currency_options(self):
+        """العملات المفعّلة: [(code, «اسم (code)», is_base)] الأساسية أولًا."""
+        return [(c['code'], f"{c['name_ar']} ({c['code']})", c['is_base']) for c in readmodel.enabled_currencies(self.s.conn, self.s.company_id)]
+
+    def base_currency(self):
+        return rates.base_currency(self.s.conn, self.s.company_id)
+
+    def default_currency(self):
+        return rates.default_currency(self.s.conn, self.s.company_id)
+
+    def rate_for(self, currency, on_date):
+        """سعر الصرف المسجّل بتاريخ القيد (Decimal) أو None إن لم يوجد."""
+        try:
+            return rates.get_rate(self.s.conn, self.s.company_id, currency, on_date)
+        except AccountingError:
+            return None
+
+    def party_accounts(self, kind):
+        return readmodel.party_account_options(self.s.conn, self.s.company_id, kind)
+
+    def recipe_options(self, kind):
+        """خيارات حقول القوالب الجاهزة: customer/supplier/cash/sales/purchases/expense ← [(account_id, تسمية)]."""
+        if kind in ('customer', 'supplier', 'employee'):
+            return self.party_accounts(kind)
+        if kind == 'opening':
+            aid = readmodel.mapped_account_id(self.s.conn, self.s.company_id, 'opening_suspense')
+            return [(a, l) for a, l in self.s.lookup_accounts(groups=None) if a == aid] if aid else []
+        if kind == 'internal':        # حسابات جارية داخلية (نقطة بيع / مستودع): أصول أو التزامات
+            return self.s.lookup_accounts(types=('asset', 'liability'))
+        if kind == 'cash':
+            return self.s.lookup_pay_accounts()
+        if kind == 'purchases':        # المخزون أولًا (جرد مستمر) ثم المصروفات وتكلفة البضاعة
+            inv = readmodel.mapped_account_id(self.s.conn, self.s.company_id, 'inventory')
+            allacc = self.s.lookup_accounts(groups=None)
+            first = [(a, l) for a, l in allacc if a == inv]
+            rest = [(a, l) for a, l in self.s.lookup_accounts(types=('expense', 'cogs')) if a != inv]
+            return first + rest
+        types = {'sales': ('revenue',), 'expense': ('expense', 'cogs'), 'income': ('revenue',),
+                 'contra': ('revenue', 'expense', 'cogs'), 'equity': ('equity',)}.get(kind)
+        try:
+            return self.s.lookup_accounts(types=types)
+        except TypeError:
+            return self.s.lookup_accounts()
+
+    def recipe_default(self, kind):
+        """الحساب المقترح مسبقًا لكل حقل في نافذة القالب: المبيعات والأرصدة المعلقة من ربط الحسابات، والصندوق الرئيسي المربوط (أو أول صندوق متاح)."""
+        if kind == 'cash':
+            opts = [a for a, _l in self.recipe_options('cash')]
+            for key in ('cash', 'bank'):
+                aid = readmodel.mapped_account_id(self.s.conn, self.s.company_id, key)
+                if aid in opts:
+                    return aid
+            return opts[0] if opts else None
+        key = {'sales': 'sales', 'opening': 'opening_suspense', 'purchases': 'inventory'}.get(kind)
+        return readmodel.mapped_account_id(self.s.conn, self.s.company_id, key) if key else None
+
+    def print_spec(self, entry_id):
+        """المواصفة المطبوعة للقيد من محرك الطباعة (printing.journal_entry_print)."""
+        return printing.journal_entry_print(self.s.conn, self.s.user_id, int(entry_id))
+
+    # ------------------------------------------------------------ كتابة (عبر المحرك)
+    def create(self, entry_date, description, lines, pending_attachments=(), source_type=None, source_id=None, entry_type='general'):
+        if entry_type not in ('general', 'adjustment'):
+            raise AccountingError('نوع القيد غير مسموح من الواجهة')
+        if entry_type == 'adjustment' and len((description or '').strip()) < 3:
+            raise AccountingError('قيد التسوية يتطلب بيانًا (وصفًا) يوضح سببه')
+        eid = je.create_draft(self.s.conn, self.s.company_id, self.s.user_id, entry_date, _engine_lines(lines), description or '',
+                              branch_id=self.s.branch_id, entry_type=entry_type, source_type=source_type, source_id=source_id)
+        for att in pending_attachments:
+            self.add_attachment(eid, att['path'], att.get('name'))
+        return eid
+
+    def update(self, entry_id, entry_date, description, lines):
+        je.update_draft(self.s.conn, int(entry_id), self.s.user_id, lines=_engine_lines(lines), entry_date=entry_date, description=description or '')
+
+    def edit_posted(self, entry_id, entry_date, description, lines, reason):
+        """تعديل قيد مرحّل يدوي: عكس + قيد جديد مرحّل (مدير النظام، والإعداد مفعّل). المحرك هو الحَكَم."""
+        return je.edit_posted(self.s.conn, int(entry_id), self.s.user_id, lines=_engine_lines(lines), entry_date=entry_date,
+                              description=description or '', reason=(reason or '').strip())
+
+    def act(self, entry_id, action, reason='', on_date=None):
+        eid, uid, c = int(entry_id), self.s.user_id, self.s.conn
+        if action == 'review':
+            return je.review(c, eid, uid)
+        if action == 'approve':
+            return je.approve(c, eid, uid)
+        if action == 'post':
+            return je.post(c, eid, uid)
+        if action == 'delete':
+            return je.delete_draft(c, eid, uid)
+        if action == 'return_to_draft':
+            return je.return_to_draft(c, eid, uid, (reason or '').strip())
+        if action == 'delete_posted':
+            return je.delete_posted(c, eid, uid, (reason or '').strip())
+        if action == 'reverse':
+            return je.reverse(c, eid, uid, on_date or date.today().isoformat(), (reason or '').strip() or 'عكس من الواجهة')
+        raise AccountingError('إجراء غير معروف على القيد')
+
+    # ------------------------------------------------------------ قوالب ومرفقات واستيراد
+    def templates(self):
+        return extras.list_templates(self.s.conn, self.s.user_id, self.s.company_id)
+
+    def template(self, template_id):
+        return extras.get_template(self.s.conn, self.s.user_id, self.s.company_id, template_id)
+
+    def save_template(self, name, description, lines):
+        return extras.save_template(self.s.conn, self.s.user_id, self.s.company_id, name, description, lines)
+
+    def delete_template(self, template_id):
+        extras.delete_template(self.s.conn, self.s.user_id, self.s.company_id, template_id)
+
+    def attachments(self, entry_id):
+        return extras.list_attachments(self.s.conn, self.s.user_id, self.s.company_id, entry_id)
+
+    def add_attachment(self, entry_id, path, name=None):
+        return extras.add_attachment(self.s.conn, self.s.user_id, self.s.company_id, self._base, entry_id, path, name)
+
+    def attachment_path(self, attachment_id):
+        return extras.attachment_path(self.s.conn, self.s.user_id, self.s.company_id, self._base, attachment_id)
+
+    def delete_attachment(self, attachment_id):
+        extras.delete_attachment(self.s.conn, self.s.user_id, self.s.company_id, self._base, attachment_id)
+
+    def parse_csv(self, text_or_path):
+        return extras.parse_lines_csv(self.s.conn, self.s.user_id, self.s.company_id, text_or_path)

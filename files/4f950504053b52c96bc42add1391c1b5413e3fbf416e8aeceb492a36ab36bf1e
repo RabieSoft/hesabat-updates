@@ -1,0 +1,40 @@
+"""ألوان خلايا الإجماليات في الجداول (منطق خالص بلا Qt ليُختبر في أي بيئة).
+
+مفتاح العمود → (خلفية، نص) من رموز tot_* في tokens: مدين أزرق، دائن برتقالي، رصيد/صافي ذهبي، وغيرها بنبرة الهوية.
+"""
+_DEBIT = ('debit', 'dr', 'مدين', 'debit_total', 'total_debit')
+_CREDIT = ('credit', 'cr', 'دائن', 'credit_total', 'total_credit')
+_BALANCE = ('balance', 'net', 'rest', 'due', 'remaining', 'الرصيد', 'الصافي', 'المتبقي')
+
+
+def kind_of(key):
+    k = str(key or '').lower()
+    if k in _DEBIT:
+        return 'debit'
+    if k in _CREDIT:
+        return 'credit'
+    if k in _BALANCE:
+        return 'balance'
+    return 'other'
+
+
+def total_cell_colors(key, pal):
+    """(خلفية، نص) لخلية رقمية في صف الإجماليات."""
+    kd = kind_of(key)
+    if kd == 'debit':
+        return pal['tot_debit_soft'], pal['tot_debit_text']
+    if kd == 'credit':
+        return pal['tot_credit_soft'], pal['tot_credit_text']
+    if kd == 'balance':
+        return pal['tot_gold_soft'], pal['tot_gold_text']
+    return pal['accent_soft'], pal['accent_soft_text']
+
+
+def total_label_colors(pal):
+    """(خلفية، نص) لخلية عنوان صف الإجماليات (الأولى)."""
+    return pal['tot_grand_a'], pal['tot_grand_text']
+
+
+def summary_value_colors(pal):
+    """(خلفية، نص) لقيم صف «الإجمالي» الرئيسي أسفل الجدول."""
+    return pal['tot_grand_b'], pal['tot_grand_text']

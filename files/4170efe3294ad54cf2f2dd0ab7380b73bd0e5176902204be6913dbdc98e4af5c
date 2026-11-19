@@ -1,0 +1,10 @@
+-- 0031: طريقة تقييم المخزون القابلة للتهيئة: متوسط مرجّح (avg) أو FIFO أو LIFO.
+-- القيمة الفارغة = وراثة (الصنف ← تصنيفه ← تصنيف الأب ... ← الافتراضي: avg). إضافي فقط؛ لا يغيّر بيانات موجودة (كل شيء يبقى avg).
+ALTER TABLE item_categories ADD COLUMN cost_method TEXT NOT NULL DEFAULT '' CHECK(cost_method IN ('','avg','fifo','lifo'));
+ALTER TABLE items ADD COLUMN cost_method TEXT NOT NULL DEFAULT '' CHECK(cost_method IN ('','avg','fifo','lifo'));
+
+-- تغيير الطريقة بعد وجود حركات يكسر ثبات التكلفة المسجّلة: مرفوض على مستوى القاعدة.
+CREATE TRIGGER item_cost_method_locked BEFORE UPDATE OF cost_method ON items
+WHEN NEW.cost_method<>OLD.cost_method AND EXISTS(SELECT 1 FROM stock_movements WHERE item_id=OLD.id) BEGIN
+  SELECT RAISE(ABORT,'لا يمكن تغيير طريقة تقييم صنف له حركات مخزنية');
+END;

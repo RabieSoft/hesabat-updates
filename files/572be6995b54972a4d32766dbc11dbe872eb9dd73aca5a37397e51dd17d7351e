@@ -1,0 +1,214 @@
+"""الصنف الأساسي الوحيد لكل الصفحات: بناء كسول، تحديث عند تغيّر السياق، Ribbon سياقي، أخطاء مترجمة، قراءة فقط.
+
+كل صفحة جديدة ترث BasePage وتنفذ: build() وrefresh() وrequired_permission وribbon_groups() (اختياري). يتطلب PySide6.
+"""
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtWidgets import QLabel, QMessageBox, QPushButton, QVBoxLayout, QWidget
+
+from . import errors, strings_ar as S
+
+
+class BasePage(QWidget):
+    key = ''
+    title = ''
+    icon = 'list'
+    required_permission = None          # str أو tuple (أي منها يكفي)
+
+    status_message = Signal(str)        # رسالة لشريط الحالة
+    open_page_requested = Signal(str, object)   # (مفتاح الصفحة، معاملات اختيارية)
+    actions_changed = Signal()          # حين تتغير حالة الأزرار (تحديد سجل مثلًا) لتُحدَّث الـRibbon
+    open_entry_requested = Signal(object)   # {entry_id, source_type, source_id}: افتح المستند الأصلي لهذا القيد/المصدر
+
+    def __init__(self, window):
+        super().__init__()
+        self.window_ = window
+        self.session = window.session
+        self.state = window.state
+        self.access = window.access
+        self._built = False
+        self._read_only = False
+        self.setLayoutDirection(Qt.RightToLeft)
+
+    # ---------------------------------------------------------------- دورة الحياة
+    def ensure_built(self):
+        if self._built:
+            return
+        self._built = True
+        self.build()
+        self.refresh()
+
+    def build(self):
+        raise NotImplementedError
+
+    def refresh(self):
+        """يعيد تحميل البيانات من المحرك (يُستدعى عند الفتح وعند تغيّر السياق)."""
+
+    def on_context_changed(self, keys):
+        if self._built:
+            self.set_read_only(self.state.is_read_only)
+            self.refresh()
+
+    def ribbon_groups(self):
+        """list[ActionGroup] — أزرار الصفحة في الـRibbon."""
+        return []
+
+    def is_dirty(self):
+        return False
+
+    def can_close(self):
+        if getattr(self, '_dock_busy', False):                  # نموذج إدخال مفتوح داخل الصفحة
+            QMessageBox.information(self, S.APP_NAME, 'أنهِ نموذج الإدخال المفتوح (حفظ أو إلغاء) قبل إغلاق هذه الصفحة.')
+            return False
+        if not self.is_dirty():
+            return True
+        r = QMessageBox.question(self, S.APP_NAME, S.GENERIC['unsaved'] + '. هل تريد الإغلاق دون حفظ؟',
+                                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        return r == QMessageBox.Yes
+
+    # ---------------------------------------------------------------- نماذج الإدخال
+    def exec_form(self, dlg):
+        """عرض نموذج الإدخال كنافذة منبثقة دائمًا. النتيجة مثل exec()."""
+        # أُلغي العرض داخل جسم الصفحة (entry_dock): كل النماذج نوافذ منبثقة كما كانت سابقًا.
+        return dlg.exec()
+
+    # ---------------------------------------------------------------- قراءة فقط
+    @property
+    def read_only(self):
+        return self._read_only
+
+    def set_read_only(self, flag):
+        self._read_only = bool(flag)
+        self.actions_changed.emit()
+
+    # ---------------------------------------------------------------- الانتقال إلى سجل (التشغيل السريع)
+    focus_grid = 'grid'                 # اسم الشبكة التي يُحدَّد فيها السجل (تتجاوزه الصفحات متعددة الشبكات)
+
+    def focus_record(self, rid):
+        """يحدّد السجل ذا المعرّف rid في شبكة الصفحة إن وُجد. يُرجع True عند النجاح، ولا يرفع أبدًا (صفحة بلا شبكة = False)."""
+        grid = getattr(self, self.focus_grid, None)
+        if grid is None or not hasattr(grid, 'select_where'):
+            return False
+        try:
+            return bool(grid.select_where(lambda r: r['id'] == rid))
+        except Exception:  # noqa: BLE001
+            return False
+
+    # ---------------------------------------------------------------- الانتقال إلى المستند الأصلي (من رقم القيد)
+    source_targets = {}                 # source_type ← (اسم الشبكة، اسم TabWidget أو None، رقم التبويب)
+    focus_source_key = 'id'             # مفتاح معرّف السجل في صفوف الشبكة
+
+    def open_source_doc(self, row, entry_key='entry_id'):
+        """من صف جدول/تقرير: يطلب من النافذة الرئيسية فتح شاشة المستند الأصلي (فاتورة/سند/قيد…)."""
+        from .source_nav import info_from_row
+        self.open_entry_requested.emit(info_from_row(row, entry_key))
+
+    def relax_filters(self):
+        """تصفير مرشحات الصفحة ليظهر السجل المطلوب (تتجاوزها الصفحات ذات المرشحات)."""
+
+    def show_source(self, tgt):
+        """يحدّد المستند المصدر في شبكة الصفحة (يبدّل التبويب إن لزم). True عند النجاح، ولا يرفع أبدًا."""
+        try:
+            spec = self.source_targets.get(tgt.source_type)
+            if not spec:
+                return False
+            grid_attr, tabs_attr, idx = spec
+            grid = getattr(self, grid_attr, None)
+            if grid is None or not hasattr(grid, 'select_where'):
+                return False
+            if tabs_attr:
+                getattr(self, tabs_attr).setCurrentIndex(idx)
+            want, key = str(tgt.source_id), self.focus_source_key
+            pred = lambda r: str(r.get(key)) == want       # noqa: E731
+            if grid.select_where(pred):
+                return True
+            self.relax_filters()
+            self.refresh()
+            return bool(grid.select_where(pred))
+        except Exception:  # noqa: BLE001
+            return False
+
+    # ---------------------------------------------------------------- مساعدات
+    def notify(self, text):
+        self.status_message.emit(text)
+
+    def show_error(self, exc):
+        """رسالة مترجمة مع زر انتقال للإجراء المقترح إن وُجد. لا traceback للمستخدم."""
+        msg = errors.translate(exc)
+        self.window_.log_error(msg, self.key)
+        if getattr(self.window_, '_restoring', False):
+            # أثناء الإقلاع لا نفتح نافذة مشروطة (تختفي خلف شاشة التحميل فتبدو كتعليق): نؤجّل عرضها لما بعد ظهور النافذة
+            QTimer.singleShot(1500, lambda m=msg: self._show_error_box(m))
+            return
+        self._show_error_box(msg)
+
+    def _show_error_box(self, msg):
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning if msg.severity == 'warning' else QMessageBox.Critical)
+        box.setWindowTitle(msg.title)
+        box.setText(msg.text)
+        if msg.hint:
+            box.setInformativeText(msg.hint)
+        go = None
+        if msg.action and msg.action[0] == 'open_page':
+            go = box.addButton('فتح الصفحة المقترحة', QMessageBox.ActionRole)
+        box.addButton(S.ACTION['close'], QMessageBox.RejectRole)
+        box.exec()
+        if go is not None and box.clickedButton() is go:
+            self.open_page_requested.emit(msg.action[1], None)
+
+    def guarded(self, fn, *args, reload=True, **kwargs):
+        """ينفّذ عملية محرك ويعرض أي خطأ مترجمًا. يُرجع (نجاح، نتيجة)."""
+        try:
+            result = fn(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            self.show_error(exc)
+            return False, None
+        if reload:
+            self.window_.data_changed(self.key)
+        return True, result
+
+    def run_service(self, factory, method, *args, on_done=None, on_error=None, on_progress=None, **kwargs):
+        """يشغّل دالة خدمة في الخلفية بنسخة جلسة مستقلة: factory(session) ← خدمة، ثم method(*args)."""
+        def _bg(s, ctx):
+            return getattr(factory(s), method)(*args, **kwargs)
+        return self.run_task(_bg, on_done=on_done, on_error=on_error, on_progress=on_progress)
+
+    def run_task(self, fn, on_done=None, on_error=None, on_progress=None):
+        """تشغيل عملية في خلفية عبر TaskRunner مع حماية الأخطاء وتحديث الواجهة."""
+        runner = getattr(self.window_, 'runner', None)
+        if runner:
+            ctx = runner.run(fn, on_done=on_done, on_error=on_error or self.show_error, on_progress=on_progress)
+            if hasattr(self.window_, 'refresh_notifications'):
+                self.window_.refresh_notifications()
+            return ctx
+        from .tasks import TaskRunner
+        if not hasattr(self, '_runner'):
+            self._runner = TaskRunner(self.session, self)
+        return self._runner.run(fn, on_done=on_done, on_error=on_error or self.show_error, on_progress=on_progress)
+
+
+class PlaceholderPage(BasePage):
+    """صفحة «قيد البناء»: تظهر الصفحات المخططة في التنقل قبل بنائها، مع وصفها وصلاحيتها ومرحلة بنائها."""
+
+    def __init__(self, window, spec):
+        super().__init__(window)
+        self.key, self.title, self.icon, self.required_permission = spec.key, spec.title, spec.icon, spec.perm
+        self._spec = spec
+
+    def build(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 24, 24, 24)
+        lay.addStretch(1)
+        t = QLabel(self._spec.title)
+        t.setObjectName('panelTitle')
+        t.setAlignment(Qt.AlignCenter)
+        lay.addWidget(t)
+        d = QLabel(self._spec.description or S.GENERIC['under_construction'])
+        d.setWordWrap(True)
+        d.setAlignment(Qt.AlignCenter)
+        lay.addWidget(d)
+        ph = QLabel(f'المرحلة {self._spec.phase} من خطة البناء')
+        ph.setObjectName('ctxKey')
+        ph.setAlignment(Qt.AlignCenter)
+        lay.addWidget(ph)
+        lay.addStretch(2)

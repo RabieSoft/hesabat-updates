@@ -1,0 +1,42 @@
+-- قيد يدوي (بسيط/مركب) على حسابات العملاء والموردين: خيار في الإعدادات + صلاحية لمدير النظام فقط.
+-- القيد يمس الحساب التفصيلي للطرف (لا الحساب الرقابي التجميعي) فيظهر في كشف حسابه ويبقى الرقابي = مجموع الأطراف.
+-- حسابات المخزون تبقى ممنوعة دائمًا (قيمة بلا كميات تُفسد مطابقة المخزون مع الأستاذ).
+ALTER TABLE journal_settings ADD COLUMN allow_manual_party_entries INTEGER NOT NULL DEFAULT 0 CHECK(allow_manual_party_entries IN (0,1));
+ALTER TABLE journal_entries ADD COLUMN party_override INTEGER NOT NULL DEFAULT 0 CHECK(party_override IN (0,1));
+
+INSERT INTO permissions(code,name_ar,is_sensitive) VALUES
+ ('journal.party_manual','قيد يدوي على حسابات العملاء والموردين (الرقابية) وتفعيله من الإعدادات',1);
+INSERT INTO role_permissions SELECT 1,'journal.party_manual';
+
+DROP TRIGGER jl_ins_rules;
+CREATE TRIGGER jl_ins_rules BEFORE INSERT ON journal_lines BEGIN
+  SELECT RAISE(ABORT,'لا يمكن إضافة سطر إلى قيد غير مسودة')
+   WHERE (SELECT status FROM journal_entries WHERE id=NEW.entry_id)<>'draft';
+  SELECT RAISE(ABORT,'القيد تحت المراجعة أو معتمد: أعده إلى المسودة قبل التعديل')
+   WHERE (SELECT workflow_state FROM journal_entries WHERE id=NEW.entry_id)<>'draft';
+  SELECT RAISE(ABORT,'الحساب غير موجود أو غير نشط أو تجميعي: لا تقبل الحركة')
+   WHERE NOT EXISTS(SELECT 1 FROM accounts a JOIN journal_entries e ON e.id=NEW.entry_id
+      WHERE a.id=NEW.account_id AND a.is_group=0 AND a.company_id=e.company_id
+        AND (a.is_active=1 OR e.entry_type IN ('reversal','closing','opening')));
+  SELECT RAISE(ABORT,'قيد الافتتاح يقبل حسابات الميزانية فقط (أصول/خصوم/حقوق ملكية)')
+   WHERE (SELECT entry_type FROM journal_entries WHERE id=NEW.entry_id)='opening'
+     AND (SELECT account_type FROM accounts WHERE id=NEW.account_id) NOT IN ('asset','liability','equity');
+  SELECT RAISE(ABORT,'حسابات العملاء والموردين لا تقبل قيدا يدويا عاديا: استخدم المستند المناسب أو قيد تسوية، أو فعّل «السماح بقيد يدوي على العملاء والموردين» من الإعدادات (لمدير النظام)')
+   WHERE (SELECT entry_type FROM journal_entries WHERE id=NEW.entry_id)='general'
+     AND (SELECT party_override FROM journal_entries WHERE id=NEW.entry_id)=0
+     AND EXISTS(SELECT 1 FROM parties WHERE account_id=NEW.account_id);
+  SELECT RAISE(ABORT,'حسابات المخزون لا تقبل قيدا يدويا عاديا: استخدم المستند المناسب (تسوية جرد/استلام) أو قيد تسوية')
+   WHERE (SELECT entry_type FROM journal_entries WHERE id=NEW.entry_id)='general'
+     AND (EXISTS(SELECT 1 FROM account_mappings m WHERE m.account_id=NEW.account_id AND m.map_key='inventory')
+          OR EXISTS(SELECT 1 FROM items WHERE inventory_account_id=NEW.account_id));
+  SELECT RAISE(ABORT,'مركز التكلفة غير صالح (غير موجود أو غير نشط أو تجميعي أو من شركة أخرى)')
+   WHERE NEW.cost_center_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM cost_centers cc JOIN journal_entries e ON e.id=NEW.entry_id
+      WHERE cc.id=NEW.cost_center_id AND cc.is_active=1 AND cc.is_group=0 AND cc.company_id=e.company_id);
+  SELECT RAISE(ABORT,'هذا الحساب يتطلب مركز تكلفة')
+   WHERE NEW.cost_center_id IS NULL AND EXISTS(SELECT 1 FROM accounts a WHERE a.id=NEW.account_id AND a.requires_cost_center=1);
+END;
+
+CREATE TRIGGER je_party_override_locked BEFORE UPDATE OF party_override ON journal_entries
+WHEN NEW.party_override<>OLD.party_override AND OLD.status<>'draft' BEGIN
+  SELECT RAISE(ABORT,'لا يمكن تغيير وسم القيد اليدوي على الأطراف بعد الترحيل');
+END;

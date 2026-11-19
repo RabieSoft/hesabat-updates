@@ -1,0 +1,223 @@
+"""نافذة إدارة مجموعات العملاء والموردين.
+"""
+from decimal import Decimal
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
+    QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton,
+    QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget
+)
+
+from alhisabat.ui.components.basic import DialogGuardMixin, MoneyEdit, ask_reason
+from alhisabat.ui.core.party_groups_service import PartyGroupsService
+
+
+class PartyGroupEditDialog(DialogGuardMixin, QDialog):
+    guard_save_stay = False
+    nonmodal_exec = False
+
+    def __init__(self, parent, kind, existing=None):
+        super().__init__(parent)
+        self.kind = kind
+        self.existing = existing or {}
+        label = 'العملاء' if kind == 'customer' else 'الموردين'
+        self.setWindowTitle(('تعديل مجموعة ' if existing else 'إضافة مجموعة ') + label)
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.setMinimumWidth(380)
+
+        lay = QVBoxLayout(self)
+        f = QFormLayout()
+
+        self.name = QLineEdit(self.existing.get('name', ''))
+        self.name.setPlaceholderText('اسم المجموعة (مطلوب)')
+        f.addRow('اسم المجموعة *', self.name)
+
+        if kind == 'customer':
+            lim_minor = self.existing.get('default_credit_limit', 0)
+            self.credit = MoneyEdit()
+            if lim_minor:
+                self.credit.set_value(Decimal(lim_minor) / 100)
+            self.credit.setPlaceholderText('0 = بلا حد ائتماني')
+            f.addRow('الحد الائتماني الافتراضي', self.credit)
+        else:
+            self.credit = None
+
+        self.terms = QSpinBox()
+        self.terms.setRange(0, 3650)
+        self.terms.setValue(int(self.existing.get('default_payment_terms_days', 0)))
+        f.addRow('مدة السداد الافتراضية (أيام)', self.terms)
+
+        lay.addLayout(f)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self._accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def _accept(self):
+        if not self.name.text().strip():
+            QMessageBox.warning(self, 'خطأ', 'اسم المجموعة مطلوب.')
+            return
+        self.accept()
+
+    def values(self):
+        out = {
+            'name': self.name.text().strip(),
+            'default_payment_terms_days': self.terms.value(),
+        }
+        if self.credit is not None:
+            out['default_credit_limit'] = self.credit.value() or Decimal(0)
+        return out
+
+
+class PartyGroupsDialog(DialogGuardMixin, QDialog):
+    guard_save_stay = False
+    nonmodal_exec = True
+
+    def __init__(self, page, kind):
+        super().__init__(page)
+        self.page = page
+        self.kind = kind
+        self.svc = PartyGroupsService(page.session)
+        label = 'العملاء' if kind == 'customer' else 'الموردين'
+        self.setWindowTitle(f'مجموعات {label}')
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.resize(580, 420)
+
+        lay = QVBoxLayout(self)
+        bar = QHBoxLayout()
+
+        btn_add = QPushButton('+ إضافة مجموعة')
+        btn_add.clicked.connect(self._add)
+        bar.addWidget(btn_add)
+
+        self.btn_edit = QPushButton('تعديل')
+        self.btn_edit.clicked.connect(self._edit)
+        bar.addWidget(self.btn_edit)
+
+        self.btn_toggle = QPushButton('تفعيل/تعطيل')
+        self.btn_toggle.clicked.connect(self._toggle)
+        bar.addWidget(self.btn_toggle)
+
+        self.btn_del = QPushButton('حذف')
+        self.btn_del.clicked.connect(self._delete)
+        bar.addWidget(self.btn_del)
+
+        bar.addStretch(1)
+        btn_refresh = QPushButton('تحديث')
+        btn_refresh.clicked.connect(self.refresh)
+        bar.addWidget(btn_refresh)
+        lay.addLayout(bar)
+
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(['الكود', 'الاسم', 'عدد الأطراف', 'الحالة'])
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.itemSelectionChanged.connect(self._selection_changed)
+        self.table.itemDoubleClicked.connect(lambda _it: self._edit())
+        lay.addWidget(self.table)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Close)
+        bb.rejected.connect(self.accept)
+        lay.addWidget(bb)
+
+        self._rows = []
+        self.refresh()
+
+    def _selected(self):
+        r = self.table.currentRow()
+        if 0 <= r < len(self._rows):
+            return self._rows[r]
+        return None
+
+    def _selection_changed(self):
+        sel = self._selected()
+        has_sel = sel is not None
+        self.btn_edit.setEnabled(has_sel)
+        self.btn_toggle.setEnabled(has_sel)
+        self.btn_del.setEnabled(has_sel)
+
+    def refresh(self):
+        try:
+            self._rows = self.svc.list(self.kind)
+        except Exception as exc:
+            QMessageBox.critical(self, 'خطأ', str(exc))
+            self._rows = []
+        self.table.setRowCount(len(self._rows))
+        for r, g in enumerate(self._rows):
+            it_code = QTableWidgetItem(str(g['code']))
+            it_code.setFlags(it_code.flags() ^ Qt.ItemIsEditable)
+            self.table.setItem(r, 0, it_code)
+
+            it_name = QTableWidgetItem(str(g['name']))
+            it_name.setFlags(it_name.flags() ^ Qt.ItemIsEditable)
+            self.table.setItem(r, 1, it_name)
+
+            it_count = QTableWidgetItem(str(g['party_count']))
+            it_count.setTextAlignment(Qt.AlignCenter)
+            it_count.setFlags(it_count.flags() ^ Qt.ItemIsEditable)
+            self.table.setItem(r, 2, it_count)
+
+            status_str = 'نشطة' if g['is_active'] else 'معطلة'
+            it_status = QTableWidgetItem(status_str)
+            it_status.setTextAlignment(Qt.AlignCenter)
+            it_status.setFlags(it_status.flags() ^ Qt.ItemIsEditable)
+            self.table.setItem(r, 3, it_status)
+        self._selection_changed()
+
+    def _add(self):
+        d = PartyGroupEditDialog(self, self.kind)
+        if d.exec():
+            v = d.values()
+            try:
+                self.svc.create(self.kind, v)
+                self.refresh()
+                if hasattr(self.page, 'refresh'):
+                    self.page.refresh()
+            except Exception as exc:
+                QMessageBox.critical(self, 'خطأ', str(exc))
+
+    def _edit(self):
+        sel = self._selected()
+        if not sel:
+            return
+        d = PartyGroupEditDialog(self, self.kind, sel)
+        if d.exec():
+            v = d.values()
+            try:
+                self.svc.edit(sel['id'], v)
+                self.refresh()
+                if hasattr(self.page, 'refresh'):
+                    self.page.refresh()
+            except Exception as exc:
+                QMessageBox.critical(self, 'خطأ', str(exc))
+
+    def _toggle(self):
+        sel = self._selected()
+        if not sel:
+            return
+        verb = 'تعطيل' if sel['is_active'] else 'تفعيل'
+        if ask_reason(self, verb, [f'هل تريد {verb} مجموعة «{sel["name"]}»؟'], need_reason=False, confirm_text=verb) is None:
+            return
+        try:
+            self.svc.set_active(sel['id'], not sel['is_active'])
+            self.refresh()
+            if hasattr(self.page, 'refresh'):
+                self.page.refresh()
+        except Exception as exc:
+            QMessageBox.critical(self, 'خطأ', str(exc))
+
+    def _delete(self):
+        sel = self._selected()
+        if not sel:
+            return
+        if ask_reason(self, 'حذف', [f'هل تريد حذف مجموعة «{sel["name"]}»؟'], need_reason=False, confirm_text='حذف', danger=True) is None:
+            return
+        try:
+            self.svc.delete(sel['id'])
+            self.refresh()
+            if hasattr(self.page, 'refresh'):
+                self.page.refresh()
+        except Exception as exc:
+            QMessageBox.critical(self, 'خطأ', str(exc))

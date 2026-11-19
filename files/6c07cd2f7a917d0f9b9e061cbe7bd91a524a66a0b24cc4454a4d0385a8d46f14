@@ -1,0 +1,73 @@
+"""الحالة المشتركة للتطبيق (الشركة/الفرع/السنة/الفترة/المستخدم/السمة) مع اشتراكات للتحديث التفاعلي.
+
+عند تغيّر أي مفتاح تُستدعى الدوال المشتركة بمجموعة المفاتيح المتغيرة، فتُعيد الصفحات المفتوحة تحميل بياناتها.
+لا تخزّن الواجهة هنا أرصدة ولا حالات مستندات: هذه سياق فقط. بلا PySide6.
+"""
+
+KEYS = ('company', 'branch', 'branches', 'year', 'period', 'user', 'mode', 'density', 'digits')
+
+
+class AppState:
+    def __init__(self):
+        self._v = {k: None for k in KEYS}
+        self._v.update(mode='light', density='compact', digits='latin', branches=[])
+        self._subs = []
+
+    # ---- اشتراكات
+    def subscribe(self, fn):
+        self._subs.append(fn)
+
+        def off():
+            if fn in self._subs:
+                self._subs.remove(fn)
+        return off
+
+    def get(self, key, default=None):
+        v = self._v.get(key)
+        return default if v is None else v
+
+    def update(self, **kw):
+        changed = {k for k, v in kw.items() if k in KEYS and self._v.get(k) != v}
+        unknown = set(kw) - set(KEYS)
+        if unknown:
+            raise KeyError(f'مفاتيح حالة غير معروفة: {sorted(unknown)}')
+        for k in changed:
+            self._v[k] = kw[k]
+        if changed:
+            for fn in list(self._subs):
+                fn(changed)
+        return changed
+
+    # ---- مشتقات
+    @property
+    def branch_id(self):
+        b = self._v.get('branch')
+        return b.get('id') if b else None
+
+    @property
+    def read_only_reason(self):
+        """سبب القراءة فقط لسياق الفترة الحالية ('' = قابل للتحرير)."""
+        from alhisabat.system import year_archive
+        if year_archive.archive_label():
+            return f"أرشيف سنة {year_archive.archive_label()}: للعرض فقط"
+        y, p = self._v.get('year'), self._v.get('period')
+        if y and y.get('status') == 'closed':
+            return f"السنة المالية «{y.get('name', '')}» مقفلة: العرض فقط"
+        if p and p.get('status') == 'closed':
+            return f"الفترة «{p.get('name', '')}» مقفلة: العرض فقط"
+        return ''
+
+    @property
+    def is_read_only(self):
+        return bool(self.read_only_reason)
+
+
+def period_reason(period_info):
+    """سبب القراءة فقط لفترة/سنة محددة (بنية find_period: ps, ys). '' = مفتوحة."""
+    if not period_info:
+        return 'التاريخ خارج أي سنة/فترة مالية معرّفة'
+    if period_info.get('ys') == 'closed':
+        return 'السنة المالية مقفلة'
+    if period_info.get('ps') == 'closed':
+        return 'الفترة مقفلة'
+    return ''

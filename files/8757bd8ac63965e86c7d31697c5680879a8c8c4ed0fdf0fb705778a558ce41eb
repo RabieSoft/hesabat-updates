@@ -1,0 +1,399 @@
+"""نوافذ اتفاقية فتح حساب التعامل التجاري: معاينة/طباعة/PDF، نسخ الاتفاقية لعميل (توليد وتوقيع ومرفق)، محرر القالب،
+والطباعة الجماعية للعملاء بلا اتفاقية موقّعة (المرحَّلون). المنطق كله في core/agreements_service ← business/agreements؛
+هنا عرض وتفاعل فقط. يتطلب PySide6.
+"""
+import os
+import tempfile
+
+from PySide6.QtCore import QMarginsF, Qt, QTimer, QUrl
+from PySide6.QtGui import QDesktopServices, QPageLayout, QPageSize, QPdfWriter, QTextDocument
+from PySide6.QtWidgets import (
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel,
+    QLineEdit, QListWidget, QMessageBox, QPlainTextEdit, QPushButton, QTableWidget, QTableWidgetItem, QTextBrowser,
+    QVBoxLayout,
+)
+
+from alhisabat.ui.core.agreements_service import AgreementsService
+
+STATUS_AR = {'draft': 'مسودة (لم تُطبع)', 'printed': 'مطبوعة — بانتظار التوقيع', 'signed': 'موقّعة', 'void': 'ملغاة', 'none': 'لا توجد'}
+PAYMENT_MODES = ['', 'نقدًا', 'آجل', 'دفعات أسبوعية', 'دفعات شهرية', 'حسب الاتفاق']
+
+
+def _doc(html):
+    d = QTextDocument()
+    d.setHtml(html)
+    return d
+
+
+def _page_layout():
+    return QPageLayout(QPageSize(QPageSize.A4), QPageLayout.Portrait, QMarginsF(15, 15, 15, 15), QPageLayout.Millimeter)
+
+
+class AgreementPreviewDialog(QDialog):
+    """معاينة نص الاتفاقية كما ستُطبع، مع «طباعة» و«حفظ PDF». on_printed() تُستدعى بعد طباعة/حفظ ناجح لتسجيل الحالة."""
+
+    def __init__(self, parent, html, title='اتفاقية فتح حساب تعامل تجاري', on_printed=None, allow_mark=True):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.resize(820, 760)
+        self._html, self._on_printed, self.printed = html, (on_printed if allow_mark else None), False
+        lay = QVBoxLayout(self)
+        bar = QHBoxLayout()
+        b_print = QPushButton('طباعة'); b_print.setProperty('primary', True); b_print.clicked.connect(self.do_print)
+        b_pdf = QPushButton('حفظ PDF'); b_pdf.clicked.connect(self.do_pdf)
+        b_close = QPushButton('إغلاق'); b_close.clicked.connect(self.accept)
+        for b in (b_print, b_pdf):
+            bar.addWidget(b)
+        bar.addStretch(1)
+        bar.addWidget(b_close)
+        lay.addLayout(bar)
+        self.view = QTextBrowser()
+        self.view.setLayoutDirection(Qt.RightToLeft)
+        self.view.setHtml(html)
+        lay.addWidget(self.view, 1)
+
+    def _done(self):
+        self.printed = True
+        if self._on_printed:
+            try:
+                self._on_printed()
+            except Exception as exc:  # noqa: BLE001 — فشل تسجيل الحالة لا يلغي الطباعة التي تمت
+                QMessageBox.warning(self, 'اتفاقية', f'تمت الطباعة لكن تعذّر تسجيل الحالة:\n{exc}')
+
+    def do_print(self):
+        from PySide6.QtPrintSupport import QPrintDialog, QPrinter
+        printer = QPrinter(QPrinter.HighResolution)
+        printer.setPageLayout(_page_layout())
+        if QPrintDialog(printer, self).exec() != QDialog.Accepted:
+            return
+        _doc(self._html).print_(printer)
+        self._done()
+
+    def do_pdf(self):
+        path, _ = QFileDialog.getSaveFileName(self, 'حفظ PDF', 'اتفاقية-فتح-حساب.pdf', 'PDF (*.pdf)')
+        if not path:
+            return
+        if not path.lower().endswith('.pdf'):
+            path += '.pdf'
+        try:
+            w = QPdfWriter(path)
+            w.setResolution(600)
+            w.setPageLayout(_page_layout())
+            _doc(self._html).print_(w)
+        except Exception as exc:  # noqa: BLE001
+            return QMessageBox.warning(self, 'اتفاقية', f'تعذّر حفظ الملف:\n{exc}')
+        self._done()
+
+
+class GenerateOptionsDialog(QDialog):
+    """بيانات تُكمَل عند التوليد: صفة السداد ومدة التأخر والمكان وبيانات ممثل المنشأة. الفارغ يظهر نقاطا للكتابة باليد."""
+
+    def __init__(self, page, info, terms_days=0, batch=False):
+        super().__init__(page)
+        self.setWindowTitle('بيانات الاتفاقية')
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.setMinimumWidth(460)
+        lay = QVBoxLayout(self)
+        note = QLabel('الحقول الفارغة تُطبع نقاطًا لتُكتب بخط اليد. بيانات العميل والمنشأة تُؤخذ تلقائيًا.'
+                      + ('\nتنطبق هذه القيم على كل العملاء المحدَّدين.' if batch else ''))
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        f = QFormLayout()
+        self.mode = QComboBox(); self.mode.setEditable(True); self.mode.addItems(PAYMENT_MODES)
+        self.delay = QLineEdit(); self.delay.setPlaceholderText(f'فارغ = {terms_days} يوم من شروط العميل' if terms_days else 'مثال: 30 يومًا')
+        self.place = QLineEdit(); self.district = QLineEdit(); self.gov = QLineEdit()
+        self.addr = QLineEdit(info.get('address', '')); self.phone = QLineEdit(info.get('phone', ''))
+        self.rep = QLineEdit(info.get('rep_name', '')); self.title = QLineEdit(info.get('rep_title', ''))
+        for lab, w in (('صفة السداد', self.mode), ('مدة التأخر', self.delay), ('المكان', self.place), ('المديرية', self.district),
+                       ('المحافظة', self.gov), ('عنوان المنشأة', self.addr), ('هاتف المنشأة', self.phone),
+                       ('ممثل المنشأة (الطرف الثاني)', self.rep), ('صفته', self.title)):
+            f.addRow(lab, w)
+        lay.addLayout(f)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setText('توليد')
+        bb.button(QDialogButtonBox.Cancel).setText('إلغاء')
+        bb.accepted.connect(self.accept); bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def values(self):
+        options = {'payment_mode': self.mode.currentText().strip(), 'delay_period': self.delay.text().strip(),
+                   'place': self.place.text().strip(), 'district': self.district.text().strip(), 'governorate': self.gov.text().strip()}
+        info = {'address': self.addr.text().strip(), 'phone': self.phone.text().strip(),
+                'rep_name': self.rep.text().strip(), 'rep_title': self.title.text().strip()}
+        return {k: v for k, v in options.items() if v}, info
+
+
+def _remember_info(page, svc, info):
+    try:
+        svc.remember(page.window_.prefs, info)
+    except Exception:  # noqa: BLE001 — التفضيلات اختيارية
+        pass
+
+
+class AgreementDialog(QDialog):
+    """اتفاقيات عميل واحد: كل النسخ وحالاتها، توليد جديدة، معاينة/طباعة، تسجيل التوقيع مع الأصل الممسوح، فتح المرفق، إلغاء."""
+
+    def __init__(self, page, party, auto_generate=False):
+        super().__init__(page)
+        self.page, self.party = page, party
+        self.svc = AgreementsService(page.session)
+        self.setWindowTitle(f"اتفاقية فتح الحساب — {party.get('name', '')}")
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.resize(820, 460)
+        lay = QVBoxLayout(self)
+        self.head = QLabel(''); self.head.setStyleSheet('font-size: 14px; font-weight: bold;')
+        lay.addWidget(self.head)
+        self.tbl = QTableWidget(0, 6)
+        self.tbl.setHorizontalHeaderLabels(['النسخة', 'الحالة', 'أُنشئت', 'طُبعت', 'وُقّعت', 'المرفق'])
+        self.tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tbl.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tbl.horizontalHeader().setStretchLastSection(True)
+        self.tbl.itemSelectionChanged.connect(self._sync)
+        lay.addWidget(self.tbl, 1)
+        row = QHBoxLayout()
+        self.b_gen = self._btn(row, 'توليد اتفاقية جديدة', self._generate, primary=True)
+        self.b_view = self._btn(row, 'معاينة وطباعة', self._preview)
+        self.b_sign = self._btn(row, 'تسجيل التوقيع / إرفاق الأصل', self._sign)
+        self.b_open = self._btn(row, 'فتح المرفق', self._open_file)
+        self.b_void = self._btn(row, 'إلغاء النسخة', self._void)
+        row.addStretch(1)
+        self.b_tpl = self._btn(row, 'قالب الاتفاقية…', self._template)
+        close = QPushButton('إغلاق'); close.clicked.connect(self.accept); row.addWidget(close)
+        lay.addLayout(row)
+        self._rows = []
+        self.refresh()
+        if auto_generate:
+            QTimer.singleShot(0, self._generate)
+
+    def _btn(self, row, text, fn, primary=False):
+        b = QPushButton(text)
+        if primary:
+            b.setProperty('primary', True)
+        b.clicked.connect(fn)
+        row.addWidget(b)
+        return b
+
+    @property
+    def _cur(self):
+        r = self.tbl.currentRow()
+        return self._rows[r] if 0 <= r < len(self._rows) else None
+
+    def refresh(self, select_id=None):
+        ok, rows = self.page.guarded(self.svc.list, self.party['id'], reload=False)
+        self._rows = rows if ok and rows else []
+        st = 'none'
+        for k in ('signed', 'printed', 'draft'):
+            if any(r['status'] == k for r in self._rows):
+                st = k
+                break
+        self.head.setText(f"الحالة الحالية: {STATUS_AR[st]}")
+        self.tbl.setRowCount(len(self._rows))
+        for i, r in enumerate(self._rows):
+            vals = [f"#{r['version']}", STATUS_AR.get(r['status'], r['status']), (r['created_at'] or '')[:16],
+                    (r['printed_at'] or '')[:16], r['signed_at'] or '', 'نعم' if r['has_file'] else '—']
+            for j, v in enumerate(vals):
+                self.tbl.setItem(i, j, QTableWidgetItem(v))
+        if self._rows:
+            pick = next((i for i, r in enumerate(self._rows) if r['id'] == select_id), 0)
+            self.tbl.selectRow(pick)
+        self._sync()
+
+    def _sync(self):
+        c = self._cur
+        live = bool(c and c['status'] != 'void')
+        self.b_view.setEnabled(bool(c))
+        self.b_sign.setEnabled(live)
+        self.b_void.setEnabled(live)
+        self.b_open.setEnabled(bool(c and c['has_file']))
+        try:
+            self.b_tpl.setVisible(self.svc.can_edit_template())
+        except Exception:  # noqa: BLE001
+            self.b_tpl.setVisible(False)
+
+    # ---- إجراءات
+    def _generate(self):
+        info = self.svc.company_info(self.page.window_.prefs)
+        d = GenerateOptionsDialog(self, info, int(self.party.get('payment_terms_days') or 0))
+        if not d.exec():
+            return
+        options, info = d.values()
+        _remember_info(self.page, self.svc, info)
+        force = False
+        if any(r['status'] == 'signed' for r in self._rows):
+            if QMessageBox.question(self, 'اتفاقية', 'للعميل اتفاقية موقّعة بالفعل. هل تريد توليد نسخة جديدة (تبقى الموقّعة محفوظة)؟') != QMessageBox.Yes:
+                return
+            force = True
+        ok, aid = self.page.guarded(self.svc.generate, self.party['id'], info, options, force, reload=False)
+        if not ok:
+            return
+        self.refresh(select_id=aid)
+        self._preview()
+
+    def _preview(self):
+        c = self._cur
+        if not c:
+            return
+        ok, html = self.page.guarded(self.svc.html, c['id'], reload=False)
+        if not ok:
+            return
+        aid = c['id']
+        dlg = AgreementPreviewDialog(self, html, on_printed=lambda: self.svc.mark_printed([aid]), allow_mark=c['status'] == 'draft')
+        dlg.exec()
+        self.refresh(select_id=aid)
+
+    def _sign(self):
+        c = self._cur
+        if not c:
+            return
+        path, _ = QFileDialog.getOpenFileName(self, 'اختر الأصل الموقّع الممسوح (اختياري — ألغِ لتسجيل التوقيع بلا مرفق)', '',
+                                              'ملفات (*.pdf *.png *.jpg *.jpeg)')
+        if not path and QMessageBox.question(self, 'اتفاقية', 'تسجيل التوقيع بدون إرفاق نسخة ممسوحة؟') != QMessageBox.Yes:
+            return
+        ok, _r = self.page.guarded(self.svc.record_signature, c['id'], None, path or None, reload=False)
+        if ok:
+            self.page.notify('سُجِّل توقيع الاتفاقية')
+            self.refresh(select_id=c['id'])
+
+    def _open_file(self):
+        c = self._cur
+        if not c:
+            return
+        ok, res = self.page.guarded(self.svc.signed_file, c['id'], reload=False)
+        if not ok:
+            return
+        name, _mime, data = res
+        path = os.path.join(tempfile.gettempdir(), f"agreement_{c['id']}_{name}")
+        with open(path, 'wb') as f:
+            f.write(data)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def _void(self):
+        c = self._cur
+        if not c:
+            return
+        from alhisabat.ui.components.basic import ask_reason
+        reason = ask_reason(self, 'إلغاء', [f"إلغاء النسخة #{c['version']}؟ تبقى محفوظة في السجل."], need_reason=True, confirm_text='إلغاء النسخة', danger=True)
+        if reason is None:
+            return
+        ok, _r = self.page.guarded(self.svc.void, c['id'], reason, reload=False)
+        if ok:
+            self.refresh()
+
+    def _template(self):
+        TemplateEditorDialog(self.page, self).exec()
+
+
+class TemplateEditorDialog(QDialog):
+    """تعديل نص قالب الاتفاقية (HTML بسيط) مع متغيرات {{...}}. التعديل يسري على النسخ الجديدة فقط."""
+
+    def __init__(self, page, parent=None):
+        super().__init__(parent or page)
+        self.page, self.svc = page, AgreementsService(page.session)
+        self.setWindowTitle('قالب اتفاقية فتح الحساب')
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.resize(980, 640)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel('عدِّل نص القالب (HTML بسيط). انقر مرتين على متغير لإدراجه. التعديل يسري على الاتفاقيات الجديدة فقط؛ المولَّدة سابقًا لا تتغير.'))
+        body = QHBoxLayout()
+        self.ed = QPlainTextEdit(); self.ed.setLayoutDirection(Qt.RightToLeft)
+        self.ed.setPlainText(self.svc.template())
+        self.keys = QListWidget(); self.keys.setMaximumWidth(220)
+        for k, label in self.svc.fields():
+            self.keys.addItem(f'{label}  ‹{k}›')
+        self.keys.itemDoubleClicked.connect(self._insert)
+        body.addWidget(self.ed, 1); body.addWidget(self.keys)
+        lay.addLayout(body, 1)
+        row = QHBoxLayout()
+        for text, fn in (('معاينة', self._preview), ('حفظ', self._save), ('استعادة الافتراضي', self._reset)):
+            b = QPushButton(text); b.clicked.connect(fn); row.addWidget(b)
+        row.addStretch(1)
+        close = QPushButton('إغلاق'); close.clicked.connect(self.accept); row.addWidget(close)
+        lay.addLayout(row)
+
+    def _insert(self, item):
+        key = item.text().rsplit('‹', 1)[-1].rstrip('›')
+        self.ed.insertPlainText('{{%s}}' % key)
+
+    def _preview(self):
+        ok, html = self.page.guarded(self.svc.preview_template, self.ed.toPlainText(), reload=False)
+        if ok:
+            AgreementPreviewDialog(self, html, 'معاينة القالب', allow_mark=False).exec()
+
+    def _save(self):
+        ok, _r = self.page.guarded(self.svc.save_template, self.ed.toPlainText(), reload=False)
+        if ok:
+            self.page.notify('حُفظ قالب الاتفاقية')
+
+    def _reset(self):
+        if QMessageBox.question(self, 'قالب الاتفاقية', 'استعادة القالب الافتراضي؟ يُحذف تخصيص شركتك.') != QMessageBox.Yes:
+            return
+        ok, _r = self.page.guarded(self.svc.reset_template, reload=False)
+        if ok:
+            self.ed.setPlainText(self.svc.template())
+
+
+class PendingAgreementsDialog(QDialog):
+    """العملاء بلا اتفاقية موقّعة (ومنهم المرحَّلون): تحديد عدة عملاء، توليد ما ينقصهم، وطباعتهم دفعة واحدة (صفحة لكل عميل)."""
+
+    def __init__(self, page):
+        super().__init__(page)
+        self.page, self.svc = page, AgreementsService(page.session)
+        self.setWindowTitle('عملاء بلا اتفاقية موقّعة')
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.resize(760, 560)
+        lay = QVBoxLayout(self)
+        self.info = QLabel(''); lay.addWidget(self.info)
+        self.tbl = QTableWidget(0, 5)
+        self.tbl.setHorizontalHeaderLabels(['', 'الكود', 'الاسم', 'الهاتف', 'حالة الاتفاقية'])
+        self.tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tbl.horizontalHeader().setStretchLastSection(True)
+        self.tbl.setColumnWidth(0, 36)
+        lay.addWidget(self.tbl, 1)
+        row = QHBoxLayout()
+        self.all = QCheckBox('تحديد الكل'); self.all.toggled.connect(self._toggle_all); row.addWidget(self.all)
+        row.addStretch(1)
+        b = QPushButton('توليد وطباعة المحدَّد'); b.setProperty('primary', True); b.clicked.connect(self._print); row.addWidget(b)
+        c = QPushButton('إغلاق'); c.clicked.connect(self.accept); row.addWidget(c)
+        lay.addLayout(row)
+        self.refresh()
+
+    def refresh(self):
+        ok, rows = self.page.guarded(self.svc.pending, reload=False)
+        self._rows = rows if ok and rows else []
+        self.info.setText(f'{len(self._rows)} عميل بلا اتفاقية موقّعة.')
+        self.tbl.setRowCount(len(self._rows))
+        for i, r in enumerate(self._rows):
+            chk = QTableWidgetItem(); chk.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled); chk.setCheckState(Qt.Unchecked)
+            self.tbl.setItem(i, 0, chk)
+            for j, v in enumerate((r['code'], r['name'], r['phone'], STATUS_AR[r['status']]), 1):
+                self.tbl.setItem(i, j, QTableWidgetItem(v))
+
+    def _toggle_all(self, on):
+        for i in range(self.tbl.rowCount()):
+            self.tbl.item(i, 0).setCheckState(Qt.Checked if on else Qt.Unchecked)
+
+    def _print(self):
+        chosen = [self._rows[i] for i in range(self.tbl.rowCount()) if self.tbl.item(i, 0).checkState() == Qt.Checked]
+        if not chosen:
+            return QMessageBox.information(self, 'اتفاقية', 'حدّد عميلًا واحدًا على الأقل.')
+        d = GenerateOptionsDialog(self.page, self.svc.company_info(self.page.window_.prefs), batch=True)
+        if not d.exec():
+            return
+        options, info = d.values()
+        _remember_info(self.page, self.svc, info)
+        ids = []
+        for r in chosen:
+            existing = [a for a in self.svc.list(r['id']) if a['status'] in ('draft', 'printed')]
+            if r['status'] == 'none' or not existing:
+                ok, aid = self.page.guarded(self.svc.generate, r['id'], info, options, False, reload=False)
+                if not ok:
+                    return
+                ids.append(aid)
+            else:
+                ids.append(existing[0]['id'])
+        ok, html = self.page.guarded(self.svc.combined_html, ids, reload=False)
+        if ok:
+            AgreementPreviewDialog(self, html, f'طباعة {len(ids)} اتفاقية', on_printed=lambda: self.svc.mark_printed(ids)).exec()
+            self.refresh()

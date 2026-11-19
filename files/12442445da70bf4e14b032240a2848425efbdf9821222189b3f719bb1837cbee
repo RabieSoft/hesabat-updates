@@ -1,0 +1,60 @@
+"""لوحة «القيود المفضلة» بجانب محرر القيد: نقرة واحدة تفتح القالب المفضل؛ زر الفأرة الأيمن يزيله من المفضلة."""
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import QFrame, QLabel, QListWidget, QListWidgetItem, QMenu, QPushButton, QVBoxLayout
+
+from alhisabat.ui.core import journal_recipes as R
+
+
+class FavoritesPanel(QFrame):
+    chosen = Signal(str)          # مفتاح القالب المطلوب فتحه
+    browse = Signal()             # استعراض كل القوالب (ومنها الإضافة للمفضلة بزر الفأرة الأيمن)
+
+    def __init__(self, store, parent=None):
+        super().__init__(parent)
+        self.store = store
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setFixedWidth(230)
+        self.setLayoutDirection(Qt.RightToLeft)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+        t = QLabel('القيود المفضلة')
+        t.setObjectName('panelTitle')
+        lay.addWidget(t)
+        self.hint = QLabel('لا مفضلات بعد. افتح «كل القوالب» ثم انقر على أي قالب بزر الفأرة الأيمن ← إضافة إلى المفضلة.')
+        self.hint.setWordWrap(True)
+        self.hint.setObjectName('ctxKey')
+        lay.addWidget(self.hint)
+        self.lst = QListWidget()
+        self.lst.setWordWrap(True)
+        self.lst.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.lst.customContextMenuRequested.connect(self._menu)
+        self.lst.itemClicked.connect(lambda it: self.chosen.emit(it.data(Qt.UserRole)))
+        lay.addWidget(self.lst, 1)
+        b = QPushButton('كل القوالب الجاهزة…')
+        b.setAutoDefault(False)
+        b.clicked.connect(self.browse.emit)
+        lay.addWidget(b)
+        self.reload()
+
+    def reload(self):
+        titles = {r.key: r.title for r in R.RECIPES}
+        self.lst.clear()
+        for k in self.store.keys():
+            it = QListWidgetItem('★ ' + titles[k])
+            it.setData(Qt.UserRole, k)
+            it.setToolTip(titles[k])
+            self.lst.addItem(it)
+        self.hint.setVisible(self.lst.count() == 0)
+
+    def _menu(self, pos):
+        it = self.lst.itemAt(pos)
+        if it is None:
+            return
+        m = QMenu(self)
+        a_open, a_del = m.addAction('فتح القالب'), m.addAction('إزالة من المفضلة')
+        pick = m.exec(self.lst.mapToGlobal(pos))
+        if pick is a_open:
+            self.chosen.emit(it.data(Qt.UserRole))
+        elif pick is a_del:
+            self.store.remove(it.data(Qt.UserRole))
+            self.reload()

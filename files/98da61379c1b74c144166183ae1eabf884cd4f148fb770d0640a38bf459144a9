@@ -1,0 +1,29 @@
+ALTER TABLE accounts ADD COLUMN description TEXT NOT NULL DEFAULT '';
+ALTER TABLE accounts ADD COLUMN merged_into_id INTEGER REFERENCES accounts(id);
+
+CREATE TABLE numbering_settings(
+  company_id INTEGER PRIMARY KEY REFERENCES companies(id),
+  mode TEXT NOT NULL DEFAULT 'auto' CHECK(mode IN ('manual','auto')),
+  segment_lengths TEXT NOT NULL DEFAULT '1,1,2,2,2',
+  prefix TEXT NOT NULL DEFAULT '');
+
+CREATE TABLE account_mappings(
+  company_id INTEGER NOT NULL REFERENCES companies(id),
+  map_key TEXT NOT NULL CHECK(map_key IN ('customers','suppliers','inventory','sales','cogs','cash','bank',
+      'retained_earnings','period_result','fx_differences')),
+  account_id INTEGER NOT NULL REFERENCES accounts(id),
+  PRIMARY KEY(company_id,map_key));
+
+CREATE TRIGGER acc_upd_code_rule BEFORE UPDATE OF code,parent_id ON accounts
+WHEN NEW.parent_id IS NOT NULL AND NEW.code NOT LIKE 'tmp:%' BEGIN
+  SELECT RAISE(ABORT,'الحساب الأب غير موجود أو ليس تجميعيا')
+   WHERE NOT EXISTS(SELECT 1 FROM accounts p WHERE p.id=NEW.parent_id AND p.is_group=1 AND p.company_id=NEW.company_id);
+  SELECT RAISE(ABORT,'رقم الحساب غير متوافق مع رقم الحساب الأب')
+   WHERE NOT EXISTS(SELECT 1 FROM accounts p WHERE p.id=NEW.parent_id AND p.code NOT LIKE 'tmp:%'
+     AND substr(NEW.code,1,length(p.code))=p.code AND length(NEW.code)>length(p.code));
+END;
+
+INSERT INTO permissions(code,name_ar,is_sensitive) VALUES
+ ('account.delete','حذف حساب',1),('account.move','نقل حساب',1),('account.merge','دمج حسابات',1);
+INSERT INTO role_permissions SELECT 1,code FROM permissions WHERE code IN ('account.delete','account.move','account.merge');
+INSERT INTO role_permissions SELECT 2,code FROM permissions WHERE code IN ('account.move','account.merge');

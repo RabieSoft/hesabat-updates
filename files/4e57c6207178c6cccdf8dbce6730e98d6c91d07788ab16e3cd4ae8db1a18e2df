@@ -1,0 +1,80 @@
+-- 0038_messaging.sql: نظام إرسال واتساب بدون API (طابور وقوالب وإعدادات وسجل)
+ALTER TABLE parties ADD COLUMN wa_consent INTEGER NOT NULL DEFAULT 1 CHECK(wa_consent IN (0,1));
+
+CREATE TABLE wa_templates(
+  id INTEGER PRIMARY KEY,
+  branch_id INTEGER REFERENCES branches(id),
+  code TEXT NOT NULL,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
+  UNIQUE(branch_id, code)
+);
+
+CREATE TABLE wa_outbox(
+  id INTEGER PRIMARY KEY,
+  branch_id INTEGER REFERENCES branches(id),
+  party_id INTEGER REFERENCES parties(id),
+  phone TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'text' CHECK(kind IN ('text','document')),
+  ref_type TEXT NOT NULL DEFAULT '',
+  ref_id INTEGER,
+  body TEXT NOT NULL DEFAULT '',
+  attachment_path TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','sending','sent','handed','failed','cancelled','blocked')),
+  error_code TEXT NOT NULL DEFAULT '',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  idempotency_key TEXT UNIQUE,
+  scheduled_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  sent_at TEXT,
+  created_by INTEGER REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX ix_wa_outbox_branch_status ON wa_outbox(branch_id, status, scheduled_at);
+CREATE INDEX ix_wa_outbox_phone ON wa_outbox(phone);
+
+CREATE TABLE wa_settings(
+  branch_id INTEGER PRIMARY KEY,
+  mode TEXT NOT NULL DEFAULT 'web' CHECK(mode IN ('web','deeplink')),
+  country_code TEXT NOT NULL DEFAULT '+967',
+  min_delay INTEGER NOT NULL DEFAULT 12 CHECK(min_delay >= 5),
+  max_delay INTEGER NOT NULL DEFAULT 35 CHECK(max_delay >= min_delay),
+  daily_cap INTEGER NOT NULL DEFAULT 150 CHECK(daily_cap BETWEEN 1 AND 400),
+  hourly_cap INTEGER NOT NULL DEFAULT 40 CHECK(hourly_cap BETWEEN 1 AND 100),
+  window_start TEXT NOT NULL DEFAULT '08:00',
+  window_end TEXT NOT NULL DEFAULT '21:00',
+  warmup_start_date TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE wa_optout(
+  branch_id INTEGER,
+  phone TEXT NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY(branch_id, phone)
+);
+
+CREATE TABLE wa_log(
+  id INTEGER PRIMARY KEY,
+  outbox_id INTEGER REFERENCES wa_outbox(id),
+  event TEXT NOT NULL,
+  detail TEXT NOT NULL DEFAULT '',
+  at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- القوالب الافتراضية
+INSERT INTO wa_templates(branch_id, code, title, body, is_active) VALUES
+  (NULL, 'sale_invoice', 'فاتورة مبيعات', 'مرحبًا {الاسم}، مرفق فاتورتكم رقم {رقم_الفاتورة} بمبلغ {المبلغ} {العملة}. شكراً لتعاملكم معنا!', 1),
+  (NULL, 'payment_receipt', 'سند قبض', 'مرحبًا {الاسم}، تم استلام مبلغ {المبلغ} {العملة} بموجب سند القبض رقم {رقم_السند}. رصيدكم الحالي: {الرصيد} {العملة}.', 1),
+  (NULL, 'statement', 'كشف حساب', 'مرحبًا {الاسم}، مرفق كشف حسابكم للفترة من {من_تاريخ} إلى {إلى_تاريخ}. رصيدكم الحالي: {الرصيد} {العملة}.', 1),
+  (NULL, 'debt_reminder', 'تذكير دين مستحق', 'مرحبًا {الاسم}، نود تذكيركم بمبلغ مستحق قدره {المبلغ} {العملة}، يُرجى التكرم بالسداد في أقرب وقت. شاكرين تعاونكم.', 1),
+  (NULL, 'custom', 'رسالة حرة', 'مرحبًا {الاسم}، {الرسالة}', 1);
+
+-- الصلاحيات
+INSERT OR IGNORE INTO permissions(code, name_ar, is_sensitive) VALUES
+  ('message.send', 'إرسال رسائل واتساب', 0),
+  ('message.manage', 'إدارة إعدادات ورسائل واتساب', 1);
+
+INSERT OR IGNORE INTO role_permissions SELECT id, 'message.send' FROM roles WHERE id IN (1,2,3);
+INSERT OR IGNORE INTO role_permissions SELECT id, 'message.manage' FROM roles WHERE id IN (1,2);

@@ -1,0 +1,499 @@
+"""نوافذ النقدية: حساب، سند، تحويل، كشف حساب.
+"""
+from PySide6.QtCore import Qt
+from alhisabat.ui.components.totals_strip import HeroTotal
+from PySide6.QtWidgets import QComboBox, QDialog, QDialogButtonBox, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QTableView, QVBoxLayout, QWidget, QCompleter
+
+from alhisabat.ui.components.basic import CompactForm, DateField, ModeRadio, compact_rows
+from alhisabat.ui.components.datagrid import DataGrid
+from alhisabat.ui.components.grid_logic import Column
+from alhisabat.ui.core import strings_ar as S
+
+class CashAccountDialog(QDialog):
+    def __init__(self, page, kind):
+        super().__init__(page); self.page=page
+        self.setWindowTitle('حساب بنكي جديد' if kind=='bank' else 'صندوق جديد'); self.setLayoutDirection(Qt.RightToLeft); self.setMinimumWidth(640)
+        form=CompactForm(self, 2)
+        self.name=QLineEdit(); self.name.setPlaceholderText('الاسم'); form.addWide('الاسم *', self.name)
+        self.currency=QComboBox()                      # عملة الصندوق/البنك = عملة سنداته؛ الافتراضية (اليمني) مختارة مسبقًا
+        try:
+            from alhisabat.ui.core import readmodel
+            _s=page.svc.s
+            _opts=[c for c in readmodel.currencies_list(_s.conn,_s.company_id) if c.get('is_enabled') or c.get('is_base')]
+        except Exception: _opts=[]
+        for c in _opts:
+            self.currency.addItem(f"{c.get('name_ar') or c['code']} ({c['code']})"+(' — الأساسية' if c.get('is_base') else ''), c['code'])
+            if c.get('is_default'): self.currency.setCurrentIndex(self.currency.count()-1)
+        if not _opts: self.currency.addItem('العملة الأساسية', None)
+        form.addRow('العملة', self.currency)
+        self.bank_name=QLineEdit(); self.account_no=QLineEdit()
+        if kind=='bank': form.addRow('اسم البنك', self.bank_name); form.addRow('IBAN/رقم الحساب', self.account_no)
+        self.parent_cb=QComboBox()
+        need_parent=False
+        try: need_parent=page.svc.parent_missing(kind)
+        except Exception: pass
+        if need_parent:
+            self.parent_cb.addItem('— اختر الحساب الأب —', None)
+            try:
+                for aid,lab in page.session.lookup_accounts(groups=True, types=('asset',)):
+                    self.parent_cb.addItem(lab, aid)
+            except Exception: pass
+            form.addWide('الحساب الأب *', self.parent_cb)
+        else:
+            self.parent_cb.hide()
+        bb=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel); bb.accepted.connect(self._accept); bb.rejected.connect(self.reject); form.addRow(bb)
+        self._need_parent=need_parent
+    def _accept(self):
+        if not self.name.text().strip(): return QMessageBox.warning(self,'خطأ','الاسم مطلوب')
+        if self._need_parent and self.parent_cb.currentData() is None: return QMessageBox.warning(self,'خطأ','اختر الحساب الأب')
+        self.accept()
+    def values(self): return {'name':self.name.text().strip(),'currency':self.currency.currentData() or None,'bank_name':self.bank_name.text().strip(),'account_no':self.account_no.text().strip(),'parent_id':self.parent_cb.currentData()}
+
+class VoucherDialog(QDialog):
+    """سند قبض/صرف مبسّط: النوع والتاريخ والعملة، الصندوق، الحساب المقابل، المبلغ والبيان،
+    مع سطر «من ← إلى» وملاحظة فورية تعرض المدين والدائن للحسابين المختارين.
+    الحساب المقابل قائمة واحدة: حسابات الأستاذ (بلا حسابات الأطراف/المخزون/الصناديق) + العملاء والموردون (والموظفون للصرف)."""
+    no_inline = True        # تُعرض كنافذة عادية لا داخل «لوحة الإدخال» أعلى الجدول
+
+    def __init__(self, page, voucher=None):
+        super().__init__(page)
+        self._editing = voucher
+        self.setWindowTitle('تعديل سند' if voucher else 'سند قبض / صرف'); self.setLayoutDirection(Qt.RightToLeft); self.setMinimumWidth(560)
+        self._page = page
+        self._cash_rows = []; self._cur_digits = {}
+        self._load_lookups(page)
+
+        self.kind = ModeRadio([('سند قبض', 'receipt'), ('سند صرف', 'payment')])      # خياران فقط: راديو بنقرة واحدة
+        self.date = DateField()
+        self.currency = QComboBox()
+        for code, label, is_default in self._currencies:
+            self.currency.addItem(label, code)
+            if is_default: self.currency.setCurrentIndex(self.currency.count() - 1)
+        self.cash = QComboBox()
+        self.counter = QComboBox(); self.counter.setEditable(True); self.counter.setInsertPolicy(QComboBox.NoInsert)
+        self.counter.setLayoutDirection(Qt.RightToLeft); self.counter.setMaxVisibleItems(14)
+        self.counter.lineEdit().setPlaceholderText('ابحث بالاسم أو الرقم أو اختر الحساب المقابل')
+        comp = QCompleter(self.counter.model(), self.counter)      # بحث بالاحتواء (الاسم أو الرقم) لا بالبداية فقط
+        comp.setCompletionColumn(0); comp.setFilterMode(Qt.MatchContains)
+        comp.setCaseSensitivity(Qt.CaseInsensitive); comp.setCompletionMode(QCompleter.PopupCompletion)
+        self.counter.setCompleter(comp)
+        self.amount = QLineEdit(); self.amount.setPlaceholderText('0.00'); self.amount.setObjectName('amountField')
+        self.desc = QLineEdit(); self.desc.setPlaceholderText('البيان (اختياري)')
+        self.hero = HeroTotal('مبلغ السند')            # الإجمالي بخانة كبرى: أخضر للقبض وأحمر للصرف
+
+        self.flow = QLabel(''); self.flow.setObjectName('voucherFlow')
+        self.note = QFrame(); self.note.setObjectName('voucherNote')
+        nl = QHBoxLayout(self.note); nl.setContentsMargins(8, 4, 8, 4)
+        self.note_txt = QLabel(''); self.note_txt.setObjectName('voucherNoteTxt'); self.note_txt.setWordWrap(True)
+        nl.addWidget(self.note_txt)
+
+        g = QGridLayout(self); g.setHorizontalSpacing(10); g.setVerticalSpacing(6)
+        g.addWidget(QLabel('النوع'), 0, 0); g.addWidget(self.kind, 0, 1)
+        g.addWidget(QLabel('التاريخ'), 0, 2); g.addWidget(self.date, 0, 3)
+        g.addWidget(QLabel('العملة'), 1, 0); g.addWidget(self.currency, 1, 1)
+        g.addWidget(QLabel('الصندوق / البنك'), 1, 2); g.addWidget(self.cash, 1, 3)
+        g.addWidget(QLabel('الحساب المقابل *'), 2, 0); g.addWidget(self.counter, 2, 1, 1, 3)
+        g.addWidget(QLabel('المبلغ *'), 3, 0); g.addWidget(self.amount, 3, 1)
+        g.addWidget(QLabel('البيان'), 3, 2); g.addWidget(self.desc, 3, 3)
+        g.addWidget(self.hero, 4, 0, 1, 4, Qt.AlignHCenter)
+        g.addWidget(self.flow, 5, 0, 1, 4)
+        g.addWidget(self.note, 6, 0, 1, 4)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel); bb.accepted.connect(self._accept); bb.rejected.connect(self.reject)
+        g.addWidget(bb, 7, 0, 1, 4)
+        g.setColumnStretch(1, 1); g.setColumnStretch(3, 1)
+
+        self._fill_cash(); self._fill_counter()
+        self.kind.currentIndexChanged.connect(lambda _i: (self._fill_counter(), self._refresh()))
+        self.currency.currentIndexChanged.connect(lambda _i: (self._fill_cash(), self._refresh()))
+        self.cash.currentIndexChanged.connect(lambda _i: self._refresh())
+        self.counter.currentIndexChanged.connect(lambda _i: self._refresh())
+        comp.activated[str].connect(self._on_counter_picked)
+        self.counter.lineEdit().editingFinished.connect(self._refresh)
+        self.amount.textChanged.connect(lambda _t: self._refresh())
+        if voucher: self._load_voucher(voucher)
+        self._refresh()
+
+    # ---------------------------------------------------------------- تعبئة السند للتعديل
+    def _set_combo(self, combo, data, label):
+        """يحدّد عنصر القائمة ببياناته، وإن لم يوجد (مثلاً صندوق معطّل/طرف غير نشط) يضيفه ليبقى السند قابلاً للتعديل."""
+        for i in range(combo.count()):
+            if combo.itemData(i) == data: combo.setCurrentIndex(i); return
+        combo.addItem(label, data); combo.setCurrentIndex(combo.count() - 1)
+
+    def _load_voucher(self, v):
+        """v = نتيجة CashService.voucher_detail (سند + بنوده). الترتيب مهم: النوع ثم العملة ثم الصندوق ثم الحساب المقابل."""
+        self._set_combo(self.kind, v['voucher_type'], 'سند قبض' if v['voucher_type'] == 'receipt' else 'سند صرف')
+        self.date.set_iso(v['voucher_date'])
+        cur = v.get('currency')
+        if cur: self._set_combo(self.currency, cur, cur)
+        row = next((a for a in self._cash_rows if a['id'] == v['cash_account_id']), None)
+        self._set_combo(self.cash, v['cash_account_id'], (row or {}).get('name') or f"صندوق #{v['cash_account_id']}")
+        conn = self._page.session.conn
+        if v.get('party_id'):
+            r = conn.execute('SELECT name FROM parties WHERE id=?', (v['party_id'],)).fetchone()
+            tag = {'customer': '[عميل] ', 'supplier': '[مورد] ', 'employee': '[موظف] '}.get(
+                (conn.execute('SELECT kind FROM parties WHERE id=?', (v['party_id'],)).fetchone() or [None])[0], '')
+            self._set_combo(self.counter, ('party', v['party_id']), tag + (r[0] if r else f"#{v['party_id']}"))
+        elif v.get('lines'):
+            aid = v['lines'][0]['account_id']
+            r = conn.execute('SELECT code,name FROM accounts WHERE id=?', (aid,)).fetchone()
+            self._set_combo(self.counter, ('account', aid), f"{r[0]} — {r[1]}" if r else f'#{aid}')
+        d = self._cur_digits.get(cur, 2)
+        self.amount.setText(f"{int(v['amount_minor']) / (10 ** d):.{d}f}")
+        self.desc.setText(v.get('description') or '')
+
+    # ---------------------------------------------------------------- البيانات
+    def _load_lookups(self, page):
+        self._currencies = []; self._cash_rows = []
+        try:
+            from alhisabat.ui.core import readmodel
+            s = page.svc.s
+            rows = [c for c in readmodel.currencies_list(s.conn, s.company_id) if c.get('is_enabled') or c.get('is_base')]
+            for c in rows:
+                self._cur_digits[c['code']] = int(c.get('minor_digits') if c.get('minor_digits') is not None else 2)
+                self._currencies.append((c['code'], f"{c.get('name_ar') or c['code']} ({c['code']})", bool(c.get('is_default'))))
+        except Exception:
+            pass
+        try:
+            self._cash_rows = [a for a in page.svc.list_accounts() if a.get('is_active', 1)]
+        except Exception:
+            self._cash_rows = []
+        if not self._currencies:                       # لا جدول عملات: استنتجها من الصناديق
+            for code in sorted({a.get('currency') for a in self._cash_rows if a.get('currency')}):
+                self._currencies.append((code, code, not self._currencies))
+        self._accounts = []; self._customers = []; self._suppliers = []; self._employees = []
+        try:
+            from alhisabat.business import cash as _cash
+            conn = page.session.conn
+            self._accounts = [(aid, lab) for aid, lab in page.session.lookup_accounts(groups=False)
+                              if not _cash.is_blocked_counter(conn, aid)
+                              and not conn.execute('SELECT 1 FROM cash_accounts WHERE account_id=?', (aid,)).fetchone()]
+        except Exception:
+            try: self._accounts = page.session.lookup_accounts(groups=False)
+            except Exception: pass
+        self._employees = []
+        try: self._employees = page.session.lookup_parties('employee')
+        except Exception: pass
+        try: self._customers = page.session.lookup_parties('customer')
+        except Exception: pass
+        try: self._suppliers = page.session.lookup_parties('supplier')
+        except Exception: pass
+
+    def _fill_cash(self):
+        cur = self.currency.currentData()
+        self.cash.blockSignals(True); self.cash.clear()
+        for a in self._cash_rows:
+            if cur is None or a.get('currency') == cur:
+                self.cash.addItem(a['name'], a['id'])
+        if self.cash.count() == 0: self.cash.addItem('— لا صندوق بهذه العملة —', None)
+        self.cash.blockSignals(False)
+
+    def _fill_counter(self):
+        receipt = self.kind.currentData() == 'receipt'
+        self.counter.blockSignals(True); self.counter.clear()
+        self.counter.addItem('', None)
+        for aid, lab in self._accounts: self.counter.addItem(lab, ('account', aid))
+        # الأصل: قبض من عميل وصرف لمورد؛ ويُتاح العكس (قبض من مورد / صرف لعميل) وصرف للموظفين
+        groups = ([('[عميل] ', self._customers), ('[مورد] ', self._suppliers)] if receipt
+                  else [('[مورد] ', self._suppliers), ('[عميل] ', self._customers), ('[موظف] ', self._employees)])
+        for tag, rows in groups:
+            for pid, lab in rows: self.counter.addItem(tag + lab, ('party', pid))
+        self.counter.setCurrentIndex(0)
+        self.counter.blockSignals(False)
+
+    def _on_counter_picked(self, text):
+        i = self.counter.findText(text, Qt.MatchFixedString)
+        if i > 0: self.counter.setCurrentIndex(i)
+        self._refresh()
+
+    def _counter_data(self):
+        i = self.counter.currentIndex()
+        if i > 0 and self.counter.currentText() == self.counter.itemText(i): return self.counter.itemData(i)
+        j = self.counter.findText(self.counter.currentText().strip(), Qt.MatchFixedString)   # نص مكتوب يطابق عنصرًا
+        return self.counter.itemData(j) if j > 0 else None
+
+    # ---------------------------------------------------------------- الملاحظة الفورية
+    def _amount_text(self):
+        raw = self.amount.text().strip().replace(',', '').replace('٫', '.')
+        try:
+            from decimal import Decimal
+            v = Decimal(raw)
+        except Exception:
+            return ''
+        d = self._cur_digits.get(self.currency.currentData(), 2)
+        return f'{v:,.{d}f} {self.currency.currentData() or ""}'.strip()
+
+    def _balance_line(self, name, account_id, cur):
+        """«الاسم: مدين X | دائن Y | الرصيد Z (مدين/دائن)» بعملة السند (أو كل عملات الحساب إن لم توجد حركة بها)."""
+        try:
+            s = self._page.session
+            iso = self.date.iso()
+            summ = s.account_summary(account_id, iso, iso)
+        except Exception:
+            return ''
+        rows = summ.get('by_currency') or []
+        mine = [r for r in rows if r.get('currency') == cur] or rows
+        if not mine: return f'{name}: لا أرصدة (مدين 0.00 | دائن 0.00)'
+        from alhisabat.ui.components.datagrid import format_minor
+        parts = []
+        for r in mine:
+            d, c = int(r.get('debit_orig') or 0), int(r.get('credit_orig') or 0)
+            net = d - c
+            side = 'مدين' if net > 0 else ('دائن' if net < 0 else 'متزن')
+            parts.append(f"مدين {format_minor(d)} | دائن {format_minor(c)} | الرصيد {format_minor(abs(net))} {side} {r.get('currency') or ''}".strip())
+        return f'{name}: ' + '  ‖  '.join(parts)
+
+    def _party_account(self, party_id):
+        try:
+            r = self._page.session.conn.execute('SELECT account_id FROM parties WHERE id=?', (party_id,)).fetchone()
+            return r[0] if r else None
+        except Exception:
+            return None
+
+    def _balances_text(self):
+        cur = self.currency.currentData()
+        lines = []
+        cid = self.cash.currentData()
+        if cid is not None:
+            row = next((a for a in self._cash_rows if a['id'] == cid), None)
+            if row:
+                bal = (row.get('balances') or {}).get(cur)
+                if bal is not None:
+                    from alhisabat.ui.components.datagrid import format_minor
+                    lines.append(f"رصيد {row['name']}: {format_minor(bal)} {cur or ''}")
+        data = self._counter_data()
+        if data:
+            kind_, ident = data
+            acc = ident if kind_ == 'account' else self._party_account(ident)
+            if acc:
+                ln = self._balance_line(self.counter.currentText().strip(), acc, cur)
+                if ln: lines.append(ln)
+        return '\n'.join(lines)
+
+    def _refresh(self):
+        receipt = self.kind.currentData() == 'receipt'
+        cash_name = self.cash.currentText() if self.cash.currentData() is not None else ''
+        other = self.counter.currentText().strip() if self._counter_data() is not None else ''
+        c_txt, o_txt = cash_name or '— الصندوق —', other or '— الحساب المقابل —'
+        frm, to = (o_txt, c_txt) if receipt else (c_txt, o_txt)
+        self.flow.setText(f'من حساب: {frm}      ←      إلى حساب: {to}')
+        debit, credit = (c_txt, o_txt) if receipt else (o_txt, c_txt)
+        amt = self._amount_text()
+        self.hero.key.setText('مبلغ سند القبض' if receipt else 'مبلغ سند الصرف')
+        self.hero.set_dir('in' if receipt else 'out')
+        self.hero.set_amount(amt or '0.00')
+        txt = f'مدين: {debit}   |   دائن: {credit}' + (f'   —   {amt}' if amt else '')
+        bal = self._balances_text()
+        self.note_txt.setText(txt + ('\n' + bal if bal else ''))
+
+    # ---------------------------------------------------------------- الحفظ
+    def _accept(self):
+        if self.cash.currentData() is None: return QMessageBox.warning(self, 'خطأ', 'اختر صندوقًا أو بنكًا بالعملة المحددة')
+        if self._counter_data() is None: return QMessageBox.warning(self, 'خطأ', 'اختر الحساب المقابل')
+        amt = self.amount.text().strip().replace(',', '')
+        if not amt: return QMessageBox.warning(self, 'خطأ', 'المبلغ مطلوب')
+        try:
+            from decimal import Decimal
+            if Decimal(amt) <= 0: return QMessageBox.warning(self, 'خطأ', 'المبلغ يجب أن يكون أكبر من صفر')
+        except Exception: return QMessageBox.warning(self, 'خطأ', 'المبلغ غير صالح')
+        self.accept()
+
+    def values(self):
+        kind_, ident = self._counter_data() or (None, None)
+        return {'kind': self.kind.currentData(), 'date': self.date.iso(), 'cash_id': self.cash.currentData(), 'currency': self.currency.currentData(),
+                'party_id': ident if kind_ == 'party' else None, 'account_id': ident if kind_ == 'account' else None,
+                'amount': self.amount.text().strip().replace(',', ''), 'description': self.desc.text().strip()}
+
+class TransferDialog(QDialog):
+    def __init__(self, page):
+        super().__init__(page); self.setWindowTitle('تحويل بين الصناديق/البنوك'); self.setLayoutDirection(Qt.RightToLeft); self.setMinimumWidth(820); form=CompactForm(self, 4)
+        self.date=DateField(); self.amount=QLineEdit(); self.amount.setPlaceholderText('0.00'); self.desc=QLineEdit()
+        self.frm=QComboBox(); self.to=QComboBox()
+        try:
+            for cid,lab in page.session.lookup_cash(): self.frm.addItem(lab,cid); self.to.addItem(lab,cid)
+        except Exception: pass
+        form.addRow('التاريخ', self.date); form.addRow('من', self.frm); form.addRow('إلى', self.to); form.addRow('المبلغ *', self.amount); form.addWide('البيان', self.desc)
+        bb=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel); bb.accepted.connect(self._accept); bb.rejected.connect(self.reject); form.addRow(bb)
+        self.frm.setFocus()
+    def _accept(self):
+        if self.frm.currentData()==self.to.currentData(): return QMessageBox.warning(self,'خطأ','اختر حسابين مختلفين')
+        if not self.amount.text().strip(): return QMessageBox.warning(self,'خطأ','المبلغ مطلوب')
+        self.accept()
+    def values(self): return {'date':self.date.iso(),'from_id':self.frm.currentData(),'to_id':self.to.currentData(),'amount':self.amount.text().strip().replace(',', ''),'description':self.desc.text().strip()}
+
+class StatementDialog(QDialog):
+    def __init__(self, page, acc):
+        super().__init__(page); self.setWindowTitle(f"كشف حساب: {acc['name']}"); self.setLayoutDirection(Qt.RightToLeft); self.resize(820,480)
+        lay=QVBoxLayout(self)
+        from datetime import date as _d
+        y=_d.today().year
+        top=QHBoxLayout()
+        self.frm=DateField(f'{y}-01-01', f'{y}-12-31'); self.to=DateField(f'{y}-01-01', f'{y}-12-31')
+        btn=QComboBox(); btn.addItem('عرض')
+        top.addWidget(QLabel('من')); top.addWidget(self.frm); top.addWidget(QLabel('إلى')); top.addWidget(self.to)
+        go=QComboBox(); go.addItem('عرض')
+        # زر عرض حقيقي
+        from PySide6.QtWidgets import QPushButton
+        go_btn=QPushButton('عرض'); go_btn.clicked.connect(self._load); top.addWidget(go_btn); lay.addLayout(top)
+        self.info=QLabel(''); lay.addWidget(self.info)
+        self.grid=DataGrid([Column('entry_date','التاريخ','date',95), Column('posted_no','رقم القيد','int',80), Column('description','البيان',width=240), Column('debit_base','مدين','money',110,minor=True), Column('credit_base','دائن','money',110,minor=True), Column('running_balance','الرصيد','money',110,minor=True)], grid_id='cash_stmt')
+        lay.addWidget(self.grid,1)
+        self.acc=acc; self.page=page
+        self._load()
+    def _load(self):
+        try:
+            st=self.page.svc.statement(self.acc['id'], self.frm.iso(), self.to.iso())
+        except Exception as e:
+            from alhisabat.ui.components.basic import ask_reason as _a
+            self.page.show_error(e); return
+        self.info.setText(f"الافتتاحي: {st.get('opening_balance') or 0} | المدين: {st.get('total_debit') or 0} | الدائن: {st.get('total_credit') or 0} | الختامي: {st.get('closing_balance') or 0}")
+        self.grid.set_rows(st.get('rows') or [])
+
+
+class CashCountDialog(QDialog):
+    """نافذة جرد الصندوق الفعلي وتسجيل فروقات الجرد."""
+    def __init__(self, page):
+        super().__init__(page)
+        self.page = page
+        self.setWindowTitle("جرد فعلي للصندوق")
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.setMinimumWidth(760)
+        form = CompactForm(self, 3)
+
+        self.cash = QComboBox()
+        try:
+            for cid, lab in page.session.lookup_cash('cashbox'):
+                self.cash.addItem(lab, cid)
+        except Exception: pass
+        self.date = DateField()
+        self.counted = QLineEdit()
+        self.counted.setPlaceholderText("المبلغ الفعلي في الصندوق...")
+        self.note = QLineEdit()
+        self.note.setPlaceholderText("ملاحظات الجرد...")
+
+        form.addRow("الصندوق *", self.cash)
+        form.addRow("تاريخ الجرد *", self.date)
+        form.addRow("المبلغ الفعلي المجرود *", self.counted)
+        form.addWide("ملاحظة", self.note)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self._accept)
+        bb.rejected.connect(self.reject)
+        form.addRow(bb)
+
+    def _accept(self):
+        if not self.cash.currentData():
+            return QMessageBox.warning(self, "خطأ", "اختر صندوقًا للجرد")
+        amt_str = self.counted.text().strip().replace(',', '')
+        if not amt_str:
+            return QMessageBox.warning(self, "خطأ", "أدخل المبلغ الفعلي المجرود")
+        try:
+            from decimal import Decimal
+            Decimal(amt_str)
+        except Exception:
+            return QMessageBox.warning(self, "خطأ", "المبلغ غير صالح")
+        self.accept()
+
+    def values(self):
+        return {
+            'cash_id': self.cash.currentData(),
+            'date': self.date.iso(),
+            'amount': self.counted.text().strip().replace(',', ''),
+            'note': self.note.text().strip()
+        }
+
+
+class BankReconReportDialog(QDialog):
+    """تقرير المطابقة البنكية: مقارنة رصيد الدفاتر برصيد كشف البنك."""
+    def __init__(self, page):
+        super().__init__(page)
+        self.page = page
+        self.setWindowTitle("تقرير المطابقة البنكية")
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.resize(760, 520)
+
+        from PySide6.QtWidgets import QGroupBox, QTableWidget, QTableWidgetItem, QHeaderView
+        from alhisabat.ui.components.datagrid import format_minor
+
+        lay = QVBoxLayout(self)
+        top = QHBoxLayout()
+        self.bank_cb = QComboBox()
+        try:
+            for cid, lab in page.session.lookup_cash('bank'):
+                self.bank_cb.addItem(lab, cid)
+        except Exception: pass
+        self.as_of = DateField()
+        self.stmt_bal = QLineEdit()
+        self.stmt_bal.setPlaceholderText("رصيد الكشف...")
+        btn_calc = QPushButton("إعداد التقرير")
+        btn_calc.setProperty("primary", True)
+        btn_calc.clicked.connect(self._calculate)
+
+        top.addWidget(QLabel("البنك:"))
+        top.addWidget(self.bank_cb)
+        top.addWidget(QLabel("حتى تاريخ:"))
+        top.addWidget(self.as_of)
+        top.addWidget(QLabel("رصيد الكشف:"))
+        top.addWidget(self.stmt_bal)
+        top.addWidget(btn_calc)
+        lay.addLayout(top)
+
+        self.summary_gb = QGroupBox("الملخص")
+        s_form = QFormLayout(self.summary_gb)
+        self.lbl_gl_bal = QLabel("0.00")
+        self.lbl_stmt_bal = QLabel("0.00")
+        self.lbl_diff = QLabel("0.00")
+        self.lbl_status = QLabel("—")
+        s_form.addRow("رصيد الدفاتر (الأستاذ العام):", self.lbl_gl_bal)
+        s_form.addRow("رصيد كشف الحساب الفعلي:", self.lbl_stmt_bal)
+        s_form.addRow("الفارق المحسوب:", self.lbl_diff)
+        s_form.addRow("حالة المطابقة:", self.lbl_status)
+        lay.addWidget(self.summary_gb)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["النوع", "التاريخ", "البيان", "المبلغ"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        lay.addWidget(self.table, 1)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Close)
+        bb.rejected.connect(self.accept)
+        lay.addWidget(bb)
+
+    def _calculate(self):
+        cid = self.bank_cb.currentData()
+        if not cid:
+            return QMessageBox.warning(self, "خطأ", "اختر حسابًا بنكيًا")
+        bal_str = self.stmt_bal.text().strip().replace(',', '')
+        if not bal_str:
+            return QMessageBox.warning(self, "خطأ", "أدخل رصيد كشف الحساب")
+        try:
+            from decimal import Decimal
+            stmt_val = Decimal(bal_str)
+        except Exception:
+            return QMessageBox.warning(self, "خطأ", "رصيد الكشف غير صالح")
+
+        from alhisabat.ui.components.datagrid import format_minor
+        ok, res = self.page.guarded(self.page.svc.reconciliation_report, cid, self.as_of.iso(), stmt_val, reload=False)
+        if not ok or not res:
+            return
+
+        self.lbl_gl_bal.setText(format_minor(res.get('gl_balance_minor', 0)))
+        self.lbl_stmt_bal.setText(format_minor(res.get('statement_balance_minor', 0)))
+        diff = res.get('difference_minor', 0)
+        self.lbl_diff.setText(format_minor(diff))
+        reconciled = res.get('is_reconciled', False)
+        if reconciled:
+            self.lbl_status.setText("✅ مطابق تمامًا (الفارق = 0)")
+            self.lbl_status.setStyleSheet("color: var(--color-success); font-weight: bold;")
+        else:
+            self.lbl_status.setText("⚠️ غير مطابق (يوجد فارق معلق)")
+            self.lbl_status.setStyleSheet("color: var(--color-danger); font-weight: bold;")
+
+        unmatched = res.get('unmatched_items', []) or []
+        self.table.setRowCount(len(unmatched))
+        for i, item in enumerate(unmatched):
+            self.table.setItem(i, 0, QTableWidgetItem(str(item.get('source', ''))))
+            self.table.setItem(i, 1, QTableWidgetItem(str(item.get('date', ''))))
+            self.table.setItem(i, 2, QTableWidgetItem(str(item.get('description', ''))))
+            self.table.setItem(i, 3, QTableWidgetItem(format_minor(item.get('amount_minor', 0))))

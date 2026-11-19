@@ -1,0 +1,419 @@
+"""قوالب القيود الجاهزة (وصفات): المستخدم يختار القالب ثم يحدد العميل/المورد/الصندوق والمبالغ فقط، والسطور تُبنى تلقائيًا.
+
+منطق نقي بلا PySide6 ولا SQL. كل قالب يعيد سطورًا بصيغة محرر القيد {account_id, debit, credit, memo} + بيانًا مقترحًا.
+المحرك (journal_engine) هو الحَكَم على التوازن والصلاحيات؛ هنا نضمن توازن السطور بالبناء.
+المصطلحات: «قيد سند قبض/صرف» · «مبيعات/مشتريات آجلة» · «مردودات» · «خصم مسموح به/مكتسب» · «ذمة مدينة/التزام».
+"""
+from dataclasses import dataclass
+from decimal import Decimal
+
+from alhisabat.accounting.errors import AccountingError
+
+# أنواع الحقول: customer/supplier/employee (حساب الطرف) · cash (صندوق/بنك) · sales · purchases · expense · opening · amount ...
+CUSTOMER, SUPPLIER, CASH, SALES, PURCHASES, EXPENSE, AMOUNT = 'customer', 'supplier', 'cash', 'sales', 'purchases', 'expense', 'amount'
+EMPLOYEE, OPENING = 'employee', 'opening'   # حساب الموظف (طرف) · حساب «الأرصدة الافتتاحية المعلقة»
+INTERNAL = 'internal'                        # حساب جاري داخلي (نقطة بيع / مستودع) من الأصول أو الالتزامات
+INCOME = 'income'                            # حسابات الإيرادات (خصم مكتسب، إيراد متنوع) بلا قيمة افتراضية
+CONTRA = 'contra'                            # مردودات المبيعات: إيرادات أو مصروفات (بحسب دليل حسابات الشركة)
+EQUITY = 'equity'                            # رأس المال / جاري الشريك
+
+G_CUS, G_SUP, G_EXP, G_CASH, G_EMP, G_INT = ('العملاء', 'الموردون', 'المصروفات والإيرادات', 'الصناديق والبنوك والملاك',
+                                              'الموظفون', 'تعاملات داخلية')
+
+
+@dataclass(frozen=True)
+class Field:
+    key: str
+    label: str
+    kind: str
+
+
+@dataclass(frozen=True)
+class Recipe:
+    key: str
+    title: str
+    hint: str
+    fields: tuple
+    build: object          # callable(values: dict) -> list[dict]
+    desc: str = ''         # بيان مقترح (يُضاف إليه اسم الطرف عند توفره)
+    group: str = ''        # مجموعة القائمة
+
+
+def _d(v):
+    if v in (None, ''):
+        return Decimal(0)
+    return v if isinstance(v, Decimal) else Decimal(str(v))
+
+
+def _ln(account_id, debit=None, credit=None, memo=''):
+    return {'account_id': int(account_id), 'debit': debit, 'credit': credit, 'memo': memo}
+
+
+def _need(v, *keys):
+    """يتحقق من الحسابات والمبالغ المطلوبة ويرمي AccountingError برسالة عربية واضحة."""
+    labels = {f.key: f.label for r in RECIPES for f in r.fields}
+    for k in keys:
+        x = v.get(k)
+        if k.startswith('amt'):
+            if _d(x) <= 0:
+                raise AccountingError(f'أدخل «{labels.get(k, k)}» بمبلغ أكبر من صفر')
+        elif not x:
+            raise AccountingError(f'اختر «{labels.get(k, k)}»')
+
+
+def _same(*ids):
+    ids = [int(i) for i in ids]
+    if len(set(ids)) != len(ids):
+        raise AccountingError('الحسابان المدين والدائن متطابقان: اختر حسابين مختلفين')
+
+
+# ---------------------------------------------------------------- العملاء
+def _cust_receipt(v):
+    _need(v, 'customer', 'cash', 'amt'); a = _d(v['amt'])
+    return [_ln(v['cash'], debit=a, memo='سند قبض'), _ln(v['customer'], credit=a, memo='سند قبض - سداد من العميل')]
+
+
+def _cust_credit_sale(v):
+    _need(v, 'customer', 'sales', 'amt'); a = _d(v['amt'])
+    return [_ln(v['customer'], debit=a, memo='مبيعات آجلة'), _ln(v['sales'], credit=a, memo='مبيعات آجلة')]
+
+
+def _cust_cash_sale(v):
+    _need(v, 'cash', 'sales', 'amt'); a = _d(v['amt'])
+    return [_ln(v['cash'], debit=a, memo='مبيعات نقدية'), _ln(v['sales'], credit=a, memo='مبيعات نقدية')]
+
+
+def _cust_pay_and_buy(v):
+    """العميل سدّد دفعة على حسابه وأخذ بضاعة بقيمة آجلة: قيد سند قبض + قيد مبيعات آجلة."""
+    _need(v, 'customer', 'cash', 'sales', 'amt_in', 'amt_out'); i, o = _d(v['amt_in']), _d(v['amt_out'])
+    return [_ln(v['cash'], debit=i, memo='سند قبض'), _ln(v['customer'], credit=i, memo='سند قبض - دفعة من العميل'),
+            _ln(v['customer'], debit=o, memo='مبيعات آجلة'), _ln(v['sales'], credit=o, memo='مبيعات آجلة')]
+
+
+def _cust_partial(v):
+    _need(v, 'customer', 'cash', 'sales', 'amt_total', 'amt_paid'); t, p = _d(v['amt_total']), _d(v['amt_paid'])
+    if p > t:
+        raise AccountingError('المدفوع أكبر من إجمالي المبيعات')
+    rows = [_ln(v['cash'], debit=p, memo='دفعة مقدمة')]
+    if t - p > 0:
+        rows.append(_ln(v['customer'], debit=t - p, memo='المتبقي ذمة على العميل (آجل)'))
+    rows.append(_ln(v['sales'], credit=t, memo='إجمالي المبيعات'))
+    return rows
+
+
+def _cust_refund(v):
+    _need(v, 'customer', 'cash', 'amt'); a = _d(v['amt'])
+    return [_ln(v['customer'], debit=a, memo='سند صرف للعميل'), _ln(v['cash'], credit=a, memo='سند صرف للعميل')]
+
+
+def _cust_sales_return(v):
+    _need(v, 'sales_ret', 'customer', 'amt'); a = _d(v['amt'])
+    return [_ln(v['sales_ret'], debit=a, memo='مردودات مبيعات'), _ln(v['customer'], credit=a, memo='مردودات مبيعات - تخفيض ذمة العميل')]
+
+
+def _cust_cash_return(v):
+    _need(v, 'sales_ret', 'cash', 'amt'); a = _d(v['amt'])
+    return [_ln(v['sales_ret'], debit=a, memo='مردودات مبيعات'), _ln(v['cash'], credit=a, memo='سند صرف - رد ثمن مردودات المبيعات')]
+
+
+def _cust_receipt_discount(v):
+    _need(v, 'customer', 'cash', 'disc_exp', 'amt_in', 'amt_disc'); i, k = _d(v['amt_in']), _d(v['amt_disc'])
+    return [_ln(v['cash'], debit=i, memo='سند قبض'), _ln(v['disc_exp'], debit=k, memo='خصم مسموح به'),
+            _ln(v['customer'], credit=i + k, memo='سند قبض - سداد من العميل مع خصم مسموح به')]
+
+
+def _cust_discount(v):
+    _need(v, 'disc_exp', 'customer', 'amt'); a = _d(v['amt'])
+    return [_ln(v['disc_exp'], debit=a, memo='خصم مسموح به'), _ln(v['customer'], credit=a, memo='خصم مسموح به - تخفيض ذمة العميل')]
+
+
+def _cust_transfer(v):
+    _need(v, 'customer2', 'customer', 'amt'); a = _d(v['amt'])
+    return [_ln(v['customer2'], debit=a, memo='تحويل رصيد من عميل آخر'), _ln(v['customer'], credit=a, memo='تحويل رصيد إلى عميل آخر')]
+
+
+def _cust_opening_debit(v):
+    """رصيد سابق على العميل (ذمة مدينة): مدين العميل / دائن الأرصدة الافتتاحية المعلقة."""
+    _need(v, 'customer', 'opening', 'amt'); a = _d(v['amt'])
+    return [_ln(v['customer'], debit=a, memo='رصيد افتتاحي مدين للعميل'), _ln(v['opening'], credit=a, memo='موازنة رصيد افتتاحي')]
+
+
+def _cust_opening_credit(v):
+    """رصيد سابق للعميل (دفعة مقدمة): دائن العميل / مدين الأرصدة الافتتاحية المعلقة."""
+    _need(v, 'customer', 'opening', 'amt'); a = _d(v['amt'])
+    return [_ln(v['opening'], debit=a, memo='موازنة رصيد افتتاحي'), _ln(v['customer'], credit=a, memo='رصيد افتتاحي دائن للعميل')]
+
+
+# ---------------------------------------------------------------- الموردون
+def _sup_payment(v):
+    _need(v, 'supplier', 'cash', 'amt'); a = _d(v['amt'])
+    return [_ln(v['supplier'], debit=a, memo='سند صرف - سداد للمورد'), _ln(v['cash'], credit=a, memo='سند صرف للمورد')]
+
+
+def _sup_credit_purchase(v):
+    _need(v, 'supplier', 'purchases', 'amt'); a = _d(v['amt'])
+    return [_ln(v['purchases'], debit=a, memo='مشتريات آجلة'), _ln(v['supplier'], credit=a, memo='مشتريات آجلة من المورد')]
+
+
+def _sup_cash_purchase(v):
+    _need(v, 'purchases', 'cash', 'amt'); a = _d(v['amt'])
+    return [_ln(v['purchases'], debit=a, memo='مشتريات نقدية'), _ln(v['cash'], credit=a, memo='سند صرف - مشتريات نقدية')]
+
+
+def _sup_pay_and_buy(v):
+    _need(v, 'supplier', 'cash', 'purchases', 'amt_out', 'amt_in'); o, i = _d(v['amt_out']), _d(v['amt_in'])
+    return [_ln(v['supplier'], debit=o, memo='سند صرف للمورد'), _ln(v['cash'], credit=o, memo='سند صرف للمورد'),
+            _ln(v['purchases'], debit=i, memo='مشتريات آجلة'), _ln(v['supplier'], credit=i, memo='مشتريات آجلة من المورد')]
+
+
+def _sup_gave_cash(v):
+    _need(v, 'supplier', 'cash', 'amt'); a = _d(v['amt'])
+    return [_ln(v['cash'], debit=a, memo='سند قبض من المورد'), _ln(v['supplier'], credit=a, memo='سند قبض - مبلغ مستلم من المورد')]
+
+
+def _sup_purchase_return(v):
+    _need(v, 'supplier', 'purchases', 'amt'); a = _d(v['amt'])
+    return [_ln(v['supplier'], debit=a, memo='مردودات مشتريات - تخفيض التزام المورد'), _ln(v['purchases'], credit=a, memo='مردودات مشتريات')]
+
+
+def _sup_payment_discount(v):
+    _need(v, 'supplier', 'cash', 'disc_inc', 'amt_out', 'amt_disc'); o, k = _d(v['amt_out']), _d(v['amt_disc'])
+    return [_ln(v['supplier'], debit=o + k, memo='سند صرف - سداد للمورد مع خصم مكتسب'), _ln(v['cash'], credit=o, memo='سند صرف للمورد'),
+            _ln(v['disc_inc'], credit=k, memo='خصم مكتسب')]
+
+
+def _sup_discount(v):
+    _need(v, 'supplier', 'disc_inc', 'amt'); a = _d(v['amt'])
+    return [_ln(v['supplier'], debit=a, memo='خصم مكتسب - تخفيض التزام المورد'), _ln(v['disc_inc'], credit=a, memo='خصم مكتسب')]
+
+
+def _setoff(v):
+    _need(v, 'customer', 'supplier', 'amt'); a = _d(v['amt'])
+    return [_ln(v['supplier'], debit=a, memo='مقاصة مع ذمة عميل'), _ln(v['customer'], credit=a, memo='مقاصة مع التزام مورد')]
+
+
+def _sup_opening_credit(v):
+    """رصيد سابق للمورد علينا (التزام): دائن المورد / مدين الأرصدة الافتتاحية المعلقة."""
+    _need(v, 'supplier', 'opening', 'amt'); a = _d(v['amt'])
+    return [_ln(v['opening'], debit=a, memo='موازنة رصيد افتتاحي'), _ln(v['supplier'], credit=a, memo='رصيد افتتاحي دائن للمورد')]
+
+
+def _sup_opening_debit(v):
+    """رصيد سابق لنا عند المورد (دفعة مقدمة/مرتجع قديم): مدين المورد / دائن الأرصدة الافتتاحية المعلقة."""
+    _need(v, 'supplier', 'opening', 'amt'); a = _d(v['amt'])
+    return [_ln(v['supplier'], debit=a, memo='رصيد افتتاحي مدين للمورد'), _ln(v['opening'], credit=a, memo='موازنة رصيد افتتاحي')]
+
+
+# ---------------------------------------------------------------- المصروفات والإيرادات
+def _expense(v):
+    _need(v, 'expense', 'cash', 'amt'); a = _d(v['amt'])
+    return [_ln(v['expense'], debit=a, memo='مصروف'), _ln(v['cash'], credit=a, memo='سند صرف مصروف')]
+
+
+def _expense_accrued(v):
+    _need(v, 'expense', 'supplier', 'amt'); a = _d(v['amt'])
+    return [_ln(v['expense'], debit=a, memo='مصروف مستحق'), _ln(v['supplier'], credit=a, memo='مصروف مستحق السداد')]
+
+
+def _other_income(v):
+    _need(v, 'cash', 'income', 'amt'); a = _d(v['amt'])
+    return [_ln(v['cash'], debit=a, memo='سند قبض - إيراد متنوع'), _ln(v['income'], credit=a, memo='إيراد متنوع')]
+
+
+# ---------------------------------------------------------------- الصناديق والبنوك والملاك
+def _cash_transfer(v):
+    _need(v, 'cash', 'cash_to', 'amt'); a = _d(v['amt'])
+    return [_ln(v['cash_to'], debit=a, memo='تحويل نقدية (استلام)'), _ln(v['cash'], credit=a, memo='تحويل نقدية (صرف)')]
+
+
+def _owner_capital(v):
+    _need(v, 'cash', 'equity', 'amt'); a = _d(v['amt'])
+    return [_ln(v['cash'], debit=a, memo='سند قبض - إيداع من الشريك'), _ln(v['equity'], credit=a, memo='إيداع رأس مال / جاري الشريك')]
+
+
+def _owner_withdrawal(v):
+    _need(v, 'equity', 'cash', 'amt'); a = _d(v['amt'])
+    return [_ln(v['equity'], debit=a, memo='مسحوبات الشريك'), _ln(v['cash'], credit=a, memo='سند صرف - مسحوبات الشريك')]
+
+
+# ---------------------------------------------------------------- الموظفون
+def _emp_advance(v):
+    """سلفة موظف: مدين حساب الموظف (تُخصم لاحقًا من مستحقاته) / دائن الصندوق."""
+    _need(v, 'employee', 'cash', 'amt'); a = _d(v['amt'])
+    return [_ln(v['employee'], debit=a, memo='سلفة موظف'), _ln(v['cash'], credit=a, memo='سند صرف - سلفة موظف')]
+
+
+def _emp_advance_repay(v):
+    _need(v, 'cash', 'employee', 'amt'); a = _d(v['amt'])
+    return [_ln(v['cash'], debit=a, memo='سند قبض - سداد سلفة'), _ln(v['employee'], credit=a, memo='سداد سلفة موظف')]
+
+
+def _emp_salary_accrual(v):
+    _need(v, 'expense', 'employee', 'amt'); a = _d(v['amt'])
+    return [_ln(v['expense'], debit=a, memo='استحقاق راتب'), _ln(v['employee'], credit=a, memo='راتب مستحق للموظف')]
+
+
+# ---------------------------------------------------------------- تعاملات داخلية
+def _wh_to_pos(v):
+    """تعامل داخلي: مبيعات من مستودع إلى نقطة بيع. البضاعة تُنقل بتحويل مخزني منفصل."""
+    _need(v, 'pos', 'wh', 'amt'); a = _d(v['amt'])
+    return [_ln(v['pos'], debit=a, memo='بيع من مستودع إلى نقطة بيع'), _ln(v['wh'], credit=a, memo='بيع من مستودع إلى نقطة بيع')]
+
+
+def _pos_to_wh(v):
+    """تعامل داخلي: تسديد من نقطة بيع إلى مستودع. البضاعة المسدَّدة تُنقل بتحويل مخزني منفصل."""
+    _need(v, 'pos', 'wh', 'amt'); a = _d(v['amt'])
+    return [_ln(v['wh'], debit=a, memo='تسديد من نقطة بيع إلى مستودع'), _ln(v['pos'], credit=a, memo='تسديد من نقطة بيع إلى مستودع')]
+
+
+F_CUS, F_SUP = Field('customer', 'العميل', CUSTOMER), Field('supplier', 'المورد', SUPPLIER)
+F_CASH, F_SAL = Field('cash', 'الصندوق/البنك', CASH), Field('sales', 'حساب المبيعات', SALES)
+F_PUR, F_EXP = Field('purchases', 'حساب المخزون / المشتريات', PURCHASES), Field('expense', 'حساب المصروف', EXPENSE)
+F_AMT = Field('amt', 'المبلغ', AMOUNT)
+F_POS, F_WH = Field('pos', 'حساب نقطة البيع (الجاري)', INTERNAL), Field('wh', 'حساب المستودع (الجاري)', INTERNAL)
+F_EMP, F_OPN = Field('employee', 'الموظف', EMPLOYEE), Field('opening', 'حساب الأرصدة الافتتاحية', OPENING)
+F_SRET = Field('sales_ret', 'حساب مردودات المبيعات', CONTRA)
+F_DEXP, F_DINC = Field('disc_exp', 'حساب الخصم المسموح به', EXPENSE), Field('disc_inc', 'حساب الخصم المكتسب (إيراد)', INCOME)
+F_INC, F_EQ = Field('income', 'حساب الإيراد', INCOME), Field('equity', 'حساب رأس المال / جاري الشريك', EQUITY)
+F_CUS_FROM, F_CUS_TO = Field('customer', 'العميل المحوَّل منه', CUSTOMER), Field('customer2', 'العميل المحوَّل إليه', CUSTOMER)
+F_CASH_FROM, F_CASH_TO = Field('cash', 'من صندوق/بنك', CASH), Field('cash_to', 'إلى صندوق/بنك', CASH)
+F_PUR_RET = Field('purchases', 'حساب المخزون / مردودات المشتريات', PURCHASES)
+F_SUP_ACC = Field('supplier', 'المورد / الجهة الدائنة', SUPPLIER)
+F_SAL_EXP = Field('expense', 'حساب مصروف الرواتب', EXPENSE)
+
+RECIPES = (
+    # ---------------- العملاء
+    Recipe('cust_pay_and_buy', 'قيد سند قبض عميل + قيد مبيعات آجلة',
+           'استلمنا دفعة من العميل وسلّمناه بضاعة على الحساب.\nالأثر: مدين الصندوق / دائن العميل بالمقبوض (سند قبض)، ثم مدين العميل / دائن المبيعات بقيمة البضاعة (مبيعات آجلة).',
+           (F_CUS, F_CASH, F_SAL, Field('amt_in', 'المبلغ المقبوض', AMOUNT), Field('amt_out', 'قيمة البضاعة (مبيعات آجلة)', AMOUNT)),
+           _cust_pay_and_buy, 'سند قبض + مبيعات آجلة', G_CUS),
+    Recipe('cust_receipt', 'قيد سند قبض من عميل (سداد على الحساب)',
+           'استلمنا من العميل مبلغًا تسديدًا لذمته.\nالأثر: مدين الصندوق / دائن العميل.', (F_CUS, F_CASH, F_AMT), _cust_receipt, 'سند قبض', G_CUS),
+    Recipe('cust_receipt_discount', 'قيد سند قبض من عميل مع خصم مسموح به',
+           'العميل سدّد جزءًا نقدًا وسمحنا له بخصم تسوية على الباقي فأُقفلت ذمته بالكامل.\nالأثر: مدين الصندوق بالمقبوض، ومدين الخصم المسموح به / دائن العميل بالمجموع.',
+           (F_CUS, F_CASH, F_DEXP, Field('amt_in', 'المبلغ المقبوض', AMOUNT), Field('amt_disc', 'الخصم المسموح به', AMOUNT)),
+           _cust_receipt_discount, 'سند قبض مع خصم مسموح به', G_CUS),
+    Recipe('cust_credit_sale', 'قيد مبيعات آجلة لعميل (بدون أصناف)',
+           'مبيعات على الحساب بمبلغ إجمالي بلا فاتورة أصناف، فلا يتأثر المخزون.\nالأثر: مدين العميل / دائن المبيعات.',
+           (F_CUS, F_SAL, F_AMT), _cust_credit_sale, 'مبيعات آجلة', G_CUS),
+    Recipe('cust_partial', 'قيد مبيعات بدفعة مقدمة والمتبقي ذمة على العميل',
+           'العميل دفع جزءًا نقدًا والباقي على حسابه.\nالأثر: مدين الصندوق بالمدفوع، ومدين العميل بالمتبقي / دائن المبيعات بالإجمالي.',
+           (F_CUS, F_CASH, F_SAL, Field('amt_total', 'إجمالي المبيعات', AMOUNT), Field('amt_paid', 'الدفعة المقدمة', AMOUNT)),
+           _cust_partial, 'مبيعات بدفعة مقدمة والباقي آجل', G_CUS),
+    Recipe('cust_cash_sale', 'قيد مبيعات نقدية (بدون أصناف)',
+           'مبيعات مقبوض ثمنها فورًا بلا فاتورة أصناف.\nالأثر: مدين الصندوق / دائن المبيعات.', (F_CASH, F_SAL, F_AMT), _cust_cash_sale, 'مبيعات نقدية', G_CUS),
+    Recipe('cust_sales_return', 'قيد مردودات مبيعات من عميل (تخفيض الذمة)',
+           'عميل أعاد بضاعة مباعة له بالآجل فتنخفض ذمته.\nالأثر: مدين مردودات المبيعات / دائن العميل.\nتنبيه: لا يعيد الكميات للمخزون؛ للبضاعة استعمل مرتجع المبيعات من الفاتورة.',
+           (F_CUS, F_SRET, F_AMT), _cust_sales_return, 'مردودات مبيعات', G_CUS),
+    Recipe('cust_cash_return', 'قيد مردودات مبيعات نقدية (رد الثمن للعميل)',
+           'أعدنا للعميل ثمن بضاعة مرتجعة سبق قبضه نقدًا.\nالأثر: مدين مردودات المبيعات / دائن الصندوق.',
+           (F_SRET, F_CASH, F_AMT), _cust_cash_return, 'مردودات مبيعات نقدية', G_CUS),
+    Recipe('cust_discount', 'قيد خصم مسموح به لعميل (تسوية)',
+           'خصم تسوية أو تخفيض على ذمة العميل دون حركة نقدية.\nالأثر: مدين الخصم المسموح به / دائن العميل.',
+           (F_CUS, F_DEXP, F_AMT), _cust_discount, 'خصم مسموح به', G_CUS),
+    Recipe('cust_refund', 'قيد سند صرف لعميل (رد دفعة أو سلفة)',
+           'دفعنا للعميل مبلغًا: رد دفعة مقدمة أو سلفة عليه.\nالأثر: مدين العميل / دائن الصندوق.', (F_CUS, F_CASH, F_AMT), _cust_refund, 'سند صرف لعميل', G_CUS),
+    Recipe('cust_transfer', 'قيد تحويل رصيد بين عميلين',
+           'نقل مبلغ من ذمة عميل إلى ذمة عميل آخر (مثل تحمّل أحدهما دين الآخر).\nالأثر: مدين العميل المحوَّل إليه / دائن العميل المحوَّل منه.',
+           (F_CUS_FROM, F_CUS_TO, F_AMT), _cust_transfer, 'تحويل رصيد بين عميلين', G_CUS),
+    Recipe('cust_opening_debit', 'قيد رصيد افتتاحي مدين لعميل (ذمة مدينة)',
+           'تثبيت دين سابق على العميل دون فاتورة أو مخزون.\nالأثر: مدين العميل / دائن «الأرصدة الافتتاحية المعلقة».',
+           (F_CUS, F_OPN, F_AMT), _cust_opening_debit, 'رصيد افتتاحي مدين لعميل', G_CUS),
+    Recipe('cust_opening_credit', 'قيد رصيد افتتاحي دائن لعميل (دفعة مقدمة)',
+           'تثبيت رصيد سابق للعميل عندنا (دفعة مقدمة أو مرتجع قديم).\nالأثر: مدين «الأرصدة الافتتاحية المعلقة» / دائن العميل.',
+           (F_CUS, F_OPN, F_AMT), _cust_opening_credit, 'رصيد افتتاحي دائن لعميل', G_CUS),
+    # ---------------- الموردون
+    Recipe('sup_pay_and_buy', 'قيد سند صرف لمورد + قيد مشتريات آجلة',
+           'سدّدنا للمورد دفعة واستلمنا منه بضاعة على الحساب.\nالأثر: مدين المورد / دائن الصندوق بالمدفوع (سند صرف)، ثم مدين المخزون / دائن المورد بقيمة البضاعة (مشتريات آجلة).',
+           (F_SUP, F_CASH, F_PUR, Field('amt_out', 'المبلغ المدفوع', AMOUNT), Field('amt_in', 'قيمة البضاعة (مشتريات آجلة)', AMOUNT)),
+           _sup_pay_and_buy, 'سند صرف + مشتريات آجلة', G_SUP),
+    Recipe('sup_payment', 'قيد سند صرف لمورد (سداد على الحساب)',
+           'سدّدنا للمورد مبلغًا من التزامه.\nالأثر: مدين المورد / دائن الصندوق.', (F_SUP, F_CASH, F_AMT), _sup_payment, 'سند صرف لمورد', G_SUP),
+    Recipe('sup_payment_discount', 'قيد سند صرف لمورد مع خصم مكتسب',
+           'سدّدنا للمورد جزءًا نقدًا وسمح لنا بخصم تسوية فأُقفل التزامنا تجاهه.\nالأثر: مدين المورد بالمجموع / دائن الصندوق بالمدفوع ودائن الخصم المكتسب.',
+           (F_SUP, F_CASH, F_DINC, Field('amt_out', 'المبلغ المدفوع', AMOUNT), Field('amt_disc', 'الخصم المكتسب', AMOUNT)),
+           _sup_payment_discount, 'سند صرف مع خصم مكتسب', G_SUP),
+    Recipe('sup_credit_purchase', 'قيد مشتريات آجلة من مورد (بدون أصناف)',
+           'مشتريات على الحساب بمبلغ إجمالي بلا فاتورة أصناف. المقترح حساب المخزون (للبضاعة)، واختر حساب مصروف إن كان الشراء خدمة. تنبيه: لا تتحدث كميات الأصناف، فللبضاعة استعمل فاتورة المشتريات.\nالأثر: مدين المخزون (أو المصروف) / دائن المورد.',
+           (F_SUP, F_PUR, F_AMT), _sup_credit_purchase, 'مشتريات آجلة', G_SUP),
+    Recipe('sup_cash_purchase', 'قيد مشتريات نقدية (بدون أصناف)',
+           'مشتريات مدفوعة نقدًا بلا فاتورة أصناف. تنبيه: لا تتحدث كميات الأصناف.\nالأثر: مدين المخزون (أو المصروف) / دائن الصندوق.',
+           (F_PUR, F_CASH, F_AMT), _sup_cash_purchase, 'مشتريات نقدية', G_SUP),
+    Recipe('sup_purchase_return', 'قيد مردودات مشتريات لمورد (تخفيض الالتزام)',
+           'أعدنا بضاعة مشتراة بالآجل إلى المورد فينخفض التزامنا تجاهه.\nالأثر: مدين المورد / دائن المخزون (أو مردودات المشتريات).\nتنبيه: لا يخصم الكميات من المخزون؛ للبضاعة استعمل مرتجع المشتريات من الفاتورة.',
+           (F_SUP, F_PUR_RET, F_AMT), _sup_purchase_return, 'مردودات مشتريات', G_SUP),
+    Recipe('sup_discount', 'قيد خصم مكتسب من مورد (تسوية)',
+           'خصم تسوية أو تخفيض على التزامنا للمورد دون حركة نقدية.\nالأثر: مدين المورد / دائن الخصم المكتسب.',
+           (F_SUP, F_DINC, F_AMT), _sup_discount, 'خصم مكتسب', G_SUP),
+    Recipe('sup_gave_cash', 'قيد سند قبض من مورد (استرداد أو دفعة مقدمة)',
+           'استلمنا من المورد مبلغًا نقدًا، فيصبح له علينا.\nالأثر: مدين الصندوق / دائن المورد.', (F_SUP, F_CASH, F_AMT), _sup_gave_cash, 'سند قبض من مورد', G_SUP),
+    Recipe('setoff', 'قيد مقاصة بين ذمة عميل والتزام مورد',
+           'نخصم المبلغ نفسه مما على العميل ومما علينا للمورد (طرف واحد يكون عميلًا ومورّدًا).\nالأثر: مدين المورد / دائن العميل.',
+           (F_CUS, F_SUP, F_AMT), _setoff, 'مقاصة عميل ومورد', G_SUP),
+    Recipe('sup_opening_credit', 'قيد رصيد افتتاحي دائن لمورد (التزام سابق)',
+           'تثبيت مبلغ سابق علينا للمورد دون فاتورة أو مخزون.\nالأثر: مدين «الأرصدة الافتتاحية المعلقة» / دائن المورد.',
+           (F_SUP, F_OPN, F_AMT), _sup_opening_credit, 'رصيد افتتاحي دائن لمورد', G_SUP),
+    Recipe('sup_opening_debit', 'قيد رصيد افتتاحي مدين لمورد (دفعة مقدمة)',
+           'تثبيت مبلغ سابق لنا عند المورد (دفعة مقدمة أو مرتجع قديم).\nالأثر: مدين المورد / دائن «الأرصدة الافتتاحية المعلقة».',
+           (F_SUP, F_OPN, F_AMT), _sup_opening_debit, 'رصيد افتتاحي مدين لمورد', G_SUP),
+    # ---------------- المصروفات والإيرادات
+    Recipe('expense', 'قيد سند صرف مصروف',
+           'دفع مصروف نقدًا من الصندوق أو البنك.\nالأثر: مدين المصروف / دائن الصندوق.', (F_EXP, F_CASH, F_AMT), _expense, 'سند صرف مصروف', G_EXP),
+    Recipe('expense_accrued', 'قيد مصروف مستحق السداد (آجل)',
+           'مصروف يخص الفترة ولم يُدفع بعد (إيجار، كهرباء، خدمات...).\nالأثر: مدين المصروف / دائن الجهة الدائنة (مورد).',
+           (F_EXP, F_SUP_ACC, F_AMT), _expense_accrued, 'مصروف مستحق', G_EXP),
+    Recipe('other_income', 'قيد سند قبض إيراد متنوع',
+           'إيراد نقدي غير مرتبط بالمبيعات (عمولة، إيجار مقبوض، فوائد...).\nالأثر: مدين الصندوق / دائن الإيراد.',
+           (F_CASH, F_INC, F_AMT), _other_income, 'إيراد متنوع', G_EXP),
+    # ---------------- الصناديق والبنوك والملاك
+    Recipe('cash_transfer', 'قيد تحويل نقدية بين صندوق وبنك',
+           'نقل مبلغ من صندوق إلى بنك أو العكس (إيداع/سحب).\nالأثر: مدين المستلِم / دائن المحوَّل منه.\nتنبيه: للتحويل الموثّق بسند استعمل «تحويل بين الصناديق/البنوك» في صفحة الصناديق.',
+           (F_CASH_FROM, F_CASH_TO, F_AMT), _cash_transfer, 'تحويل نقدية', G_CASH),
+    Recipe('owner_capital', 'قيد إيداع رأس مال / جاري الشريك',
+           'شريك أودع مبلغًا في الصندوق أو البنك.\nالأثر: مدين الصندوق / دائن رأس المال (أو جاري الشريك).',
+           (F_CASH, F_EQ, F_AMT), _owner_capital, 'إيداع رأس مال / جاري الشريك', G_CASH),
+    Recipe('owner_withdrawal', 'قيد مسحوبات الشريك',
+           'شريك سحب مبلغًا من الصندوق أو البنك.\nالأثر: مدين جاري الشريك (المسحوبات) / دائن الصندوق.',
+           (F_EQ, F_CASH, F_AMT), _owner_withdrawal, 'مسحوبات الشريك', G_CASH),
+    # ---------------- الموظفون
+    Recipe('emp_advance', 'قيد سلفة موظف',
+           'دفعنا للموظف سلفة تُخصم لاحقًا من مستحقاته.\nالأثر: مدين حساب الموظف / دائن الصندوق.',
+           (F_EMP, F_CASH, F_AMT), _emp_advance, 'سلفة موظف', G_EMP),
+    Recipe('emp_advance_repay', 'قيد سداد سلفة موظف نقدًا',
+           'الموظف سدّد سلفته نقدًا.\nالأثر: مدين الصندوق / دائن حساب الموظف.',
+           (F_EMP, F_CASH, F_AMT), _emp_advance_repay, 'سداد سلفة موظف', G_EMP),
+    Recipe('emp_salary_accrual', 'قيد استحقاق راتب موظف',
+           'إثبات راتب مستحق للموظف قبل صرفه.\nالأثر: مدين مصروف الرواتب / دائن حساب الموظف.\nتنبيه: للرواتب الشهرية الكاملة استعمل مسير الرواتب.',
+           (F_SAL_EXP, F_EMP, F_AMT), _emp_salary_accrual, 'استحقاق راتب', G_EMP),
+    # ---------------- تعاملات داخلية
+    Recipe('wh_to_pos', 'قيد تعامل داخلي: مبيعات من مستودع إلى نقطة بيع',
+           'تعامل داخلي بين مستودعك ونقطة البيع التابعة لك: المستودع «باع» للنقطة بضاعة بقيمة معينة تُسدَّد لاحقًا.\nالأثر: مدين حساب نقطة البيع / دائن حساب المستودع.\nتنبيه: لا يحرّك الكميات؛ انقل البضاعة بـ«تحويل مخزني» من المستودع إلى نقطة البيع، وخذ القيمة من التحويل بتكلفة المتوسط.',
+           (F_POS, F_WH, F_AMT), _wh_to_pos, 'بيع من مستودع إلى نقطة بيع', G_INT),
+    Recipe('pos_to_wh', 'قيد تعامل داخلي: تسديد من نقطة بيع إلى مستودع',
+           'نقطة البيع تسدّد للمستودع (بضاعة أو نقدًا) مقابل ما أخذته منه.\nالأثر: مدين حساب المستودع / دائن حساب نقطة البيع.\nتنبيه: لا يحرّك الكميات؛ إن كان التسديد بضاعة فانقلها بـ«تحويل مخزني» من نقطة البيع إلى المستودع، وإن كان نقدًا فاعمل مستند تحويل بين الصندوقين.',
+           (F_POS, F_WH, F_AMT), _pos_to_wh, 'تسديد من نقطة بيع إلى مستودع', G_INT),
+)
+BY_KEY = {r.key: r for r in RECIPES}
+
+
+def build(key, values):
+    """يبني سطور القيد من قالب. يرمي AccountingError عند نقص بيان. يضمن توازن السطور."""
+    r = BY_KEY[key]
+    rows = r.build(values)
+    for x in rows:
+        dv, cv = _d(x['debit']), _d(x['credit'])
+        if (dv > 0) == (cv > 0) or dv < 0 or cv < 0:
+            raise AccountingError('تعذر بناء القيد: كل سطر يجب أن يكون مدينًا أو دائنًا بمبلغ موجب')
+    d = sum((_d(x['debit']) for x in rows), Decimal(0))
+    c = sum((_d(x['credit']) for x in rows), Decimal(0))
+    if d != c:
+        raise AccountingError('تعذر بناء قيد متوازن من هذه المدخلات')
+    ids = [x['account_id'] for x in rows]
+    if len(ids) == 2:
+        _same(*ids)
+    return rows
+
+
+def suggested_description(key, party_label=''):
+    base = BY_KEY[key].desc
+    return f'{base} — {party_label}'.strip(' —') if party_label else base

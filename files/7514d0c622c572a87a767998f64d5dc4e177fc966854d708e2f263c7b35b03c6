@@ -1,0 +1,64 @@
+"""شاشة التحميل بعد تسجيل الدخول: الشعار + «الربيع سوفت» + شريط تقدم حقيقي + اسم الخطوة الجارية. يتطلب PySide6."""
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QGuiApplication
+from PySide6.QtWidgets import QApplication, QLabel, QProgressBar, QVBoxLayout, QWidget
+
+from alhisabat import branding
+from alhisabat.ui.components.brand_widgets import app_icon, logo_pixmap
+from alhisabat.ui.design import tokens as T
+
+
+class SplashScreen(QWidget):
+    def __init__(self, mode='light', version=''):
+        super().__init__(None, Qt.SplashScreen | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        pal = T.palette(mode)
+        self.setObjectName('splash')
+        self.setWindowIcon(app_icon())
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.setFixedSize(520, 440)
+        self.setStyleSheet(f"#splash {{ background: {pal['surface']}; border: 1px solid {pal['border_strong']}; }} "
+                           f"QLabel {{ color: {pal['text']}; background: transparent; }}")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(40, 28, 40, 22)
+        lay.setSpacing(8)
+
+        logo = QLabel()
+        logo.setAlignment(Qt.AlignCenter)
+        pm = logo_pixmap(mode, 220)
+        if pm is not None:
+            logo.setPixmap(pm)
+        else:                                              # ملف الشعار مفقود: الاسم نصًا بدل نافذة فارغة
+            logo.setText(branding.PRODUCT_NAME)
+            logo.setStyleSheet('font-size: 28pt; font-weight: bold;')
+        lay.addWidget(logo, 1)
+
+        company = QLabel(f'من {branding.COMPANY_NAME}')
+        company.setAlignment(Qt.AlignCenter)
+        company.setStyleSheet(f"color: {pal['muted']}; font-size: 11pt;")
+        lay.addWidget(company)
+
+        self.status = QLabel('جارٍ التحضير…')
+        self.status.setAlignment(Qt.AlignCenter)
+        lay.addWidget(self.status)
+
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 100)
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(10)
+        lay.addWidget(self.bar)
+
+        if version:
+            ver = QLabel(f'الإصدار {version}')
+            ver.setAlignment(Qt.AlignCenter)
+            ver.setStyleSheet(f"color: {pal['muted']}; font-size: 8pt;")
+            lay.addWidget(ver)
+
+        screen = QGuiApplication.primaryScreen()
+        if screen is not None:
+            self.move(screen.availableGeometry().center() - self.rect().center())
+
+    def set_progress(self, fraction, text=''):
+        self.bar.setValue(int(round(max(0.0, min(1.0, fraction)) * 100)))
+        if text:
+            self.status.setText(text)
+        QApplication.processEvents()                       # الخطوات تجري على خيط الواجهة؛ نُنعش الرسم بين كل خطوة

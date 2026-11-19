@@ -1,0 +1,370 @@
+"""خدمات الفواتير (مبيعات/مشتريات) للواجهة الجديدة: Decimal فقط، كل الكتابة عبر محركات business.
+
+pages تستدعي هذه الخدمة فقط؛ لا SQL ولا استدعاء مباشر للمحركات من الصفحات. الطباعة عبر reporting.printing.
+بلا PySide6.
+"""
+from decimal import Decimal
+
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.accounting import rates as fxr
+from alhisabat.business import item_variants, purchases, sales
+from alhisabat.reporting import printing as PR
+
+
+def _dec(v):
+    if v in (None, ''):
+        return Decimal(0)
+    return v if isinstance(v, Decimal) else Decimal(str(v))
+
+
+def _norm_tax(v):
+    if v in (None, '', 0, '0'):
+        return None
+    return int(v)
+
+
+class InvoiceService:
+    def __init__(self, session):
+        self.s = session
+
+    # ---------------------------------------------------------------- قراءة
+    def list(self, kind='sales', limit=300):
+        self.s.require('sales.view' if kind == 'sales' else 'purchases.view')
+        from alhisabat.ui.core import readmodel
+        return readmodel.invoices(self.s.conn, self.s.company_id, kind=kind, limit=limit)
+
+    def get(self, kind, invoice_id):
+        return sales.get_invoice(self.s.conn, self.s.user_id, int(invoice_id)) if kind == 'sales' else purchases.get_purchase(self.s.conn, self.s.user_id, int(invoice_id))
+
+    def preview(self, kind, v):
+        """معاينة إجماليات الفاتورة من المحرك نفسه دون كتابة (وحدة صغرى). الأسطر غير المكتملة تُتجاهل؛ AccountingError تُرفع كما هي."""
+        from alhisabat.ui.core import entry_logic as EL
+        rows = EL.invoice_rows_for_preview(v.get('lines') or [])
+        if not rows:
+            return None
+        lines = self._lines_for_engine(rows)
+        disc = str(v.get('discount') or '').strip()
+        kw = dict(discount_percent=_dec(disc) if disc else None)
+        if str(v.get('discount_amount') or '').strip():
+            kw = dict(discount_amount=_dec(v['discount_amount']))
+        fn = sales.preview_totals if kind == 'sales' else purchases.preview_totals
+        return fn(self.s.conn, self.s.company_id, lines, **kw)
+
+    # ---------------------------------------------------------------- العملات (للفاتورة بعملة غير الأساسية)
+    def currency_options(self):
+        """العملات المفعّلة للشركة، الأساسية أولًا: [{code, name_ar, symbol, is_base}]. بلا صلاحية خاصة (قراءة لأغراض الاختيار)."""
+        from alhisabat.ui.core import readmodel
+        return [c for c in readmodel.currencies_list(self.s.conn, self.s.company_id) if c.get('is_enabled') or c.get('is_base')]
+
+    def rate_info(self, currency, on_date):
+        """سعر الصرف الذي سيُرحَّل به المستند: {'base': bool, 'rate': Decimal|None, 'error': str}. لا افتراض 1 أبدًا."""
+        from decimal import Decimal as _D
+        code = (currency or '').strip().upper()
+        base = fxr.base_currency(self.s.conn, self.s.company_id)
+        if not code or code == base:
+            return {'base': True, 'rate': _D(1), 'error': '', 'base_code': base}
+        try:
+            return {'base': False, 'rate': fxr.get_rate(self.s.conn, self.s.company_id, code, on_date), 'error': '', 'base_code': base}
+        except Exception as exc:  # noqa: BLE001 — AccountingError: لا يوجد سعر
+            return {'base': False, 'rate': None, 'error': str(exc), 'base_code': base}
+
+    def set_rate(self, currency, on_date, rate, reason=''):
+        """تسجيل سعر صرف بتاريخ المستند (يحتاج صلاحية أسعار الصرف). يرفع AccountingError كما هي."""
+        self.s.require('currency.rates')
+        return fxr.set_rate(self.s.conn, self.s.user_id, self.s.company_id, currency.strip().upper(), on_date, rate, reason=reason)
+
+    def party_context(self, kind, party_id):
+        """رصيد الطرف وحدّه الائتماني للعرض أثناء الإدخال: {'balance','limit'} بالوحدة الصغرى أو None عند غياب الصلاحية/الطرف."""
+        if not party_id:
+            return None
+        from alhisabat.business import parties as pt
+        try:
+            p = pt.get_party(self.s.conn, self.s.user_id, self.s.company_id, int(party_id))
+        except Exception:  # noqa: BLE001 — الصلاحية قد تمنع العرض؛ الفاتورة لا تتوقف
+            return None
+        return {'balance': p['balance'], 'limit': p['credit_limit'] if kind == 'sales' else 0}
+
+    def print_spec(self, kind, invoice_id):
+        return PR.invoice_print(self.s.conn, self.s.user_id, int(invoice_id), kind)
+
+    # ---------------------------------------------------------------- مساعدات حيّة أثناء الإدخال (عرض فقط، بلا أثر محاسبي)
+    def last_price(self, kind, item_id, party_id=None, exclude_invoice_id=None):
+        """آخر سعر بيع/شراء لصنف: {'price','unit_id','factor_milli','date','invoice_no','currency','status','same_party'} أو None."""
+        if not item_id:
+            return None
+        from alhisabat.ui.core import readmodel
+        try:
+            row = readmodel.last_price(self.s.conn, self.s.company_id, kind, int(item_id), int(party_id) if party_id else None,
+                                       exclude_invoice_id)
+        except Exception:  # noqa: BLE001 — مساعد فقط؛ لا يعطّل الإدخال
+            return None
+        if not row:
+            return None
+        return {'price': _dec(row['price_minor']) / 100, 'unit_id': row['unit_id'], 'factor_milli': int(row['factor_milli']),
+                'date': row['date'], 'invoice_no': row['invoice_no'], 'currency': row['currency'], 'status': row['status'],
+                'same_party': row['same_party']}
+
+    def item_units(self, item_id):
+        """وحدات الصنف: [{id, name, factor_milli, is_base}] الأساسية أولًا. قراءة لأغراض الاختيار (بلا صلاحية مخزون)."""
+        if not item_id:
+            return []
+        try:
+            return [dict(r) for r in self.s.conn.execute(
+                "SELECT u.id, u.name, iu.factor_milli, (iu.unit_id=i.base_unit_id) is_base FROM item_units iu "
+                "JOIN units u ON u.id=iu.unit_id JOIN items i ON i.id=iu.item_id WHERE iu.item_id=? ORDER BY is_base DESC, u.name",
+                (int(item_id),))]
+        except Exception:  # noqa: BLE001
+            return []
+
+    def _factor(self, item_id, unit_id):
+        if not unit_id:
+            return 1
+        r = self.s.conn.execute("SELECT factor_milli FROM item_units WHERE item_id=? AND unit_id=?", (int(item_id), int(unit_id))).fetchone()
+        return _dec(r[0]) / 1000 if r else 1
+
+    def _avg_cost_base(self, item_id, warehouse_id, cache):
+        """متوسط تكلفة وحدة الأساس بالعملة الأساسية (قيمة رئيسية) أو None إن لا رصيد/لا صلاحية."""
+        key = (int(item_id), int(warehouse_id) if warehouse_id else None)
+        if key in cache:
+            return cache[key]
+        from alhisabat.business import inventory as INV
+        cost = None
+        try:
+            report = INV.stock_report(self.s.conn, self.s.user_id, self.s.company_id, item_id=key[0], warehouse_id=key[1], include_zero=True)
+            tot_qty = sum((_dec(x['qty_milli']) for x in report), Decimal(0))
+            tot_val = sum((_dec(x['value_base']) for x in report), Decimal(0))
+            if tot_qty > 0:
+                cost = (tot_val * 1000 / tot_qty) / 100
+        except Exception:  # noqa: BLE001 — لا صلاحية أو خطأ: لا تنبيه ولا ربح تقديري
+            cost = None
+        cache[key] = cost
+        return cost
+
+    def below_cost_rows(self, kind, rows, warehouse_id=None, fx_rate=None, general_disc_pct=None):
+        """تنبيه البيع بأقل من التكلفة (مبيعات فقط): [{'row': رقم السطر من 1 (ترتيب rows), 'price', 'cost', 'loss'}] بالعملة الأساسية لكل
+        وحدة السطر. السعر الفعلي = السعر بعد خصم البند والخصم العام × سعر الصرف. تكلفة = متوسط تكلفة الصنف الحالي × معامل الوحدة.
+        أصناف بلا رصيد/تكلفة تُتجاهل. تنبيه فقط ولا يمنع الحفظ."""
+        if kind != 'sales':
+            return []
+        out, cache = [], {}
+        rate = _dec(fx_rate) if fx_rate not in (None, '') else Decimal(1)
+        gd = _dec(general_disc_pct or 0)
+        for n, r in enumerate(rows or [], 1):
+            item_id, price_raw, qty_raw = r.get('item_id'), r.get('price'), r.get('qty')
+            if not item_id or price_raw in (None, '') or qty_raw in (None, '') or _dec(qty_raw) <= 0:
+                continue
+            base_cost = self._avg_cost_base(item_id, warehouse_id, cache)
+            if base_cost is None:
+                continue
+            cost = base_cost * self._factor(item_id, r.get('unit_id'))
+            price = _dec(price_raw)
+            ld = _dec(r.get('disc') or 0)
+            if ld:
+                price = price * (1 - ld / 100)
+            if gd:
+                price = price * (1 - gd / 100)
+            price = price * rate
+            if price < cost:
+                out.append({'row': n, 'price': price, 'cost': cost, 'loss': cost - price})
+        return out
+
+    def stock_on_hand_milli(self, item_id, warehouse_id=None):
+        """الكمية الحالية بالمخزون (وحدة ملّي) لصنف، بمستودع الفاتورة إن حُدِّد وإلا إجمالي كل المستودعات."""
+        if not item_id:
+            return None
+        from alhisabat.ui.core import readmodel
+        try:
+            return readmodel.stock_on_hand(self.s.conn, self.s.company_id, int(item_id), int(warehouse_id) if warehouse_id else None)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def item_colors(self, item_ids):
+        """لون كل صنف ملوّن في الفاتورة (للأصناف العادية لا شيء) — لعمود اللون."""
+        try:
+            return item_variants.item_colors(self.s.conn, self.s.company_id, list(item_ids))
+        except Exception:  # noqa: BLE001 — عرض مساعد فقط
+            return {}
+
+    def variants_of(self, parent_id):
+        """ألوان صنف أم: [(item_id, اسم اللون، hex)] الفعّالة فقط."""
+        try:
+            rows = self.s.conn.execute(
+                "SELECT i.id,c.name,c.shade_code,c.hex FROM items i JOIN colors c ON c.id=i.color_id "
+                "WHERE i.parent_item_id=? AND i.is_active=1 ORDER BY c.color_family,c.name,c.shade_code", (int(parent_id),)).fetchall()
+            return [(r['id'], f"{r['name']} {r['shade_code']}".strip(), r['hex']) for r in rows]
+        except Exception:  # noqa: BLE001
+            return []
+
+    def parent_of(self, item_id):
+        try:
+            r = self.s.conn.execute("SELECT parent_item_id FROM items WHERE id=?", (int(item_id),)).fetchone()
+            return r[0] if r and r[0] else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def color_balances(self, parent_ids, warehouse_id=None):
+        """أرصدة كل ألوان الأصناف الأمهات (بمستودع الفاتورة أو كل المستودعات) — لشريط الأرصدة أسفل الفاتورة."""
+        try:
+            return item_variants.color_balances(self.s.conn, self.s.company_id, list(parent_ids), warehouse_id)
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def estimate_profit(self, kind, rows, warehouse_id=None):
+        """ربح تقديري لفاتورة مبيعات قبل الحفظ: Σ(سعر البيع − متوسط تكلفة الصنف الحالي) × الكمية. تقديري فقط (لا يُستخدم
+        للترحيل؛ التكلفة الفعلية تُحسب عند الترحيل حسب طريقة التقييم المعتمدة FIFO/متوسط). يتطلب صلاحية عرض المخزون، وإلا None."""
+        if kind != 'sales':
+            return None
+        from alhisabat.business import inventory as INV
+        total, any_cost = Decimal(0), False
+        for r in rows or []:
+            item_id, qty_raw, price_raw = r.get('item_id'), r.get('qty'), r.get('price')
+            if not item_id or qty_raw in (None, '') or price_raw in (None, ''):
+                continue
+            qty, price = _dec(qty_raw), _dec(price_raw)
+            if qty <= 0:
+                continue
+            try:
+                report = INV.stock_report(self.s.conn, self.s.user_id, self.s.company_id, item_id=int(item_id),
+                                          warehouse_id=int(warehouse_id) if warehouse_id else None, include_zero=True)
+            except Exception:  # noqa: BLE001 — لا صلاحية أو خطأ: نتجاهل الربح التقديري بصمت
+                return None
+            if not report:
+                continue
+            # متوسط موزون عبر كل المستودعات التي أعادها التقرير (قد يكون أكثر من مستودع إن لم يُحدَّد مستودع للفاتورة)
+            tot_qty = sum((_dec(x['qty_milli']) for x in report), Decimal(0))
+            tot_val = sum((_dec(x['value_base']) for x in report), Decimal(0))
+            if tot_qty <= 0:
+                continue
+            cost = (tot_val * 1000 / tot_qty) / 100 * self._factor(item_id, r.get('unit_id'))      # التكلفة لكل وحدة السطر لا الأساس
+            disc = _dec(r.get('disc') or 0)
+            net_price = price * (1 - disc / 100) if disc else price
+            total += (net_price - cost) * qty
+            any_cost = True
+        return total if any_cost else None
+
+    # ---------------------------------------------------------------- مساعدات التطبيع
+    def _lines_for_engine(self, lines):
+        """خطوط الواجهة → المحرك: [{item_id, qty(milli? يتحملها business), price(minor), tax_rate_id, line_discount_percent}]"""
+        out = []
+        for n, ln in enumerate(lines or [], 1):
+            item_id = ln.get('item_id') or ln.get('first_id')
+            exp_acc = ln.get('expense_account_id')
+            if not item_id and not exp_acc:
+                raise AccountingError(f'السطر {n}: اختر الصنف')
+            qty = _dec(ln.get('qty') if ln.get('qty') not in (None, '') else 1)
+            if qty <= 0:
+                raise AccountingError(f'السطر {n}: الكمية مطلوبة')
+            row = {'qty': qty, 'unit_price': _dec(ln.get('price') if ln.get('price') is not None else ln.get('unit_price')),
+                   'tax_rate_id': _norm_tax(ln.get('tax_rate_id')), 'tax_inclusive': bool(ln.get('tax_included') or ln.get('tax_inclusive')),
+                   'description': ln.get('description') or ''}
+            if item_id:
+                row['item_id'] = int(item_id)
+            if exp_acc:
+                row['expense_account_id'] = int(exp_acc)
+            if ln.get('unit_id'):
+                row['unit_id'] = int(ln['unit_id'])
+            if ln.get('expiry_date'):
+                row['expiry_date'] = ln['expiry_date']
+            if ln.get('lot_no'):
+                row['lot_no'] = str(ln['lot_no']).strip()
+            if ln.get('amount') not in (None, ''):        # إجمالي البند كما كُتب: يمنع فرق التقريب (السعر بخانتين)
+                row['line_total'] = _dec(ln['amount'])
+            disc = _dec(ln.get('disc') or ln.get('discount') or 0)
+            if disc:
+                row['discount_percent'] = disc
+            out.append(row)
+        return out
+
+    def _payments(self, payments):
+        out = []
+        for p in payments or []:
+            amt = _dec(p.get('amount'))
+            if amt <= 0:
+                continue
+            out.append({'account_id': int(p['account_id']), 'amount': amt, 'note': p.get('note') or ''})
+        return out
+
+    # ---------------------------------------------------------------- كتابة
+    def create(self, kind, v):
+        lines = self._lines_for_engine(v.get('lines'))
+        payments = self._payments(v.get('payments'))
+        common = dict(warehouse_id=int(v['warehouse_id']) if v.get('warehouse_id') else None,
+                      currency=(v.get('currency') or '').strip().upper() or None,
+                      discount_percent=_dec(v.get('discount') or 0) if str(v.get('discount') or '').strip() else None,
+                      **({'discount_amount': _dec(v['discount_amount'])} if str(v.get('discount_amount') or '').strip() else {}),
+                      notes=v.get('notes') or '', branch_id=self.s.branch_id)
+        # الضريبة الافتراضية إن سُلّمت كحقل منفصل
+        party = int(v['party_id']) if v.get('party_id') else None
+        if kind == 'sales':
+            return sales.create_invoice(self.s.conn, self.s.user_id, self.s.company_id, v['date'], lines,
+                                        customer_id=party, payments=payments, **common)
+        # مشتريات قد يشمل direct_costs
+        dc = []
+        if v.get('direct_costs'):
+            for x in v['direct_costs']:
+                dc.append({'account_id': int(x['account_id']), 'amount': _dec(x['amount']), 'description': x.get('description') or '',
+                           'capitalize': bool(x.get('capitalize', True))})
+        elif v.get('direct_account') and _dec(v.get('direct_amount') or 0):
+            dc = [{'account_id': int(v['direct_account']), 'amount': _dec(v['direct_amount']), 'description': 'مصروف مباشر'}]
+        return purchases.create_purchase(self.s.conn, self.s.user_id, self.s.company_id, v['date'], lines,
+                                         supplier_id=party, payments=payments, direct_costs=dc,
+                                         supplier_ref=(v.get('supplier_ref') or '').strip(), **common)
+
+    def update(self, kind, invoice_id, v):
+        lines = self._lines_for_engine(v.get('lines'))
+        payments = self._payments(v.get('payments'))
+        common = dict(warehouse_id=int(v['warehouse_id']) if v.get('warehouse_id') else None,
+                      currency=(v.get('currency') or '').strip().upper() or None,
+                      discount_percent=_dec(v.get('discount') or 0) if str(v.get('discount') or '').strip() else None,
+                      **({'discount_amount': _dec(v['discount_amount'])} if str(v.get('discount_amount') or '').strip() else {}),
+                      notes=v.get('notes') or '')
+        party = int(v['party_id']) if v.get('party_id') else None
+        if kind == 'sales':
+            return sales.update_invoice(self.s.conn, self.s.user_id, int(invoice_id), v['date'], lines,
+                                        customer_id=party, payments=payments, **common)
+        dc = [{'account_id': int(x['account_id']), 'amount': _dec(x['amount']), 'description': x.get('description') or '',
+               'capitalize': bool(x.get('capitalize', True))} for x in (v.get('direct_costs') or [])]
+        return purchases.update_purchase(self.s.conn, self.s.user_id, int(invoice_id), v['date'], lines,
+                                         supplier_id=party, payments=payments, direct_costs=dc,
+                                         supplier_ref=(v.get('supplier_ref') or '').strip(), **common)
+
+    def policies(self):
+        """سياسات المبيعات من الإعدادات: allow_edit_posted_invoice / allow_negative_stock / credit_limit_mode."""
+        return sales.get_settings(self.s.conn, self.s.company_id)
+
+    def edit_posted(self, invoice_id, v, reason):
+        """تعديل فاتورة مبيعات مرحّلة (يتطلب تفعيل الخيار من الإعدادات + صلاحية sales.edit_posted)."""
+        lines = self._lines_for_engine(v.get('lines'))
+        payments = self._payments(v.get('payments'))
+        extra = {'discount_amount': _dec(v['discount_amount'])} if str(v.get('discount_amount') or '').strip() else {}
+        return sales.edit_posted_invoice(
+            self.s.conn, self.s.user_id, int(invoice_id), v['date'], lines, reason=reason,
+            customer_id=int(v['party_id']) if v.get('party_id') else None,
+            warehouse_id=int(v['warehouse_id']) if v.get('warehouse_id') else None,
+            currency=(v.get('currency') or '').strip().upper() or None,
+            discount_percent=_dec(v.get('discount') or 0) if str(v.get('discount') or '').strip() else None,
+            payments=payments, notes=v.get('notes') or '', **extra)
+
+    def delete_draft(self, kind, invoice_id):
+        return sales.delete_draft(self.s.conn, self.s.user_id, int(invoice_id)) if kind == 'sales' else purchases.delete_draft(self.s.conn, self.s.user_id, int(invoice_id))
+
+    def post(self, kind, invoice_id):
+        return sales.post_invoice(self.s.conn, self.s.user_id, int(invoice_id)) if kind == 'sales' else purchases.post_purchase(self.s.conn, self.s.user_id, int(invoice_id))
+
+    def do_return(self, kind, original_id, v):
+        lines = [{'orig_line_id': int(x['orig_line_id']), 'qty': _dec(x['qty'])} for x in (v.get('lines') or [])]
+        if not lines:
+            raise AccountingError('حدد كمية مرتجع لبند واحد على الأقل')
+        payments = self._payments(v.get('payments'))
+        if kind == 'sales':
+            return sales.create_return(self.s.conn, self.s.user_id, int(original_id), v['date'], lines, payments=payments, notes=v.get('notes') or '')
+        return purchases.create_purchase_return(self.s.conn, self.s.user_id, int(original_id), v['date'], lines, payments=payments, notes=v.get('notes') or '')
+
+    def return_preview(self, kind, original_id, lines, date):
+        """إجمالي المرتجع (وحدة صغرى) من المحرك نفسه دون كتابة. AccountingError تُرفع كما هي."""
+        ls = [{'orig_line_id': int(x['orig_line_id']), 'qty': _dec(x['qty'])} for x in lines]
+        fn = sales.create_return if kind == 'sales' else purchases.create_purchase_return
+        return fn(self.s.conn, self.s.user_id, int(original_id), date, ls, dry_run=True)
+
+    def cancel(self, kind, invoice_id, cancel_date, reason):
+        return sales.cancel_invoice(self.s.conn, self.s.user_id, int(invoice_id), cancel_date, reason) if kind == 'sales' else purchases.cancel_purchase(self.s.conn, self.s.user_id, int(invoice_id), cancel_date, reason)

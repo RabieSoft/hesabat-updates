@@ -1,0 +1,323 @@
+"""عامل معالجة وإرسال طابور رسائل واتساب في خيط خلفي مستقل (MessagingWorker).
+
+خالص بلا Qt (يعتمد على threading وقاعدة البيانات)، لضمان استقلالية خيط Playwright sync،
+وتطبيق كافة سياسات الأمان: الفواصل العشوائية، الاستراحات الدورية، السقوف، وإيقاف الحظر.
+"""
+import random
+import threading
+import time
+from datetime import datetime
+from typing import Any, Callable, Dict, List, Optional
+
+from alhisabat.database.connection import connect
+from alhisabat.messaging import policy, queue
+from alhisabat.messaging.transports.base import ConnectionStatus, MessageTransport, SendResult
+from alhisabat.messaging.transports.deeplink import DeepLinkTransport
+from alhisabat.messaging.transports.fake import FakeTransport
+from alhisabat.messaging.transports.web import WebTransport, get_shared_transport
+
+
+class MessagingWorker:
+    def __init__(
+        self,
+        db_path: str,
+        branch_id: Optional[int] = None,
+        transport: Optional[MessageTransport] = None,
+    ):
+        self.db_path = str(db_path)
+        self.branch_id = branch_id
+        self._custom_transport = transport
+        self._transport: Optional[MessageTransport] = transport
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._paused = False
+        self._pause_reason = ""
+        self._listeners: List[Callable[[str, Any], None]] = []
+        self._transport_mode: Optional[str] = None
+        self._failure_baseline_id = 0
+        self.manually_stopped = False   # أوقفه المستخدم عمدًا: لا يُشغَّل تلقائيًا
+        self.wait_reason = ""           # سبب عدم الإرسال الآن (خارج النافذة/سقف...) للعرض
+        self.last_error = ""            # آخر عطل في الناقل/المتصفح للعرض
+
+        self.last_status: ConnectionStatus = ConnectionStatus(state="disconnected", message="العامل متوقف")
+        self.batch_sent_count = 0
+        self.target_batch_break = random.randint(15, 25)
+
+    def add_listener(self, callback: Callable[[str, Any], None]) -> None:
+        if callback not in self._listeners:
+            self._listeners.append(callback)
+
+    def remove_listener(self, callback: Callable[[str, Any], None]) -> None:
+        if callback in self._listeners:
+            self._listeners.remove(callback)
+
+    def _notify(self, event: str, data: Any = None) -> None:
+        for cb in list(self._listeners):
+            try:
+                cb(event, data)
+            except Exception:
+                pass
+
+    @property
+    def is_running(self) -> bool:
+        return bool(self._thread and self._thread.is_alive())
+
+    @property
+    def is_paused(self) -> bool:
+        return self._paused
+
+    @property
+    def pause_reason(self) -> str:
+        return self._pause_reason
+
+    def pause(self, reason: str = "موقوف يدويًا") -> None:
+        self._paused = True
+        self._pause_reason = reason
+        self._notify("paused", reason)
+
+    def _reset_failure_baseline(self) -> None:
+        """عند الاستئناف المقصود لا نحتسب الإخفاقات القديمة، وإلا يتوقف الطابور فورًا من جديد."""
+        conn = connect(self.db_path)
+        try:
+            self._failure_baseline_id = queue.latest_terminal_id(conn, self.branch_id)
+        finally:
+            conn.close()
+
+    def resume(self) -> None:
+        self._reset_failure_baseline()
+        self._paused = False
+        self._pause_reason = ""
+        self._notify("resumed", None)
+
+    @property
+    def status_text(self) -> str:
+        """وصف حالة الخدمة للواجهة: يشرح لماذا تبقى الرسائل «في الانتظار»."""
+        if not self.is_running:
+            return "خدمة الطابور متوقفة"
+        if self._paused:
+            return f"خدمة الطابور موقوفة مؤقتًا: {self._pause_reason}"
+        if self.last_error:
+            return f"خدمة الطابور تعمل لكن آخر محاولة فشلت: {self.last_error}"
+        if self.wait_reason:
+            return f"خدمة الطابور تعمل وتنتظر: {self.wait_reason}"
+        return "خدمة الطابور تعمل بنشاط"
+
+    def start(self) -> None:
+        if self.is_running:
+            return
+        self.manually_stopped = False
+        self.last_error = ""
+        self.wait_reason = ""
+        # كان الإيقاف التلقائي (٣ إخفاقات/حظر) يبقى فعّالًا للأبد حتى بعد إعادة تشغيل الخدمة من الواجهة
+        self._reset_failure_baseline()
+        self._paused = False
+        self._pause_reason = ""
+        conn = connect(self.db_path)
+        try:
+            queue.recover_interrupted(conn, self.branch_id)
+            conn.commit()
+        finally:
+            conn.close()
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True, name=f"wa-worker-{self.branch_id}")
+        self._thread.start()
+        self._notify("started", None)
+
+    def stop(self, timeout: float = 3.0) -> None:
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=timeout)
+        self._thread = None
+        self._release_transport()
+        self._notify("stopped", None)
+
+    def _release_transport(self) -> None:
+        """يغلق الناقل المُنشأ داخليًا (الناقل المُمرَّر من الخارج لا نملكه فلا نغلقه)."""
+        tr, self._transport, self._transport_mode = self._transport, None, None
+        if tr is not None and tr is not self._custom_transport:
+            try:
+                if getattr(tr, "shared", False):
+                    tr.reset()          # الناقل المشترك يبقى للاستعمال (واجهة + عامل)؛ نفصل Playwright فقط ونترك النافذة كما هي
+                else:
+                    tr.close()
+            except Exception:
+                pass
+
+    def _get_transport(self, settings_mode: str) -> MessageTransport:
+        """ناقل واحد مُعاد استعماله. (كان يُنشأ ناقل جديد كل ثانيتين فتُفتح نوافذ متصفح متكررة على نفس الملف وتتعارض.)"""
+        if self._custom_transport:
+            return self._custom_transport
+        if self._transport is not None and self._transport_mode != settings_mode:
+            self._release_transport()
+        if self._transport is None:
+            self._transport = DeepLinkTransport() if settings_mode == "deeplink" else get_shared_transport(self.branch_id)
+            self._transport_mode = settings_mode
+        return self._transport
+
+    def check_connection(self) -> ConnectionStatus:
+        """يستعمل ناقل العامل نفسه إن كان يعمل، وإلا ناقلًا مؤقتًا يُفصل بعد الفحص (النافذة تبقى مفتوحة).
+        قد يستغرق ثوانٍ؛ استدعِه من خيط خلفي لا من خيط الواجهة."""
+        conn = connect(self.db_path)
+        try:
+            cfg = queue.get_settings(conn, self.branch_id)
+        finally:
+            conn.close()
+        mode = cfg.get("mode", "web")
+        if self.is_running or self._custom_transport:
+            self.last_status = self._get_transport(mode).check_connection()
+        else:
+            if mode == "deeplink":
+                tr = DeepLinkTransport()
+                try:
+                    self.last_status = tr.check_connection()
+                finally:
+                    tr.close()
+            else:                       # نفس الناقل المشترك الذي يستعمله الطابور: لا نافذة ثانية ولا تعارض
+                self.last_status = get_shared_transport(self.branch_id).check_connection()
+        return self.last_status
+
+    def _sleep_interruptible(self, seconds: float) -> bool:
+        """انتظار قابل للإلغاء. يرجع True إذا طُلب الإيقاف أثناء الانتظار."""
+        step = 0.5
+        elapsed = 0.0
+        while elapsed < seconds:
+            if self._stop_event.is_set():
+                return True
+            time.sleep(min(step, seconds - elapsed))
+            elapsed += step
+        return False
+
+    def _fail_soft(self, text: str) -> None:
+        self.last_error = text
+        self._notify("worker_error", text)
+
+    def _run_loop(self) -> None:
+        conn = connect(self.db_path)
+        try:
+            while not self._stop_event.is_set():
+                if self._paused:
+                    if self._sleep_interruptible(1.0):
+                        break
+                    continue
+
+                cfg = queue.get_settings(conn, self.branch_id)
+                mode = cfg.get("mode", "web")
+                try:
+                    transport = self._get_transport(mode)
+                except Exception as e:  # noqa: BLE001 — تعذر إنشاء الناقل (Chrome/Playwright): لا يموت الخيط بصمت
+                    self._fail_soft(f"تعذر تجهيز الناقل: {e}")
+                    if self._sleep_interruptible(10.0):
+                        break
+                    continue
+
+                # 1) فحص سياسات الأمان
+                daily_sent, hourly_sent, consecutive_failures = queue.get_safety_metrics(
+                    conn, self.branch_id, self._failure_baseline_id
+                )
+                now_str = datetime.now().strftime("%H:%M")
+                effective_daily_cap = policy.compute_warmup_cap(
+                    cfg.get("warmup_start_date"),
+                    configured_daily_cap=cfg.get("daily_cap", 150),
+                )
+
+                can_send, reason = policy.check_send_policy(
+                    daily_sent=daily_sent,
+                    hourly_sent=hourly_sent,
+                    effective_daily_cap=effective_daily_cap,
+                    hourly_cap=cfg.get("hourly_cap", 40),
+                    current_time=now_str,
+                    window_start=cfg.get("window_start", "08:00"),
+                    window_end=cfg.get("window_end", "21:00"),
+                    consecutive_failures=consecutive_failures,
+                )
+
+                self.wait_reason = "" if can_send else reason
+                if not can_send:
+                    if consecutive_failures >= 3:
+                        self.pause(reason)
+                        self._notify("safety_tripped", reason)
+                    if self._sleep_interruptible(3.0):
+                        break
+                    continue
+
+                # 2) جلب الرسالة التالية
+                msg = queue.get_next_queued(conn, self.branch_id)
+                if not msg:
+                    if self._sleep_interruptible(2.0):
+                        break
+                    continue
+
+                # 3) إرسال الرسالة
+                queue.update_message_status(conn, msg["id"], "sending", detail="جاري الإرسال عبر الناقل...")
+                conn.commit()
+                self._notify("message_sending", msg["id"])
+
+                try:
+                    result = transport.send_message(
+                        phone=msg["phone"],
+                        text=msg["body"],
+                        attachment_path=msg.get("attachment_path"),
+                    )
+                except Exception as e:  # noqa: BLE001 — عطل في المتصفح أثناء الإرسال
+                    self._fail_soft(f"عطل أثناء الإرسال: {e}")
+                    self._release_transport()      # يُعاد إنشاء الناقل في الدورة التالية
+                    if int(msg.get("attempts") or 0) + 1 >= 6:
+                        queue.update_message_status(conn, msg["id"], "failed", error_code="transport_error", detail=str(e))
+                    else:
+                        conn.execute("UPDATE wa_outbox SET status='queued' WHERE id=?", (msg["id"],))
+                    conn.commit()
+                    if self._sleep_interruptible(10.0):
+                        break
+                    continue
+                self.last_error = ""
+
+                queue.update_message_status(
+                    conn,
+                    msg["id"],
+                    result.status,
+                    error_code=result.error_code,
+                    detail=result.detail,
+                )
+                conn.commit()
+                self._notify("message_processed", {"id": msg["id"], "result": result})
+
+                # فحص الحظر
+                if result.status == "blocked":
+                    self.pause("تم إيقاف الطابور فورًا لاكتشاف تنبيه حظر/تقييد")
+                    self._notify("blocked_alert", result.detail)
+                    break
+
+                # عداد الدفعة والاستراحة
+                if result.success:
+                    self.batch_sent_count += 1
+                    if self.batch_sent_count >= self.target_batch_break:
+                        break_secs = random.uniform(180, 360)
+                        self._notify("taking_batch_break", {"seconds": break_secs})
+                        if self._sleep_interruptible(break_secs):
+                            break
+                        self.batch_sent_count = 0
+                        self.target_batch_break = random.randint(15, 25)
+
+                # فاصل عشوائي بين الرسائل
+                min_delay = max(5, int(cfg.get("min_delay", 12)))
+                max_delay = max(min_delay, int(cfg.get("max_delay", 35)))
+                delay = random.uniform(min_delay, max_delay)
+                if self._sleep_interruptible(delay):
+                    break
+
+        except Exception as e:
+            self.last_error = f"توقف الخيط: {e}"
+            self._notify("worker_error", str(e))
+        finally:
+            conn.close()
+            self._release_transport()
+
+
+_WORKERS: Dict[str, MessagingWorker] = {}
+
+
+def get_worker(db_path: str, branch_id: Optional[int] = None) -> MessagingWorker:
+    key = f"{db_path}:{branch_id}"
+    if key not in _WORKERS:
+        _WORKERS[key] = MessagingWorker(db_path, branch_id)
+    return _WORKERS[key]

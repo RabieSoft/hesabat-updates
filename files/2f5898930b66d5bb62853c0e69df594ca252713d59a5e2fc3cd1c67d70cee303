@@ -1,0 +1,171 @@
+"""تعريف التنقل في مكان واحد (صفحات/مجموعات/صلاحيات/أيقونات/إفصاح تدريجي). خالص بلا PySide6.
+
+- كل صفحة لها مفتاح ثابت `key` يستعمله errors.py وRelatedPanel ولوحة الأوامر للانتقال.
+- `phase` = المرحلة (من phases.md) التي تُبنى فيها الصفحة؛ ما لم يُبنَ بعد يُعرض بصفحة «قيد البناء» لكنه ظاهر في القائمة.
+- `advanced=True`: يُخفى افتراضيًا ويظهر عند تفعيل «الخيارات المتقدمة» أو عند وجود ما يستدعيه (feature) — الإفصاح التدريجي.
+- `TOP_MENUS`: تعريف الشريط العلوي الثابت (زر ← قائمة منسدلة). كل صفحة تظهر في قائمة واحدة بالضبط (يفحصه الاختبار).
+"""
+from dataclasses import dataclass
+from typing import Optional, Tuple, Union
+
+from alhisabat.ui.core.logic import matches
+
+Perm = Union[None, str, Tuple[str, ...]]
+
+
+@dataclass(frozen=True)
+class PageSpec:
+    key: str
+    title: str
+    group: str
+    perm: Perm = None
+    icon: str = 'list'
+    phase: int = 3
+    advanced: bool = False
+    feature: Optional[str] = None      # مفتاح ميزة يُظهر الصفحة المتقدمة تلقائيًا (مثل multi_currency)
+    keywords: str = ''
+    description: str = ''
+
+
+_PERIOD_PERMS = ('fiscalyear.create', 'fiscalyear.close', 'fiscalyear.reopen', 'period.close', 'period.reopen', 'opening.manage', 'fx.revalue', 'report.view')
+
+PAGES = [
+    # عام
+    PageSpec('dashboard', 'لوحة التحكم', 'عام', 'report.view', 'home', 6, keywords='رئيسية مؤشرات',
+             description='مؤشرات حقيقية من المحرك وصحة النظام مع تفاصيل بنقرة.'),
+    # المحاسبة
+    PageSpec('accounts', 'شجرة الحسابات', 'المحاسبة', 'account.view', 'tree', 3, keywords='حسابات دليل'),
+    PageSpec('mappings', 'ربط الحسابات', 'المحاسبة', 'account.view', 'link', 3, keywords='ربط mapping'),
+    PageSpec('journal', 'القيود المحاسبية', 'المحاسبة', 'journal.view', 'journal', 3, keywords='قيد يومية'),
+    PageSpec('ledger', 'دفتر الأستاذ', 'المحاسبة', 'report.view', 'book', 5, keywords='كشف حساب أستاذ'),
+    PageSpec('currencies', 'العملات وأسعار الصرف', 'المحاسبة', ('currency.manage', 'currency.rates'), 'coins', 4,
+             keywords='عملة عملات دليل صرف سعر'),    # ظاهرة دائمًا: تفعيل أول عملة أجنبية يتم من هذه الصفحة نفسها
+    PageSpec('cost_centers', 'مراكز التكلفة', 'المحاسبة', 'costcenter.view', 'branch', 3, advanced=True, keywords='مركز تكلفة'),
+    # المبيعات والمشتريات
+    PageSpec('sales', 'المبيعات', 'المبيعات والمشتريات', 'sales.view', 'cart', 3, keywords='فاتورة بيع مبيعات كاشير'),
+    PageSpec('purchases', 'المشتريات', 'المبيعات والمشتريات', 'purchases.view', 'truck', 3, keywords='فاتورة شراء مشتريات'),
+    PageSpec('parties', 'العملاء والموردون', 'المبيعات والمشتريات', 'party.view', 'users', 3, keywords='عميل مورد طرف'),
+    PageSpec('aging', 'أعمار الديون', 'المبيعات والمشتريات', 'report.view', 'calendar', 5, keywords='ديون أعمار'),
+    PageSpec('taxes', 'الضرائب', 'المبيعات والمشتريات', 'sales.view', 'percent', 3, keywords='ضريبة'),
+    # المخزون
+    PageSpec('stock', 'الأصناف والأرصدة', 'المخزون', 'inventory.view', 'box', 3, keywords='صنف مخزون رصيد'),
+    PageSpec('item_info', 'معلومات الصنف', 'المخزون', 'inventory.view', 'info', 3, keywords='معلومات صنف بطاقة ملف سعر تكلفة هامش باركود مورد',
+             description='ملف شامل للصنف: التكلفة والأسعار والهامش والرصيد والحركات والمخازن والباركودات.'),
+    PageSpec('stock_ops', 'عمليات المخزون', 'المخزون', 'inventory.view', 'truck', 3, keywords='تحويل تسوية جرد'),
+    PageSpec('warehouses', 'المستودعات', 'المخزون', 'inventory.view', 'building', 3, keywords='مخزن مستودع'),
+    PageSpec('item_categories', 'دليل التصنيفات', 'المخزون', 'inventory.view', 'tree', 3, keywords='تصنيف تصنيفات مجموعات فئات أصناف شجرة'),
+    PageSpec('units', 'دليل الوحدات', 'المخزون', 'inventory.view', 'coins', 3, keywords='وحدة وحدات قياس كرتون قطعة تحويل'),
+    PageSpec('stock_recon', 'مطابقة المخزون مع الأستاذ', 'المخزون', 'inventory.view', 'check', 4, keywords='مطابقة مخزون'),
+    # النقدية
+    PageSpec('cash', 'الصناديق والبنوك', 'النقدية', 'cash.view', 'cash', 3, keywords='صندوق بنك سند قبض صرف'),
+    PageSpec('bank_recon', 'المطابقة البنكية', 'النقدية', 'cash.reconcile', 'bank', 3, keywords='مطابقة كشف بنك'),
+    # الموارد
+    PageSpec('employees', 'الموظفون', 'الموارد', 'employee.view', 'user', 3, keywords='موظف'),
+    PageSpec('payroll', 'الرواتب', 'الموارد', 'payroll.run', 'coins', 3, keywords='راتب مسير'),
+    PageSpec('assets', 'الأصول الثابتة', 'الموارد', 'asset.view', 'building', 3, keywords='أصل إهلاك'),
+    # التقارير
+    PageSpec('reports', 'القوائم والتقارير', 'التقارير والبيانات', 'report.view', 'chart', 5, keywords='تقرير ميزان قائمة دخل ميزانية'),
+    PageSpec('import', 'الاستيراد', 'التقارير والبيانات', 'data.import', 'import', 3, keywords='استيراد csv'),
+    # نهاية الفترة
+    PageSpec('period_end', 'نهاية الفترة والسنة', 'نهاية الفترة', _PERIOD_PERMS, 'lock', 4,
+             keywords='إقفال سنة فترة افتتاحي تقييم سلامة',
+             description='معالج الإقفال: فحوصات ما قبل الإقفال، إقفال السنة، الأرصدة الافتتاحية، إعادة التقييم، فحص السلامة.'),
+    # النظام
+    PageSpec('backup', 'النسخ الاحتياطي', 'النظام', 'backup.manage', 'backup', 3, keywords='نسخ احتياطي استعادة'),
+    PageSpec('audit', 'سجل التدقيق', 'النظام', 'audit.view', 'history', 3, keywords='تدقيق سجل'),
+    PageSpec('users', 'المستخدمون والصلاحيات', 'النظام', 'user.manage', 'shield', 3, keywords='مستخدم صلاحية دور'),
+    PageSpec('branches', 'الفروع', 'النظام', 'settings.manage', 'branch', 3, keywords='فرع فروع إعدادات الفروع'),
+    PageSpec('settings', 'الإعدادات', 'النظام', 'settings.manage', 'settings', 3, keywords='إعدادات'),
+    PageSpec('notebook', 'دفتر الملاحظات', 'النظام', None, 'notes', 3, keywords='ملاحظات دفتر مذكرة تذكير مهام ملاحظة وسوم',
+             description='دفتر ملاحظات احترافي: نص منسق، وسوم وألوان، تثبيت وأرشفة وتذكير، بحث عربي، ومشاركة للقراءة مع الزملاء.'),
+    PageSpec('mobile_link', 'ربط الهاتف (أندرويد)', 'النظام', 'settings.manage', 'settings', 3, keywords='هاتف جوال موبايل أندرويد اقتران qr مزامنة تطبيق',
+             description='تشغيل خدمة المزامنة، رمز QR لاقتران هاتف، وإدارة الأجهزة المقترنة.'),
+    PageSpec('print_guide', 'دليل الطباعة', 'النظام', None, 'print', 3, keywords='طباعة طابعة ورق ترويسة شعار تذييل إيصال pdf',
+             description='شرح الطباعة وإعدادات الطباعة الخاصة بحسابك مع معاينة حية.'),
+    PageSpec('messages', 'دليل الرسائل', 'النظام', ('message.send', 'message.manage'), 'mail', 3,
+             keywords='رسائل واتساب إرسال طابور مسجات قوالب عملاء',
+             description='إدارة وإرسال رسائل واتساب للعملاء والموردين بطابور آمن وقوالب وإعدادات منع الحظر.'),
+]
+
+PAGE_KEYS = tuple(p.key for p in PAGES)
+_BY_KEY = {p.key: p for p in PAGES}
+GROUP_ORDER = ('عام', 'المحاسبة', 'المبيعات والمشتريات', 'المخزون', 'النقدية', 'الموارد', 'التقارير والبيانات', 'نهاية الفترة', 'النظام')
+
+
+def get(key):
+    return _BY_KEY.get(key)
+
+
+def allowed(spec, access):
+    """هل يحق للمستخدم فتح الصفحة؟ perm قد تكون None أو رمزًا أو مجموعة (أي منها يكفي)."""
+    p = spec.perm
+    if not p:
+        return True
+    if isinstance(p, str):
+        return access.has(p)
+    return access.any_of(*p)
+
+
+def visible_pages(access, features=None, show_advanced=False):
+    """الصفحات المرئية مجمّعة: [(المجموعة, [PageSpec])]. تُحذف المجموعات الفارغة وتُخفى المتقدمة ما لم تُفعَّل."""
+    features = features or {}
+    out = {}
+    for spec in PAGES:
+        if not allowed(spec, access):
+            continue
+        if spec.advanced and not (show_advanced or (spec.feature and features.get(spec.feature))):
+            continue
+        out.setdefault(spec.group, []).append(spec)
+    return [(g, out[g]) for g in GROUP_ORDER if g in out]
+
+
+def search_pages(query, access, features=None, show_advanced=True):
+    """بحث عربي (يتجاهل التشكيل والهمزات) في عناوين الصفحات وكلماتها المفتاحية، للصفحات المسموح بها فقط."""
+    res = []
+    for _g, specs in visible_pages(access, features, show_advanced):
+        for s in specs:
+            if not query or matches(query, s.title, s.keywords, s.group):
+                res.append(s)
+    return res
+
+
+# ------------------------------------------------------------------ الشريط العلوي الثابت
+@dataclass(frozen=True)
+class TopMenu:
+    title: str
+    icon: str
+    items: Tuple[Optional[str], ...]     # مفاتيح الصفحات؛ None = فاصل بين مجموعتين داخل القائمة
+    direct: bool = False                 # زر مباشر بلا قائمة (للصفحة الوحيدة فيه)
+
+
+TOP_MENUS = (
+    TopMenu('الرئيسية', 'home', ('dashboard',), direct=True),
+    TopMenu('المحاسبة', 'book', ('journal', 'accounts', 'mappings', None, 'currencies', 'cost_centers', None, 'period_end')),
+    TopMenu('البيع والشراء', 'cart', ('sales', 'purchases', 'parties', None, 'taxes')),
+    TopMenu('المخزون', 'box', ('stock', 'item_info', 'stock_ops', 'warehouses', None, 'item_categories', 'units')),
+    TopMenu('النقدية', 'cash', ('cash', 'bank_recon')),
+    TopMenu('الموارد', 'users', ('employees', 'payroll', 'assets')),
+    TopMenu('التقارير', 'chart', ('reports', 'ledger', 'aging', 'stock_recon')),
+    TopMenu('الأدوات', 'import', ('notebook', None, 'import', 'backup', 'audit', None, 'mobile_link', 'messages')),
+    TopMenu('الإعدادات', 'settings', ('settings', 'users', 'branches', None, 'print_guide')),
+)
+
+
+def top_menus(access, features=None, show_advanced=False):
+    """القوائم المرئية للمستخدم: [(TopMenu, [PageSpec | None])]. تُحذف الصفحات غير المسموحة والمتقدمة المخفية،
+    وتُنظَّف الفواصل (لا فاصل في الأول/الآخر ولا فاصلان متتاليان)، وتُحذف القائمة الفارغة."""
+    visible = {s.key for _g, specs in visible_pages(access, features, show_advanced) for s in specs}
+    out = []
+    for menu in TOP_MENUS:
+        rows = []
+        for k in menu.items:
+            if k is None:
+                if rows and rows[-1] is not None:
+                    rows.append(None)
+            elif k in visible:
+                rows.append(_BY_KEY[k])
+        while rows and rows[-1] is None:
+            rows.pop()
+        if rows:
+            out.append((menu, rows))
+    return out

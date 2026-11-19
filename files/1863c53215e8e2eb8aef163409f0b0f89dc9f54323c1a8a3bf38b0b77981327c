@@ -1,0 +1,50 @@
+"""تقارير مراكز التكلفة: نتيجة كل مركز (إيراد − تكلفة نشاط − مصروفات) لفترة، ومقارنة المراكز، وكشف حركات مركز (Drill Down)."""
+from alhisabat.accounting import balance_engine as be
+from alhisabat.security import permissions
+
+
+def _floor_query(conn, company_id, date_from, date_to):
+    ys = be.year_start(conn, company_id, date_from)
+    if be.year_start(conn, company_id, date_to) != ys:
+        raise Exception("الفترة يجب أن تقع داخل سنة مالية واحدة")
+    return ys, be.perm_floor(conn, company_id, ys)
+
+
+def cost_center_pl(conn, user_id, company_id, date_from, date_to, *, include_unassigned=True):
+    """{cost_center_id أو None: {revenue, cogs, expense, net_result}} لحسابات الإيراد/التكلفة/المصروف فقط."""
+    permissions.require(conn, user_id, company_id, "costcenter.view", check_branch=False)
+    permissions.require(conn, user_id, company_id, "report.view", check_branch=False)
+    ys, fl = _floor_query(conn, company_id, date_from, date_to)
+    ccs = {r["id"]: dict(r) for r in conn.execute("SELECT * FROM cost_centers WHERE company_id=?", (company_id,))}
+    rows = conn.execute(
+        "SELECT l.cost_center_id cc,a.account_type t,SUM(l.debit_base-l.credit_base) net FROM journal_lines l "
+        "JOIN journal_entries e ON e.id=l.entry_id JOIN accounts a ON a.id=l.account_id WHERE e.company_id=? AND e.status IN ('posted','reversed') "
+        "AND e.entry_date BETWEEN ? AND ? AND a.account_type IN ('revenue','cogs','expense') GROUP BY l.cost_center_id,a.account_type",
+        (company_id, date_from, date_to)).fetchall()
+    out = {}
+    for r in rows:
+        key = r["cc"]
+        if key is None and not include_unassigned:
+            continue
+        d = out.setdefault(key, {"revenue": 0, "cogs": 0, "expense": 0})
+        d[r["t"]] += r["net"]
+    result = {}
+    for key, d in out.items():
+        revenue, cogs, expense = -d["revenue"], d["cogs"], d["expense"]
+        cc = ccs.get(key)
+        result[key] = {"cost_center_id": key, "code": cc["code"] if cc else None, "name": cc["name"] if cc else "بلا مركز تكلفة",
+                       "revenue": revenue, "cogs": cogs, "expense": expense, "net_result": revenue - cogs - expense}
+    return result
+
+
+def cost_center_ledger(conn, user_id, company_id, cost_center_id, date_from, date_to, *, limit=200, offset=0):
+    """Drill Down: سطور القيود على مركز التكلفة، مع القيد والمستند المصدر."""
+    permissions.require(conn, user_id, company_id, "costcenter.view", check_branch=False)
+    permissions.require(conn, user_id, company_id, "report.view", check_branch=False)
+    rows = conn.execute(
+        "SELECT l.id,e.id entry_id,e.posted_no,e.entry_date,e.description,e.source_type,e.source_id,a.code account_code,a.name account_name,"
+        "l.currency,l.debit_base,l.credit_base FROM journal_lines l JOIN journal_entries e ON e.id=l.entry_id JOIN accounts a ON a.id=l.account_id "
+        "WHERE l.cost_center_id=? AND e.company_id=? AND e.status IN ('posted','reversed') AND e.entry_date BETWEEN ? AND ? "
+        "ORDER BY e.entry_date,e.posted_no,l.id LIMIT ? OFFSET ?",
+        (cost_center_id, company_id, date_from, date_to, min(int(limit), 1000), int(offset))).fetchall()
+    return [dict(r) for r in rows]

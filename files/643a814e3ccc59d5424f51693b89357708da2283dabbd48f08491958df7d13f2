@@ -1,0 +1,209 @@
+"""منطق شاشات الإدخال (v1.6) الخالص: تحقق لحظي من النماذج وأدوات القيد وتنسيق معاينة الفاتورة.
+
+بلا PySide6 وبلا SQL وبلا float. لا منطق محاسبي هنا: أرقام الفاتورة تأتي من المحرك (preview_totals)،
+وهذه الوحدة تتحقق من صورة الإدخال وتنسّق العرض فقط. المحرك يبقى الحَكَم النهائي عند الحفظ.
+"""
+import re
+from decimal import Decimal
+
+from .logic import normalize_ar, parse_money, to_ascii_digits
+
+_EMAIL = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]{2,}$')
+_CODE = re.compile(r'^[A-Za-z0-9\u0621-\u064A_./-]{1,30}$')
+_PHONE_OK = re.compile(r'^\+?[0-9]{6,15}$')
+MAX_TERMS_DAYS = 3650
+
+
+# ---------------------------------------------------------------- العملاء والموردون
+def normalize_phone(text):
+    """يحوّل الأرقام العربية ويحذف المسافات والشرطات والأقواس: '٧٧٧ 123-456' → '777123456'."""
+    t = to_ascii_digits(text or '')
+    return re.sub(r'[\s\-().]', '', t)
+
+
+def find_similar_name(name, existing_names):
+    """أول اسم موجود يطابق `name` بعد توحيد الهمزات والتشكيل والمسافات (للتنبيه من التكرار)، أو None."""
+    key = ' '.join(normalize_ar(name).split())
+    if not key:
+        return None
+    for n in existing_names:
+        if ' '.join(normalize_ar(n).split()) == key:
+            return n
+    return None
+
+
+def party_errors(kind, v):
+    """أخطاء نموذج الطرف: {الحقل: الرسالة}. الحقول: name, phone, email, credit, terms, opening_amount."""
+    errs = {}
+    label = 'العميل' if kind == 'customer' else 'المورد'
+    if not (v.get('name') or '').strip():
+        errs['name'] = f'اسم {label} مطلوب.'
+    phone = normalize_phone(v.get('phone'))
+    if phone and not _PHONE_OK.match(phone):
+        errs['phone'] = 'رقم الهاتف يجب أن يكون من 6 إلى 15 رقمًا (يقبل + في البداية).'
+    email = (v.get('email') or '').strip()
+    if email and not _EMAIL.match(email):
+        errs['email'] = 'صيغة البريد الإلكتروني غير صحيحة.'
+    if kind == 'customer':
+        try:
+            parse_money(v.get('credit'), 'الحد الائتماني')
+        except ValueError as e:
+            errs['credit'] = str(e)
+    t = to_ascii_digits(str(v.get('terms') or '0')).strip() or '0'
+    if not t.isdigit() or int(t) > MAX_TERMS_DAYS:
+        errs['terms'] = f'أيام السداد عدد صحيح من 0 إلى {MAX_TERMS_DAYS}.'
+    amt = (v.get('opening_amount') or '')
+    if str(amt).strip():
+        try:
+            if parse_money(amt, 'الرصيد الافتتاحي') <= 0:
+                errs['opening_amount'] = 'الرصيد الافتتاحي يجب أن يكون أكبر من صفر (أو اتركه فارغًا).'
+        except ValueError as e:
+            errs['opening_amount'] = str(e)
+    return errs
+
+
+def clean_party_values(kind, v):
+    """قيم جاهزة للخدمة: هاتف منسّق، أرقام لاتينية، فراغات مقصوصة."""
+    out = dict(v)
+    out['name'] = ' '.join((v.get('name') or '').split())
+    out['phone'] = normalize_phone(v.get('phone'))
+    out['email'] = (v.get('email') or '').strip()
+    out['address'] = (v.get('address') or '').strip()
+    out['terms'] = to_ascii_digits(str(v.get('terms') or '0')).strip() or '0'
+    if kind == 'customer':
+        out['credit'] = str(parse_money(v.get('credit')))
+    if str(v.get('opening_amount') or '').strip():
+        out['opening_amount'] = str(parse_money(v.get('opening_amount')))
+    return out
+
+
+# ---------------------------------------------------------------- الأصناف
+def item_errors(v):
+    """أخطاء نموذج الصنف: {الحقل: الرسالة}. الحقول: name, code, unit_id, min_qty, barcode."""
+    errs = {}
+    if not (v.get('name') or '').strip():
+        errs['name'] = 'اسم الصنف مطلوب.'
+    code = (v.get('code') or '').strip()
+    if code and not _CODE.match(code):
+        errs['code'] = 'الكود: حتى 30 حرفًا (أحرف وأرقام و - _ . /) بلا مسافات.'
+    if v.get('unit_id') is None:
+        errs['unit_id'] = 'اختر الوحدة الأساسية.'
+    try:
+        parse_money(v.get('min_qty'), 'الحد الأدنى')
+    except ValueError as e:
+        errs['min_qty'] = str(e)
+    bc = (v.get('barcode') or '').strip()
+    if bc and (len(bc) > 64 or re.search(r'\s', bc)):
+        errs['barcode'] = 'الباركود بلا مسافات وحتى 64 حرفًا.'
+    return errs
+
+
+def clean_item_values(v):
+    out = dict(v)
+    out['name'] = ' '.join((v.get('name') or '').split())
+    out['code'] = (v.get('code') or '').strip()
+    out['barcode'] = to_ascii_digits((v.get('barcode') or '').strip())
+    out['min_qty'] = str(parse_money(v.get('min_qty')))
+    return out
+
+
+# ---------------------------------------------------------------- القيود
+def journal_row_issues(rows):
+    """مشكلات سطور القيد (للتلوين اللحظي): [(رقم_السطر_من_1، المفتاح، الرسالة)]. الأسطر الفارغة تمامًا تُتجاهل."""
+    issues = []
+    for n, r in enumerate(rows, 1):
+        d, c = r.get('debit'), r.get('credit')
+        has_d, has_c = bool(d), bool(c)
+        if not (r.get('account_id') or has_d or has_c or (r.get('memo') or '').strip()):
+            continue
+        if has_d and has_c:
+            issues.append((n, 'debit', f'السطر {n}: لا يجمع بين مدين ودائن، افصلهما في سطرين.'))
+        if (has_d or has_c) and not r.get('account_id'):
+            issues.append((n, 'account_id', f'السطر {n}: اختر الحساب.'))
+        if r.get('account_id') and not (has_d or has_c):
+            issues.append((n, 'debit', f'السطر {n}: أدخل مبلغًا مدينًا أو دائنًا.'))
+        for key, val in (('debit', d), ('credit', c)):
+            if val is not None and val != '' and Decimal(str(val)) < 0:
+                issues.append((n, key, f'السطر {n}: لا يقبل قيمة سالبة.'))
+    return issues
+
+
+def balancing_suggestion(rows):
+    """المبلغ والجهة اللازمان لموازنة القيد: ('debit'|'credit'|None، Decimal). يُستعمل لتعبئة السطر الجديد تلقائيًا."""
+    d = sum((Decimal(str(r.get('debit'))) for r in rows if r.get('debit')), Decimal(0))
+    c = sum((Decimal(str(r.get('credit'))) for r in rows if r.get('credit')), Decimal(0))
+    if d > c:
+        return 'credit', d - c
+    if c > d:
+        return 'debit', c - d
+    return None, Decimal(0)
+
+
+def journal_status_text(d, c):
+    """نص شريط التوازن ونبرته: (النص، 'success'|'warning')."""
+    diff = d - c
+    base = f'المدين {d:,.2f}   الدائن {c:,.2f}   الفرق {diff:,.2f}   '
+    if d > 0 and diff == 0:
+        return base + '✔ متوازن', 'success'
+    return base + '⚠ غير متوازن (يُحفظ كمسودة ويُرفض ترحيله)', 'warning'
+
+
+# ---------------------------------------------------------------- الفاتورة
+def minor_to_text(minor, places=2):
+    """وحدة صغرى (int) → نص بفواصل. None → '—'."""
+    if minor is None:
+        return '—'
+    return f'{(Decimal(int(minor)) / 100):,.{places}f}'
+
+
+def invoice_rows_for_preview(rows):
+    """سطور المحرر → سطور المعاينة: يحذف الفارغ وغير المكتمل (بلا صنف أو كمية) كي لا تُرفض المعاينة أثناء الكتابة."""
+    out = []
+    for r in rows:
+        if not r.get('item_id') or not r.get('qty') or Decimal(str(r['qty'])) <= 0:
+            continue
+        out.append(r)
+    return out
+
+
+def invoice_summary(totals, paid_minor=0, credit=None):
+    """يبني نصوص ملخص الفاتورة من إجماليات المحرك (وحدة صغرى).
+    totals: ناتج preview_totals أو None. credit: ناتج credit_status أو None.
+    يعيد dict: gross, discount, net, tax, total, paid, due, warnings(list)."""
+    warnings = []
+    if not totals:
+        return {'gross': '—', 'discount': '—', 'net': '—', 'tax': '—', 'total': '—', 'paid': minor_to_text(paid_minor),
+                'due': '—', 'warnings': warnings}
+    total = int(totals['total'])
+    due = total - int(paid_minor or 0)
+    if paid_minor and int(paid_minor) > total:
+        warnings.append('مبلغ الدفعة يتجاوز إجمالي الفاتورة.')
+    if credit and due > 0:
+        limit, bal = credit.get('limit') or 0, credit.get('balance') or 0
+        if limit and bal + due > limit:
+            warnings.append(f'تجاوز الحد الائتماني: الرصيد {minor_to_text(bal)} + المتبقي {minor_to_text(due)} '
+                            f'أكبر من الحد {minor_to_text(limit)}.')
+    return {'gross': minor_to_text(totals['gross_ex']), 'discount': minor_to_text(totals['discount_ex']),
+            'net': minor_to_text(totals['net_ex']), 'tax': minor_to_text(totals['tax']), 'total': minor_to_text(total),
+            'paid': minor_to_text(paid_minor), 'due': minor_to_text(due), 'warnings': warnings}
+
+
+def duplicate_item_groups(rows):
+    """الأصناف المكررة في بنود الفاتورة: [(item_id, [أرقام الأسطر من 1])] لكل صنف ظهر في سطرين فأكثر (بترتيب أول ظهور).
+    تُحسب على كل أسطر المحرر (بما فيها الفارغة) كي يطابق الرقم ما يراه المستخدم في الجدول."""
+    seen = {}
+    for n, r in enumerate(rows, 1):
+        iid = r.get('item_id')
+        if iid in (None, ''):
+            continue
+        seen.setdefault(str(iid), []).append(n)
+    return [(k, v) for k, v in seen.items() if len(v) > 1]
+
+
+def duplicate_item_text(groups, name_of=None):
+    """نص تنبيه التكرار: «الصنف X مكرر في الأسطر 1، 3». name_of(رقم_أول_سطر)->اسم الصنف (اختياري). فارغ إن لا تكرار."""
+    parts = []
+    for iid, nums in groups:
+        name = (name_of(nums[0]) if name_of else '') or f'#{iid}'
+        parts.append(f"«{name}» مكرر في الأسطر {'، '.join(str(n) for n in nums)}")
+    return '؛ '.join(parts)

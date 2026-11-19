@@ -1,0 +1,36 @@
+-- 0029: إدارة الفروع + دليل تصنيفات الأصناف (شجرة) + دليل الوحدات (كود/تفعيل/ملاحظات)
+-- الترحيل إضافي فقط: لا يحذف ولا يغيّر بيانات موجودة. العمود النصي items.category يبقى للتوافق (يُزامَن تلقائيًا).
+
+-- الفروع
+ALTER TABLE branches ADD COLUMN code TEXT NOT NULL DEFAULT '';
+ALTER TABLE branches ADD COLUMN address TEXT NOT NULL DEFAULT '';
+ALTER TABLE branches ADD COLUMN phone TEXT NOT NULL DEFAULT '';
+ALTER TABLE branches ADD COLUMN notes TEXT NOT NULL DEFAULT '';
+UPDATE branches SET code='BR'||printf('%02d',(SELECT COUNT(*) FROM branches b2 WHERE b2.company_id=branches.company_id AND b2.id<=branches.id)) WHERE code='';
+CREATE UNIQUE INDEX ux_branches_code ON branches(company_id, code COLLATE NOCASE) WHERE code<>'';
+
+-- الوحدات
+ALTER TABLE units ADD COLUMN code TEXT NOT NULL DEFAULT '';
+ALTER TABLE units ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1));
+ALTER TABLE units ADD COLUMN notes TEXT NOT NULL DEFAULT '';
+UPDATE units SET code='U'||printf('%02d',(SELECT COUNT(*) FROM units u2 WHERE u2.company_id=units.company_id AND u2.id<=units.id)) WHERE code='';
+CREATE UNIQUE INDEX ux_units_code ON units(company_id, code COLLATE NOCASE) WHERE code<>'';
+
+-- تصنيفات الأصناف (شجرة بعدد مستويات غير محدود)
+CREATE TABLE item_categories(
+  id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id),
+  code TEXT NOT NULL DEFAULT '', name TEXT NOT NULL CHECK(length(trim(name))>0),
+  parent_id INTEGER REFERENCES item_categories(id),
+  is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
+  notes TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE UNIQUE INDEX ux_item_cat_name ON item_categories(company_id, COALESCE(parent_id,0), name COLLATE NOCASE);
+CREATE UNIQUE INDEX ux_item_cat_code ON item_categories(company_id, code COLLATE NOCASE) WHERE code<>'';
+CREATE INDEX ix_item_cat_parent ON item_categories(parent_id);
+
+ALTER TABLE items ADD COLUMN category_id INTEGER REFERENCES item_categories(id);
+CREATE INDEX ix_items_category ON items(category_id);
+
+-- ترحيل التصنيفات النصية القديمة إلى الدليل وربط الأصناف بها
+INSERT INTO item_categories(company_id,name) SELECT company_id, TRIM(category) FROM items WHERE TRIM(category)<>'' GROUP BY company_id, TRIM(category) COLLATE NOCASE;
+UPDATE item_categories SET code='C'||printf('%03d',id) WHERE code='';
+UPDATE items SET category_id=(SELECT c.id FROM item_categories c WHERE c.company_id=items.company_id AND c.parent_id IS NULL AND c.name=TRIM(items.category) COLLATE NOCASE) WHERE TRIM(category)<>'' AND category_id IS NULL;

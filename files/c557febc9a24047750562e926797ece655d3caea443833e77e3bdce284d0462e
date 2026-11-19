@@ -1,0 +1,317 @@
+"""نوافذ ألوان الأصناف (أقمشة/ملابس): دليل الألوان، ألوان صنف، أرصدة حسب اللون.
+تعمل عبر page.svc (InventoryService) فقط؛ كل لون صنف فرعي له رصيده وتكلفته (انظر business/item_variants.py)."""
+from decimal import Decimal
+
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import (
+    QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMessageBox, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QColorDialog, QToolButton)
+
+from alhisabat.ui.design.color_swatch import PRESETS, normalize_hex, set_swatch, swatch_icon
+
+
+def _qty(m): return f"{Decimal(m or 0) / 1000:,.3f}".rstrip('0').rstrip('.')
+def _val(v): return f"{Decimal(v or 0) / 100:,.2f}"
+
+
+def _table(headers):
+    t = QTableWidget(0, len(headers))
+    t.setHorizontalHeaderLabels(headers)
+    t.setEditTriggers(QAbstractItemView.NoEditTriggers)
+    t.setSelectionBehavior(QAbstractItemView.SelectRows)
+    t.horizontalHeader().setStretchLastSection(True)
+    return t
+
+
+def _fill(t, rows, hexes=None, swatch_cols=(1,)):
+    """يملأ الجدول؛ hexes (اختياري) = قائمة HEX لكل صف فتظهر معاينة اللون في swatch_cols."""
+    t.setRowCount(0)
+    for n, row in enumerate(rows):
+        r = t.rowCount(); t.insertRow(r)
+        for c, v in enumerate(row):
+            it = QTableWidgetItem(str(v))
+            if hexes is not None and c in swatch_cols:
+                set_swatch(it, hexes[n])
+            t.setItem(r, c, it)
+
+
+class ColorFormDialog(QDialog):
+    def __init__(self, parent, families=()):
+        super().__init__(parent)
+        self.setWindowTitle('لون جديد'); self.setLayoutDirection(Qt.RightToLeft); self.resize(380, 260)
+        f = QFormLayout(self)
+        self.setMinimumWidth(420)
+        self.name = QLineEdit(); self.shade = QLineEdit(); self.code = QLineEdit(); self.hex = QLineEdit()
+        self.family = QComboBox(); self.family.setEditable(True); self.family.addItems([''] + list(families))
+        self.name.setPlaceholderText('مثال: أبيض'); self.shade.setPlaceholderText('الدرجة، مثال: 12')
+        self.code.setPlaceholderText('اختياري (تلقائي)'); self.hex.setPlaceholderText('اختياري، مثال: #FFFFFF')
+        for lab, w in (('اسم اللون *', self.name), ('الدرجة اللونية', self.shade), ('العائلة', self.family),
+                       ('الرمز', self.code)):
+            f.addRow(lab, w)
+        # اللون: معاينة حيّة + زر اختيار + ألوان جاهزة
+        self.preview = QLabel(); self.preview.setFixedSize(34, 22); self.preview.setToolTip('معاينة اللون')
+        pick = QPushButton('اختيار اللون…'); pick.clicked.connect(self._pick)
+        hrow = QHBoxLayout(); hrow.addWidget(self.preview); hrow.addWidget(self.hex, 1); hrow.addWidget(pick)
+        f.addRow('اللون (HEX)', hrow)
+        pal = QHBoxLayout(); pal.setSpacing(3)
+        for nm, hx, fam in PRESETS:
+            b = QToolButton(); b.setIcon(swatch_icon(hx, 18)); b.setToolTip(nm); b.setAutoRaise(True)
+            b.clicked.connect(lambda _c=False, n=nm, h=hx, fm=fam: self._preset(n, h, fm)); pal.addWidget(b)
+        pal.addStretch(1)
+        f.addRow('ألوان جاهزة', pal)
+        self.hex.textChanged.connect(self._sync_preview); self._sync_preview()
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setText('حفظ'); bb.button(QDialogButtonBox.Cancel).setText('إلغاء')
+        bb.accepted.connect(self._ok); bb.rejected.connect(self.reject); f.addRow(bb)
+
+    def _sync_preview(self):
+        h = normalize_hex(self.hex.text())
+        if h is None:
+            self.preview.setStyleSheet('border: 1px solid #d32f2f; border-radius: 3px;'); self.preview.setToolTip('HEX غير صالح (مثال: #FFFFFF)')
+        else:
+            self.preview.setStyleSheet(f'background: {h}; border: 1px solid #7a8699; border-radius: 3px;' if h
+                                       else 'border: 1px dashed #9aa5b5; border-radius: 3px;')
+            self.preview.setToolTip('معاينة اللون' if h else 'لم يُحدَّد لون')
+
+    def _pick(self):
+        init = QColor(normalize_hex(self.hex.text()) or '#FFFFFF')
+        c = QColorDialog.getColor(init, self, 'اختيار اللون')
+        if c.isValid():
+            self.hex.setText(c.name().upper())
+
+    def _preset(self, name, hx, family):
+        self.hex.setText(hx)
+        if not self.name.text().strip(): self.name.setText(name)
+        if not self.family.currentText().strip(): self.family.setCurrentText(family)
+
+    def _ok(self):
+        if not self.name.text().strip():
+            return QMessageBox.warning(self, 'لون جديد', 'اسم اللون مطلوب')
+        if normalize_hex(self.hex.text()) is None:
+            return QMessageBox.warning(self, 'لون جديد', 'قيمة HEX غير صالحة. مثال: #FFFFFF أو FFF')
+        self.accept()
+
+    def values(self):
+        return {'name': self.name.text().strip(), 'shade_code': self.shade.text().strip(), 'color_family': self.family.currentText().strip(),
+                'code': self.code.text().strip(), 'hex': normalize_hex(self.hex.text()) or ''}
+
+
+def add_color_flow(page, parent=None):
+    """يعرض نموذج لون جديد ويحفظه؛ يعيد id أو None."""
+    fams = sorted({c['color_family'] for c in _safe(page, lambda: page.svc.colors(active_only=False)) if c['color_family']})
+    d = ColorFormDialog(parent or page, fams)
+    if d.exec() != QDialog.Accepted: return None
+    ok, cid = page.guarded(page.svc.create_color, d.values(), reload=False)
+    return cid if ok else None
+
+
+def _safe_one(page, fn):
+    try: return fn()
+    except Exception as exc:  # noqa: BLE001
+        page.show_error(exc); return {'colors': 0, 'qty_milli': 0, 'value_base': 0}
+
+
+def _safe(page, fn):
+    try: return fn()
+    except Exception as exc:  # noqa: BLE001
+        page.show_error(exc); return []
+
+
+class ColorsCatalogDialog(QDialog):
+    """دليل الألوان: تعريف مرة واحدة وربطه بأي عدد من الأصناف."""
+    def __init__(self, page):
+        super().__init__(page); self.page = page
+        self.setWindowTitle('دليل الألوان'); self.setLayoutDirection(Qt.RightToLeft); self.resize(640, 440)
+        lay = QVBoxLayout(self)
+        self.tbl = _table(['الرمز', 'اللون', 'الدرجة', 'العائلة', 'HEX', 'الحالة']); lay.addWidget(self.tbl, 1)
+        row = QHBoxLayout()
+        b = QPushButton('+ لون جديد'); b.clicked.connect(self._add); row.addWidget(b)
+        b = QPushButton('تفعيل/تعطيل'); b.clicked.connect(self._toggle); row.addWidget(b)
+        row.addStretch(1)
+        c = QPushButton('إغلاق'); c.clicked.connect(self.accept); row.addWidget(c)
+        lay.addLayout(row); self._rows = []; self._load()
+
+    def _load(self):
+        self._rows = _safe(self.page, lambda: self.page.svc.colors(active_only=False))
+        _fill(self.tbl, [(c['code'], c['name'], c.get('shade_code', ''), c.get('color_family', ''), c.get('hex', ''), 'مفعّل' if c.get('is_active', 1) else 'معطّل') for c in self._rows],
+              hexes=[c.get('hex', '') for c in self._rows], swatch_cols=(1, 4))
+
+    def _add(self):
+        if add_color_flow(self.page, self): self._load()
+
+    def _toggle(self):
+        r = self.tbl.currentRow()
+        if not 0 <= r < len(self._rows): return
+        c = self._rows[r]
+        ok, _ = self.page.guarded(self.page.svc.set_color_active, c['id'], not c['is_active'], reload=False)
+        if ok: self._load()
+
+
+class ItemColorsDialog(QDialog):
+    """ألوان صنف: تفعيل الألوان، إضافة ألوان، وعرض رصيد وقيمة كل لون."""
+    def __init__(self, page, item):
+        super().__init__(page); self.page, self.item = page, dict(item)
+        self.setWindowTitle(f"ألوان الصنف — {item.get('name')}"); self.setLayoutDirection(Qt.RightToLeft); self.resize(700, 460)
+        lay = QVBoxLayout(self)
+        self.note = QLabel(); self.note.setWordWrap(True); lay.addWidget(self.note)
+        self.tbl = _table(['الكود', 'اللون', 'الدرجة', 'العائلة', 'الكمية', 'القيمة']); lay.addWidget(self.tbl, 1)
+        row = QHBoxLayout()
+        self.b_enable = QPushButton('تفعيل الألوان لهذا الصنف'); self.b_enable.clicked.connect(self._enable); row.addWidget(self.b_enable)
+        self.b_add = QPushButton('+ إضافة ألوان'); self.b_add.clicked.connect(self._add); row.addWidget(self.b_add)
+        self.b_link = QPushButton('ربط صنف قائم بلون'); self.b_link.clicked.connect(self._link); row.addWidget(self.b_link)
+        self.b_unlink = QPushButton('فك ربط المحدد'); self.b_unlink.clicked.connect(self._unlink); row.addWidget(self.b_unlink)
+        row.addStretch(1)
+        c = QPushButton('إغلاق'); c.clicked.connect(self.accept); row.addWidget(c)
+        lay.addLayout(row); self._load()
+
+    def _load(self):
+        has = bool(self.item.get('has_variants'))
+        self.b_enable.setVisible(not has); self.b_add.setVisible(has); self.b_link.setVisible(has); self.b_unlink.setVisible(has); self._vrows = []
+        if self.item.get('parent_item_id'):
+            self.note.setText('هذا الصنف لون تابع لصنف أم؛ يُدار من الصنف الأم.'); self.b_enable.hide(); self.b_add.hide(); self.b_link.hide(); self.b_unlink.hide()
+        elif not has:
+            self.note.setText('الصنف بلا ألوان. فعّل الألوان ليُتتبَّع كل لون برصيده وتكلفته وجرده وفواتيره على حدة '
+                              '(متاح لصنف بلا حركات؛ ويصبح الصنف الأم مجمِّعًا لا تُسجَّل عليه حركات).')
+            self.b_enable.setEnabled(not self.item.get('has_moves'))
+            _fill(self.tbl, [])
+            return
+        else:
+            self.note.setText('كل لون صنف مستقل في الفواتير والجرد والتقارير. الأم تعرض المجموع فقط. '
+                              'تنبيه: الأم لا تظهر في الفواتير؛ تظهر ألوانها فقط، فأضف لونًا واحدًا على الأقل.')
+        rows = self._vrows = _safe(self.page, lambda: self.page.svc.item_variants(self.item['id']))
+        _fill(self.tbl, [(r['code'], r['color_name'], r['shade_code'], r['color_family'], _qty(r['qty_milli']), _val(r['value_base'])) for r in rows],
+              hexes=[r.get('hex', '') for r in rows])
+        if rows:
+            t = _safe_one(self.page, lambda: self.page.svc.item_totals(self.item['id']))
+            self.tbl.insertRow(self.tbl.rowCount())
+            r = self.tbl.rowCount() - 1
+            for c, v in enumerate(('', f"الإجمالي ({t['colors']} لون)", '', '', _qty(t['qty_milli']), _val(t['value_base']))):
+                self.tbl.setItem(r, c, QTableWidgetItem(v))
+
+    def _enable(self):
+        ok, _ = self.page.guarded(self.page.svc.enable_item_variants, self.item['id'], reload=False)
+        if ok:
+            self.item['has_variants'] = 1; self._load(); self.page.refresh()
+
+    def _link(self):
+        d = LinkItemDialog(self.page, self.item)
+        d.exec()
+        self._load(); self.page.refresh()
+
+    def _unlink(self):
+        r = self.tbl.currentRow()
+        if not 0 <= r < len(self._vrows): return QMessageBox.information(self, 'فك الربط', 'حدد لونًا من الجدول أولًا')
+        v = self._vrows[r]
+        if QMessageBox.question(self, 'فك الربط', f"فك ارتباط «{v['name']}» بالصنف الأم؟ (ممكن فقط بلا حركات)") != QMessageBox.Yes: return
+        ok, _ = self.page.guarded(self.page.svc.unlink_item_from_parent, v['item_id'], reload=False)
+        if ok: self._load(); self.page.refresh()
+
+    def _add(self):
+        have = {r['color_id'] for r in _safe(self.page, lambda: self.page.svc.item_variants(self.item['id']))}
+        dlg = QDialog(self); dlg.setWindowTitle('اختر الألوان'); dlg.setLayoutDirection(Qt.RightToLeft); dlg.resize(380, 440)
+        v = QVBoxLayout(dlg); lst = QListWidget(); v.addWidget(lst)
+
+        def fill():
+            lst.clear()
+            for c in _safe(self.page, lambda: self.page.svc.colors()):
+                if c['id'] in have: continue
+                it = QListWidgetItem(f"{c['name']} {c['shade_code']}".strip() + (f"  ({c['color_family']})" if c['color_family'] else ''))
+                it.setData(Qt.UserRole, c['id']); it.setFlags(it.flags() | Qt.ItemIsUserCheckable); it.setCheckState(Qt.Unchecked)
+                set_swatch(it, c.get('hex', ''))
+                lst.addItem(it)
+        fill()
+        nb = QPushButton('+ لون جديد في الدليل')
+        nb.clicked.connect(lambda: (add_color_flow(self.page, dlg), fill())); v.addWidget(nb)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setText('إضافة'); bb.button(QDialogButtonBox.Cancel).setText('إلغاء')
+        bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject); v.addWidget(bb)
+        if dlg.exec() != QDialog.Accepted: return
+        ids = [lst.item(i).data(Qt.UserRole) for i in range(lst.count()) if lst.item(i).checkState() == Qt.Checked]
+        if not ids: return
+        if len(ids) == 1:
+            ok, _ = self.page.guarded(self.page.svc.add_item_color, self.item['id'], ids[0], reload=False)
+        else:
+            ok, _ = self.page.guarded(self.page.svc.add_item_colors, self.item['id'], ids, reload=False)
+        if ok: self._load(); self.page.refresh()
+
+
+class LinkItemDialog(QDialog):
+    """ربط صنف قائم (بلا حركات) بالأم الحالية: اختر الصنف ثم اللون ثم «ربط» (يبقى مفتوحًا لربط غيره)."""
+    def __init__(self, page, parent_item):
+        super().__init__(page); self.page, self.parent = page, parent_item
+        self.setWindowTitle(f"ربط أصناف قائمة بـ «{parent_item.get('name')}»"); self.setLayoutDirection(Qt.RightToLeft); self.resize(520, 520)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel('تظهر الأصناف المخزنية التي بلا حركات وبنفس الوحدة الأساسية للأم. يبقى اسم الصنف وكوده كما هما.'))
+        self.search = QLineEdit(); self.search.setPlaceholderText('بحث بالكود أو الاسم…'); self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(self._fill_items); lay.addWidget(self.search)
+        self.lst = QListWidget(); lay.addWidget(self.lst, 1)
+        row = QHBoxLayout(); row.addWidget(QLabel('اللون:'))
+        self.color = QComboBox(); row.addWidget(self.color, 1)
+        nb = QPushButton('+ لون جديد'); nb.clicked.connect(self._new_color); row.addWidget(nb); lay.addLayout(row)
+        self.msg = QLabel(); lay.addWidget(self.msg)
+        row2 = QHBoxLayout()
+        b = QPushButton('ربط'); b.clicked.connect(self._link); row2.addWidget(b); row2.addStretch(1)
+        c = QPushButton('إغلاق'); c.clicked.connect(self.accept); row2.addWidget(c); lay.addLayout(row2)
+        self._fill_items(); self._fill_colors()
+
+    def _fill_items(self):
+        self.lst.clear()
+        rows = _safe(self.page, lambda: self.page.svc.link_candidates(self.parent['id'], self.search.text().strip() or None))
+        for r in rows:
+            it = QListWidgetItem(f"{r['code']} — {r['name']}"); it.setData(Qt.UserRole, r['id']); self.lst.addItem(it)
+        if not rows and not self.search.text().strip():
+            e = QListWidgetItem('لا توجد أصناف صالحة للربط. الصنف الذي له حركات (فواتير/أرصدة/تسويات) أو وحدته تختلف عن وحدة الأم '
+                                'أو هو أم بألوان لا يظهر هنا. أنشئ لونًا جديدًا من «+ إضافة ألوان» أو أضف صنفًا جديدًا بلا حركات.')
+            e.setFlags(Qt.NoItemFlags); self.lst.addItem(e)
+
+    def _fill_colors(self, select=None):
+        have = {r['color_id'] for r in _safe(self.page, lambda: self.page.svc.item_variants(self.parent['id']))}
+        self.color.clear()
+        for c in _safe(self.page, lambda: self.page.svc.colors()):
+            if c['id'] in have: continue
+            self.color.addItem(swatch_icon(c.get('hex', '')), f"{c['name']} {c['shade_code']}".strip() + (f"  ({c['color_family']})" if c['color_family'] else ''), c['id'])
+        if select is not None:
+            i = self.color.findData(select)
+            if i >= 0: self.color.setCurrentIndex(i)
+
+    def _new_color(self):
+        cid = add_color_flow(self.page, self)
+        if cid: self._fill_colors(select=cid)
+
+    def _link(self):
+        it, cid = self.lst.currentItem(), self.color.currentData()
+        if not it: return QMessageBox.information(self, 'الربط', 'اختر صنفًا من القائمة')
+        if cid is None: return QMessageBox.information(self, 'الربط', 'اختر لونًا غير مستخدم لهذه الأم أو أضف لونًا جديدًا')
+        ok, _ = self.page.guarded(self.page.svc.link_item_to_parent, it.data(Qt.UserRole), self.parent['id'], cid, reload=False)
+        if ok:
+            self.msg.setText(f"تم ربط «{it.text().split(' — ', 1)[-1]}» باللون {self.color.currentText().split('  (')[0]}")
+            self._fill_items(); self._fill_colors()
+
+
+class StockByColorDialog(QDialog):
+    """أرصدة وقيم الألوان: لكل صنف أم، أو لدرجة/عائلة لونية عبر كل الأصناف (مثل: كل أبيض درجة 12)."""
+    def __init__(self, page, item=None):
+        super().__init__(page); self.page = page
+        self.parent_id = item['id'] if item and item.get('has_variants') else None
+        self.setWindowTitle('أرصدة حسب اللون'); self.setLayoutDirection(Qt.RightToLeft); self.resize(820, 480)
+        lay = QVBoxLayout(self)
+        top = QHBoxLayout()
+        self.family = QComboBox(); self.family.addItem('كل العائلات', '')
+        for f in sorted({c['color_family'] for c in _safe(page, lambda: page.svc.colors(active_only=False)) if c['color_family']}):
+            self.family.addItem(f, f)
+        self.shade = QLineEdit(); self.shade.setPlaceholderText('الدرجة (مثال: 12)'); self.shade.setClearButtonEnabled(True)
+        go = QPushButton('عرض'); go.clicked.connect(self._load)
+        for w in (QLabel('العائلة:'), self.family, QLabel('الدرجة:'), self.shade, go): top.addWidget(w)
+        top.addStretch(1); lay.addLayout(top)
+        self.tbl = _table(['الصنف الأم', 'اللون', 'الدرجة', 'العائلة', 'المستودع', 'الكمية', 'القيمة']); lay.addWidget(self.tbl, 1)
+        self.total = QLabel(); lay.addWidget(self.total)
+        c = QPushButton('إغلاق'); c.clicked.connect(self.accept); lay.addWidget(c, 0, Qt.AlignLeft)
+        self._load()
+
+    def _load(self):
+        flt = {k: v for k, v in (('parent_id', self.parent_id), ('color_family', self.family.currentData()), ('shade_code', self.shade.text().strip())) if v}
+        rows = _safe(self.page, lambda: self.page.svc.stock_by_color(**flt))
+        _fill(self.tbl, [(r['parent_name'], r['color_name'], r['shade_code'], r['color_family'], r['warehouse_name'],
+                          _qty(r['qty_milli']), _val(r['value_base'])) for r in rows], hexes=[r.get('hex', '') for r in rows])
+        self.total.setText(f"الإجمالي: {_qty(sum(r['qty_milli'] for r in rows))}  |  القيمة: {_val(sum(r['value_base'] for r in rows))}")

@@ -1,0 +1,227 @@
+"""شجرة الحسابات + ربط الحسابات. بلا float، بلا منطق محاسبي.
+"""
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QStackedWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget, QDialog, QFormLayout, QDialogButtonBox, QMenu
+
+from alhisabat.ui.core.actions import Action, ActionGroup
+from alhisabat.ui.core.base_page import BasePage
+from alhisabat.ui.core.accounts_service import AccountsService
+from alhisabat.ui.core.permissions import ActionState
+
+class AccountsPage(BasePage):
+    key='accounts'; title='شجرة الحسابات'; icon='tree'; required_permission='account.view'
+    def build(self):
+        self.svc=AccountsService(self.session); self._nodes=[]; self._selected=None
+        lay=QVBoxLayout(self); lay.setContentsMargins(6,6,6,6)
+        bar=QHBoxLayout()
+        self.search=QLineEdit(); self.search.setPlaceholderText('ابحث بالرقم أو اسم الحساب…'); self.search.setClearButtonEnabled(True); self.search.textChanged.connect(lambda t: self._fill())
+        bar.addWidget(self.search,1)
+        for text,fn in (('توسيع الكل', lambda: self.tree.expandAll()), ('طي الكل', lambda: self.tree.collapseAll())):
+            from PySide6.QtWidgets import QPushButton
+            b=QPushButton(text); b.clicked.connect(fn); bar.addWidget(b)
+        lay.addLayout(bar)
+        self.stack=QStackedWidget()
+        self.tree=QTreeWidget(); self.tree.setHeaderLabels(['الحساب','النوع','نشط']); self.tree.setLayoutDirection(Qt.RightToLeft); self.tree.setAlternatingRowColors(True)
+        self.tree.itemSelectionChanged.connect(self._on_select); self.tree.itemDoubleClicked.connect(lambda _i,_c: self.do('edit'))
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu); self.tree.customContextMenuRequested.connect(self._menu)
+        self.stack.addWidget(self.tree)
+        from alhisabat.ui.components.basic import ask_reason as _a  # noqa
+        self.empty=QLabel('لا توجد حسابات بعد. حمّل الشجرة الافتراضية.'); self.empty.setAlignment(Qt.AlignCenter); self.stack.addWidget(self.empty)
+        lay.addWidget(self.stack,1)
+    def refresh(self):
+        if not getattr(self,'_built',False): return
+        try: self._nodes=self.svc.tree()
+        except Exception as e: self.show_error(e); self._nodes=[]
+        self._fill(); self.actions_changed.emit()
+    def _fill(self):
+        self.tree.clear()
+        q=(self.search.text() or '').strip().lower()
+        def add(nodes, parent):
+            for n in nodes or []:
+                name=f"{n.get('code','')} — {n.get('name','')}"
+                if q and q not in name.lower() and q not in (n.get('name','').lower()): 
+                    # ابحث في الأطفال أيضًا
+                    if n.get('children'):
+                        tmp=QTreeWidgetItem([n.get('name','') or 'مجلد','', ''])
+                        add(n.get('children'), tmp)
+                        if tmp.childCount(): parent.addChild(tmp); tmp.setExpanded(True)
+                    continue
+                it=QTreeWidgetItem([name, n.get('account_type') or '', 'نشط' if n.get('is_active') else 'معطل'])
+                it.setData(0, Qt.UserRole, n)
+                if not n.get('is_active'): it.setForeground(0, QColor('#999'))
+                parent.addChild(it)
+                if n.get('children'): add(n.get('children'), it)
+                it.setExpanded(True)
+        # self._nodes قد يكون مسطحًا أو شجريًا حسب coa.get_tree
+        # نحاول التعامل مع الشكلين
+        root=QTreeWidgetItem(); root.setHidden(True); self.tree.addTopLevelItem(root)
+        # إذا كان مسطحًا: نبني شجرة بسيطة حسب parent_id
+        if self._nodes and isinstance(self._nodes, list) and self._nodes and 'children' not in self._nodes[0]:
+            # مسطح — اعرضه مسطحًا
+            for n in self._nodes:
+                name=f"{n.get('code','')} — {n.get('name','')}"
+                if q and q not in name.lower(): continue
+                it=QTreeWidgetItem([name, n.get('account_type') or '', 'نشط' if n.get('is_active') else 'معطل'])
+                it.setData(0, Qt.UserRole, n); self.tree.addTopLevelItem(it)
+            self.tree.takeTopLevelItem(0)
+        else:
+            for n in self._nodes:
+                name=f"{n.get('code','')} — {n.get('name','')}"
+                if q and q not in name.lower() and not n.get('children'): continue
+                it=QTreeWidgetItem([name, n.get('account_type') or '', 'نشط' if n.get('is_active') else 'معطل'])
+                it.setData(0, Qt.UserRole, n)
+                if n.get('children'): add(n.get('children'), it); it.setExpanded(True)
+                self.tree.addTopLevelItem(it)
+            self.tree.takeTopLevelItem(0)
+        self.stack.setCurrentIndex(0 if self.tree.topLevelItemCount() else 1)
+    def _on_select(self):
+        it=self.tree.currentItem(); self._selected=it.data(0, Qt.UserRole) if it else None; self.actions_changed.emit()
+    def _menu(self,pos):
+        it=self.tree.itemAt(pos)
+        if it: self.tree.setCurrentItem(it)
+        node=self._selected
+        menu=QMenu(self.tree); menu.setLayoutDirection(Qt.RightToLeft)
+        if node and self.access.has('account.create') and node.get('is_group') and node.get('is_active',1):
+            a=menu.addAction('➕ إضافة حساب فرعي'); a.triggered.connect(lambda: self._add(parent_id=node['id'], parent_type=node.get('account_type')))
+            menu.addSeparator()
+        if self.access.has('account.create'):
+            a=menu.addAction('➕ حساب جديد'); a.triggered.connect(lambda: self._add())
+            menu.addSeparator()
+        if node:
+            if self.access.has('account.edit'):
+                a=menu.addAction('✏️ تعديل'); a.triggered.connect(lambda: self.do('edit'))
+            if self.access.has('account.move'):
+                a=menu.addAction('↔️ نقل الحساب'); a.triggered.connect(lambda: self.do('move'))
+            if self.access.has('account.merge') and not node.get('is_group'):
+                a=menu.addAction('🔀 دمج الحساب'); a.triggered.connect(lambda: self.do('merge'))
+            if self.access.has('account.deactivate'):
+                verb='تعطيل' if node.get('is_active',1) else 'تفعيل'; a=menu.addAction(f'🚫 {verb}'); a.triggered.connect(lambda: self.do('toggle'))
+            if self.access.has('account.delete') and not node.get('is_system'):
+                a=menu.addAction('🗑️ حذف الحساب'); a.triggered.connect(lambda: self.do('delete'))
+        if menu.actions(): menu.exec(self.tree.viewport().mapToGlobal(pos))
+    def _state(self,k):
+        if k=='add': return self.access.state('account.create')
+        if k=='load_default': return self.access.state('account.system_edit')
+        if not self._selected: return ActionState(False,'حدد حسابًا')
+        if k=='edit': return self.access.state('account.edit')
+        if k=='toggle': return self.access.state('account.deactivate')
+        if k=='move':
+            if self._selected.get('is_system'): return self.access.state('account.system_edit')
+            return self.access.state('account.move')
+        if k=='merge':
+            if self._selected.get('is_group'): return ActionState(False, 'الدمج بين حسابات الحركة فقط')
+            if self._selected.get('is_system'): return ActionState(False, 'حساب نظامي محمي: لا يمكن دمجه')
+            return self.access.state('account.merge')
+        if k=='delete':
+            if self._selected.get('is_system'): return ActionState(False, 'حساب نظامي محمي: لا يمكن حذفه')
+            return self.access.state('account.delete')
+        return ActionState(True)
+    def ribbon_groups(self):
+        def a(k,lab,icon,**kw): return Action(k,lab,icon,state_fn=lambda kk=k: self._state(kk), handler=lambda kk=k: self.do(kk), **kw)
+        return [ActionGroup('حساب',[
+            a('add','+ حساب جديد','new',primary=True),
+            a('edit','تعديل','edit'),
+            a('move','نقل','truck'),
+            a('merge','دمج','link'),
+            a('toggle','تفعيل/تعطيل','refresh'),
+            a('delete','حذف','delete',danger=True),
+            a('load_default','تحميل الشجرة الافتراضية','refresh')
+        ]), ActionGroup('عرض',[Action('refresh','تحديث','refresh',handler=self.refresh)])]
+    def do(self,k):
+        st=self._state(k)
+        if not st.enabled: return QMessageBox.information(self,self.title,st.reason)
+        if k=='add': return self._add()
+        if k=='load_default':
+            if self.svc.tree():   # لدى الشركة شجرة: لا تحميل فوقها، بل استكمال الربط النظامي الناقص فقط
+                if QMessageBox.question(self,'استكمال الربط النظامي','لدى الشركة شجرة حسابات بالفعل، ولا يمكن تحميل القالب فوقها.\nهل تريد استكمال ربط الحسابات النظامية الناقصة (وإنشاء الحسابات الناقصة منها كحساب الأرصدة الافتتاحية المعلقة)؟ لن يتغير أي ربط قائم.', QMessageBox.Yes|QMessageBox.No)!=QMessageBox.Yes: return
+                ok,added=self.guarded(self.svc.complete_mappings, reload=False)
+                if ok:
+                    QMessageBox.information(self,'استكمال الربط', f'تم ربط {len(added)} حساب نظامي.' if added else 'كل الحسابات النظامية مربوطة بالفعل.')
+                    self.refresh(); self.window_.data_changed(self.key)
+                return
+            if QMessageBox.question(self,'تحميل الشجرة الافتراضية','سيتم إنشاء شجرة الحسابات الافتراضية وربط الحسابات النظامية.', QMessageBox.Yes|QMessageBox.No)!=QMessageBox.Yes: return
+            ok,_=self.guarded(self.svc.load_default, reload=False)
+            if ok: self.refresh(); self.window_.data_changed(self.key)
+            return
+        if k=='edit':
+            from alhisabat.ui.app_dialogs.accounts import AccountEditDialog
+            d=AccountEditDialog(self, self._selected)
+            if self.exec_form(d):
+                ok,_=self.guarded(self.svc.edit, self._selected['id'], d.values(), reload=False)
+                if ok: self.refresh(); self.window_.data_changed(self.key)
+        if k=='move':
+            from alhisabat.ui.app_dialogs.accounts import AccountMoveDialog
+            d=AccountMoveDialog(self, self._selected)
+            if self.exec_form(d):
+                v=d.values()
+                ok,_=self.guarded(self.svc.move_account, self._selected['id'], v['new_parent_id'], reload=False)
+                if ok: self.refresh(); self.window_.data_changed(self.key)
+        if k=='merge':
+            from alhisabat.ui.app_dialogs.accounts import AccountMergeDialog
+            d=AccountMergeDialog(self, self._selected)
+            if self.exec_form(d):
+                v=d.values()
+                ok,_=self.guarded(self.svc.merge_accounts, self._selected['id'], v['target_id'], v['reason'], reload=False)
+                if ok: self.refresh(); self.window_.data_changed(self.key)
+        if k=='delete':
+            code=self._selected.get('code','')
+            name=self._selected.get('name','')
+            if QMessageBox.question(self,'حذف الحساب',f"هل أنت متأكد من حذف الحساب «{code} — {name}» نهائيًا؟", QMessageBox.Yes|QMessageBox.No)!=QMessageBox.Yes: return
+            ok,_=self.guarded(self.svc.delete_account, self._selected['id'], reload=False)
+            if ok: self.refresh(); self.window_.data_changed(self.key)
+        if k=='toggle':
+            verb='تعطيل' if self._selected.get('is_active',1) else 'تفعيل'
+            ok,_=self.guarded(self.svc.set_active, self._selected['id'], not bool(self._selected.get('is_active')), reload=False)
+            if ok: self.refresh(); self.window_.data_changed(self.key)
+    def _add(self, parent_id=None, parent_type=None):
+        from alhisabat.ui.app_dialogs.accounts import AccountCreateDialog
+        d=AccountCreateDialog(self, parent_id, parent_type)
+        if self.exec_form(d):
+            ok,_=self.guarded(self.svc.create, d.values(), reload=False)
+            if ok: self.refresh(); self.window_.data_changed(self.key)
+
+
+class MappingsPage(BasePage):
+    key='mappings'; title='ربط الحسابات'; icon='link'; required_permission='account.view'
+    def build(self):
+        self.svc=AccountsService(self.session); self._rows=[]; self._sel=None
+        lay=QVBoxLayout(self); lay.setContentsMargins(6,6,6,6)
+        from alhisabat.ui.components.datagrid import DataGrid
+        from alhisabat.ui.components.grid_logic import Column
+        self.grid=DataGrid([Column('label','المفتاح',width=180), Column('account','الحساب المربوط',width=300), Column('status','التفاصيل',width=300)], grid_id='mappings')
+        self.grid.selectionChangedRows.connect(lambda rows: (setattr(self,'_sel', rows[0] if len(rows)==1 else None), self.actions_changed.emit()))
+        self.grid.rowActivated.connect(lambda _r: self.do('edit'))
+        lay.addWidget(self.grid,1)
+    def refresh(self):
+        if not getattr(self,'_built',False): return
+        keep=self._sel['key'] if self._sel else None
+        try:
+            from alhisabat.ui.core import logic as L
+            rows=[]
+            for m in self.svc.mappings():
+                need=L.MAP_KEYS_NEEDED_FOR.get(m['key']); status='مربوط' if m['account_id'] else ('غير مربوط — يلزم لـ '+need if need else 'غير مربوط')
+                rows.append({'id':m['key'],'key':m['key'],'label':L.MAP_KEYS_AR.get(m['key'],m['key']),'account':m['account'],'status':status,'account_id':m['account_id']})
+            self._rows=rows; self.grid.set_rows(rows)
+            if keep is not None: self.grid.select_where(lambda r: r['key']==keep)
+        except Exception as e: self.show_error(e)
+        self.actions_changed.emit()
+    def _state(self,k):
+        if k=='edit':
+            if not self._sel: return ActionState(False,'حدد صفًا')
+            return self.access.state('account.system_edit')
+        return ActionState(True)
+    def ribbon_groups(self):
+        def a(k,lab,icon,**kw): return Action(k,lab,icon,state_fn=lambda kk=k: self._state(kk), handler=lambda kk=k: self.do(kk), **kw)
+        return [ActionGroup('ربط',[a('edit','ربط/تعديل الحساب','edit',primary=True)]), ActionGroup('عرض',[Action('refresh','تحديث','refresh',handler=self.refresh)])]
+    def do(self,k):
+        st=self._state(k)
+        if not st.enabled: return QMessageBox.information(self,self.title,st.reason)
+        if k=='edit':
+            from alhisabat.ui.app_dialogs.accounts import MappingDialog
+            d=MappingDialog(self, self._sel)
+            if self.exec_form(d):
+                ok,_=self.guarded(self.svc.set_mapping, self._sel['key'], d.values()['account_id'], reload=False)
+                if ok: self.refresh(); self.window_.data_changed(self.key)
+
+

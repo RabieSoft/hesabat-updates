@@ -1,0 +1,149 @@
+"""إدارة الفروع: إنشاء/تعديل/تفعيل/حذف آمن. كل عملية بصلاحية settings.manage وتُسجَّل في التدقيق.
+
+القاعدة: الفرع الذي له أي حركة أو ارتباط لا يُحذف بل يُعطَّل. لا يجوز تعطيل آخر فرع نشط،
+ولا تعطيل فرع هو الفرع الوحيد المتاح لمستخدم مقيَّد (حتى لا يُقفل عليه الدخول).
+"""
+import re
+
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.audit import audit
+from alhisabat.database.tx import transaction
+from alhisabat.security import permissions
+
+_PERM = "settings.manage"
+
+
+def _req(conn, actor_id, company_id):
+    permissions.require(conn, actor_id, company_id, _PERM, check_branch=False)
+
+
+def _branch(conn, branch_id, company_id):
+    r = conn.execute("SELECT * FROM branches WHERE id=? AND company_id=?", (int(branch_id), company_id)).fetchone()
+    if not r:
+        raise AccountingError("الفرع غير موجود في هذه الشركة")
+    return r
+
+
+def _clean(s):
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+
+def _next_code(conn, company_id):
+    n = conn.execute(
+        "SELECT COALESCE(MAX(CAST(substr(code,3) AS INTEGER)),0)+1 FROM branches WHERE company_id=? AND code GLOB 'BR[0-9]*'",
+        (company_id,)).fetchone()[0]
+    return "BR%02d" % n
+
+
+def _check_unique(conn, company_id, name, code, exclude_id=None):
+    q = "SELECT 1 FROM branches WHERE company_id=? AND name=? COLLATE NOCASE AND id<>?"
+    if conn.execute(q, (company_id, name, exclude_id or 0)).fetchone():
+        raise AccountingError("يوجد فرع بنفس الاسم")
+    if code and conn.execute("SELECT 1 FROM branches WHERE company_id=? AND code=? COLLATE NOCASE AND id<>?",
+                             (company_id, code, exclude_id or 0)).fetchone():
+        raise AccountingError("يوجد فرع بنفس الكود")
+
+
+def branch_usage(conn, branch_id):
+    """عدد السجلات المرتبطة بالفرع في كل الجداول (يُكتشف ديناميكيًا من أعمدة branch_id)."""
+    total, detail = 0, {}
+    for (t,) in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchall():
+        if t in ("branches",):
+            continue
+        cols = [r[1] for r in conn.execute(f"PRAGMA table_info({t})")]
+        if "branch_id" in cols:
+            n = conn.execute(f"SELECT COUNT(*) FROM {t} WHERE branch_id=?", (int(branch_id),)).fetchone()[0]
+            if n:
+                detail[t] = n
+                total += n
+    return total, detail
+
+
+def list_branches(conn, actor_id, company_id, include_inactive=True):
+    _req(conn, actor_id, company_id)
+    q = ("SELECT b.id,b.code,b.name,b.address,b.phone,b.notes,b.is_active,"
+         "(SELECT COUNT(*) FROM user_branch_access a WHERE a.branch_id=b.id) restricted_users "
+         "FROM branches b WHERE b.company_id=?")
+    if not include_inactive:
+        q += " AND b.is_active=1"
+    rows = [dict(r) for r in conn.execute(q + " ORDER BY b.id", (company_id,))]
+    for r in rows:
+        r["usage"] = branch_usage(conn, r["id"])[0]
+    return rows
+
+
+def create_branch(conn, actor_id, company_id, name, *, code=None, address="", phone="", notes=""):
+    _req(conn, actor_id, company_id)
+    name = _clean(name)
+    if not name:
+        raise AccountingError("اسم الفرع مطلوب")
+    code = _clean(code) or _next_code(conn, company_id)
+    _check_unique(conn, company_id, name, code)
+    with transaction(conn):
+        bid = conn.execute(
+            "INSERT INTO branches(company_id,name,code,address,phone,notes) VALUES(?,?,?,?,?,?)",
+            (company_id, name, code, _clean(address), _clean(phone), (notes or "").strip())).lastrowid
+        audit.log(conn, actor_id, "create_branch", "branches", bid, after={"code": code, "name": name})
+    return bid
+
+
+def edit_branch(conn, actor_id, company_id, branch_id, *, name=None, code=None, address=None, phone=None, notes=None):
+    _req(conn, actor_id, company_id)
+    b = _branch(conn, branch_id, company_id)
+    new = {
+        "name": b["name"] if name is None else _clean(name),
+        "code": b["code"] if code is None else _clean(code),
+        "address": b["address"] if address is None else _clean(address),
+        "phone": b["phone"] if phone is None else _clean(phone),
+        "notes": b["notes"] if notes is None else (notes or "").strip(),
+    }
+    if not new["name"]:
+        raise AccountingError("اسم الفرع مطلوب")
+    if not new["code"]:
+        new["code"] = b["code"] or _next_code(conn, company_id)
+    _check_unique(conn, company_id, new["name"], new["code"], exclude_id=b["id"])
+    old = {k: b[k] for k in new}
+    if old == new:
+        return b["id"]
+    with transaction(conn):
+        conn.execute("UPDATE branches SET name=?,code=?,address=?,phone=?,notes=? WHERE id=?",
+                     (new["name"], new["code"], new["address"], new["phone"], new["notes"], b["id"]))
+        audit.log(conn, actor_id, "edit_branch", "branches", b["id"], old, new)
+    return b["id"]
+
+
+def set_branch_active(conn, actor_id, company_id, branch_id, active):
+    _req(conn, actor_id, company_id)
+    b = _branch(conn, branch_id, company_id)
+    active = bool(active)
+    if bool(b["is_active"]) == active:
+        return
+    if not active:
+        others = conn.execute("SELECT COUNT(*) FROM branches WHERE company_id=? AND is_active=1 AND id<>?",
+                              (company_id, b["id"])).fetchone()[0]
+        if not others:
+            raise AccountingError("لا يمكن تعطيل آخر فرع نشط")
+        stuck = conn.execute(
+            "SELECT u.full_name FROM user_branch_access a JOIN users u ON u.id=a.user_id "
+            "WHERE a.branch_id=? AND (SELECT COUNT(*) FROM user_branch_access a2 JOIN branches b2 ON b2.id=a2.branch_id "
+            "WHERE a2.user_id=a.user_id AND b2.is_active=1 AND b2.id<>a.branch_id)=0", (b["id"],)).fetchall()
+        if stuck:
+            names = "، ".join(r[0] for r in stuck[:3])
+            raise AccountingError(f"الفرع هو الفرع الوحيد المتاح للمستخدم: {names}. أضف له فرعًا آخر قبل التعطيل")
+    with transaction(conn):
+        conn.execute("UPDATE branches SET is_active=? WHERE id=?", (int(active), b["id"]))
+        audit.log(conn, actor_id, "branch_active", "branches", b["id"], after={"active": active})
+
+
+def delete_branch(conn, actor_id, company_id, branch_id):
+    _req(conn, actor_id, company_id)
+    b = _branch(conn, branch_id, company_id)
+    total, detail = branch_usage(conn, b["id"])
+    if total:
+        raise AccountingError("لا يمكن حذف فرع له حركات أو ارتباطات؛ عطِّله بدلًا من حذفه")
+    if conn.execute("SELECT COUNT(*) FROM branches WHERE company_id=?", (company_id,)).fetchone()[0] <= 1:
+        raise AccountingError("لا يمكن حذف الفرع الوحيد")
+    with transaction(conn):
+        conn.execute("DELETE FROM user_branch_access WHERE branch_id=?", (b["id"],))
+        conn.execute("DELETE FROM branches WHERE id=?", (b["id"],))
+        audit.log(conn, actor_id, "delete_branch", "branches", b["id"], before={"code": b["code"], "name": b["name"]})

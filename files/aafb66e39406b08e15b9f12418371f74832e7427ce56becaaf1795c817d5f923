@@ -1,0 +1,64 @@
+"""شاشة «لا تنسَ ذكر الله»: تُعرض فوق منطقة العمل حين تُغلق كل التبويبات، وتحتها أذكار الصباح أو المساء حسب الوقت."""
+from datetime import datetime
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QFrame, QLabel, QScrollArea, QVBoxLayout, QWidget
+
+from alhisabat.ui.core import adhkar as AD
+from alhisabat.ui.design.tokens import BRAND
+
+
+class EmptyWorkspace(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName('emptyWorkspace')
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet('QWidget#emptyWorkspace { background: palette(window); }')
+        root = QVBoxLayout(self)
+        root.setContentsMargins(24, 28, 24, 16)
+        self.title = QLabel(AD.REMINDER)
+        self.title.setAlignment(Qt.AlignCenter)
+        self.title.setStyleSheet(f'color: {BRAND["green"]}; font-size: 30pt; font-weight: bold; background: transparent;')
+        root.addWidget(self.title)
+        self.sub = QLabel('')
+        self.sub.setAlignment(Qt.AlignCenter)
+        self.sub.setStyleSheet(f'color: {BRAND["gold"]}; font-size: 16pt; font-weight: bold; background: transparent; padding: 6px 0 10px 0;')
+        root.addWidget(self.sub)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.setStyleSheet('QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }')
+        root.addWidget(self.scroll, 1)
+        self._period = None
+
+    def refresh(self):
+        """يُعاد بناء القائمة فقط إذا تغيّر القسم (صباح/مساء) منذ آخر عرض."""
+        title, items = AD.adhkar_for(datetime.now().hour)
+        if title == self._period:
+            return
+        self._period = title
+        self.sub.setText(title)
+        host = QWidget()
+        host.setLayoutDirection(Qt.RightToLeft)
+        lay = QVBoxLayout(host)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(10)
+        for text, times in items:
+            card = QFrame()
+            card.setStyleSheet('QFrame { border: 1px solid palette(mid); border-radius: 8px; background: transparent; }'
+                               'QLabel { border: none; }')
+            cl = QVBoxLayout(card)
+            cl.setContentsMargins(14, 10, 14, 10)
+            t = QLabel(text)
+            t.setWordWrap(True)
+            t.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            t.setStyleSheet('font-size: 13pt; background: transparent;')
+            c = QLabel(times)
+            c.setStyleSheet(f'color: {BRAND["green"]}; font-weight: bold; background: transparent;')
+            cl.addWidget(t)
+            cl.addWidget(c)
+            lay.addWidget(card)
+        lay.addStretch(1)
+        self.scroll.setWidget(host)

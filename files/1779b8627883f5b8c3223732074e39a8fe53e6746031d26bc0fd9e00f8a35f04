@@ -1,0 +1,394 @@
+"""العملاء والموردون: جدول + ورقة كشف حساب مطابقة للطباعة.
+
+القائمة من PartiesService (لا SQL في الصفحة). الطباعة عبر reporting.printing.party_statement_print.
+"""
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QComboBox, QHBoxLayout, QInputDialog, QLabel, QMessageBox, QSplitter, QVBoxLayout, QWidget
+
+from alhisabat.ui.components import document_model as DM
+from alhisabat.ui.components.basic import ask_reason
+from alhisabat.ui.components.datagrid import DataGrid
+from alhisabat.ui.components.document_sheet import DocumentSheet
+from alhisabat.ui.components.grid_logic import Column
+from alhisabat.ui.components.panels import RelatedPanel
+from alhisabat.ui.core.actions import Action, ActionGroup
+from alhisabat.ui.core.base_page import BasePage
+from alhisabat.ui.core.parties_service import PartiesService
+from alhisabat.ui.core.permissions import ActionState
+
+FILTERS=[('الكل',None),('عملاء','customer'),('موردون','supplier')]
+
+class PartiesPage(BasePage):
+    source_targets = {'party_opening': ('grid', None, 0)}
+    key='parties'; title='العملاء والموردون'; icon='users'; required_permission='party.view'
+    def build(self):
+        self.svc=PartiesService(self.session); self._rows=[]; self._sel=None
+        lay=QVBoxLayout(self); lay.setContentsMargins(6,6,6,6)
+        bar=QHBoxLayout()
+        self.f=QComboBox()
+        for lab,val in FILTERS: self.f.addItem(lab,val)
+        self.f.currentIndexChanged.connect(self._on_kind_changed)
+        bar.addWidget(QLabel('النوع:')); bar.addWidget(self.f)
+        self.f_group=QComboBox()
+        self.f_group.addItem('كل المجموعات', None)
+        self.f_group.currentIndexChanged.connect(lambda _i: self.refresh())
+        bar.addWidget(QLabel('المجموعة:')); bar.addWidget(self.f_group)
+        self.f_cur=QComboBox()                       # تصفية بالعملة: القائمة وكشف الحساب بحسب ما قُيِّد بتلك العملة
+        self.f_cur.setToolTip('يعرض الأطراف التي لها حركات بالعملة المختارة، ويكون كشف الحساب بتلك العملة. «كل العملات» = كل الحركات مع عمود العملة.')
+        self._fill_currency_filter()
+        self.f_cur.currentIndexChanged.connect(lambda _i: self.refresh())
+        bar.addWidget(QLabel('العملة:')); bar.addWidget(self.f_cur)
+        bar.addStretch(1)
+        self.count=QLabel(''); self.count.setObjectName('ctxKey'); bar.addWidget(self.count)
+        lay.addLayout(bar)
+        from alhisabat.ui.components.inline_party_form import InlinePartyForm
+        self.entry=InlinePartyForm(self)               # نموذج الإدخال المدمج فوق الجدول (إدخال متتابع بلا نوافذ)
+        self.entry.saved.connect(self._on_entry_saved)
+        self.entry.fullFormRequested.connect(self._add_dialog)
+        lay.addWidget(self.entry)
+        split=QSplitter(Qt.Horizontal)
+        cols=[Column('code','الكود',width=90), Column('name','الاسم',width=190), Column('group_name','المجموعة',width=110),
+              Column('kind','النوع',width=70), Column('phone','الهاتف',width=110),
+              Column('credit_limit_minor','الحد الائتماني','money',100,minor=True), Column('is_active','نشط','status',60)]
+        for c in cols:
+            if c.key=='is_active': c.type='bool'
+        self.grid=DataGrid(cols, grid_id='parties_list')
+        self.grid.selectionChangedRows.connect(self._on_select); self.grid.rowActivated.connect(lambda _r: self.do('edit'))
+        self.grid.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.grid.table.customContextMenuRequested.connect(self._context_menu)
+        split.addWidget(self.grid)
+        right=QWidget(); rl=QVBoxLayout(right); rl.setContentsMargins(0,0,0,0)
+        self.sheet=DocumentSheet(self.window_.prefs.get('paper')); self.sheet.paperChanged.connect(lambda p: self.window_.prefs.set('paper', p))
+        self.related=RelatedPanel(); self.related.setMaximumHeight(100)
+        self.related.openRequested.connect(lambda page, params: self.open_page_requested.emit(page, params))
+        rl.addWidget(self.sheet,1); rl.addWidget(self.related)
+        split.addWidget(right); split.setStretchFactor(0,2); split.setStretchFactor(1,2)
+        lay.addWidget(split,1)
+        self._empty=QLabel('لا يوجد عملاء أو موردون بعد.'); self._empty.setAlignment(Qt.AlignCenter); lay.addWidget(self._empty)
+        self._on_kind_changed()
+    def on_context_changed(self, keys):
+        super().on_context_changed(keys)
+        if getattr(self, '_built', False) and hasattr(self, 'entry'): self.entry.reload_context()
+    def _fill_currency_filter(self):
+        self.f_cur.blockSignals(True)
+        keep=self.f_cur.currentData()
+        self.f_cur.clear(); self.f_cur.addItem('كل العملات', None)
+        try:
+            for c in self.svc.currency_options():
+                self.f_cur.addItem(f"{c.get('name_ar') or c['code']} ({c['code']})", c['code'])
+        except Exception: pass
+        i=self.f_cur.findData(keep) if keep else -1
+        self.f_cur.setCurrentIndex(max(i,0))
+        self.f_cur.blockSignals(False)
+    @property
+    def current_currency(self):
+        return (self.f_cur.currentData() or None) if hasattr(self, 'f_cur') else None
+    @property
+    def current_group_id(self):
+        return self.f_group.currentData() if hasattr(self, 'f_group') else None
+    def _on_kind_changed(self, _i=None):
+        if not hasattr(self, 'f_group'): return
+        kind = self.f.currentData()
+        if kind and hasattr(self, 'entry') and not self.entry.editing: self.entry.set_kind(kind)   # نموذج الإدخال يتبع نوع التصفية
+        self.f_group.blockSignals(True)
+        self.f_group.clear()
+        self.f_group.addItem('كل المجموعات', None)
+        self.f_group.addItem('بلا مجموعة', 0)
+        if kind:
+            try:
+                from alhisabat.ui.core.party_groups_service import PartyGroupsService
+                for g in PartyGroupsService(self.session).list(kind):
+                    self.f_group.addItem(g['name'], g['id'])
+            except Exception: pass
+        self.f_group.blockSignals(False)
+        self.refresh()
+    def _context_menu(self, pos):
+        if not self._sel: return
+        from PySide6.QtWidgets import QMenu
+        m = QMenu(self); m.setLayoutDirection(Qt.RightToLeft)
+        m.addAction('✏️ تعديل').triggered.connect(lambda: self.do('edit'))
+        m.addAction('↔️ نقل إلى مجموعة…').triggered.connect(lambda: self.do('move_to_group'))
+        if self._sel.get('kind') == 'customer':
+            m.addAction('📄 اتفاقية الحساب').triggered.connect(lambda: self.do('agreement'))
+        m.addAction('🚫 تفعيل/تعطيل').triggered.connect(lambda: self.do('toggle'))
+        m.addAction('🗑️ حذف').triggered.connect(lambda: self.do('delete'))
+        m.exec(self.grid.table.viewport().mapToGlobal(pos))
+    def refresh(self):
+        if not getattr(self,'_built',False): return
+        keep=self._sel['id'] if self._sel else None
+        kind=self.f.currentData()
+        gid=self.current_group_id
+        try: rows=self.svc.list(kind, group_id=gid, currency=self.current_currency)
+        except Exception as exc: self.show_error(exc); rows=[]
+        self._rows=rows; self.grid.set_rows(rows); self.count.setText(f'{len(rows)} طرف'); self._empty.setVisible(not rows)
+        if keep is not None:
+            if not self.grid.select_where(lambda r: r['id']==keep): self._on_select([])
+            elif self._sel: self._on_select([self._sel])         # يعيد رسم الكشف بالعملة المختارة حاليًا
+        else: self._on_select([])
+    def _on_select(self, rows):
+        self._sel = rows[0] if len(rows) == 1 else None
+        if self._sel:
+            try:
+                from datetime import date
+                today = date.today()
+                d_from = f"{today.year}-01-01"
+                d_to = today.isoformat()
+                spec = self.svc.statement_spec(self._sel['id'], d_from, d_to, currency=self.current_currency)
+                doc = DM.from_print_spec(spec, 'statement', status='')
+                self.sheet.set_document(doc)
+            except Exception:
+                self.sheet.set_document(None)
+            items = []
+            if self._sel.get('kind') == 'customer':
+                items.append(('المبيعات', f"فواتير العميل {self._sel['name']}", 'sales', {'customer_id': self._sel['id']}))
+                items.append(('أعمار الديون', 'تقرير أعمار ديون العملاء', 'reports', {'report': 'أعمار ديون العملاء'}))
+            else:
+                items.append(('المشتريات', f"فواتير المورد {self._sel['name']}", 'purchases', {'supplier_id': self._sel['id']}))
+                items.append(('أعمار الديون', 'تقرير أعمار ديون الموردين', 'reports', {'report': 'أعمار ديون الموردين'}))
+            if self._sel.get('account_id'):
+                items.append(('كشف الحساب', f"دفتر أستاذ {self._sel['name']}", 'ledger', {'account_id': self._sel['account_id']}))
+            self.related.set_items(items)
+        else:
+            self.sheet.set_document(None)
+            self.related.set_items([])
+        self.actions_changed.emit()
+
+    def _action_state(self, key):
+        if key in ('add_customer', 'add_supplier'):
+            return self.access.state('party.create')
+        if key in ('groups', 'pending_agreements'):
+            return self.access.state('party.view')
+        if not self._sel:
+            return ActionState(False, 'حدد طرفًا أولًا')
+        if key == 'edit':
+            return self.access.state('party.edit')
+        if key == 'agreement':
+            if self._sel.get('kind') != 'customer':
+                return ActionState(False, 'اتفاقية فتح الحساب خاصة بالعملاء')
+            return self.access.state('party.view')
+        if key == 'move_to_group':
+            can = self.access.has('party.edit') and self.access.has('account.move')
+            return ActionState(can, 'تحتاج صلاحيتي تعديل الأطراف ونقل الحسابات' if not can else '')
+        if key == 'whatsapp_stmt':
+            if not self._sel:
+                return ActionState(False, 'حدد طرفًا أولًا')
+            if not self.access.has('message.send'):
+                return ActionState(False, 'تتطلب صلاحية «إرسال رسائل واتساب»')
+            return ActionState(True)
+        if key in ('toggle', 'delete', 'credit_details', 'opening_balance'):
+            return ActionState(True)
+        return ActionState(True)
+
+    def ribbon_groups(self):
+        def a(k, lab, icon, **kw):
+            return Action(k, lab, icon, state_fn=lambda kk=k: self._action_state(kk), handler=lambda kk=k: self.do(kk), **kw)
+        return [
+            ActionGroup('طرف', [
+                a('add_customer', '+ عميل', 'new', primary=True),
+                a('add_supplier', '+ مورد', 'new'),
+                a('groups', 'المجموعات', 'users'),
+                a('move_to_group', 'نقل إلى مجموعة…', 'refresh'),
+                a('edit', 'تعديل', 'edit'),
+                a('credit_details', 'الائتمان والعملات', 'coins'),
+                a('agreement', 'اتفاقية الحساب', 'print'),
+                a('pending_agreements', 'عملاء بلا اتفاقية', 'users'),
+                a('opening_balance', 'رصيد افتتاحي', 'coins'),
+                a('toggle', 'تفعيل/تعطيل', 'refresh'),
+                a('delete', 'حذف', 'delete', danger=True)
+            ]),
+            ActionGroup('عرض', [
+                Action('print', 'طباعة', 'print', state_fn=lambda: ActionState(bool(self._sel), 'حدد طرفًا'), handler=lambda: self.sheet.print_()),
+                a('whatsapp_stmt', 'إرسال كشف الحساب واتساب', 'mail'),
+                Action('refresh', 'تحديث', 'refresh', handler=self.refresh)
+            ])
+        ]
+
+    def _send_whatsapp_stmt(self):
+        if not self._sel:
+            return
+        party_name = self._sel.get('name', '')
+        phone = (self._sel.get('phone') or '').strip()
+        party_id = self._sel.get('id')
+        from datetime import date
+        today = date.today()
+        d_from = f"{today.year}-01-01"
+        d_to = today.isoformat()
+        from alhisabat.ui.core import format as fmt
+        bal_str = ''
+        cur = self.current_currency or ''
+        try:
+            bal = self.session.party_balance(party_id)
+            bal_str = fmt.fmt_money(bal, minor=False)
+        except Exception:
+            pass
+        bal_part = f" رصيدكم الحالي: {bal_str} {cur}." if bal_str else ""
+        msg_text = f"مرحبًا {party_name}، مرفق كشف حسابكم للفترة من {d_from} إلى {d_to}.{bal_part}"
+        pdf_path = ""
+        try:
+            import tempfile, os
+            from alhisabat.ui.components import print_service as PS
+            if hasattr(self, 'sheet') and self.sheet.document:
+                tfile = os.path.join(tempfile.gettempdir(), f"statement_party_{party_id}.pdf")
+                paper = self.window_.prefs.get('paper') or 'A4'
+                PS.export_pdf(self.sheet.document, tfile, paper=paper)
+                pdf_path = tfile
+        except Exception:
+            pdf_path = ""
+        from alhisabat.ui.components.whatsapp_preview import WhatsAppPreviewDialog
+        dlg = WhatsAppPreviewDialog(
+            self,
+            db_path=self.session.db_path,
+            phone=phone,
+            party_name=party_name,
+            message_text=msg_text,
+            party_id=party_id,
+            attachment_path=pdf_path,
+            ref_type='party_statement',
+            ref_id=party_id,
+            branch_id=getattr(self.session, 'branch_id', None),
+            user_id=getattr(self.session, 'user_id', None),
+        )
+        self.exec_form(dlg)
+
+    def do(self,key):
+        if key in ('add_customer','add_supplier'):
+            return self._add('customer' if key=='add_customer' else 'supplier')
+        if key == 'groups':
+            return self._manage_groups()
+        if key == 'pending_agreements':
+            return self._pending_agreements()
+        if not self._sel: return QMessageBox.information(self,self.title,'حدد طرفًا أولًا.')
+        st=self._action_state(key)
+        if not st.enabled: return QMessageBox.information(self,self.title,st.reason)
+        if key == 'move_to_group':
+            return self._move_party()
+        if key == 'whatsapp_stmt':
+            return self._send_whatsapp_stmt()
+        if key == 'credit_details':
+            return self._show_credit_details()
+        if key == 'agreement':
+            return self._open_agreement(self._sel)
+        if key == 'opening_balance':
+            return self._set_opening_balance()
+        if key=='edit': return self._edit()
+        if key=='toggle':
+            verb='تعطيل' if self._sel.get('is_active') else 'تفعيل'
+            if ask_reason(self,verb,[f"هل تريد {verb} «{self._sel.get('name','')}»؟"],need_reason=False,confirm_text=verb) is None: return
+            ok,_=self.guarded(self.svc.set_active,self._sel['id'], not bool(self._sel.get('is_active')), reload=False)
+            if ok: self.notify(f'تم {verb}'); self.refresh(); self.window_.data_changed(self.key)
+        if key=='delete':
+            if ask_reason(self,'حذف',[f"حذف «{self._sel.get('name','')}»؟ لا يمكن الحذف إن كانت له حركات."],need_reason=False,confirm_text='حذف',danger=True) is None: return
+
+            ok,_=self.guarded(self.svc.delete,self._sel['id'],reload=False)
+            if ok: self.notify('تم الحذف'); self.refresh(); self.window_.data_changed(self.key)
+
+    def _manage_groups(self):
+        from alhisabat.ui.app_dialogs.party_groups import PartyGroupsDialog
+        kind = self.f.currentData() or 'customer'
+        d = PartyGroupsDialog(self, kind)
+        self.exec_form(d)
+        self._on_kind_changed()
+
+    def _move_party(self):
+        if not self._sel: return
+        from alhisabat.ui.core.party_groups_service import PartyGroupsService
+        gs = PartyGroupsService(self.session)
+        kind = self._sel.get('kind') or 'customer'
+        try:
+            groups = [g for g in gs.list(kind) if g.get('is_active')]
+        except Exception as exc:
+            return QMessageBox.critical(self, self.title, str(exc))
+        items = ['بلا مجموعة (تحت الرقابي مباشرة)'] + [g['name'] for g in groups]
+        cur_gid = self._sel.get('group_id')
+        cur_idx = 0
+        for idx, g in enumerate(groups, 1):
+            if g['id'] == cur_gid:
+                cur_idx = idx
+                break
+        text, ok = QInputDialog.getItem(self, 'نقل إلى مجموعة', f"اختر المجموعة للطرف «{self._sel.get('name')}»:", items, cur_idx, False)
+        if not ok: return
+        target_gid = None if text == items[0] else next((g['id'] for g in groups if g['name'] == text), None)
+        ok_move, res = self.guarded(gs.move_party, self._sel['id'], target_gid, reload=False)
+        if ok_move:
+            self.notify(f"تم نقل الطرف بنجاح (رقم الحساب الجديد: {res['new_code']})")
+            self.refresh()
+            self.window_.data_changed(self.key)
+    def _add(self,kind):
+        """«+ عميل/مورد»: يفتح الإدخال السريع داخل الصفحة بدل النافذة."""
+        self.entry.start_add(kind)
+    def _edit(self):
+        if self._sel: self.entry.start_edit(self._sel)
+    def _on_entry_saved(self, pid):
+        """بعد الحفظ: تحديث الجدول وتحديد السجل الجديد دون نقل التركيز من نموذج الإدخال."""
+        self.refresh(); self.window_.data_changed(self.key)
+        if pid: self.grid.select_where(lambda r: r['id']==pid)
+        self.entry.focus_name()
+    def _add_dialog(self,kind):
+        """النموذج الكامل (نافذة): الهوية واتفاقية فتح الحساب وبقية الحقول."""
+        from alhisabat.ui.app_dialogs.parties import PartyEditor
+        while True:                                   # «حفظ وإضافة آخر» يعيد فتح النموذج الفارغ بعد كل حفظ ناجح
+            d=PartyEditor(self,kind)
+            if not self.exec_form(d): return
+            v=d.values(); ok,res=self.guarded(self.svc.create,kind,v,reload=False)
+            if not ok: return
+            if res.get('opening_error'):
+                self.notify(f"تمت الإضافة، لكن تعذّر تسجيل الرصيد الافتتاحي: {res['opening_error']}")
+            elif res.get('opening_entry_id'):
+                self.notify(f"تمت الإضافة، وسُجِّل الرصيد الافتتاحي كقيد مسودة رقم {res['opening_entry_id']} بانتظار الترحيل من شاشة القيود.")
+            else:
+                self.notify('تمت الإضافة')
+            self.refresh(); self.window_.data_changed(self.key)
+            if kind == 'customer' and self.access.has('party.edit'):
+                self._offer_agreement({'id': res['id'], 'name': v['name'], 'kind': 'customer', 'payment_terms_days': v.get('terms') or 0})
+            if not d.add_another: return
+    def _offer_agreement(self, party):
+        """بعد إضافة عميل جديد: عرض توليد وطباعة اتفاقية فتح الحساب ببياناته ليوقّعها ويحتفظ بها في ملفه."""
+        if QMessageBox.question(self, self.title, f"طباعة اتفاقية فتح حساب تعامل تجاري للعميل «{party['name']}» الآن؟") != QMessageBox.Yes:
+            return
+        from alhisabat.ui.app_dialogs.agreement import AgreementDialog
+        AgreementDialog(self, party, auto_generate=True).exec()
+
+    def _open_agreement(self, party):
+        from alhisabat.ui.app_dialogs.agreement import AgreementDialog
+        AgreementDialog(self, party).exec()
+
+    def _pending_agreements(self):
+        from alhisabat.ui.app_dialogs.agreement import PendingAgreementsDialog
+        PendingAgreementsDialog(self).exec()
+
+    def _edit_dialog(self):
+        from alhisabat.ui.app_dialogs.parties import PartyEditor
+        d=PartyEditor(self, self._sel.get('kind') or 'customer', self._sel)
+        if self.exec_form(d):
+            v=d.values(); ok,_=self.guarded(self.svc.edit,self._sel['id'],v,reload=False)
+            if ok: self.notify('تم حفظ التعديل'); self.refresh(); self.window_.data_changed(self.key)
+
+    def _set_opening_balance(self):
+        if not self._sel:
+            return
+        from alhisabat.ui.app_dialogs.parties import PartyOpeningBalanceDialog
+        d = PartyOpeningBalanceDialog(self, self._sel)
+        if self.exec_form(d):
+            items, as_of, note = d.values()
+            ok, eid = self.guarded(self.svc.post_opening_balances, self._sel['id'], items, as_of, note, reload=False)
+            if ok:
+                self.notify(f"سُجِّل الرصيد الافتتاحي كقيد مسودة رقم {eid} بانتظار الترحيل من شاشة القيود.")
+                self.refresh(); self.window_.data_changed(self.key)
+
+    def _show_credit_details(self):
+        if not self._sel:
+            return
+        from alhisabat.ui.app_dialogs.parties import PartyCreditDialog
+        pid = self._sel['id']
+        kind = self._sel.get('kind')
+        cred = None
+        if kind == 'customer':
+            ok, res = self.guarded(self.svc.credit_status, pid, reload=False)
+            if ok:
+                cred = res
+        ok, currs = self.guarded(self.svc.balance_by_currency, pid, reload=False)
+        currencies = currs if ok else []
+        dlg = PartyCreditDialog(self, self._sel, credit_status=cred, currencies=currencies)
+        self.exec_form(dlg)
+
+

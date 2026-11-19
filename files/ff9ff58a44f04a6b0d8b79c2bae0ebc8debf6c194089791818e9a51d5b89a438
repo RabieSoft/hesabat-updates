@@ -1,0 +1,28 @@
+"""هوية المنتج: اسم المنتج والشركة المطوّرة ومسارات الشعارات، تقرأ منها الواجهات والتقارير المطبوعة. خالصة بلا PySide6."""
+from pathlib import Path
+
+PRODUCT_NAME = 'الحسابات برو'
+COMPANY_NAME = 'الربيع سوفت'
+BRAND_LINE = f'{PRODUCT_NAME} — {COMPANY_NAME}'
+
+ASSETS = Path(__file__).resolve().parent / 'assets'
+
+
+def _existing(name):
+    p = ASSETS / name
+    return p if p.is_file() else None
+
+
+def logo_path(dark=False):
+    """الشعار الكامل (الدرع + الاسم). النسخة الداكنة بنص فاتح لتُقرأ على خلفية السمة الداكنة. None إن فُقد الملف."""
+    return _existing('logo_full_dark.png' if dark else 'logo_full.png')
+
+
+def icon_png_path():
+    """الدرع وحده (مربع) لأيقونة النافذة."""
+    return _existing('logo_icon.png')
+
+
+def icon_ico_path():
+    """ملف .ico متعدد الأحجام لأيقونة التطبيق (PyInstaller وسطح المكتب)."""
+    return _existing('app.ico')

@@ -1,0 +1,124 @@
+"""خدمات النظام والمستخدمين والإعدادات وسجل التدقيق والنسخ الاحتياطي والاستيراد."""
+from pathlib import Path
+
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.business import branches as branches_biz, importer, sales
+from alhisabat.security import auth
+from alhisabat.system import audit_query, backup
+from .base import IMPORT_TARGETS, _SETTINGS_TABLES
+
+
+class SystemMixin:
+    # ---------------- الفروع (إدارة)
+    def branches_admin(self):
+        return branches_biz.list_branches(self.conn, self.user_id, self.company_id)
+
+    def create_branch(self, v):
+        return branches_biz.create_branch(self.conn, self.user_id, self.company_id, v['name'], code=v.get('code') or None,
+                                          address=v.get('address') or '', phone=v.get('phone') or '', notes=v.get('notes') or '')
+
+    def edit_branch(self, branch_id, v):
+        return branches_biz.edit_branch(self.conn, self.user_id, self.company_id, int(branch_id), name=v.get('name'),
+                                        code=v.get('code'), address=v.get('address'), phone=v.get('phone'), notes=v.get('notes'))
+
+    def set_branch_active(self, branch_id, active):
+        return branches_biz.set_branch_active(self.conn, self.user_id, self.company_id, int(branch_id), bool(active))
+
+    def delete_branch(self, branch_id):
+        return branches_biz.delete_branch(self.conn, self.user_id, self.company_id, int(branch_id))
+
+    def branch_isolation_mode(self):
+        from alhisabat.business import branch_scope
+        return branch_scope.get_mode(self.conn, self.company_id)
+
+    def set_branch_isolation(self, mode):
+        from alhisabat.business import branch_scope
+        return branch_scope.set_mode(self.conn, self.user_id, self.company_id, mode)
+
+    def users(self):
+        self.require('user.manage')
+        return [dict(r) for r in self.conn.execute(
+            "SELECT u.id,u.username,u.full_name,GROUP_CONCAT(r.name_ar,'، ') roles,u.is_active FROM users u "
+            "JOIN user_roles ur ON ur.user_id=u.id AND ur.company_id=? JOIN roles r ON r.id=ur.role_id GROUP BY u.id ORDER BY u.username",
+            (self.company_id,))]
+
+    def create_user(self, v):
+        return auth.create_user(self.conn, self.user_id, self.company_id, v['username'], v['name'], v['password'], int(v['role']))
+
+    def set_user_active(self, target_user_id, active):
+        return auth.set_active(self.conn, self.user_id, self.company_id, int(target_user_id), bool(active))
+
+    def assign_role(self, target_user_id, role_id):
+        return auth.assign_role(self.conn, self.user_id, self.company_id, int(target_user_id), int(role_id))
+
+    def settings(self):
+        self.require('settings.manage')
+        rows = [{'group': 'الشركة', 'key': 'الاسم', 'value': self.company().get('name', '')},
+                {'group': 'الشركة', 'key': 'العملة الأساسية', 'value': self.company().get('base_currency', '')}]
+        for table, (group, names) in _SETTINGS_TABLES.items():
+            r = self.conn.execute(f"SELECT * FROM {table} WHERE company_id=?", (self.company_id,)).fetchone()
+            if r:
+                for k, label in names.items():
+                    v = r[k]
+                    rows.append({'group': group, 'key': label, 'value': ('نعم' if v == 1 else 'لا') if k in ('require_review', 'require_approval', 'enforce_separation', 'allow_manual_party_entries', 'allow_edit_posted_entries', 'allow_delete_posted_entries', 'transfer_to_retained', 'allow_edit_posted_invoice', 'allow_negative_stock') else v})
+        return rows
+
+    def update_settings(self, values):
+        self.require('settings.manage')
+        j = {k: bool(values.get(k)) for k in ('require_review', 'require_approval', 'enforce_separation')}
+        for k in ('allow_manual_party_entries', 'allow_edit_posted_entries', 'allow_delete_posted_entries'):
+            if k in values:
+                j[k] = bool(values[k])
+        from alhisabat.accounting import journal_engine as je
+        je.set_settings(self.conn, self.user_id, self.company_id, **j)
+        sp = {k: (values[k] if k == 'credit_limit_mode' else bool(values[k])) for k in ('credit_limit_mode', 'allow_edit_posted_invoice', 'allow_negative_stock') if k in values}
+        if sp:
+            sales.set_settings(self.conn, self.user_id, self.company_id, **sp)
+        return self.settings()
+
+    def audit(self, limit=200, table_name=None):
+        self.require('audit.view')
+        tables = [table_name] if table_name else ['journal_entries', 'accounts', 'parties', 'items', 'sales_invoices',
+                                                   'purchase_invoices', 'cash_vouchers', 'cash_transfers', 'payroll_runs',
+                                                   'fixed_assets', 'user_roles', 'import_batches']
+        rows = []
+        for t in tables:
+            rows += audit_query.search(self.conn, self.user_id, self.company_id, table_name=t, limit=limit)
+        rows.sort(key=lambda r: r['id'], reverse=True)
+        return rows[:limit]
+
+    def backups(self):
+        return backup.list_backups(self.conn, self.user_id, self.company_id)
+
+    def create_backup(self, path, reason='نسخة من الواجهة'):
+        return backup.create_backup(self.conn, self.user_id, self.company_id, path, reason)
+
+    def verify_backup(self, path):
+        return backup.verify_backup(path)
+
+    def restore(self, path):
+        self.conn.close()
+        result = backup.restore_database(self.user_id, self.company_id, self.db_path, path,
+                                         safety_dir=str(Path(self.db_path).parent / 'restore_safety'))
+        self.conn = result['connection']
+        return result
+
+    @staticmethod
+    def read_csv(path):
+        import csv
+        if not path:
+            raise AccountingError('اختر ملف CSV')
+        with open(path, 'r', encoding='utf-8-sig', newline='') as f:
+            return list(csv.DictReader(f))
+
+    def import_preview(self, rows, kind_label):
+        target = IMPORT_TARGETS[kind_label]
+        if target == 'item':
+            return importer.preview_items_import(self.conn, self.user_id, self.company_id, rows)
+        return importer.preview_parties_import(self.conn, self.user_id, self.company_id, target, rows)
+
+    def import_commit(self, rows, kind_label):
+        target = IMPORT_TARGETS[kind_label]
+        if target == 'item':
+            return importer.commit_items_import(self.conn, self.user_id, self.company_id, rows)
+        return importer.commit_parties_import(self.conn, self.user_id, self.company_id, target, rows)

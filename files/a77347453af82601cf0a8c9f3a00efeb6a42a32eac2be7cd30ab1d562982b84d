@@ -1,0 +1,114 @@
+"""خدمات المخزون للواجهة الجديدة: واجهة رفيعة فوق AppSession (لا SQL مباشر في core).
+
+القراءة عبر المحرك أو AppSession؛ الكتابة عبر business.inventory. Decimal فقط.
+بلا PySide6.
+"""
+from datetime import date
+from decimal import Decimal
+
+class InventoryService:
+    def __init__(self, session):
+        self.s = session
+    def items(self, limit=500): return self.s.items(limit=limit)
+    def warehouses(self): return self.s.warehouses()
+    def colors(self, **kw): return self.s.colors(**kw)
+    def create_color(self, v): return self.s.create_color(v)
+    def set_color_active(self, color_id, active): return self.s.set_color_active(color_id, active)
+    def enable_item_variants(self, item_id): return self.s.enable_item_variants(item_id)
+    def add_item_colors(self, parent_id, color_ids): return self.s.add_item_colors(parent_id, color_ids)
+    def link_candidates(self, parent_id, search=None): return self.s.link_candidates(parent_id, search=search)
+    def link_item_to_parent(self, item_id, parent_id, color_id): return self.s.link_item_to_parent(item_id, parent_id, color_id)
+    def unlink_item_from_parent(self, item_id): return self.s.unlink_item_from_parent(item_id)
+    def add_item_color(self, parent_id, color_id): return self.s.add_item_color(parent_id, color_id)
+    def item_totals(self, parent_id): return self.s.item_totals(parent_id)
+    def count_sheet(self, count_id): return self.s.count_sheet(count_id)
+    def save_count_lines(self, count_id, qtys): return self.s.save_count_lines(count_id, qtys)
+    def item_variants(self, parent_id): return self.s.item_variants(parent_id)
+    def stock_by_color(self, **flt): return self.s.stock_by_color(**flt)
+    def create_item(self, v): return self.s.create_item(v)
+    def create_warehouse(self, v): return self.s.create_warehouse(v)
+    def set_warehouse_active(self, wid, active): return self.s.set_warehouse_active(wid, active)
+    def edit_item(self, item_id, v): return self.s.edit_item(item_id, v)
+    def set_item_active(self, item_id, active): return self.s.set_item_active(item_id, active)
+    def unused_items(self): return self.s.unused_items()
+    def duplicate_items(self): return self.s.duplicate_items()
+    def delete_unused_items(self, item_ids): return self.s.delete_unused_items(item_ids)
+    def delete_duplicate_items(self, item_ids): return self.s.delete_duplicate_items(item_ids)
+    def item_units(self, item_id): return self.s.item_units(item_id)
+    def units(self, include_inactive=False): return self.s.units(include_inactive=include_inactive)
+    def units_catalog(self): return self.s.units_catalog()
+    def create_unit(self, name, code=None, notes=''): return self.s.create_unit(name, code=code, notes=notes)
+    def edit_unit(self, uid, v): return self.s.edit_unit(uid, v)
+    def set_unit_active(self, uid, active): return self.s.set_unit_active(uid, active)
+    def delete_unit(self, uid): return self.s.delete_unit(uid)
+    def add_item_unit(self, item_id, unit_id, factor): return self.s.add_item_unit(item_id, unit_id, factor)
+    def update_item_unit(self, item_id, unit_id, factor): return self.s.update_item_unit(item_id, unit_id, factor)
+    def remove_item_unit(self, item_id, unit_id): return self.s.remove_item_unit(item_id, unit_id)
+    def category_tree(self, include_inactive=True): return self.s.category_tree(include_inactive=include_inactive)
+    def create_category(self, v): return self.s.create_category(v)
+    def edit_category(self, cid, v): return self.s.edit_category(cid, v)
+    def move_category(self, cid, parent_id): return self.s.move_category(cid, parent_id)
+    def set_category_active(self, cid, active): return self.s.set_category_active(cid, active)
+    def delete_category(self, cid): return self.s.delete_category(cid)
+    def assign_items_category(self, item_ids, category_id): return self.s.assign_items_category(item_ids, category_id)
+    def category_descendants(self, cid): return self.s.category_descendants(cid)
+    def stock_report(self, warehouse_id=None, item_id=None, include_zero=False): return self.s.stock_report(warehouse_id=warehouse_id, item_id=item_id, include_zero=include_zero)
+    def low_stock(self): return self.s.low_stock()
+    def transfer(self, v): return self.s.transfer_stock(v)
+    def adjust(self, v): return self.s.adjust_stock(v)
+    def post_opening_stock(self, v): return self.s.post_opening_stock(v)
+    def opening_counter_accounts(self): return self.s.lookup_accounts(types=['equity'], groups=False)
+    def item_card(self, item_id, warehouse_id, date_from, date_to, limit=200): return self.s.item_card(item_id, warehouse_id, date_from, date_to, limit=limit)
+    def list_counts(self, limit=100): return self.s.list_stock_counts(limit=limit)
+    def create_count(self, warehouse_id, count_date, is_full=False, note=''): return self.s.create_stock_count(warehouse_id, count_date, is_full=is_full, note=note)
+    def set_count_line(self, count_id, item_id, counted_qty, unit_cost=None): return self.s.set_count_line(count_id, item_id, counted_qty, unit_cost=unit_cost)
+    def post_count(self, count_id): return self.s.post_stock_count(count_id)
+    def cancel_count(self, count_id, reason=''): return self.s.cancel_stock_count(count_id, reason=reason)
+    def count_lines(self, count_id): return self.s.stock_count_lines(count_id)
+
+    def item_color_map(self): return self.s.item_color_map()
+    def item_info(self, item_id): return self.s.item_info(item_id)
+    def item_movements(self, item_id, limit=300): return self.s.item_movements(item_id, limit)
+    def item_invoice_history(self, item_id, kind, limit=100): return self.s.item_invoice_history(item_id, kind, limit)
+    def item_find_barcode(self, code): return self.s.item_find_barcode(code)
+    def item_update_extras(self, item_id, **kw): return self.s.item_update_extras(item_id, **kw)
+    def item_add_barcode(self, item_id, barcode, unit_id=None, note=''): return self.s.item_add_barcode(item_id, barcode, unit_id, note)
+    def item_remove_barcode(self, barcode_id): return self.s.item_remove_barcode(barcode_id)
+    def currency_view(self, code, on_date=None): return self.s.currency_view(code, on_date)
+    def enabled_currencies(self):
+        from alhisabat.ui.core import readmodel
+        return [c for c in readmodel.currencies_list(self.s.conn, self.s.company_id) if c['is_enabled']]
+
+    def expiry_report(self, status=None, warehouse_id=None, item_id=None, within_days=None):
+        return self.s.expiry_report(status=status, warehouse_id=warehouse_id, item_id=item_id, within_days=within_days)
+    def expiry_summary(self): return self.s.expiry_summary()
+    def item_lots(self, item_id, warehouse_id=None): return self.s.item_lots(item_id, warehouse_id)
+    def untracked_qty_milli(self, item_id, warehouse_id): return self.s.untracked_qty_milli(item_id, warehouse_id)
+    def assign_untracked(self, item_id, warehouse_id, expiry_date, lot_no='', qty=None):
+        return self.s.assign_untracked(item_id, warehouse_id, expiry_date, lot_no, qty)
+
+    def reconcile_with_gl(self, as_of):
+        self.s.require('inventory.view')
+        from alhisabat.accounting import inventory_recon
+        return inventory_recon.reconcile(self.s.conn, self.s.company_id, as_of)
+
+    def verify_cache(self):
+        self.s.require('inventory.view')
+        from alhisabat.accounting import inventory_recon
+        return inventory_recon.verify_cache(self.s.conn, self.s.company_id)
+
+    def void_movement(self, movement_id, reason, movement_date=None, reverse_entry=False):
+        self.s.require('inventory.adjust')
+        from alhisabat.business import inventory as inv
+        return inv.void_movement(self.s.conn, self.s.user_id, movement_id, reason, movement_date=movement_date, reverse_entry=reverse_entry)
+
+    def opening_stock_lines(self):
+        self.s.require('inventory.adjust')
+        from alhisabat.business import inventory as inv
+        return inv.opening_stock_lines(self.s.conn, self.s.user_id, self.s.company_id)
+
+    def link_opening_movements(self, entry_id):
+        self.s.require('inventory.adjust')
+        from alhisabat.business import inventory as inv
+        return inv.link_opening_movements(self.s.conn, self.s.user_id, self.s.company_id, int(entry_id))
+

@@ -1,0 +1,88 @@
+"""خدمة اتفاقية فتح حساب التعامل التجاري: واجهة رفيعة فوق business.agreements (لا SQL ولا PySide6)."""
+from alhisabat.business import agreements as ag
+
+
+class AgreementsService:
+    def __init__(self, session):
+        self.s = session
+
+    # --- معلومات المنشأة للاتفاقية: الهاتف من إعدادات الطباعة، وبقية الحقول يدخلها المستخدم ويُحفظ آخر إدخال في التفضيلات
+    def company_info(self, prefs=None):
+        info = {'address': '', 'phone': '', 'rep_name': '', 'rep_title': ''}
+        try:
+            from alhisabat.ui.core import print_settings as PSET
+            info['phone'] = PSET.active().phone or ''
+        except Exception:  # noqa: BLE001
+            pass
+        if prefs is not None:
+            for k in ('address', 'rep_name', 'rep_title'):
+                info[k] = prefs.get_raw(f'agreement_{k}', '')
+        return info
+
+    def remember(self, prefs, info):
+        if prefs is None:
+            return
+        for k in ('address', 'rep_name', 'rep_title'):
+            if k in info:
+                prefs.set_raw(f'agreement_{k}', info[k] or '')
+
+    def status(self, party_id):
+        self.s.require('party.view')
+        return ag.status_of(self.s.conn, int(party_id))
+
+    def list(self, party_id):
+        return ag.list_agreements(self.s.conn, self.s.user_id, self.s.company_id, int(party_id))
+
+    def generate(self, party_id, company_info=None, options=None, force=False):
+        return ag.generate(self.s.conn, self.s.user_id, self.s.company_id, int(party_id), company_info=company_info,
+                           options=options, force=force)
+
+    def html(self, agreement_id):
+        return ag.get_html(self.s.conn, self.s.user_id, self.s.company_id, int(agreement_id))
+
+    def combined_html(self, agreement_ids):
+        return ag.combine([self.html(i) for i in agreement_ids])
+
+    def mark_printed(self, agreement_ids):
+        for i in agreement_ids:
+            ag.mark_printed(self.s.conn, self.s.user_id, self.s.company_id, int(i))
+
+    def record_signature(self, agreement_id, signed_date=None, file_path=None):
+        name = data = None
+        if file_path:
+            import os
+            name = os.path.basename(file_path)
+            with open(file_path, 'rb') as f:
+                data = f.read(ag.MAX_FILE_BYTES + 1)
+        return ag.record_signature(self.s.conn, self.s.user_id, self.s.company_id, int(agreement_id),
+                                   signed_date=signed_date or None, file_name=name, data=data)
+
+    def signed_file(self, agreement_id):
+        return ag.get_signed_file(self.s.conn, self.s.user_id, self.s.company_id, int(agreement_id))
+
+    def void(self, agreement_id, reason):
+        return ag.void_agreement(self.s.conn, self.s.user_id, self.s.company_id, int(agreement_id), reason)
+
+    def pending(self):
+        return ag.parties_without_signed(self.s.conn, self.s.user_id, self.s.company_id, branch_id=getattr(self.s, 'branch_id', None))
+
+    # --- القالب
+    def template(self):
+        return ag.get_template(self.s.conn, self.s.company_id)
+
+    def can_edit_template(self):
+        from alhisabat.security import permissions
+        return permissions.has(self.s.conn, self.s.user_id, self.s.company_id, 'party.agreement_template')
+
+    def save_template(self, html):
+        return ag.set_template(self.s.conn, self.s.user_id, self.s.company_id, html)
+
+    def reset_template(self):
+        return ag.reset_template(self.s.conn, self.s.user_id, self.s.company_id)
+
+    def preview_template(self, html):
+        return ag.preview_template(html, self.s.company().get('name', ''))
+
+    @staticmethod
+    def fields():
+        return ag.FIELDS

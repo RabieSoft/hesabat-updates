@@ -1,0 +1,183 @@
+"""نافذة مطابقة أرصدة العملاء والموردين مع ملف من نظام قديم:
+ملف ← معاينة (فرق + اقتراحات للأسماء غير المعروفة) ← تعديل «الرصيد المعتمد» يدويًا ← تصدير Excel ← مسودات أو ترحيل."""
+from decimal import Decimal
+
+from PySide6.QtCore import Qt, QDate
+from PySide6.QtWidgets import (
+    QCheckBox, QComboBox, QDateEdit, QDialog, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton,
+    QTableWidget, QTableWidgetItem, QVBoxLayout,
+)
+
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.ui.core.reconcile_service import ReconcileService
+
+_ST = {'match': 'متطابق', 'diff': 'فرق', 'unknown_party': 'طرف غير موجود', 'invalid': 'خطأ',
+       'duplicate_in_file': 'مكرر في الملف', 'pending_draft': 'مسودة قائمة',
+       'ambiguous_party': 'اسم مكرر في النظام', 'merged': 'مدموج'}
+_PICK = ('unknown_party', 'ambiguous_party')      # حالات تحتاج اختيار الطرف يدويًا
+_COLS = ['الكود', 'الاسم', 'العملة', 'رصيد الملف', 'رصيد النظام', 'الرصيد المعتمد', 'الفرق', 'الحالة', 'اقتراح الطرف / ملاحظة']
+_C_APPR, _C_DIFF, _C_ST, _C_SUG = 5, 6, 7, 8
+_EDITABLE = ('match', 'diff', 'pending_draft')
+_MAX_SHOWN = 3000        # الجدول للعرض فقط؛ التصدير والاعتماد يشملان كل الصفوف
+_fmt = lambda v: '' if v is None else f'{Decimal(v):,.2f}'
+
+
+class PartyReconcileDialog(QDialog):
+    def __init__(self, page):
+        super().__init__(page)
+        self.setWindowTitle('مطابقة أرصدة العملاء والموردين'); self.setLayoutDirection(Qt.RightToLeft); self.resize(1100, 640)
+        self.svc = ReconcileService(page.session); self._rows = None; self._prev = None; self._lines = {}; self._busy = False
+        lay = QVBoxLayout(self)
+        top = QHBoxLayout()
+        self.kind = QComboBox(); self.kind.addItems(list(ReconcileService.KINDS))
+        self.cur = QComboBox(); self.cur.addItem('حسب الملف (الأساسية إن لم تُذكر)', None)
+        try:
+            for c in self.svc.currencies(): self.cur.addItem(f"{c['name_ar']} ({c['code']})", c['code'])
+        except Exception: pass
+        self.force = QCheckBox('فرض العملة على كل الصفوف')
+        self.date = QDateEdit(QDate.currentDate()); self.date.setCalendarPopup(True); self.date.setDisplayFormat('yyyy-MM-dd')
+        self.dup = QComboBox(); self.dup.addItem('المكرر في الملف: تجاهل (الأول فقط)', 'skip'); self.dup.addItem('المكرر في الملف: جمع الأرصدة', 'sum')
+        self.dup.setToolTip('إذا تكرر نفس الطرف بنفس العملة في الملف: إمّا يُحتسب أول صف فقط، أو تُجمع أرصدة كل الصفوف المكررة')
+        self.dup.currentIndexChanged.connect(lambda _i: self.preview() if self._rows and self._prev else None)
+        for w in (QLabel('النوع:'), self.kind, QLabel('العملة:'), self.cur, self.force, self.dup, QLabel('تاريخ المطابقة:'), self.date): top.addWidget(w)
+        top.addStretch(1); lay.addLayout(top)
+        f = QHBoxLayout()
+        self.path = QLineEdit(); self.path.setReadOnly(True); self.path.setPlaceholderText('ملف Excel أو CSV: الاسم، مدين، دائن، الرصيد (أو دائن/مدين فقط)')
+        pick = QPushButton('اختيار الملف...'); pick.clicked.connect(self.choose)
+        self.go = QPushButton('معاينة'); self.go.setProperty('primary', True); self.go.clicked.connect(self.preview)
+        f.addWidget(self.path, 1); f.addWidget(pick); f.addWidget(self.go); lay.addLayout(f)
+        self.sum = QLabel('الأرصدة بطبيعة الطرف: الموجب = مدين للعميل / دائن للمورد. الفرق = الرصيد المعتمد − رصيد النظام. '
+                          'عدّل عمود «الرصيد المعتمد» يدويًا في أي صف (يساوي رصيد الملف افتراضيًا).')
+        self.sum.setWordWrap(True); lay.addWidget(self.sum)
+        opt = QHBoxLayout()
+        self.only_diff = QCheckBox('إخفاء المتطابق'); self.only_diff.setChecked(True); self.only_diff.toggled.connect(self._fill)
+        self.b_acc = QPushButton('قبول الاقتراحات الواثقة (90% فأكثر)'); self.b_acc.clicked.connect(self.accept_confident); self.b_acc.setEnabled(False)
+        opt.addWidget(self.only_diff); opt.addWidget(self.b_acc); opt.addStretch(1); lay.addLayout(opt)
+        self.tbl = QTableWidget(0, len(_COLS)); self.tbl.setHorizontalHeaderLabels(_COLS)
+        self.tbl.horizontalHeader().setStretchLastSection(True); self.tbl.itemChanged.connect(self._edited)
+        lay.addWidget(self.tbl, 1)
+        self.note = QLineEdit(); self.note.setPlaceholderText('ملاحظة تُضاف إلى بيان القيد (اختياري)')
+        lay.addWidget(self.note)
+        b = QHBoxLayout()
+        self.b_x = QPushButton('تصدير Excel'); self.b_x.clicked.connect(self.export)
+        self.b_d = QPushButton('إنشاء مسودات المطابقة'); self.b_d.setProperty('primary', True); self.b_d.clicked.connect(lambda: self.commit(False))
+        self.b_p = QPushButton('ترحيل مباشر'); self.b_p.clicked.connect(lambda: self.commit(True))
+        close = QPushButton('إغلاق'); close.clicked.connect(self.reject)
+        for w in (self.b_x, self.b_d, self.b_p): b.addWidget(w); w.setEnabled(False)
+        b.addStretch(1); b.addWidget(close); lay.addLayout(b)
+
+    def _err(self, e):
+        QMessageBox.warning(self, 'مطابقة الأرصدة', str(e))
+
+    def choose(self):
+        p, _ = QFileDialog.getOpenFileName(self, 'ملف الأرصدة', '', 'Excel / CSV (*.xlsx *.xlsm *.csv)')
+        if not p: return
+        self.path.setText(p.strip().strip('"'))
+        try: self._rows = self.svc.read(self.path.text())
+        except (AccountingError, OSError) as e: self._rows = None; self._err(e); return
+        self._lines = {r['line']: r for r in self._rows}; self._prev = None
+        self.sum.setText(f'تمت قراءة {len(self._rows):,} صفًا. اضغط «معاينة».')
+
+    def _args(self):
+        return self.kind.currentText(), self._rows, self.date.date().toString('yyyy-MM-dd'), self.cur.currentData(), self.force.isChecked(), self.dup.currentData()
+
+    def _summary(self):
+        cnt = {k: 0 for k in _ST}
+        for r in self._prev['rows']: cnt[r['status']] += 1
+        self._prev['summary'] = cnt
+        parts = [('متطابق', 'match'), ('فرق', 'diff'), ('طرف غير موجود', 'unknown_party'), ('اسم مكرر في النظام', 'ambiguous_party'),
+                 ('أخطاء', 'invalid'), ('مكرر في الملف', 'duplicate_in_file'), ('مدموج', 'merged'), ('مسودة قائمة', 'pending_draft')]
+        self.sum.setText(' | '.join(f'{lbl} {cnt[k]:,}' for lbl, k in parts if cnt[k] or k in ('match', 'diff')))
+        self.b_d.setEnabled(cnt['diff'] > 0); self.b_p.setEnabled(cnt['diff'] > 0)
+
+    def preview(self):
+        if not self._rows: self._err('اختر ملفًا أولًا'); return
+        try: self._prev = self.svc.preview(*self._args())
+        except AccountingError as e: self._err(e); return
+        self.b_x.setEnabled(True)
+        self.b_acc.setEnabled(any(r['status'] == 'unknown_party' and r['suggestions'] for r in self._prev['rows']))
+        self._summary(); self._fill()
+
+    def _fill(self, *_):
+        if not self._prev: return
+        rows = [r for r in self._prev['rows'] if not (self.only_diff.isChecked() and r['status'] == 'match')]
+        self._busy = True
+        try:
+            self.tbl.setRowCount(0); self.tbl.setRowCount(min(len(rows), _MAX_SHOWN))
+            for i, r in enumerate(rows[:_MAX_SHOWN]):
+                vals = [r['code'], r['name'], r['currency'], _fmt(r['file']), _fmt(r['system']), _fmt(r['approved']), _fmt(r['diff']),
+                        _ST[r['status']], '؛ '.join(r['errors']) if r['status'] not in _PICK else '']
+                for c, v in enumerate(vals):
+                    it = QTableWidgetItem(str(v))
+                    flags = it.flags() & ~Qt.ItemIsEditable
+                    if c == _C_APPR and r['status'] in _EDITABLE: flags |= Qt.ItemIsEditable; it.setToolTip('اكتب الرصيد المعتمد يدويًا (بطبيعة الطرف) أو امسحه للعودة لرصيد الملف')
+                    it.setFlags(flags)
+                    if c in (3, 4, 5, 6): it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    if c == 1 and r['file_name'] and r['file_name'] != r['name']: it.setToolTip(f"الاسم في الملف: {r['file_name']}")
+                    it.setData(Qt.UserRole, r['line']); self.tbl.setItem(i, c, it)
+                if r['status'] in _PICK:
+                    self.tbl.setItem(i, 1, QTableWidgetItem(r['file_name'])); self._sugg_combo(i, r)
+        finally:
+            self._busy = False
+        if len(rows) > _MAX_SHOWN:
+            self.sum.setText(self.sum.text() + f' — المعروض أول {_MAX_SHOWN:,} فقط؛ التصدير والاعتماد يشملان الكل.')
+
+    def _sugg_combo(self, i, r):
+        amb = r['status'] == 'ambiguous_party'
+        cb = QComboBox(); cb.addItem('— الاسم مكرر في النظام: اختر الطرف الصحيح —' if amb else '— اختر الطرف الصحيح —', None)
+        for s in r['suggestions']:
+            tail = f" — رصيد النظام {_fmt(s['system'])}" if amb and s.get('system') is not None else ('' if amb else f" ({s['score']:.0%})")
+            cb.addItem(f"{s['code']} — {s['name']}{tail}", s['party_id'])
+        if not r['suggestions']: cb.setItemText(0, 'لا اقتراح: أنشئ الطرف أو اكتب كوده في الملف')
+        line = r['line']
+        cb.currentIndexChanged.connect(lambda _i, cb=cb, line=line: self._choose(line, cb.currentData()))
+        self.tbl.setCellWidget(i, _C_SUG, cb)
+
+    def _choose(self, line, party_id):
+        if self._busy or party_id is None: return
+        self._lines[line]['party_id'] = party_id
+        self.preview()
+
+    def accept_confident(self):
+        m = self.svc.confident(self._prev)
+        if not m: QMessageBox.information(self, 'مطابقة الأرصدة', 'لا توجد اقتراحات واثقة (90% فأكثر وبفارق واضح عن الثاني).'); return
+        if QMessageBox.question(self, 'قبول الاقتراحات', f'سيُربط {len(m):,} اسمًا بأقرب طرف مقترح (تشابه 90% فأكثر). راجع الأسماء في الجدول بعدها. متابعة؟') != QMessageBox.Yes: return
+        for line, pid in m.items(): self._lines[line]['party_id'] = pid
+        self.preview()
+
+    def _edited(self, it):
+        if self._busy or it.column() != _C_APPR: return
+        line = it.data(Qt.UserRole); r = next((x for x in self._prev['rows'] if x['line'] == line), None)
+        if r is None or r['status'] not in _EDITABLE: return
+        txt = it.text().strip(); src = self._lines[line]
+        try:
+            if txt: val = self.svc.parse_amount(txt); src['approved'] = str(val)
+            else: val = r['file']; src.pop('approved', None)             # مسح الخلية = العودة لرصيد الملف
+        except AccountingError as e:
+            self._err(e); self._busy = True; it.setText(_fmt(r['approved'])); self._busy = False; return
+        r['approved'] = val; r['diff'] = val - r['system']
+        r['status'] = 'match' if r['diff'] == 0 else ('pending_draft' if r['status'] == 'pending_draft' else 'diff')
+        row = it.row(); self._busy = True
+        it.setText(_fmt(val)); self.tbl.item(row, _C_DIFF).setText(_fmt(r['diff'])); self.tbl.item(row, _C_ST).setText(_ST[r['status']])
+        self._busy = False; self._summary()
+
+    def export(self):
+        p, _ = QFileDialog.getSaveFileName(self, 'حفظ ملف المطابقة', 'مطابقة_الأرصدة.xlsx', 'Excel (*.xlsx)')
+        if not p: return
+        try: self.svc.export(self._prev, p)
+        except (AccountingError, OSError) as e: self._err(e); return
+        QMessageBox.information(self, 'مطابقة الأرصدة', 'تم التصدير. للأسماء غير المعروفة اكتب كود الطرف الصحيح في عمود «الكود»، وعدّل «الرصيد المعتمد» إن لزم، ثم أعد رفع الملف هنا.')
+
+    def commit(self, post):
+        sm = self._prev['summary']; n = sm['diff']
+        left = sm['unknown_party'] + sm['ambiguous_party'] + sm['invalid']
+        q = f'سيُنشأ قيد مطابقة لكل طرف له فرق ({n:,} طرفًا)' + (' ويُرحَّل مباشرة.' if post else ' كمسودة للمراجعة.')
+        if left: q += f'\nتنبيه: {left:,} صفًا لم يُحسم (غير موجود / اسم مكرر / خطأ) ولن يدخل في القيود.'
+        q += '\nمتابعة؟'
+        if QMessageBox.question(self, 'تأكيد المطابقة', q) != QMessageBox.Yes: return
+        try: r = self.svc.commit(*self._args(), post=post, note=self.note.text())
+        except AccountingError as e: self._err(e); return
+        msg = f"تم إنشاء {r['created']:,} قيدًا" + (f" (رُحِّل {r['posted']:,})" if post else ' كمسودات') + f"، المتطابق: {r['matched']:,}."
+        if r['failed']: msg += f"\nتعذّر {len(r['failed'])} طرفًا، أولها: {r['failed'][0]['name']} — {r['failed'][0]['error']}"
+        QMessageBox.information(self, 'مطابقة الأرصدة', msg)
+        self.preview()

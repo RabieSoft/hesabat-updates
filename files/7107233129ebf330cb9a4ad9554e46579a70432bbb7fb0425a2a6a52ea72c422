@@ -1,0 +1,340 @@
+"""نوافذ المصادقة والتهيئة: تسجيل الدخول والإعداد الأول للنظام.
+
+التنسيق كله في design/qss.py (أسماء الكائنات loginDialog/brandStrip/loginButton…) وألوان الهوية في tokens.BRAND؛
+لا ألوان هنا ولا استعلامات SQL مباشرة.
+"""
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QCheckBox, QComboBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QLayout, QLineEdit,
+    QMessageBox, QPushButton, QVBoxLayout, QWidget
+)
+
+from alhisabat import branding
+from alhisabat.ui.components.brand_widgets import logo_pixmap
+from alhisabat.ui.core import logic
+from alhisabat.ui.design import icons, tokens as T
+
+
+def _header(mode, logo_height):
+    """شريط الهوية الملوّن + الشعار الكامل: رأس موحّد لنوافذ الدخول والإعداد الأول."""
+    strip = QFrame()
+    strip.setObjectName('brandStrip')
+    logo = QLabel(branding.PRODUCT_NAME)                  # الاسم نصًا احتياطًا إن فُقد ملف الشعار
+    logo.setObjectName('loginWelcome')
+    logo.setAlignment(Qt.AlignCenter)
+    pm = logo_pixmap(mode, logo_height)
+    if pm is not None:
+        logo.setPixmap(pm)
+    return strip, logo
+
+
+def _field(label_text, widget):
+    box = QVBoxLayout()
+    box.setSpacing(3)
+    lab = QLabel(label_text)
+    lab.setObjectName('fieldLabel')
+    box.addWidget(lab)
+    box.addWidget(widget)
+    return box
+
+
+class LoginDialog(QDialog):
+    """شاشة تسجيل الدخول: المستخدم وكلمة المرور، والشركة/الفرع (تُخفى تلقائيًا إن لم يكن هناك خيار آخر)."""
+
+    def __init__(self, session, parent=None, mode='light', version=''):
+        super().__init__(parent)
+        self.session = session
+        self.result_data = None
+        self._muted = T.palette(mode)['muted']
+        self.setObjectName('loginDialog')
+        self.setWindowTitle('تسجيل الدخول — الحسابات برو')
+        self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.setFixedWidth(400)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.setSizeConstraint(QLayout.SetMinimumSize)
+
+        strip, logo = _header(mode, 104)
+        root.addWidget(strip)
+
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(32, 18, 32, 14)
+        lay.setSpacing(10)
+        lay.addWidget(logo)
+        tag = QLabel('نظام المحاسبة وإدارة المخزون المتكامل')
+        tag.setObjectName('loginTagline')
+        tag.setAlignment(Qt.AlignCenter)
+        lay.addWidget(tag)
+        lay.addSpacing(4)
+
+        self.user = QComboBox()
+        self.user.setEditable(False)
+        self._load_users()
+        lay.addLayout(_field('اسم المستخدم', self.user))
+
+        self.pw = QLineEdit()
+        self.pw.setPlaceholderText('أدخل كلمة المرور')
+        self.pw.setEchoMode(QLineEdit.Password)
+        self.pw.returnPressed.connect(self.login)
+        self._eye = self.pw.addAction(icons.qicon('eye', self._muted, 18), QLineEdit.TrailingPosition)
+        self._eye.setToolTip('إظهار كلمة المرور')
+        self._eye.triggered.connect(self._toggle_pw)
+        lay.addLayout(_field('كلمة المرور', self.pw))
+
+        # الشركة والفرع: صف من عمودين، أو سطر معلومات واحد حين لا يوجد غير خيار وحيد
+        self.company = QComboBox()
+        self.branch = QComboBox()
+        self.scope = QWidget()
+        sl = QHBoxLayout(self.scope)
+        sl.setContentsMargins(0, 0, 0, 0)
+        sl.setSpacing(10)
+        sl.addLayout(_field('الشركة', self.company), 3)
+        sl.addLayout(_field('الفرع', self.branch), 2)
+        lay.addWidget(self.scope)
+        self.scope_info = QLabel()
+        self.scope_info.setObjectName('loginScope')
+        self.scope_info.setAlignment(Qt.AlignCenter)
+        lay.addWidget(self.scope_info)
+
+        self.status = QLabel()
+        self.status.setObjectName('loginError')
+        self.status.setWordWrap(True)
+        self.status.hide()
+        lay.addWidget(self.status)
+
+        self.btn = QPushButton('تسجيل الدخول')
+        self.btn.setObjectName('loginButton')
+        self.btn.setDefault(True)
+        self.btn.setCursor(Qt.PointingHandCursor)
+        self.btn.clicked.connect(self.login)
+        lay.addSpacing(2)
+        lay.addWidget(self.btn)
+
+        foot_text = f'من {branding.COMPANY_NAME}' + (f'  •  الإصدار {version}' if version else '')
+        foot = QLabel(foot_text)
+        foot.setObjectName('loginFooter')
+        foot.setAlignment(Qt.AlignCenter)
+        lay.addWidget(foot)
+
+        root.addWidget(body, 1)
+
+        self.user.currentIndexChanged.connect(self._on_user_changed)
+        self.company.currentIndexChanged.connect(self._reload_branches)
+        self._on_user_changed()
+        self.pw.setFocus()
+
+    def _toggle_pw(self):
+        show = self.pw.echoMode() == QLineEdit.Password
+        self.pw.setEchoMode(QLineEdit.Normal if show else QLineEdit.Password)
+        self._eye.setIcon(icons.qicon('eye_off' if show else 'eye', self._muted, 18))
+        self._eye.setToolTip('إخفاء كلمة المرور' if show else 'إظهار كلمة المرور')
+
+    def _load_users(self):
+        self.user.blockSignals(True)
+        self.user.clear()
+        users = self.session.list_login_users()
+        if not users:
+            self.user.addItem('— لا يوجد مستخدمون —', None)
+        else:
+            for u in users:
+                label = u['username'] if not u.get('full_name') else f"{u['username']}  —  {u['full_name']}"
+                self.user.addItem(label, u['username'])
+        self.user.blockSignals(False)
+
+    def _on_user_changed(self, *_a):
+        username = self.user.currentData()
+        self.company.blockSignals(True)
+        self.company.clear()
+        self.branch.blockSignals(True)
+        self.branch.clear()
+        if not username:
+            self.company.blockSignals(False)
+            self.branch.blockSignals(False)
+            self._refresh_scope()
+            return
+
+        comps = self.session.list_companies_for_user(username)
+        if not comps:
+            self.company.addItem('— لا شركات متاحة —', None)
+        else:
+            for c in comps:
+                self.company.addItem(c['name'], c['id'])
+        self.company.blockSignals(False)
+        self._reload_branches()
+
+    def _reload_branches(self, *_a):
+        username = self.user.currentData()
+        company_id = self.company.currentData()
+        self.branch.blockSignals(True)
+        self.branch.clear()
+        if not username or company_id is None:
+            self.branch.blockSignals(False)
+            self._refresh_scope()
+            return
+
+        branches = self.session.list_branches_for_user(username, int(company_id))
+        if not branches:
+            self.branch.addItem('— لا فروع متاحة —', None)
+        else:
+            for b in branches:
+                self.branch.addItem(b['name'], b['id'])
+        self.branch.blockSignals(False)
+        self._refresh_scope()
+
+    def _refresh_scope(self):
+        """خيار وحيد صالح للشركة والفرع ← سطر معلومات مختصر؛ غير ذلك (أو وجود مشكلة) ← القائمتان."""
+        single = (self.company.count() == 1 and self.branch.count() == 1
+                  and self.company.currentData() is not None and self.branch.currentData() is not None)
+        self.scope.setVisible(not single)
+        self.scope_info.setVisible(single)
+        if single:
+            self.scope_info.setText(f'{self.company.currentText()}  •  {self.branch.currentText()}')
+
+    def login(self):
+        username = self.user.currentData()
+        if not username:
+            self._err('اختر اسم المستخدم.')
+            return
+        if not self.pw.text():
+            self._err('أدخل كلمة المرور.')
+            self.pw.setFocus()
+            return
+        company_id = self.company.currentData()
+        branch_id = self.branch.currentData()
+        if company_id is None:
+            self._err('اختر الشركة.')
+            return
+        if branch_id is None:
+            self._err('اختر الفرع.')
+            return
+        try:
+            self.result_data = self.session.authenticate(
+                username, self.pw.text(), company_id=int(company_id), branch_id=int(branch_id)
+            )
+            self.accept()
+        except Exception as e:
+            self._err(logic.friendly_error(e))
+            self.pw.selectAll()
+            self.pw.setFocus()
+
+    def _err(self, msg):
+        self.status.setText(str(msg))
+        self.status.show()
+        self.adjustSize()
+
+
+class BootstrapDialog(QDialog):
+    """نافذة الإعداد الأولي للنظام عند التشغيل الأول."""
+
+    def __init__(self, session, parent=None, mode='light'):
+        super().__init__(parent)
+        self.session = session
+        self.setObjectName('bootstrapDialog')
+        self.setWindowTitle('الإعداد الأول للنظام — الحسابات برو')
+        self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.setFixedWidth(460)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.setSizeConstraint(QLayout.SetMinimumSize)
+        strip, logo = _header(mode, 84)
+        root.addWidget(strip)
+
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(32, 16, 32, 18)
+        lay.setSpacing(10)
+        lay.addWidget(logo)
+
+        t = QLabel('مرحبًا بك في الحسابات برو')
+        t.setObjectName('loginWelcome')
+        t.setAlignment(Qt.AlignCenter)
+        lay.addWidget(t)
+        s = QLabel('أنشئ الشركة ومدير النظام للبدء. تُنشأ السنة المالية الحالية والفرع الرئيسي تلقائيًا.')
+        s.setObjectName('loginTagline')
+        s.setAlignment(Qt.AlignCenter)
+        s.setWordWrap(True)
+        lay.addWidget(s)
+
+        self.company = QLineEdit('شركة الربيع سوفت للحلول التقنية والمحاسبية')
+        self.user = QLineEdit('admin')
+        self.name = QLineEdit('المدير')
+        self.pw = QLineEdit()
+        self.pw2 = QLineEdit()
+        for w in (self.pw, self.pw2):
+            w.setEchoMode(QLineEdit.Password)
+        lay.addLayout(_field('اسم الشركة', self.company))
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        row.addLayout(_field('اسم المستخدم', self.user), 1)
+        row.addLayout(_field('الاسم الكامل', self.name), 1)
+        lay.addLayout(row)
+        row2 = QHBoxLayout()
+        row2.setSpacing(10)
+        row2.addLayout(_field('كلمة المرور', self.pw), 1)
+        row2.addLayout(_field('تأكيد كلمة المرور', self.pw2), 1)
+        lay.addLayout(row2)
+        # العملة الأساسية تُحدَّد مرة واحدة عند التهيئة؛ كل القيود والتقارير تُحتسب بها والعملات الأخرى تُحوَّل إليها بالأسعار
+        self.base_cur = QComboBox()
+        for code, label in (('SAR', 'ريال سعودي (SAR)'), ('YER', 'ريال يمني (YER)'), ('USD', 'دولار أمريكي (USD)'), ('AED', 'درهم إماراتي (AED)')):
+            self.base_cur.addItem(label, code)
+        lay.addLayout(_field('العملة الأساسية للشركة (اختر بعناية، لا تُغيَّر بعد بدء العمل)', self.base_cur))
+
+        self.chart = QCheckBox('تحميل شجرة الحسابات الافتراضية (موصى به؛ يلزم لإنشاء العملاء والموردين)')
+        self.chart.setChecked(True)
+        lay.addWidget(self.chart)
+
+        self.error = QLabel()
+        self.error.setObjectName('loginError')
+        self.error.setWordWrap(True)
+        self.error.hide()
+        lay.addWidget(self.error)
+
+        b = QPushButton('إنشاء وبدء الاستخدام')
+        b.setObjectName('loginButton')
+        b.setDefault(True)
+        b.setCursor(Qt.PointingHandCursor)
+        b.clicked.connect(self.go)
+        lay.addWidget(b)
+
+        foot = QLabel(f'من {branding.COMPANY_NAME}')
+        foot.setObjectName('loginFooter')
+        foot.setAlignment(Qt.AlignCenter)
+        lay.addWidget(foot)
+        root.addWidget(body, 1)
+
+    def _fail(self, msg):
+        self.error.setText(msg)
+        self.error.show()
+        self.adjustSize()
+
+    def go(self):
+        if not self.company.text().strip() or not self.user.text().strip() or not self.pw.text():
+            self._fail('جميع الحقول مطلوبة.')
+            return
+        if self.pw.text() != self.pw2.text():
+            self._fail('كلمتا المرور غير متطابقتين.')
+            return
+        try:
+            self.session.bootstrap(
+                self.company.text().strip(),
+                self.user.text().strip(),
+                self.name.text().strip() or self.user.text().strip(),
+                self.pw.text(),
+                load_chart=self.chart.isChecked(),
+                base_currency=self.base_cur.currentData()
+            )
+            err = getattr(self.session, 'chart_error', '')
+            if self.chart.isChecked() and err:
+                QMessageBox.warning(self, 'شجرة الحسابات',
+                                    'تم إنشاء الشركة والمستخدم، لكن تعذّر تحميل شجرة الحسابات الافتراضية:\n' + err +
+                                    '\nيمكنك تحميلها لاحقًا من صفحة شجرة الحسابات (تحميل الشجرة الافتراضية).')
+            self.accept()
+        except Exception as e:
+            self._fail(logic.friendly_error(e))

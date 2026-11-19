@@ -1,0 +1,554 @@
+"""صفحة القيود المحاسبية (دفعة 1 من المرحلة 3): قائمة + ورقة القيد الواقعية + شريط سير العمل + مرفقات + قوالب + استيراد.
+
+كل الكتابة عبر JournalService → journal_engine (المحرك هو الحَكَم). الأزرار تُشتق من core.workflow (مختبَر مقابل المحرك).
+يحل محل JournalPage وJournalDialog وEnhancedJournalDialog القديمة (تبقى في الواجهة القديمة حتى نهاية المرحلة 3). يتطلب PySide6.
+"""
+import calendar
+import datetime as _dt
+import re
+
+from PySide6.QtCore import QRegularExpression, QTimer, Qt
+from PySide6.QtGui import QRegularExpressionValidator
+from PySide6.QtWidgets import (QComboBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QSizePolicy, QSplitter,
+                               QVBoxLayout, QWidget)
+
+from alhisabat.ui.components import document_model as DM
+from alhisabat.ui.components.basic import DateField, ask_reason
+from alhisabat.ui.components.datagrid import DataGrid
+from alhisabat.ui.components.document_sheet import DocumentSheet
+from alhisabat.ui.components.grid_logic import Column
+from alhisabat.ui.components.panels import RelatedPanel
+from alhisabat.ui.core import state as ST, workflow as W
+from alhisabat.ui.core.actions import Action, ActionGroup
+from alhisabat.ui.core.base_page import BasePage
+from alhisabat.ui.core.journal_service import ENTRY_TYPES, JournalService
+from alhisabat.ui.core.permissions import ActionState
+
+from alhisabat.ui.app_dialogs.journal import AttachmentsDialog, ReverseDialog
+from alhisabat.ui.app_dialogs.journal_editor import JournalEditor
+
+# مرشح الحالة ← (status, workflow_state)
+FILTERS = [('الكل', None, None), ('مسودة', 'draft', 'draft'), ('قيد المراجعة', 'draft', 'reviewed'), ('معتمد غير مرحّل', 'draft', 'approved'),
+           ('مرحّل', 'posted', None), ('معكوس', 'reversed', None)]
+# فترات جاهزة للتصفية بالتاريخ (المفتاح، الاسم): تضبط «من/إلى» تلقائيًا؛ «مدى مخصص» يفتحهما للتعديل
+PERIODS = [('month', 'هذا الشهر'), ('today', 'اليوم'), ('last_month', 'الشهر الماضي'), ('last30', 'آخر 30 يومًا'),
+           ('year', 'هذه السنة'), ('all', 'كل التواريخ'), ('custom', 'مدى مخصص')]
+PAGE_SIZE = 200
+_AR_DIGITS = str.maketrans('٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹', '01234567890123456789')
+
+
+def period_range(key, today=None):
+    """(من، إلى) لفترة جاهزة، أو None لـ «كل التواريخ/مخصص»."""
+    t = today or _dt.date.today()
+    if key == 'today':
+        return t, t
+    if key == 'month':
+        return t.replace(day=1), t.replace(day=calendar.monthrange(t.year, t.month)[1])
+    if key == 'last_month':
+        last = t.replace(day=1) - _dt.timedelta(days=1)
+        return last.replace(day=1), last
+    if key == 'last30':
+        return t - _dt.timedelta(days=29), t
+    if key == 'year':
+        return t.replace(month=1, day=1), t.replace(month=12, day=31)
+    return None
+
+
+def parse_entry_no(text):
+    """«25» أو «#25» أو «25-40» (وبالأرقام العربية) ← (من، إلى)، وإلا None."""
+    t = (text or '').translate(_AR_DIGITS).replace('#', '').strip()
+    m = re.fullmatch(r'(\d+)', t)
+    if m:
+        return int(m.group(1)), int(m.group(1))
+    m = re.fullmatch(r'(\d+)\s*-\s*(\d+)', t)
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        return (a, b) if a <= b else (b, a)
+    return None
+
+
+SOURCE_PAGES = {'sales_invoice': 'sales', 'purchase_invoice': 'purchases', 'cash_voucher': 'cash', 'cash_transfer': 'cash',
+                'cash_count': 'cash', 'bank_statement': 'bank_recon', 'payroll_run': 'payroll', 'depreciation_run': 'assets',
+                'asset': 'assets', 'stock_count': 'stock_ops', 'revaluation': 'period_end', 'year_closing': 'period_end'}
+DONE = {'review': 'تمت المراجعة', 'approve': 'تم الاعتماد', 'post': 'تم الترحيل', 'delete': 'حُذفت المسودة',
+        'return_to_draft': 'أُعيد القيد إلى المسودة', 'reverse': 'تم عكس القيد', 'delete_posted': 'حُذف القيد المرحّل (نسخته محفوظة في سجل المحذوفات)'}
+
+
+class JournalPage(BasePage):
+    key = 'journal'
+    title = 'القيود المحاسبية'
+    icon = 'journal'
+    required_permission = 'journal.view'
+
+    def build(self):
+        self.svc = JournalService(self.session)
+        self._rows, self._sel, self._entry, self._ro = [], None, None, ''
+        self._qkw, self._more = None, False
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(6, 6, 6, 6)
+
+        sbar = QHBoxLayout()                               # صف البحث: رقم القيد (فوري) + بحث في البيان
+        self.f_no = QLineEdit()
+        self.f_no.setPlaceholderText('رقم القيد: 25 أو 25-40')
+        self.f_no.setToolTip('يبحث مباشرة في كل القيود وبكل التواريخ (لا يقتصر على ما هو معروض). Enter يحدّد أول نتيجة.')
+        self.f_no.setValidator(QRegularExpressionValidator(QRegularExpression(r'[#0-9٠-٩۰-۹\- ]*')))
+        self.f_no.setClearButtonEnabled(True)
+        self.f_no.setFixedWidth(190)
+        self.f_text = QLineEdit()
+        self.f_text.setPlaceholderText('بحث في البيان أو بيان السطور…')
+        self.f_text.setToolTip('يبحث في قاعدة البيانات ضمن التصفية الحالية (الفترة والحالة والعملة)')
+        self.f_text.setClearButtonEnabled(True)
+        self.f_text.setMinimumWidth(240)
+        self.btn_more = QPushButton('عرض المزيد')
+        self.btn_more.setAutoDefault(False)
+        self.btn_more.setVisible(False)
+        self.btn_more.clicked.connect(self._load_more)
+        self.count_lbl = QLabel('')
+        self.count_lbl.setObjectName('ctxKey')
+        for w in (QLabel('رقم القيد:'), self.f_no, QLabel('بحث:'), self.f_text, self.btn_more):
+            sbar.addWidget(w)
+        sbar.addStretch(1)
+        sbar.addWidget(self.count_lbl)
+        lay.addLayout(sbar)
+        self._t_no, self._t_text = QTimer(self), QTimer(self)      # تأخير قصير يجمع الضغطات ثم يبحث (سريع بلا تقطيع)
+        for t_, ms in ((self._t_no, 120), (self._t_text, 300)):
+            t_.setSingleShot(True); t_.setInterval(ms); t_.timeout.connect(self.refresh)
+        self.f_no.textChanged.connect(lambda _t: self._t_no.start())
+        self.f_text.textChanged.connect(lambda _t: self._t_text.start())
+        self.f_no.returnPressed.connect(self._search_now)
+
+        bar = QHBoxLayout()
+        self.f_status = QComboBox()
+        for label, st, ws in FILTERS:
+            self.f_status.addItem(label, (st, ws))
+        self.f_from, self.f_to = DateField(), DateField()
+        self.f_period = QComboBox()                        # فترة جاهزة (هذا الشهر افتراضيًا) تضبط «من/إلى» تلقائيًا
+        for key, label in PERIODS:
+            self.f_period.addItem(label, key)
+        self._set_period('month', refresh=False)
+        self.f_cur = QComboBox()                           # تصفية القيود بالعملة (القيد الذي فيه سطر بتلك العملة)
+        self.f_cur.addItem('كل العملات', None)
+        try:
+            for code, label, _b in self.svc.currency_options():
+                self.f_cur.addItem(label, code)
+        except Exception:  # noqa: BLE001
+            pass
+        for w in (QLabel('الحالة:'), self.f_status, QLabel('العملة:'), self.f_cur, QLabel('الفترة:'), self.f_period, QLabel('من'), self.f_from, QLabel('إلى'), self.f_to):
+            bar.addWidget(w)
+        bar.addStretch(1)
+        lay.addLayout(bar)
+        for w in (self.f_status, self.f_cur):
+            w.currentIndexChanged.connect(lambda _i: self.refresh())
+        self.f_period.currentIndexChanged.connect(lambda _i: self._set_period(self.f_period.currentData()))
+        self.f_from.dateChanged.connect(lambda _d: self.f_period.currentData() == 'custom' and self.refresh())
+        self.f_to.dateChanged.connect(lambda _d: self.f_period.currentData() == 'custom' and self.refresh())
+
+        split = QSplitter(Qt.Horizontal)
+        cols = [Column('entry_no', 'رقم القيد', 'int', 62, link=True), Column('entry_date', 'التاريخ', 'date', 82), Column('description', 'البيان', width=230),
+                Column('counter_label', 'من / إلى (الطرف المقابل)', width=170),
+                Column('debit_label', 'مدين', width=160), Column('credit_label', 'دائن', width=160),
+                Column('ref', 'المرجع', width=130),
+                Column('type_label', 'النوع', width=62), Column('currency', 'العملة', width=64),
+                Column('total_orig_minor', 'الإجمالي بالعملة', 'money', 100, minor=True),
+                Column('total_minor', 'المعادل بالأساسية', 'money', 100, minor=True),
+                Column('source_type', 'المصدر', width=84), Column('attachment_count', 'مرفقات', 'int', 52),
+                Column('link', 'الارتباط', width=100), Column('state', 'الحالة', 'status', 70)]
+        self.grid = DataGrid(cols, grid_id='journal_list_v5')      # مفتاح جديد: لا تُستعاد عروض الأعمدة الكبيرة القديمة
+        self.grid.set_dense(22, 8.5)
+        self.grid.set_free_resize()
+        self.grid.selectionChangedRows.connect(self._on_select)
+        self.grid.rowActivated.connect(self._on_activate)
+        self.grid.linkClicked.connect(self._on_link)           # رقم القيد ← المستند الأصلي (فاتورة/سند/قيد…)
+        split.addWidget(self.grid)
+
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(0, 0, 0, 0)
+        self.sheet = DocumentSheet(self.window_.prefs.get('paper'))
+        self.sheet.paperChanged.connect(lambda p: self.window_.prefs.set('paper', p))
+        self.related = RelatedPanel()
+        self.related.setMaximumHeight(130)
+        self.related.openRequested.connect(self._open_related)
+        rl.addWidget(self.sheet, 1)
+        rl.addWidget(self.related)
+        split.addWidget(right)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        self.sheet.set_compact(True)
+        right.setMinimumWidth(340)
+        right.setMaximumWidth(780)                     # المعاينة بحجم معقول مهما اتسعت الشاشة
+        QTimer.singleShot(0, lambda: split.setSizes([max(480, int(split.width() * 0.56)), max(380, int(split.width() * 0.44))]))
+        split.setChildrenCollapsible(True)             # يمكن طي المعاينة بسحب الفاصل لتظهر كل أعمدة الجدول
+        # Qt يعتبر الحد الأدنى 0 بمثابة «غير محدد» فيرجع لعرض أدوات الورقة؛ لذا نتجاهل السياسة الأفقية صراحةً
+        right.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        self.sheet.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        lay.addWidget(split, 1)
+        self._empty = QLabel('لا توجد قيود بعد. أنشئ أول قيد يومية من الزر «قيد جديد».')
+        self._empty.setAlignment(Qt.AlignCenter)
+        lay.addWidget(self._empty)
+
+    # ---------------------------------------------------------------- تحميل
+    def refresh(self):
+        if not self._built:
+            return
+        st, ws = self.f_status.currentData()
+        kw, cur, by_no = {}, self.f_cur.currentData(), parse_entry_no(self.f_no.text())
+        if by_no:                                          # بحث برقم القيد: عبر كل التواريخ والحالات والعملات (فوري ولا يتأثر بحد العرض)
+            st = ws = cur = None
+            kw = {'no_from': by_no[0], 'no_to': by_no[1]}
+        elif self.f_period.currentData() != 'all':
+            kw = {'date_from': self.f_from.iso(), 'date_to': self.f_to.iso()}
+        if self.f_text.text().strip():
+            kw['text'] = self.f_text.text().strip()
+        keep = self._sel['id'] if self._sel else None
+        if keep is None and getattr(self, 'params', None):
+            if isinstance(self.params, dict):
+                keep = self.params.get('id') or self.params.get('entry_id')
+            elif isinstance(self.params, int):
+                keep = self.params
+            self.params = None
+        try:
+            self._qkw = dict(status=st, workflow_state=ws, currency=cur, **kw)
+            rows = self.svc.list(**self._qkw, limit=PAGE_SIZE)
+        except Exception as exc:  # noqa: BLE001
+            self.show_error(exc)
+            rows = []
+            self._qkw = None
+        # إذا كان السجل المطلوب غير موجود في التصفية الحالية، نلغي التصفية لعرضه
+        if keep is not None and not any(r.get('id') == keep for r in rows):
+            try:
+                self._qkw = dict(status=None, workflow_state=None, currency=None)
+                rows = self.svc.list(**self._qkw, limit=PAGE_SIZE)
+                self._set_period('all', refresh=False)
+                self.f_status.blockSignals(True)
+                self.f_status.setCurrentIndex(0)
+                self.f_status.blockSignals(False)
+                self.f_cur.blockSignals(True)
+                self.f_cur.setCurrentIndex(0)
+                self.f_cur.blockSignals(False)
+            except Exception:
+                pass
+        for r in rows:
+            r['type_label'] = ENTRY_TYPES.get(r.get('entry_type'), r.get('entry_type') or '')
+        self._rows = rows
+        self.grid.set_rows(rows)
+        self._more = len(rows) >= PAGE_SIZE
+        self.btn_more.setVisible(self._more)
+        self._update_count(by_no)
+        has_any = True
+        if not rows:
+            try:
+                has_any = bool(self.svc.list(limit=1))
+            except Exception:  # noqa: BLE001
+                has_any = True
+        self._empty.setVisible(not has_any)
+        if keep is not None:
+            self._select_id(keep)
+        else:
+            self._on_select([])
+
+    def _update_count(self, by_no=None):
+        msg = f'{len(self._rows)} قيد'
+        if by_no:
+            msg += ' — نتيجة البحث برقم القيد في كل التواريخ'
+        if getattr(self, '_more', False):
+            msg += ' — توجد قيود أخرى: «عرض المزيد»'
+        self.count_lbl.setText(msg)
+
+    def _load_more(self):
+        """يحمّل الدفعة التالية من نفس التصفية ويضيفها بدل حد العرض الثابت."""
+        if not getattr(self, '_qkw', None):
+            return
+        keep = self._sel['id'] if self._sel else None
+        try:
+            more = self.svc.list(**self._qkw, limit=PAGE_SIZE, offset=len(self._rows))
+        except Exception as exc:  # noqa: BLE001
+            return self.show_error(exc)
+        for r in more:
+            r['type_label'] = ENTRY_TYPES.get(r.get('entry_type'), r.get('entry_type') or '')
+        self._rows = self._rows + more
+        self.grid.set_rows(self._rows)
+        self._more = len(more) >= PAGE_SIZE
+        self.btn_more.setVisible(self._more)
+        self._update_count(parse_entry_no(self.f_no.text()))
+        if keep is not None:
+            self._select_id(keep)
+
+    def _set_period(self, key, refresh=True):
+        """يضبط الفترة: الفترات الجاهزة تملأ «من/إلى» وتقفلهما، و«مدى مخصص» يفتحهما انطلاقًا من آخر فترة (لا «اليوم» فقط)."""
+        i = self.f_period.findData(key)
+        if i >= 0 and self.f_period.currentIndex() != i:
+            self.f_period.blockSignals(True)
+            self.f_period.setCurrentIndex(i)
+            self.f_period.blockSignals(False)
+        rng = period_range(key)
+        if rng:
+            for w, d in ((self.f_from, rng[0]), (self.f_to, rng[1])):
+                w.blockSignals(True)
+                w.set_iso(d.isoformat())
+                w.blockSignals(False)
+        self.f_from.setEnabled(key == 'custom')
+        self.f_to.setEnabled(key == 'custom')
+        if refresh:
+            self.refresh()
+
+    def _search_now(self):
+        """Enter في خانة رقم القيد: بحث فوري ثم تحديد أول نتيجة ونقل التركيز للجدول."""
+        self._t_no.stop()
+        self.refresh()
+        if self._rows and self.grid.select_where(lambda r: True):
+            self.grid.table.setFocus()
+
+    def _select_id(self, eid):
+        if not self.grid.select_where(lambda r: r['id'] == eid):
+            self._on_select([])
+
+    def _on_select(self, rows):
+        self._sel = rows[0] if len(rows) == 1 else None
+        self._entry, self._ro = None, ''
+        if self._sel:
+            try:
+                self._entry = self.svc.get(self._sel['id'])
+                self._ro = ST.period_reason(self.session.period_info(self._entry['entry_date']))
+                self.sheet.set_document(self._doc())
+            except Exception as exc:  # noqa: BLE001
+                self._entry = None
+                self.show_error(exc)
+        else:
+            self.sheet.set_document(None)
+        self._fill_related()
+        self.actions_changed.emit()
+
+    def _on_activate(self, _row):
+        if self._action_state('edit').enabled:        # النقر المزدوج يعدّل المسودة فقط، وبصمت لغيرها
+            self.do('edit')
+
+    def _foreign(self):
+        """هل في القيد سطور بعملة غير عملة الأساس؟ تعديلها من هنا يفقد العملة الأصلية، فنمنعه حماية للبيانات."""
+        base = (self.state.get('company') or {}).get('base_currency')
+        curs = {(ln.get('currency') or base) for ln in (self._entry or {}).get('lines', [])}
+        return len(curs) > 1        # عملة واحدة (يمني مثلًا) تُعدَّل بأصلها؛ المختلط فقط غير مدعوم
+
+    def _ctx_entry(self):
+        return {**self._entry, 'entry_no': (self._sel or {}).get('entry_no', self._entry.get('entry_no'))}
+
+    def _doc(self):
+        e = self._entry
+        doc = DM.from_print_spec(self.svc.print_spec(e['id']), 'journal', status=e['status'])
+        if e['status'] == 'draft' and e.get('workflow_state') in ('reviewed', 'approved'):
+            doc.status = e['workflow_state']
+        return doc
+
+    def _fill_related(self):
+        items, e = [], self._entry
+        if e:
+            page = SOURCE_PAGES.get(e.get('source_type') or '')
+            if e.get('source_type'):
+                items.append(('المصدر', f"{e['source_type']} #{e.get('source_id')}", page or 'journal', None))
+            if self._sel and self._sel.get('link'):
+                items.append(('ارتباط', self._sel['link'], 'journal', None))
+            if self._sel and self._sel.get('attachment_count'):
+                items.append(('مرفقات', f"{self._sel['attachment_count']} ملف", 'journal', None))
+        self.related.set_items(items)
+
+    def _open_related(self, page, params):
+        if page != 'journal':
+            self.open_page_requested.emit(page, params)
+
+    def on_context_changed(self, keys):
+        super().on_context_changed(keys)
+
+    def is_dirty(self):
+        return False
+
+    # ---------------------------------------------------------------- الإجراءات
+    def _action_state(self, key):
+        e = self._entry
+        if key == 'new':
+            return self.access.state('journal.create')
+        if not e:
+            return ActionState(False, 'حدد قيدًا أولًا')
+        acts = {a.key: a for a in W.journal_actions(e, self.svc.settings(), self.access, self.session.user_id, self._ro)}
+        a = acts.get(key)
+        if a is not None and key in ('edit', 'edit_posted') and a.enabled and self._foreign():
+            return ActionState(False, 'القيد يحوي أكثر من عملة: تعديله من هذه الشاشة غير مدعوم بعد (يفقد العملة الأصلية)')
+        return ActionState(a.enabled, a.reason) if a else ActionState(False, 'غير متاح لهذه الحالة')
+
+    def ribbon_groups(self):
+        def act(key, label, icon, **kw):
+            return Action(key, label, icon, state_fn=lambda k=key: self._action_state(k), handler=lambda k=key: self.do(k), **kw)
+        return [
+            ActionGroup('قيد', [act('new', 'قيد جديد', 'new', shortcut='Ctrl+N', primary=True), act('edit', 'تعديل', 'edit', shortcut='F2'),
+                                act('delete', 'حذف المسودة', 'delete', danger=True),
+                                act('edit_posted', 'تعديل مرحّل', 'edit'), act('delete_posted', 'حذف مرحّل', 'delete', danger=True)]),
+            ActionGroup('سير العمل', [act('review', 'مراجعة', 'review'), act('approve', 'اعتماد', 'approve'),
+                                      act('return_to_draft', 'إعادة لمسودة', 'return'), act('post', 'ترحيل', 'post', shortcut='F9'),
+                                      act('reverse', 'عكس', 'reverse', danger=True)]),
+            ActionGroup('أدوات', [Action('attach', 'مرفقات', 'attach', state_fn=lambda: self._action_state('print') if self._entry else ActionState(False, 'حدد قيدًا أولًا'),
+                                         handler=lambda: self.do('attachments')),
+                                  Action('print', 'طباعة', 'print', shortcut='Ctrl+P', state_fn=lambda: self._action_state('print'), handler=lambda: self.sheet.print_()),
+                                  Action('refresh', 'تحديث', 'refresh', handler=self.refresh)]),
+        ]
+
+    def do(self, key):
+        e = self._entry
+        if key == 'new':
+            return self._new()
+        if not e:
+            return QMessageBox.information(self, self.title, 'حدد قيدًا أولًا.')
+        st = self._action_state(key) if key not in ('attachments',) else ActionState(True)
+        if not st.enabled:
+            return QMessageBox.information(self, self.title, st.reason)
+        if key == 'edit':
+            return self._edit()
+        if key == 'edit_posted':
+            return self._edit_posted()
+        if key == 'delete_posted':
+            r = ask_reason(self, 'حذف قيد مرحّل', ['سيُحذف القيد نهائيًا (مع عكسه إن وُجد) ولا يمكن التراجع.',
+                                                 'تُحفظ نسخة كاملة منه مع السبب في سجل المحذوفات ويُسجَّل في التدقيق.',
+                                                 'يبقى رقمه الرسمي فجوة في ترقيم القيود.'], True, 'حذف')
+            return None if r is None else self._run('delete_posted', reason=r)
+        if key == 'attachments':
+            return self._attachments()
+        if key == 'post':
+            if ask_reason(self, 'تأكيد الترحيل', ['الترحيل يثبّت القيد ولا يمكن تعديله بعده (يمكن عكسه فقط).'], need_reason=False, confirm_text='ترحيل', danger=False) is None:
+                return
+            return self._run('post')
+        if key == 'delete':
+            if ask_reason(self, 'حذف المسودة', ['ستُحذف مسودة القيد نهائيًا ويُسجَّل ذلك في التدقيق.'], need_reason=False, confirm_text='حذف') is None:
+                return
+            return self._run('delete')
+        if key == 'return_to_draft':
+            r = ask_reason(self, 'إعادة القيد إلى المسودة', ['يعود القيد إلى حالة المسودة ويُلغى ما تم من مراجعة/اعتماد.'], True, 'إعادة')
+            return None if r is None else self._run('return_to_draft', reason=r)
+        if key == 'reverse':
+            y = self.state.get('year') or {}
+            d = ReverseDialog(self, self._ctx_entry(), None, y.get('end'))
+            if self.exec_form(d):
+                on_date, reason = d.values()
+                self._run('reverse', reason=reason, on_date=on_date)
+            return None
+        return self._run(key)
+
+    def _run(self, key, **kw):
+        eid = self._entry['id']
+        ok, _ = self.guarded(self.svc.act, eid, key, reload=False, **kw)
+        if ok:
+            self.notify(DONE.get(key, 'تم'))
+            self.refresh()
+            self.window_.data_changed(self.key)
+        return ok
+
+    def resume_draft(self, dialog_id):
+        """استئناف قيد جديد من مسودة محفوظة (بعد انقطاع الكهرباء)."""
+        if dialog_id == 'journal_new':
+            self._new(resume=True)
+
+    def start_new(self, preset=None):
+        """من قائمة المحاسبة العلوية: 'receipt' قيد سند قبض، 'payment' قيد سند صرف، 'recipe:<key>' قالب جاهز."""
+        return self._new(preset=preset)
+
+    def _new(self, resume=False, preset=None):
+        if not self.access.has('journal.create'):
+            return QMessageBox.information(self, self.title, 'ليست لديك صلاحية إنشاء القيود.')
+        tab = None
+        while True:                                    # «حفظ وقيد جديد» يعيد فتح محرر فارغ بعد كل حفظ ناجح
+            d = JournalEditor(self, preset=preset, tab=tab)
+            d.enable_stay_save(self._save_stay_new)
+            d._resume, resume = resume, False
+            if not self.exec_form(d):
+                return
+            v = d.values()
+            ok, eid = self.guarded(self.svc.create, v['date'], v['description'], v['lines'], v['pending_attachments'],
+                                 entry_type=v.get('entry_type', 'general'), reload=False)
+            if not ok:
+                return
+            d.clear_draft()                            # نجح الحفظ: لا حاجة للمسودة التلقائية
+            self.notify('تم حفظ القيد كمسودة')
+            self._sel = {'id': eid}
+            self.refresh()
+            self.window_.data_changed(self.key)
+            if not d.add_another:
+                return
+            # يعود لآخر قالب مفضل/جاهز استُعمل، وإلا لآخر واجهة (بسيط/مركب) كنت فيها
+            preset = f'recipe:{d.used_recipe}' if d.used_recipe else (preset if preset in ('receipt', 'payment') else None)
+            tab = d.tabs.currentIndex()
+
+    def _on_link(self, row, _key):
+        self.open_entry_requested.emit({'entry_id': row.get('id'), 'source_type': row.get('source_type'), 'source_id': row.get('source_id')})
+
+    def show_source(self, tgt):
+        """يحدّد القيد في القائمة؛ وإن كان خارج الفلاتر يبحث برقمه (البحث بالرقم يتجاوز الفترة والحالة والعملة)."""
+        try:
+            eid = tgt.entry_id
+            if not eid:
+                return False
+            if self.grid.select_where(lambda r: r.get('id') == eid):
+                return True
+            from alhisabat.ui.core import readmodel
+            meta = readmodel.entry_source(self.session.conn, eid)
+            if not meta:
+                return False
+            self.f_no.setText(str(meta['label_no']))
+            self.refresh()
+            return bool(self.grid.select_where(lambda r: r.get('id') == eid))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _save_stay_new(self, d):
+        """زر «حفظ» في المحرر: يحفظ مسودة جديدة وتبقى النافذة مفتوحة لإدخال التالي."""
+        v = d.values()
+        ok, eid = self.guarded(self.svc.create, v['date'], v['description'], v['lines'], v['pending_attachments'],
+                               entry_type=v.get('entry_type', 'general'), reload=False)
+        if not ok:
+            return False
+        d.clear_draft()
+        self.notify('تم حفظ القيد كمسودة')
+        self._sel = {'id': eid}
+        self.refresh()
+        self.window_.data_changed(self.key)
+        return True
+
+    def _save_stay_edit(self, d):
+        v = d.values()
+        ok, _ = self.guarded(self.svc.update, d.entry['id'], v['date'], v['description'], v['lines'], reload=False)
+        if not ok:
+            return False
+        self.notify('تم تحديث المسودة')
+        self.refresh()
+        self.window_.data_changed(self.key)
+        return True
+
+    def _edit(self):
+        d = JournalEditor(self, self._entry)
+        d.enable_stay_save(self._save_stay_edit)
+        if self.exec_form(d):
+            v = d.values()
+            ok, _ = self.guarded(self.svc.update, self._entry['id'], v['date'], v['description'], v['lines'], reload=False)
+            if ok:
+                self.notify('تم تحديث المسودة')
+                self.refresh()
+                self.window_.data_changed(self.key)
+
+    def _edit_posted(self):
+        d = JournalEditor(self, self._entry)
+        if not self.exec_form(d):
+            return
+        v = d.values()
+        r = ask_reason(self, 'تعديل قيد مرحّل', ['سيُعكس القيد الحالي بقيد عكسي ويُرحَّل قيد جديد بالقيم المعدّلة.',
+                                                'يظهر الأثران في كشف الحساب، ويُسجَّل السبب في التدقيق.'], True, 'تعديل')
+        if r is None:
+            return
+        ok, _ = self.guarded(self.svc.edit_posted, self._entry['id'], v['date'], v['description'], v['lines'], r, reload=False)
+        if ok:
+            self.notify('تم تعديل القيد: عُكس القديم ورُحّل الجديد')
+            self.refresh()
+            self.window_.data_changed(self.key)
+
+    def _attachments(self):
+        d = AttachmentsDialog(self, self.svc, self._ctx_entry(), self.access.has('journal.create'), self.show_error)
+        self.exec_form(d)
+        if d.changed:
+            self.refresh()
+
+

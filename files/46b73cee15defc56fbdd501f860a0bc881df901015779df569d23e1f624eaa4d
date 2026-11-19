@@ -1,0 +1,12 @@
+-- 0048_wa_movements.sql: الحركات الجديدة في دليل الرسائل (تجاهل حركة + قالب افتراضي)
+CREATE TABLE wa_movement_ignored(
+  entry_id INTEGER NOT NULL REFERENCES journal_entries(id),
+  party_id INTEGER NOT NULL REFERENCES parties(id),
+  ignored_by INTEGER REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY(entry_id, party_id)
+);
+
+INSERT OR IGNORE INTO wa_templates(branch_id, code, title, body, is_active) VALUES
+  (NULL, 'movement', 'إشعار حركة حساب',
+   'مرحبًا {الاسم}، تم تسجيل {نوع_الحركة} رقم {رقم_المستند} بتاريخ {التاريخ} بمبلغ {المبلغ} {العملة} ({الجانب}). رصيدكم الحالي: {الرصيد} {العملة}.', 1);

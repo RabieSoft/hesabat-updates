@@ -1,0 +1,31 @@
+-- 0050: سجل معالجات المطابقة والتشخيص المحاسبي (إضافة جداول فقط — لا تعديل على أي جدول قائم).
+-- كل معالجة تُنفَّذ بموافقة صريحة من المستخدم وتُسجَّل هنا بالأثر والقيد الناتج (إن وُجد).
+CREATE TABLE IF NOT EXISTS reconciliation_log(
+  id INTEGER PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id),
+  finding_code TEXT NOT NULL,
+  subject TEXT NOT NULL DEFAULT '',
+  amount_base INTEGER NOT NULL DEFAULT 0,
+  action TEXT NOT NULL,
+  entry_id INTEGER REFERENCES journal_entries(id),
+  reason TEXT NOT NULL,
+  impact_before TEXT NOT NULL DEFAULT '',
+  impact_after TEXT NOT NULL DEFAULT '',
+  performed_by INTEGER NOT NULL REFERENCES users(id),
+  performed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS ix_reconciliation_log_company ON reconciliation_log(company_id, performed_at);
+
+-- سجل إقفال/إعادة فتح الفترات الشهرية (نطاق حر): النطاق المطلوب + السبب + المستخدم + التاريخ
+CREATE TABLE IF NOT EXISTS period_close_log(
+  id INTEGER PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id),
+  action TEXT NOT NULL CHECK(action IN ('close','reopen','split')),
+  range_start TEXT NOT NULL,
+  range_end TEXT NOT NULL,
+  periods_count INTEGER NOT NULL DEFAULT 0,
+  reason TEXT NOT NULL DEFAULT '',
+  checks_summary TEXT NOT NULL DEFAULT '',
+  performed_by INTEGER NOT NULL REFERENCES users(id),
+  performed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);

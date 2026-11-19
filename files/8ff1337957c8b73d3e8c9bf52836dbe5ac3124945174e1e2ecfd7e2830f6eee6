@@ -1,0 +1,33 @@
+-- خدمة مزامنة تطبيق الأندرويد: أجهزة مقترنة (رمز وصول مُجزَّأ)، رموز اقتران مؤقتة، وسجل طلبات يمنع تكرار التنفيذ.
+CREATE TABLE sync_devices(
+  id INTEGER PRIMARY KEY,
+  device_uid TEXT NOT NULL,
+  name TEXT NOT NULL,
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  company_id INTEGER NOT NULL REFERENCES companies(id),
+  branch_id INTEGER NOT NULL REFERENCES branches(id),
+  token_hash TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  last_seen_at TEXT,
+  revoked_at TEXT);
+CREATE UNIQUE INDEX ux_sync_devices_uid ON sync_devices(device_uid) WHERE revoked_at IS NULL;
+
+CREATE TABLE sync_pairings(
+  id INTEGER PRIMARY KEY,
+  code_hash TEXT NOT NULL UNIQUE,
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  company_id INTEGER NOT NULL REFERENCES companies(id),
+  branch_id INTEGER NOT NULL REFERENCES branches(id),
+  expires_at TEXT NOT NULL,
+  used_at TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+
+CREATE TABLE sync_requests(
+  id INTEGER PRIMARY KEY,
+  device_id INTEGER NOT NULL REFERENCES sync_devices(id),
+  client_uid TEXT NOT NULL,
+  req_type TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('accepted','rejected')),
+  result_json TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(device_id, client_uid));

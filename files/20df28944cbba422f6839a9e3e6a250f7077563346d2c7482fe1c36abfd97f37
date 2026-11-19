@@ -1,0 +1,157 @@
+"""TabWorkspace: منطقة العمل بتبويبات متعددة للصفحات والمستندات (إغلاق/إعادة ترتيب/استعادة عند التشغيل + مؤشر تعديل غير محفوظ)."""
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import QTabWidget
+
+from .empty_workspace import EmptyWorkspace
+
+DIRTY_MARK = '● '
+MAX_TABS = 8                                      # أقصى عدد للتبويبات المفتوحة معًا
+PINNED_KEYS = frozenset({'dashboard'})            # لا تُغلق تلقائيًا لإفساح المكان
+
+
+class TabWorkspace(QTabWidget):
+    currentPageChanged = Signal(object)          # الصفحة النشطة (أو None)
+    limitReached = Signal(str)                   # تعذّر الفتح: كل التبويبات فيها إدخال غير محفوظ
+
+    def __init__(self, factory, parent=None):
+        """factory(key, params) ← صفحة (BasePage) أو None إن لم تتوفر."""
+        super().__init__(parent)
+        self.setObjectName('workTabs')
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.setTabsClosable(True)
+        self.setMovable(True)
+        self.setDocumentMode(True)
+        self.max_tabs = MAX_TABS
+        self.setUsesScrollButtons(False)          # العدد محدود فلا حاجة لأسهم التمرير
+        self.setElideMode(Qt.ElideRight)
+        self.tabBar().setExpanding(False)
+        self._recent = []                         # tab_id بترتيب آخر استخدام (الأقدم أولًا)
+        self._factory = factory
+        self._pages = {}                          # tab_id → page
+        self.tabCloseRequested.connect(self._close_index)
+        self.currentChanged.connect(self._on_current)
+        self._empty = EmptyWorkspace(self)        # «لا تنسَ ذكر الله» + أذكار الصباح/المساء عند عدم وجود أي تبويب
+        self._sync_empty()
+
+    # ---- الشاشة الفارغة
+    def _sync_empty(self):
+        e = getattr(self, '_empty', None)
+        if e is None:
+            return
+        if self.count() == 0:
+            e.refresh()
+            e.setGeometry(self.rect())
+            e.show()
+            e.raise_()
+        else:
+            e.hide()
+
+    def tabInserted(self, index):
+        super().tabInserted(index)
+        self._sync_empty()
+
+    def tabRemoved(self, index):
+        super().tabRemoved(index)
+        self._sync_empty()
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._sync_empty()
+
+    # ---- فتح
+    def open(self, key, params=None, title=None, unique=True):
+        """يفتح صفحة (أو يفعّل المفتوحة). المستندات المتعددة تمرّر unique=False مع tab_id ضمن params."""
+        tab_id = key if unique else f"{key}:{(params or {}).get('id', id(params))}"
+        page = self._pages.get(tab_id)
+        if page is not None:
+            self.setCurrentWidget(page)
+            self._mark_used(page)
+            return page
+        if not self._make_room():
+            return None
+        page = self._factory(key, params)
+        if page is None:
+            return None
+        page.tab_id = tab_id
+        self._pages[tab_id] = page
+        idx = self.addTab(page, title or page.title)
+        self.setTabToolTip(idx, title or page.title)
+        self.setCurrentIndex(idx)
+        page.ensure_built()
+        if hasattr(page, 'actions_changed'):
+            page.actions_changed.connect(lambda p=page: self._retitle(p))
+        return page
+
+    # ---- حد عدد التبويبات
+    def _evictable(self, page):
+        """يُغلق تلقائيًا فقط ما لا يضيع شيء بإغلاقه: ليس مثبّتًا ولا معدَّلًا ولا فيه نموذج إدخال مفتوح."""
+        if getattr(page, 'key', '') in PINNED_KEYS or getattr(page, '_dock_busy', False):
+            return False
+        try:
+            return not page.is_dirty()
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _make_room(self):
+        """عند بلوغ الحد يُغلق أقدم تبويب غير مستخدم بلا نافذة تأكيد؛ وإن كانت كلها معدَّلة يُرفض الفتح برسالة."""
+        while self.count() >= self.max_tabs:
+            cur = self.current_page()
+            order = [t for t in self._recent if t in self._pages] + [t for t in self._pages if t not in self._recent]
+            victim = next((self._pages[t] for t in order if self._pages[t] is not cur and self._evictable(self._pages[t])), None)
+            if victim is None:
+                self.limitReached.emit(f'بلغت الحد الأقصى ({self.max_tabs}) للتبويبات المفتوحة، وكلها فيها إدخال غير محفوظ. أغلق تبويبًا ثم أعد المحاولة.')
+                return False
+            self._forget(victim)
+        return True
+
+    def _forget(self, page):
+        tid = getattr(page, 'tab_id', None)
+        self._pages.pop(tid, None)
+        if tid in self._recent:
+            self._recent.remove(tid)
+        i = self.indexOf(page)
+        if i >= 0:
+            self.removeTab(i)
+        page.deleteLater()
+
+    def _mark_used(self, page):
+        tid = getattr(page, 'tab_id', None)
+        if tid is None:
+            return
+        if tid in self._recent:
+            self._recent.remove(tid)
+        self._recent.append(tid)
+
+    def pages(self):
+        return list(self._pages.values())
+
+    def current_page(self):
+        w = self.currentWidget()
+        return w if w in self._pages.values() else None
+
+    def keys(self):
+        return [p.key for p in self._pages.values() if getattr(p, 'tab_id', '') == p.key]
+
+    def _retitle(self, page):
+        i = self.indexOf(page)
+        if i >= 0:
+            self.setTabText(i, (DIRTY_MARK if page.is_dirty() else '') + page.title)
+
+    def _close_index(self, i):
+        page = self.widget(i)
+        if page is None or not page.can_close():
+            return
+        self._forget(page)
+
+    def close_current(self):
+        self._close_index(self.currentIndex())
+
+    def can_close_all(self):
+        return all(p.can_close() for p in self._pages.values())
+
+    def _on_current(self, i):
+        page = self.widget(i) if i >= 0 else None
+        if page is not None:
+            self._mark_used(page)
+            page.ensure_built()
+        self.currentPageChanged.emit(page)

@@ -1,0 +1,13 @@
+INSERT INTO permissions(code,name_ar,is_sensitive) VALUES('currency.override_rate','تجاوز سعر الصرف المسجّل في قيد',1);
+INSERT INTO role_permissions SELECT r.id,'currency.override_rate' FROM roles r WHERE r.id IN (1,2);
+
+-- إضافة مفتاح ربط جديد (فروقات/تسويات المخزون): CHECK في SQLite لا يُعدَّل فنعيد بناء الجدول
+CREATE TABLE account_mappings_new(
+  company_id INTEGER NOT NULL REFERENCES companies(id),
+  map_key TEXT NOT NULL CHECK(map_key IN ('customers','suppliers','inventory','sales','cogs','cash','bank',
+      'retained_earnings','period_result','fx_differences','inventory_adjustment')),
+  account_id INTEGER NOT NULL REFERENCES accounts(id),
+  PRIMARY KEY(company_id,map_key));
+INSERT INTO account_mappings_new SELECT company_id,map_key,account_id FROM account_mappings;
+DROP TABLE account_mappings;
+ALTER TABLE account_mappings_new RENAME TO account_mappings;

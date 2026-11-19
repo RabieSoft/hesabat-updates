@@ -1,0 +1,261 @@
+"""منطق الواجهة الخالص (بلا PySide6): تنسيق المبالغ والأرقام، البحث العربي، الفترات، التسميات، رسائل الأخطاء.
+
+كل ما هنا قابل للاختبار في أي بيئة (tests/test_ui_logic.py). لا منطق محاسبي هنا: المحركات الخلفية هي المرجع.
+"""
+import re
+from datetime import date, timedelta
+from decimal import Decimal, InvalidOperation
+
+# ---------------------------------------------------------------- الأرقام
+_DIGITS = str.maketrans('٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹٫٬،', '01234567890123456789.,,')
+_BIDI = dict.fromkeys(list(range(0x200E, 0x2010)) + list(range(0x202A, 0x202F)) + list(range(0x2066, 0x206A)))
+
+
+def to_ascii_digits(s):
+    """يحوّل الأرقام العربية/الفارسية وفواصلها إلى لاتينية."""
+    return str(s).translate(_DIGITS)
+
+
+def strip_bidi(s):
+    return str(s).translate(_BIDI)
+
+
+def parse_money(text, label='القيمة', allow_empty=True, allow_negative=False):
+    """نص → Decimal. يقبل الأرقام العربية وفواصل الآلاف. يرفع ValueError برسالة عربية واضحة."""
+    t = strip_bidi(to_ascii_digits(text or '')).replace(',', '').replace(' ', '').strip()
+    if not t:
+        if allow_empty:
+            return Decimal(0)
+        raise ValueError(f'{label}: أدخل قيمة.')
+    try:
+        v = Decimal(t)
+    except InvalidOperation:
+        raise ValueError(f'{label}: قيمة غير صالحة ({text}).')
+    if not v.is_finite():
+        raise ValueError(f'{label}: قيمة غير صالحة.')
+    if v < 0 and not allow_negative:
+        raise ValueError(f'{label}: لا تقبل قيمة سالبة.')
+    return v
+
+
+def fmt_money(v, minor=False, places=2):
+    """يُنسّق مبلغًا بفواصل الآلاف. minor=True يعني أن القيمة بالوحدة الصغرى (1/100)."""
+    if v is None or v == '':
+        return '—'
+    try:
+        d = Decimal(str(v))
+    except InvalidOperation:
+        return str(v)
+    if minor:
+        d = d / 100
+    q = Decimal(1).scaleb(-places)
+    d = d.quantize(q)
+    return f'{d:,.{places}f}'
+
+
+def fmt_qty_milli(v):
+    if v is None:
+        return '—'
+    d = Decimal(int(v)) / 1000
+    s = f'{d:,.3f}'.rstrip('0').rstrip('.')
+    return s or '0'
+
+
+# ---------------------------------------------------------------- البحث العربي
+_TASHKEEL = re.compile('[\u064B-\u0652\u0670\u0640]')
+
+
+def normalize_ar(s):
+    """توحيد النص للبحث: يتجاوز التشكيل والتطويل واختلاف الألف والتاء المربوطة والياء، والأرقام العربية."""
+    t = strip_bidi(to_ascii_digits(s or '')).lower()
+    t = _TASHKEEL.sub('', t)
+    for a in 'أإآٱ':
+        t = t.replace(a, 'ا')
+    return t.replace('ى', 'ي').replace('ة', 'ه').replace('ؤ', 'و').replace('ئ', 'ي').strip()
+
+
+def matches(query, *texts):
+    """كل كلمات الاستعلام (مفصولة بمسافة) يجب أن تظهر في النص المجمَّع."""
+    q = normalize_ar(query)
+    if not q:
+        return True
+    hay = normalize_ar(' '.join(str(t) for t in texts if t is not None))
+    return all(w in hay for w in q.split())
+
+
+def relevance(query, title, *others):
+    """درجة صلة نتيجة بحث (للترتيب): تطابق تام 100 > بداية العنوان 80 > بداية كلمة 60 > احتواء 40 > في حقل آخر 20 > 10."""
+    q, t = normalize_ar(query), normalize_ar(title)
+    if not q:
+        return 0
+    if t == q:
+        return 100
+    if t.startswith(q):
+        return 80
+    if any(w.startswith(q) for w in t.split()):
+        return 60
+    if q in t:
+        return 40
+    return 20 if any(q in normalize_ar(o) for o in others) else 10
+
+
+def numeric_query(query):
+    """استعلام رقمي صرف (يقبل الأرقام العربية والفواصل) → Decimal غير سالب، وإلا None."""
+    t = to_ascii_digits(query).replace(',', '').replace(' ', '').strip()
+    if not t:
+        return None
+    try:
+        d = Decimal(t)
+    except InvalidOperation:
+        return None
+    return d if d.is_finite() and d >= 0 else None
+
+
+# ---------------------------------------------------------------- الفترات
+PERIODS = ['كل الفترات', 'اليوم', 'هذا الشهر', 'الشهر الماضي', 'هذا العام']
+
+
+def period_range(label, today=None):
+    t = today or date.today()
+    if label == 'اليوم':
+        return t.isoformat(), t.isoformat()
+    if label == 'هذا الشهر':
+        a = t.replace(day=1)
+        nxt = date(t.year + (t.month == 12), (t.month % 12) + 1, 1)
+        return a.isoformat(), (nxt - timedelta(days=1)).isoformat()
+    if label == 'الشهر الماضي':
+        first = t.replace(day=1)
+        last = first - timedelta(days=1)
+        return last.replace(day=1).isoformat(), last.isoformat()
+    if label == 'هذا العام':
+        return date(t.year, 1, 1).isoformat(), date(t.year, 12, 31).isoformat()
+    return None, None
+
+
+# ---------------------------------------------------------------- التسميات والحالات
+LABELS = {
+    'status': {'draft': 'مسودة', 'posted': 'مرحّل', 'cancelled': 'ملغى', 'reversed': 'معكوس', 'reviewed': 'مراجَع', 'approved': 'معتمد',
+               'active': 'نشط', 'disposed': 'مستبعد', 'open': 'مفتوح', 'closed': 'مغلق', 'unmatched': 'غير مطابق', 'matched': 'مطابق',
+               'ignored': 'متجاهل', 'valid': 'صحيح', 'invalid': 'خاطئ', 'duplicate': 'مكرر', 'duplicate_in_file': 'مكرر داخل الملف',
+               'duplicate_existing': 'موجود مسبقًا', 'linked': 'مربوط', 'unlinked': 'غير مربوط', 'previewed': 'معاينة', 'committed': 'معتمد'},
+    'entry_type': {'general': 'عام', 'opening': 'افتتاحي', 'closing': 'إقفال', 'adjustment': 'تسوية', 'reversal': 'عكسي', 'auto': 'تلقائي'},
+    'doc_type': {'invoice': 'فاتورة', 'return': 'مرتجع', 'sales_invoice': 'فاتورة مبيعات', 'purchase_invoice': 'فاتورة مشتريات'},
+    'kind': {'cashbox': 'صندوق', 'bank': 'بنك', 'customer': 'عميل', 'supplier': 'مورد', 'employee': 'موظف', 'stock': 'مخزني', 'service': 'خدمي', 'receipt': 'سند قبض', 'payment': 'سند صرف'},
+}
+# لون الحالة: success/warning/danger/info/neutral (ألوان مفحوصة التباين في theme.py)
+STATUS_TONE = {'posted': 'success', 'approved': 'info', 'reviewed': 'info', 'draft': 'warning', 'cancelled': 'neutral', 'reversed': 'neutral',
+               'active': 'success', 'disposed': 'neutral', 'matched': 'success', 'unmatched': 'warning', 'ignored': 'neutral',
+               'valid': 'success', 'invalid': 'danger', 'duplicate': 'warning', 'duplicate_in_file': 'warning', 'duplicate_existing': 'warning',
+               'linked': 'success', 'unlinked': 'danger', 'open': 'success', 'closed': 'neutral', 'previewed': 'info', 'committed': 'success'}
+
+
+def label(kind, value):
+    if value is None:
+        return ''
+    return LABELS.get(kind, {}).get(str(value), str(value))
+
+
+def tone_of_status(st):
+    return STATUS_TONE.get(str(st), 'neutral')
+
+
+# مفاتيح الربط النظامية (Account Mapping) بأسماء عربية، وما يحتاج كل مفتاح
+MAP_KEYS_AR = {
+    'cash': 'الصناديق', 'bank': 'البنوك', 'customers': 'العملاء (حساب رقابي)', 'inventory': 'المخزون', 'suppliers': 'الموردون (حساب رقابي)',
+    'sales': 'المبيعات', 'cogs': 'تكلفة البضاعة المباعة', 'retained_earnings': 'الأرباح المحتجزة', 'period_result': 'نتيجة الفترة',
+    'fx_differences': 'فروقات العملة', 'inventory_adjustment': 'تسويات المخزون', 'sales_discount': 'الخصم المسموح',
+    'sales_returns': 'مردودات المبيعات', 'cash_difference': 'فروقات الصندوق', 'employees': 'الموظفون (حساب رقابي)',
+    'payroll_expense': 'مصروف الرواتب', 'payroll_deductions': 'استقطاعات الرواتب', 'accum_depreciation': 'مجمع الإهلاك (حساب رقابي)',
+    'depreciation_expense': 'مصروف الإهلاك', 'disposal_gain_loss': 'مكسب/خسارة الاستبعاد', 'opening_suspense': 'حساب الأرصدة الافتتاحية المعلّق',
+    'reconcile_diff': 'فروقات مطابقة الأرصدة (حقوق ملكية مؤقت)',
+}
+MAP_KEYS_NEEDED_FOR = {
+    'employees': 'إضافة الموظفين', 'payroll_expense': 'ترحيل الرواتب', 'payroll_deductions': 'ترحيل الرواتب',
+    'accum_depreciation': 'تسجيل الأصول الثابتة', 'depreciation_expense': 'الإهلاك', 'disposal_gain_loss': 'استبعاد الأصول',
+    'opening_suspense': 'استيراد الأرصدة الافتتاحية', 'reconcile_diff': 'مطابقة أرصدة العملاء والموردين',
+}
+
+ACCOUNT_TYPES = [('asset', 'أصول'), ('liability', 'خصوم'), ('equity', 'حقوق ملكية'), ('revenue', 'إيرادات'), ('cogs', 'تكلفة نشاط'), ('expense', 'مصروفات')]
+ACCOUNT_TYPE_AR = dict(ACCOUNT_TYPES)
+
+
+# ---------------------------------------------------------------- القيود
+def journal_totals(rows):
+    """rows: [{'debit': نص/رقم, 'credit': نص/رقم, ...}] → (مدين, دائن, الفرق, متوازن).
+    القيم غير الصالحة تُحسب صفرًا هنا (التحقق الكامل يجري في LinesEditor.validated والمحرك)."""
+    d = c = Decimal(0)
+    for r in rows:
+        try:
+            d += parse_money(r.get('debit'))
+        except ValueError:
+            pass
+        try:
+            c += parse_money(r.get('credit'))
+        except ValueError:
+            pass
+    return d, c, d - c, (d > 0 and d == c)
+
+
+def invoice_line_total(qty, price, discount_pct=0):
+    """إجمالي بند فاتورة للعرض فقط (المحرك هو المرجع عند الحفظ: يضيف الضريبة والخصم العام)."""
+    try:
+        q, p, x = parse_money(qty), parse_money(price), parse_money(discount_pct)
+    except ValueError:
+        return Decimal(0)
+    return (q * p * (Decimal(100) - x) / Decimal(100)).quantize(Decimal('0.01'))
+
+
+# ---------------------------------------------------------------- الأخطاء
+def _is_sqlite(e, name):
+    return type(e).__module__ == 'sqlite3' and type(e).__name__ == name
+
+
+def friendly_error(e):
+    """رسالة عربية مفهومة لأي استثناء (الرسائل المحاسبية عربية أصلًا)."""
+    from alhisabat.accounting.errors import AccountingError
+    if isinstance(e, AccountingError):
+        return str(e)
+    if _is_sqlite(e, 'IntegrityError'):
+        m = str(e)
+        if 'UNIQUE' in m:
+            return 'القيمة موجودة مسبقًا (تكرار غير مسموح).'
+        if 'FOREIGN KEY' in m:
+            return 'السجل مرتبط بسجلات أخرى ولا يمكن تنفيذ العملية عليه.'
+        if 'CHECK' in m or 'trigger' in m.lower():
+            return 'العملية مرفوضة لأنها تخالف قواعد سلامة البيانات.'
+        return 'تعذر حفظ البيانات: ' + m
+    if _is_sqlite(e, 'OperationalError'):
+        if 'locked' in str(e).lower():
+            return 'قاعدة البيانات مشغولة حاليًا. أعد المحاولة بعد لحظات.'
+        return 'خطأ في قاعدة البيانات: ' + str(e)
+    if isinstance(e, PermissionError):
+        return 'ليست لديك صلاحية لتنفيذ هذه العملية.'
+    if isinstance(e, ValueError):
+        return str(e)
+    if isinstance(e, (FileNotFoundError, OSError)):
+        return 'تعذر الوصول إلى الملف: ' + str(e)
+    return 'حدث خطأ غير متوقع: ' + (str(e) or e.__class__.__name__)
+
+
+def cell_text(value, kind):
+    """تنسيق خلية جدول حسب نوع العمود: text/int/minor/money/status/bool/qty/label:<group>."""
+    if value is None:
+        return ''
+    if kind == 'minor':
+        return fmt_money(value, minor=True)
+    if kind == 'money':
+        return fmt_money(value) if not isinstance(value, str) else value
+    if kind == 'qty':
+        return fmt_qty_milli(value)
+    if kind == 'bool':
+        return 'نعم' if value in (1, True, '1') else 'لا'
+    if kind == 'status':
+        return label('status', value)
+    if kind.startswith('label:'):
+        return label(kind.split(':', 1)[1], value)
+    if kind == 'int':
+        return str(value)
+    return str(value)
+
+
+NUMERIC_KINDS = ('int', 'minor', 'money', 'qty')

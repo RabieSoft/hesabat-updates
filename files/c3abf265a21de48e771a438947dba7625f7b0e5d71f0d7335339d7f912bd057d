@@ -1,0 +1,593 @@
+"""منطق خدمة المزامنة (بلا إطار ويب): اقتران الأجهزة، القراءة، وتنفيذ الطلبات مرة واحدة فقط."""
+import hashlib
+import json
+import secrets
+import threading
+import time
+from contextlib import contextmanager
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.accounting import rates as fxr
+from alhisabat.audit import audit
+from alhisabat.business import cash as business_cash
+from alhisabat.business import parties as business_parties
+from alhisabat.database.connection import connect
+from alhisabat.database.tx import transaction
+from alhisabat.ui.services import AppSession
+
+from . import item_prices, reports_v6, requests_v2, settings_v8
+
+API_VERSION = 1
+PAIR_TTL_MINUTES = 10
+SESSION_IDLE_DAYS = 30                      # جلسة الدخول بالمستخدم تنتهي بعد 30 يومًا بلا استخدام
+_STAMP_TABLES = ("sales_invoices", "purchase_invoices", "cash_vouchers")
+_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"      # بلا حروف ملتبسة (0/O/1/I)
+_CAPS = ("sales.view", "sales.create", "sales.post", "purchases.view", "purchases.create", "purchases.post", "cash.view", "cash.voucher",
+         "party.view", "party.create", "party.edit", "party.delete", "inventory.view", "inventory.manage", "inventory.move", "opening.manage", "report.view",
+         "journal.create", "journal.post")
+REQUEST_TYPES = ("sales_invoice", "purchase_invoice", "receipt", "payment") + requests_v2.REQUEST_TYPES_V2
+FEATURES = ("party_create", "party_opening", "item_create", "opening_balance", "whatsapp", "journal_multi", "journal_currency", "reports", "item_prices", "settings", "line_expiry",
+            "party_edit", "party_delete", "item_edit", "item_delete")
+
+
+class SyncAuthError(Exception):
+    """رمز غير صالح/جهاز محجوب → 401."""
+
+
+def _hash(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _now():
+    return datetime.now(timezone.utc)
+
+
+def jsonable(x):
+    """يحوّل نواتج الخدمات (Row/Decimal/date/tuple) إلى JSON آمن؛ المبالغ العشرية نصوص لا float."""
+    if x is None or isinstance(x, (bool, int, float, str)):
+        return x
+    if isinstance(x, Decimal):
+        return str(x)
+    if isinstance(x, (date, datetime)):
+        return x.isoformat()
+    if isinstance(x, dict):
+        return {str(k): jsonable(v) for k, v in x.items()}
+    if hasattr(x, "keys") and hasattr(x, "__getitem__") and not isinstance(x, (list, tuple)):   # sqlite3.Row
+        return {k: jsonable(x[k]) for k in x.keys()}
+    if isinstance(x, (list, tuple, set)):
+        return [jsonable(v) for v in x]
+    return str(x)
+
+
+class _FailureLimiter:
+    """حدّ بسيط في الذاكرة لمحاولات الاقتران الفاشلة (يحمي رمز الاقتران من التخمين)."""
+
+    def __init__(self, max_fail=10, window=300):
+        self.max_fail, self.window, self._t, self._lock = max_fail, window, [], threading.Lock()
+
+    def check(self):
+        with self._lock:
+            cut = time.monotonic() - self.window
+            self._t = [t for t in self._t if t > cut]
+            if len(self._t) >= self.max_fail:
+                raise AccountingError("محاولات اقتران فاشلة كثيرة؛ انتظر بضع دقائق ثم أعد المحاولة")
+
+    def fail(self):
+        with self._lock:
+            self._t.append(time.monotonic())
+
+
+class SyncService:
+    def __init__(self, db_path):
+        self.db_path = str(db_path)
+        self._limiter = _FailureLimiter()
+        self._login_limiter = _FailureLimiter(max_fail=20, window=300)
+
+    # ------------------------------------------------------------------ جلسات
+    def _bare_session(self):
+        s = object.__new__(AppSession)               # نفس نمط CoreSession.clone: اتصال مستقل لكل طلب (SQLite لا يُشارَك بين الخيوط)
+        s.db_path, s.conn = self.db_path, connect(self.db_path)
+        s.user_id = s.company_id = s.branch_id = None
+        return s
+
+    @contextmanager
+    def _open(self, device):
+        s = self._bare_session()
+        try:
+            u = s.conn.execute("SELECT is_active FROM users WHERE id=?", (device["user_id"],)).fetchone()
+            if not u or not u["is_active"]:
+                raise SyncAuthError("حساب المستخدم معطّل")
+            s.user_id, s.company_id = device["user_id"], device["company_id"]
+            if device["branch_id"] not in {b["id"] for b in s.branches_for_user(s.user_id, s.company_id)}:
+                raise SyncAuthError("الفرع لم يعد متاحًا لهذا المستخدم")
+            s.branch_id = device["branch_id"]
+            yield s
+        finally:
+            s.close()
+
+    # ------------------------------------------------------------------ الاقتران
+    def create_pairing(self, username, password, company_id=None, branch_id=None):
+        """يُستدعى على المكتبي بعد التحقق من كلمة مرور المستخدم؛ يرجع رمزًا قصير العمر يُدخله الهاتف (أو يمسحه كـ QR)."""
+        s = self._bare_session()
+        try:
+            uid, company = s.authenticate(username, password, company_id, branch_id)
+            code = "".join(secrets.choice(_CODE_ALPHABET) for _ in range(8))
+            exp = (_now() + timedelta(minutes=PAIR_TTL_MINUTES)).isoformat()
+            with transaction(s.conn):
+                s.conn.execute("INSERT INTO sync_pairings(code_hash,user_id,company_id,branch_id,expires_at) VALUES(?,?,?,?,?)",
+                               (_hash(code), uid, s.company_id, s.branch_id, exp))
+                audit.log(s.conn, uid, "sync_pairing_created", "sync_pairings", None, after={"branch": s.branch_id})
+            return {"code": code, "expires_at": exp, "company": company.get("name", ""), "branch": company.get("branch_name", "")}
+        finally:
+            s.close()
+
+    @staticmethod
+    def qr_payload(code, base_url):
+        payload = {"v": API_VERSION, "url": base_url}
+        if code:                                    # بلا رمز: QR لعنوان الخدمة فقط (لشاشة تسجيل الدخول)
+            payload["code"] = code
+        return json.dumps(payload, ensure_ascii=False)
+
+    def pair(self, code, device_uid, device_name):
+        self._limiter.check()
+        device_uid, device_name = str(device_uid or "").strip(), str(device_name or "").strip()
+        if len(device_uid) < 8 or not device_name:
+            raise AccountingError("معرّف الجهاز واسمه مطلوبان")
+        s = self._bare_session()
+        try:
+            row = s.conn.execute("SELECT * FROM sync_pairings WHERE code_hash=? AND used_at IS NULL",
+                                 (_hash(str(code or "").strip().upper()),)).fetchone()
+            if not row or row["expires_at"] < _now().isoformat():
+                self._limiter.fail()
+                raise AccountingError("رمز الاقتران غير صحيح أو منتهي")
+            token = secrets.token_urlsafe(32)
+            with transaction(s.conn):
+                s.conn.execute("UPDATE sync_devices SET revoked_at=CURRENT_TIMESTAMP WHERE device_uid=? AND revoked_at IS NULL", (device_uid,))
+                did = s.conn.execute(
+                    "INSERT INTO sync_devices(device_uid,name,user_id,company_id,branch_id,token_hash) VALUES(?,?,?,?,?,?)",
+                    (device_uid, device_name, row["user_id"], row["company_id"], row["branch_id"], _hash(token))).lastrowid
+                s.conn.execute("UPDATE sync_pairings SET used_at=CURRENT_TIMESTAMP WHERE id=?", (row["id"],))
+                audit.log(s.conn, row["user_id"], "sync_device_paired", "sync_devices", did, after={"name": device_name})
+            return {"token": token, "device_id": did, "api_version": API_VERSION}
+        finally:
+            s.close()
+
+    # ------------------------------------------------------------------ الدخول بالمستخدم
+    def login(self, username, password, device_uid, device_name, company_id=None, branch_id=None):
+        """دخول مستخدم أُنشئ في المكتبي (مدير، محاسب…) باسمه وكلمة مروره؛ نفس التحقق والقفل المؤقت في شاشة دخول المكتبي.
+        يرجع رمز جلسة مرتبطًا بهذا المستخدم، فيُنسب إليه كل ما ينشئه من فواتير وسندات. إن كان له أكثر من شركة/فرع ولم يحدد
+        يرجع {status: choose} بعد التحقق من كلمة المرور ليختار التطبيق ثم يعيد الطلب."""
+        self._login_limiter.check()
+        username, device_uid, device_name = str(username or "").strip(), str(device_uid or "").strip(), str(device_name or "").strip()
+        if not username or not password:
+            raise AccountingError("أدخل اسم المستخدم وكلمة المرور")
+        if len(device_uid) < 8 or not device_name:
+            raise AccountingError("معرّف الجهاز واسمه مطلوبان")
+        s = self._bare_session()
+        try:
+            try:
+                uid, _company = s.authenticate(username, str(password), company_id, branch_id)
+            except AccountingError:
+                self._login_limiter.fail()
+                raise
+            companies = s.companies_for_user(uid)
+            if company_id is None and len(companies) > 1:
+                return {"status": "choose", "step": "company", "companies": companies}
+            branches = s.branches_for_user(uid, s.company_id)
+            if branch_id is None and len(branches) > 1:
+                return {"status": "choose", "step": "branch", "company_id": s.company_id, "branches": branches}
+            token = secrets.token_urlsafe(32)
+            with transaction(s.conn):
+                s.conn.execute("UPDATE sync_devices SET revoked_at=CURRENT_TIMESTAMP WHERE device_uid=? AND revoked_at IS NULL", (device_uid,))
+                did = s.conn.execute(
+                    "INSERT INTO sync_devices(device_uid,name,user_id,company_id,branch_id,token_hash,auth_kind) VALUES(?,?,?,?,?,?,'login')",
+                    (device_uid, device_name, uid, s.company_id, s.branch_id, _hash(token))).lastrowid
+                audit.log(s.conn, uid, "sync_login", "sync_devices", did, after={"device": device_name, "branch": s.branch_id})
+            comp = s.company()
+            br = next((b for b in branches if b["id"] == s.branch_id), None)
+            return {"status": "ok", "token": token, "device_id": did, "api_version": API_VERSION,
+                    "user": {"id": uid, "username": username, "name": s.username()},
+                    "company": {"id": comp.get("id"), "name": comp.get("name", "")}, "branch": br}
+        finally:
+            s.close()
+
+    def logout(self, device):
+        """خروج المستخدم من هذا الهاتف: يُلغى رمز الجلسة فورًا."""
+        conn = connect(self.db_path)
+        try:
+            with transaction(conn):
+                n = conn.execute("UPDATE sync_devices SET revoked_at=CURRENT_TIMESTAMP WHERE id=? AND revoked_at IS NULL", (device["id"],)).rowcount
+                if n:
+                    audit.log(conn, device["user_id"], "sync_logout", "sync_devices", device["id"])
+            return {"ok": True}
+        finally:
+            conn.close()
+
+    def authenticate_token(self, token):
+        if not token:
+            raise SyncAuthError("رمز الوصول مفقود")
+        conn = connect(self.db_path)
+        try:
+            d = conn.execute("SELECT * FROM sync_devices WHERE token_hash=? AND revoked_at IS NULL", (_hash(token),)).fetchone()
+            if not d:
+                raise SyncAuthError("الجهاز غير مقترن أو تم إلغاء ربطه")
+            if d["auth_kind"] == "login" and d["last_seen_at"] and d["last_seen_at"] < (_now() - timedelta(days=SESSION_IDLE_DAYS)).strftime("%Y-%m-%d %H:%M:%S"):
+                raise SyncAuthError("انتهت الجلسة لعدم الاستخدام؛ سجّل الدخول من جديد")
+            if not d["last_seen_at"] or d["last_seen_at"] < (_now() - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S"):
+                conn.execute("UPDATE sync_devices SET last_seen_at=CURRENT_TIMESTAMP WHERE id=?", (d["id"],))
+            return dict(d)
+        finally:
+            conn.close()
+
+    def list_devices(self):
+        conn = connect(self.db_path)
+        try:
+            return [dict(r) for r in conn.execute(
+                "SELECT d.id,d.name,u.username,u.full_name,d.auth_kind,d.branch_id,d.created_at,d.last_seen_at,d.revoked_at FROM sync_devices d "
+                "JOIN users u ON u.id=d.user_id ORDER BY d.id")]
+        finally:
+            conn.close()
+
+    def revoke_device(self, device_id, actor_id=None):
+        conn = connect(self.db_path)
+        try:
+            with transaction(conn):
+                n = conn.execute("UPDATE sync_devices SET revoked_at=CURRENT_TIMESTAMP WHERE id=? AND revoked_at IS NULL", (int(device_id),)).rowcount
+                if n:
+                    audit.log(conn, actor_id, "sync_device_revoked", "sync_devices", int(device_id))
+            return bool(n)
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------ أثر المستخدم
+    @staticmethod
+    def _names(conn, ids):
+        """{user_id: الاسم الكامل أو اسم الدخول} للمعرّفات المعطاة."""
+        ids = sorted({int(i) for i in ids if i})
+        if not ids:
+            return {}
+        q = ",".join("?" * len(ids))
+        return {r["id"]: (r["full_name"] or r["username"]) for r in conn.execute(f"SELECT id,full_name,username FROM users WHERE id IN ({q})", ids)}
+
+    def _stamp(self, s, table, rows):
+        """يضيف لكل مستند: created_by_name/created_at (المنشئ) وposted_by_name/posted_at (المُرحِّل)."""
+        if table not in _STAMP_TABLES or not rows:
+            return rows
+        ids = [r["id"] for r in rows if r.get("id")]
+        if not ids:
+            return rows
+        q = ",".join("?" * len(ids))
+        meta = {m["id"]: m for m in s.conn.execute(f"SELECT id,created_by,created_at,posted_by,posted_at FROM {table} WHERE id IN ({q})", ids)}
+        names = self._names(s.conn, [m["created_by"] for m in meta.values()] + [m["posted_by"] for m in meta.values()])
+        for r in rows:
+            m = meta.get(r.get("id"))
+            if m:
+                r["created_by_name"], r["created_at"] = names.get(m["created_by"], ""), m["created_at"]
+                r["posted_by_name"], r["posted_at"] = names.get(m["posted_by"], ""), m["posted_at"]
+        return rows
+
+    # ------------------------------------------------------------------ القراءة
+    def me(self, device):
+        with self._open(device) as s:
+            comp = s.company()
+            br = next((b for b in s.branches_for_user(s.user_id, s.company_id) if b["id"] == s.branch_id), None)
+            return {"api_version": API_VERSION, "server_time": _now().isoformat(),
+                    "user": {"id": s.user_id, "name": s.username(), "username": s.login_name()},
+                    "company": {"id": comp.get("id"), "name": comp.get("name", ""), "base_currency": comp.get("base_currency", "")},
+                    "branch": br, "can": self._caps(s)}
+
+    @staticmethod
+    def _caps(s):
+        can = {c: s.can(c) for c in _CAPS}
+        can["item.edit"] = can["item.delete"] = can.get("inventory.manage", False)      # صلاحية الأصناف في المكتبي واحدة
+        return can
+
+    def bootstrap(self, device):
+        """كل ما يحتاجه الهاتف للعمل دون إنترنت: الأطراف والأصناف (بوحداتها) والمخازن والصناديق."""
+        with self._open(device) as s:
+            out = self.me(device)
+            out["customers"] = jsonable(s.parties("customer", limit=5000)) if s.can("party.view") else []
+            out["suppliers"] = jsonable(s.parties("supplier", limit=5000)) if s.can("party.view") else []
+            items, units = [], {}
+            if s.can("inventory.view"):
+                for r in s.conn.execute("SELECT iu.item_id,u.id,u.name,iu.factor_milli FROM item_units iu JOIN units u ON u.id=iu.unit_id"):
+                    units.setdefault(r["item_id"], []).append({"unit_id": r["id"], "name": r["name"], "factor_milli": r["factor_milli"]})
+                prices = item_prices.item_prices(s.conn, s.company_id)
+                items = [dict(i, units=units.get(i["id"], []), **prices.get(i["id"], {})) for i in s.items(limit=5000) if not i.get("has_variants")]
+                out["warehouses"] = jsonable(s.warehouses())
+            else:
+                out["warehouses"] = []
+            out["items"] = jsonable(items)
+            out["features"] = list(FEATURES)
+            out["reports"] = reports_v6.definitions(s.can)             # تقارير الهاتف (GET /v1/reports/{code})
+            # حسابات الأستاذ القابلة للقيد (بلا المجموعات والموقوفة) لشاشة «قيد بسيط/متعدد» في الهاتف
+            out["accounts"] = [dict(r) for r in s.conn.execute(
+                "SELECT id,code,name,account_type AS type FROM accounts WHERE company_id=? AND is_group=0 AND is_active=1 "
+                "AND (branch_id IS NULL OR branch_id=?) ORDER BY code", (s.company_id, s.branch_id))] if s.can("journal.create") else []
+            try:
+                from alhisabat.messaging import queue as wa_queue
+                out["wa_country_code"] = wa_queue.get_settings(s.conn, s.branch_id).get("country_code", "+967")
+            except Exception:
+                out["wa_country_code"] = "+967"
+            out["settings"] = settings_v8.phone_settings(s.conn, s.company_id, s.branch_id, out["company"].get("base_currency", ""))
+            out["units"] = jsonable([{"id": u["id"], "name": u["name"]} for u in s.units()]) if s.can("inventory.view") else []
+            out["categories"] = self._categories(s) if s.can("inventory.view") else []
+            out["currencies"] = jsonable(self._currencies(s))
+            if s.can("party.view"):
+                self._decorate_parties(s, out)
+            if s.can("cash.view"):
+                gl = {r["id"]: r["account_id"] for r in s.conn.execute("SELECT id,account_id FROM cash_accounts WHERE company_id=?", (s.company_id,))}
+                # دفعات الفاتورة تُرسل بـ account_id (حساب الأستاذ للصندوق/البنك) لا بمعرّف الصندوق cash_accounts.id
+                out["cash_accounts"] = jsonable([dict(c, account_id=gl.get(c["id"])) for c in s.cash_accounts()])
+            else:
+                out["cash_accounts"] = []
+            return out
+
+    @staticmethod
+    def _categories(s):
+        try:
+            return jsonable([{"id": c["id"], "name": c.get("path") or c["name"]} for c in s.category_tree(include_inactive=False)])
+        except Exception:                       # التصنيفات اختيارية: لا نُفشل الـ bootstrap بسببها
+            return []
+
+    @staticmethod
+    def _currencies(s):
+        from alhisabat.ui.core import readmodel
+        out = []
+        try:
+            today = date.today().isoformat()
+            for c in readmodel.currencies_list(s.conn, s.company_id):
+                if not (c.get("is_enabled") or c.get("is_base")):
+                    continue
+                row = {"code": c["code"], "name": c["name_ar"], "symbol": c.get("symbol", ""), "is_base": bool(c["is_base"])}
+                if not row["is_base"]:
+                    try:        # آخر سعر حتى اليوم (وحدات الأساسية لوحدة أجنبية)؛ رقم لا نص. لا سعر ⇒ بلا حقل rate
+                        row["rate"] = float(fxr.get_rate(s.conn, s.company_id, c["code"], today))
+                    except Exception:
+                        pass
+                out.append(row)
+        except Exception:
+            return []
+        return out
+
+    @staticmethod
+    def _decorate_parties(s, out):
+        """يضيف لكل طرف: wa_consent والرصيد (موجب = مستحق لنا للعميل / علينا للمورد) بالوحدة الصغرى بالعملة الأساسية."""
+        ids = [p["id"] for k in ("customers", "suppliers") for p in out[k]]
+        if not ids:
+            return
+        consent = {r["id"]: bool(r["wa_consent"]) for r in s.conn.execute(
+            f"SELECT id,wa_consent FROM parties WHERE id IN ({','.join('?' * len(ids))})", ids)}
+        rows = s.conn.execute(f"SELECT * FROM parties WHERE id IN ({','.join('?' * len(ids))})", ids).fetchall()
+        try:
+            bal = business_parties.balances(s.conn, s.company_id, rows, business_parties.latest_day(s.conn, s.company_id))
+        except Exception:
+            bal = {}
+        limits = {r["id"]: r["credit_limit"] for r in rows}
+        addr = {r["id"]: r["address"] or "" for r in rows}
+        terms = {r["id"]: int(r["payment_terms_days"] or 0) for r in rows}
+        for k in ("customers", "suppliers"):
+            for p in out[k]:
+                p["wa_consent"] = consent.get(p["id"], True)
+                p["address"] = addr.get(p["id"], "")
+                p["terms"] = terms.get(p["id"], 0)
+                if k == "customers":                       # 2.0.13: الحد الائتماني (وحدة صغرى) لتنبيه تجاوزه في فاتورة الهاتف
+                    p["credit_limit_minor"] = int(limits.get(p["id"]) or 0)
+                if p["id"] in bal:
+                    p["balance_minor"] = int(bal[p["id"]])
+
+    def dashboard(self, device):
+        with self._open(device) as s:
+            d = s.dashboard()
+            d["cash"] = self._cash_rows(s)
+            c = s.company_id
+            for key, table in (("due_by_currency", "sales_invoices"), ("due_purchases_by_currency", "purchase_invoices")):
+                d[key] = [{"currency": r[0], "due_minor": r[1]} for r in s.conn.execute(
+                    f"SELECT currency,COALESCE(SUM(due_total),0) FROM {table} WHERE company_id=? AND status='posted' AND doc_type='invoice' "
+                    "GROUP BY currency HAVING SUM(due_total)<>0 ORDER BY currency", (c,))]
+            return jsonable(d)
+
+    @staticmethod
+    def _cash_rows(s):
+        """أرصدة الصناديق: net_minor معادل أساسي (كما كان)، وnet_orig_minor بعملة الصندوق نفسها مع currency، فلا تُجمع عملات مختلفة."""
+        out = []
+        for r in s.conn.execute("SELECT * FROM cash_accounts WHERE company_id=? AND is_active=1 ORDER BY name", (s.company_id,)):
+            base_net = orig_net = 0
+            try:
+                for x in business_cash.cash_balance(s.conn, s.user_id, s.company_id, r["id"]):
+                    base_net += x["net_base"] or 0
+                    if x["currency"] == r["currency"]:
+                        orig_net += x["net_orig"] or 0
+            except Exception:
+                pass
+            out.append({"name": r["name"], "currency": r["currency"], "net_minor": base_net, "net_orig_minor": orig_net})
+        return out
+
+    def invoices(self, device, kind="sales", limit=100):
+        if kind not in ("sales", "purchases"):
+            raise AccountingError("نوع الفاتورة غير معروف")
+        with self._open(device) as s:
+            return jsonable(self._stamp(s, "sales_invoices" if kind == "sales" else "purchase_invoices", s.invoices(kind, limit=min(int(limit), 500))))
+
+    def get_invoice(self, device, kind, invoice_id):
+        if kind not in ("sales", "purchases"):
+            raise AccountingError("نوع الفاتورة غير معروف")
+        with self._open(device) as s:
+            s.require("sales.view" if kind == "sales" else "purchases.view")
+            inv = s.get_invoice(kind, invoice_id)
+            if isinstance(inv, dict):
+                self._stamp(s, "sales_invoices" if kind == "sales" else "purchase_invoices", [inv])
+            return jsonable(inv)
+
+    def vouchers(self, device, limit=100):
+        with self._open(device) as s:
+            return jsonable(self._stamp(s, "cash_vouchers", s.cash_vouchers(limit=min(int(limit), 500))))
+
+    def stock(self, device, warehouse_id=None, item_id=None):
+        with self._open(device) as s:
+            return jsonable(s.stock_report(warehouse_id=warehouse_id, item_id=item_id))
+
+    def aging(self, device, kind):
+        if kind not in ("customer", "supplier"):
+            raise AccountingError("النوع customer أو supplier")
+        with self._open(device) as s:
+            return jsonable(s.aging(kind))
+
+    def report(self, device, code, params=None):
+        """تقرير جاهز بالشكل العام للهاتف (reports_v6): معاملات الاستعلام تمرَّر كما هي، والمحرك هو الحَكَم على الصلاحيات."""
+        with self._open(device) as s:
+            return jsonable(reports_v6.run(s, str(code), {k: v for k, v in (params or {}).items() if v not in (None, "")}))
+
+    def party_statement(self, device, party_id, date_from=None, date_to=None, currency=None):
+        """كشف حساب عميل/مورد (نفس دالة الواجهة المكتبية). الافتراضي: من بداية السنة إلى اليوم.
+        مع currency يقتصر على حركات تلك العملة، وتحمل النتيجة الحقول *_orig (opening_balance_orig/total_debit_orig/total_credit_orig/
+        closing_balance_orig وفي الصفوف debit_orig/credit_orig/running_balance_orig) بعملة الكشف نفسها، أما الحقول الأخرى فمعادل أساسي."""
+        today = date.today()
+        date_from = date_from or f"{today.year}-01-01"
+        date_to = date_to or today.isoformat()
+        for v in (date_from, date_to):
+            try:
+                date.fromisoformat(v)
+            except (TypeError, ValueError):
+                raise AccountingError("صيغة التاريخ يجب أن تكون YYYY-MM-DD")
+        currency = str(currency or "").strip().upper() or None
+        with self._open(device) as s:
+            if currency and currency != fxr.base_currency(s.conn, s.company_id) and not fxr.currency_enabled(s.conn, s.company_id, currency):
+                raise AccountingError(f"العملة {currency} غير مفعّلة")
+            st = business_parties.party_statement(s.conn, s.user_id, s.company_id, int(party_id), date_from, date_to, currency=currency)
+            names = self._names(s.conn, [r.get("created_by") for r in st.get("rows", [])] + [r.get("posted_by") for r in st.get("rows", [])])
+            for r in st.get("rows", []):
+                r["created_by_name"] = names.get(r.get("created_by"), "")
+                r["posted_by_name"] = names.get(r.get("posted_by"), "")
+            st["prepared_by"] = s.username()                       # من أعدّ الكشف (المستخدم الداخل)
+            st["prepared_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+            return jsonable(st)
+
+    # ------------------------------------------------------------------ الكتابة (مرة واحدة فقط)
+    def submit(self, device, body):
+        """ينفّذ طلبًا من الهاتف. المفتاح (device, client_uid) يجعل إعادة الإرسال آمنة: يرجع النتيجة المحفوظة ولا يكرر المستند."""
+        cuid = str(body.get("client_uid") or "").strip()
+        rtype = body.get("type")
+        if not 8 <= len(cuid) <= 64:
+            raise AccountingError("client_uid مطلوب (8–64 حرفًا)")
+        if rtype not in REQUEST_TYPES:
+            raise AccountingError("نوع الطلب غير مدعوم")
+        data, want_post = body.get("data") or {}, bool(body.get("post"))
+        with self._open(device) as s:
+            prior = s.conn.execute("SELECT status,result_json FROM sync_requests WHERE device_id=? AND client_uid=?",
+                                   (device["id"], cuid)).fetchone()
+            if prior:
+                return dict(json.loads(prior["result_json"]), duplicate=True)
+            try:
+                with transaction(s.conn):                  # المستند وسجل الطلب في معاملة واحدة: لا مستند بلا سجل ولا العكس
+                    result = self._execute(s, rtype, data, want_post)
+                    s.conn.execute("INSERT INTO sync_requests(device_id,client_uid,req_type,status,result_json) VALUES(?,?,?,?,?)",
+                                   (device["id"], cuid, rtype, "accepted", json.dumps(result, ensure_ascii=False)))
+                    audit.log(s.conn, s.user_id, "mobile_request", "sync_requests", None,
+                              after={"type": rtype, "device": device["name"], "status": result.get("status")})
+                return dict(result, duplicate=False)
+            except AccountingError as e:                   # رفض محاسبي/صلاحية: نتيجة نهائية لا تُعاد محاولتها
+                result = {"status": "rejected", "error": str(e)}
+                with transaction(s.conn):
+                    s.conn.execute("INSERT OR IGNORE INTO sync_requests(device_id,client_uid,req_type,status,result_json) VALUES(?,?,?,?,?)",
+                                   (device["id"], cuid, rtype, "rejected", json.dumps(result, ensure_ascii=False)))
+                return dict(result, duplicate=False)
+
+    @staticmethod
+    def _clean_lines(lines):
+        if not isinstance(lines, list) or not lines:
+            raise AccountingError("الفاتورة يجب أن تحتوي بندًا واحدًا على الأقل")
+        out = []
+        for ln in lines:
+            try:
+                row = {"item_id": int(ln["item_id"]), "qty": Decimal(str(ln["qty"])), "unit_price": Decimal(str(ln["unit_price"]))}
+            except (KeyError, TypeError, ValueError, InvalidOperation):
+                raise AccountingError("بند غير صالح: item_id وqty وunit_price مطلوبة")
+            if ln.get("unit_id"):
+                row["unit_id"] = int(ln["unit_id"])
+            if ln.get("description"):
+                row["description"] = str(ln["description"])
+            if ln.get("discount_percent") is not None:
+                row["discount_percent"] = Decimal(str(ln["discount_percent"]))
+            if ln.get("tax_rate_id"):
+                row["tax_rate_id"] = int(ln["tax_rate_id"])
+            # إجمالي البند كما كتبه المستخدم (يمنع فرق التقريب)، وتاريخ الانتهاء/الدفعة للأصناف المتتبَّع صلاحيتها (مشتريات)
+            if ln.get("line_total") not in (None, ""):
+                row["line_total"] = Decimal(str(ln["line_total"]))
+            if ln.get("expiry_date"):
+                row["expiry_date"] = str(ln["expiry_date"]).strip()
+            if ln.get("lot_no"):
+                row["lot_no"] = str(ln["lot_no"]).strip()
+            out.append(row)
+        return out
+
+    @staticmethod
+    def _clean_payments(payments):
+        out = []
+        for p in payments or []:
+            try:
+                out.append({"account_id": int(p["account_id"]), "amount": Decimal(str(p["amount"])), "note": str(p.get("note", ""))})
+            except (KeyError, TypeError, ValueError, InvalidOperation):
+                raise AccountingError("دفعة غير صالحة: account_id وamount مطلوبان")
+        return out
+
+    @staticmethod
+    def _check_payment_currency(s, currency, payments):
+        """دفعة الفاتورة تُرحَّل بعملة الفاتورة، فيجب أن يكون الصندوق/البنك بالعملة نفسها (طبقة الأعمال لا تتحقق من ذلك)."""
+        if not payments:
+            return
+        inv_cur = currency or fxr.base_currency(s.conn, s.company_id)
+        for p in payments:
+            row = s.conn.execute("SELECT name,currency FROM cash_accounts WHERE account_id=? AND company_id=?", (p["account_id"], s.company_id)).fetchone()
+            if row and row["currency"] != inv_cur:
+                raise AccountingError(f"عملة الصندوق «{row['name']}» ({row['currency']}) تختلف عن عملة الفاتورة ({inv_cur}): اختر صندوقًا بنفس العملة")
+
+    def _execute(self, s, rtype, d, want_post):
+        today = str(date.today())
+        if rtype in requests_v2.REQUEST_TYPES_V2:
+            try:
+                return jsonable(getattr(requests_v2, rtype)(s, d, want_post))
+            except (ValueError, TypeError, KeyError, InvalidOperation) as e:    # طلب مشوّه = رفض نهائي، لا 500 تُعيد الهاتف محاولته إلى الأبد
+                raise AccountingError(f"بيانات الطلب غير صالحة: {e}")
+        if rtype in ("sales_invoice", "purchase_invoice"):
+            kind = "sales" if rtype == "sales_invoice" else "purchases"
+            currency = str(d.get("currency") or "").strip().upper() or None
+            payments = self._clean_payments(d.get("payments"))
+            self._check_payment_currency(s, currency, payments)
+            doc_id = s.create_invoice(kind, {
+                "date": d.get("date") or today, "party_id": d.get("party_id"), "warehouse_id": d.get("warehouse_id"),
+                "currency": currency, "discount": d.get("discount"), "notes": d.get("notes", ""),
+                "lines": self._clean_lines(d.get("lines")), "payments": payments})
+            poster = lambda: s.post_invoice(kind, doc_id)          # noqa: E731
+            key = "invoice_id"
+        else:
+            try:
+                amount = Decimal(str(d["amount"]))
+                cash_id = int(d["cash_id"])
+            except (KeyError, TypeError, ValueError, InvalidOperation):
+                raise AccountingError("السند يتطلب cash_id وamount")
+            asked = str(d.get("currency") or "").strip().upper()
+            if asked:           # عملة السند هي عملة الصندوق دائمًا؛ إن أرسل الهاتف عملة مختلفة نرفض بدل ترحيل خاطئ بصمت
+                row = s.conn.execute("SELECT currency FROM cash_accounts WHERE id=? AND company_id=?", (cash_id, s.company_id)).fetchone()
+                if row and row["currency"] != asked:
+                    raise AccountingError(f"عملة السند ({asked}) تختلف عن عملة الصندوق ({row['currency']}): اختر صندوقًا بنفس العملة")
+            doc_id = s.create_voucher("receipt" if rtype == "receipt" else "payment", {
+                "date": d.get("date") or today, "cash_id": cash_id, "amount": amount, "party_id": d.get("party_id"),
+                "account_id": d.get("account_id"), "description": d.get("description", "")})
+            if isinstance(doc_id, dict):
+                doc_id = doc_id.get("voucher_id") or doc_id.get("id")
+            poster = lambda: s.post_voucher(doc_id)                   # noqa: E731
+            key = "voucher_id"
+        result = {"status": "draft", key: doc_id, "type": rtype}
+        if want_post:
+            try:
+                with transaction(s.conn):                             # فشل الترحيل لا يلغي المسودة: يراجعها المستخدم على المكتبي
+                    posted = poster()
+                result["status"] = "posted"
+                if isinstance(posted, dict):
+                    result.update({k: posted[k] for k in ("invoice_no", "voucher_no", "entry_id") if k in posted})
+            except AccountingError as e:
+                result["post_error"] = str(e)
+        return jsonable(result)

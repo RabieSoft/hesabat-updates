@@ -1,0 +1,33 @@
+"""عناصر الهوية البصرية (شعار المنتج) لشاشات Qt. يتطلب PySide6. يرجع None بلا أخطاء إن فُقد ملف الشعار."""
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QIcon, QPixmap
+
+from alhisabat import branding
+from alhisabat.ui.design import tokens as T
+
+
+def logo_pixmap(mode='light', height=200):
+    """الشعار الكامل بالنسخة المناسبة للسمة، بارتفاع محدد وتنعيم عالٍ. None إن لم يوجد الملف."""
+    path = branding.logo_path(dark=T.is_dark(mode))
+    if path is None:
+        return None
+    pm = QPixmap(str(path))
+    if pm.isNull():
+        return None
+    return pm.scaledToHeight(height, Qt.SmoothTransformation)
+
+
+def icon_pixmap(size=40):
+    """الدرع وحده (مربع) بحجم محدد للترويسات الصغيرة. None إن لم يوجد الملف."""
+    path = branding.icon_png_path()
+    if path is None:
+        return None
+    pm = QPixmap(str(path))
+    if pm.isNull():
+        return None
+    return pm.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+
+def app_icon():
+    ico = branding.icon_ico_path() or branding.icon_png_path()
+    return QIcon(str(ico)) if ico else QIcon()

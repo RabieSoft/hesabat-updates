@@ -1,0 +1,217 @@
+"""مشغّل الواجهة الجديدة (المرحلة 2): نفس منطق الدخول والتهيئة القديمين (LoginDialog/BootstrapDialog) على الهيكل الجديد.
+
+الواجهة القديمة تبقى تعمل عبر run_app.py إلى أن تُرحَّل صفحاتها في المرحلة 3. يتطلب PySide6.
+"""
+import os
+import sys
+import traceback
+from pathlib import Path
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
+
+from alhisabat import licensing
+from alhisabat.ui.components.brand_widgets import app_icon
+from alhisabat.ui.core.prefs import Prefs
+from alhisabat.ui.core.startup import StartupProgress
+from alhisabat.ui.core.session import CoreSession
+from alhisabat.ui.core import strings_ar as S
+from alhisabat.ui.design import qss
+from alhisabat.ui.app_dialogs.auth import BootstrapDialog, LoginDialog
+
+from . import splash
+from .main_window import APP_DIR, VERSION, MainWindow
+from alhisabat.ui.pages import registry
+
+DB_PATH = APP_DIR / 'alhisabat.db'
+
+
+def _mark_healthy():
+    try:
+        import update_bootstrap
+        update_bootstrap.mark_healthy()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _license_gate():
+    """يتحقق من الترخيص؛ إن لم يصلح تعرض نافذة تفعيل (بصمة الجهاز + استيراد ملفي الترخيص). True إذا صار صالحًا."""
+    from PySide6.QtWidgets import (QApplication, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QPushButton,
+                                   QVBoxLayout)
+    kf = licensing.keyfile
+    try:
+        kf.verify()
+        return True
+    except kf.KeyFileError as e:
+        err = str(e)
+    dlg = QDialog()
+    dlg.setWindowTitle('تفعيل الحسابات برو')
+    dlg.setLayoutDirection(Qt.RightToLeft)
+    dlg.setWindowIcon(app_icon())
+    dlg.setMinimumWidth(460)
+    lay = QVBoxLayout(dlg)
+    msg = QLabel(err)
+    msg.setWordWrap(True)
+    msg.setStyleSheet('color:#b00020;font-weight:bold;')
+    lay.addWidget(msg)
+    lay.addWidget(QLabel('بصمة هذا الجهاز — أرسلها للمطوّر ليصدر لك ملفي الترخيص:'))
+    box = QLineEdit(kf.hwid())
+    box.setReadOnly(True)
+    box.setAlignment(Qt.AlignCenter)
+    box.setStyleSheet('font-family:Consolas,monospace;font-size:18px;font-weight:bold;padding:6px;')
+    lay.addWidget(box)
+    row = QHBoxLayout()
+    b_copy = QPushButton('نسخ البصمة')
+    b_pick = QPushButton('اختيار ملفي الترخيص…')
+    b_exit = QPushButton('خروج')
+    for b in (b_pick, b_copy, b_exit):
+        row.addWidget(b)
+    lay.addLayout(row)
+    hint = QLabel('بعد استلام الملفين license.key و license.sig اضغط «اختيار ملفي الترخيص» وحدّد الاثنين معًا.')
+    hint.setWordWrap(True)
+    lay.addWidget(hint)
+
+    def copy():
+        QApplication.clipboard().setText(kf.hwid())
+        hint.setText('تم نسخ البصمة ✔')
+
+    def pick():
+        files, _ = QFileDialog.getOpenFileNames(dlg, 'اختر license.key و license.sig', '',
+                                                'ملفات الترخيص (license.key license.sig);;كل الملفات (*)')
+        if not files:
+            return
+        by_name = {Path(f).name.lower(): f for f in files}
+        k, s = by_name.get(kf.KEY_NAME), by_name.get(kf.SIG_NAME)
+        if not (k and s):
+            msg.setText('يجب اختيار الملفين معًا: ' + kf.KEY_NAME + ' و ' + kf.SIG_NAME)
+            return
+        try:
+            kf.install_files(k, s)
+        except kf.KeyFileError as e:
+            msg.setText(str(e))
+            return
+        dlg.accept()
+
+    b_copy.clicked.connect(copy)
+    b_pick.clicked.connect(pick)
+    b_exit.clicked.connect(dlg.reject)
+    return dlg.exec() == QDialog.Accepted
+
+
+def run():
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+
+    _last = {'sig': None, 't': 0.0}
+
+    def _excepthook(etype, value, tb):
+        import time
+        from datetime import datetime
+        text = ''.join(traceback.format_exception(etype, value, tb))
+        try:                                     # سجل تراكمي بالوقت (لا يُكتب فوق الأخطاء السابقة)
+            with open(APP_DIR / 'error.log', 'a', encoding='utf-8') as fh:
+                fh.write(f'\n===== {datetime.now():%Y-%m-%d %H:%M:%S} =====\n{text}')
+        except OSError:
+            pass
+        sig, now = text.strip().splitlines()[-1] if text.strip() else '', time.monotonic()
+        if sig == _last['sig'] and now - _last['t'] < 5:      # نفس الخطأ يتكرر: لا نغرق الشاشة بنوافذ
+            _last['t'] = now
+            return
+        _last['sig'], _last['t'] = sig, now
+        try:
+            m = QMessageBox()
+            m.setIcon(QMessageBox.Critical)
+            m.setWindowTitle('خطأ غير متوقع')
+            m.setText('حدث خطأ غير متوقع. تفاصيله محفوظة في:\n' + str(APP_DIR / 'error.log'))
+            m.setDetailedText(text)
+            m.exec()
+        except Exception:  # noqa: BLE001
+            print(text)
+
+    sys.excepthook = _excepthook
+    app = QApplication(sys.argv)
+    app.setApplicationName(S.APP_NAME)
+    app.setLayoutDirection(Qt.RightToLeft)
+    app.setWindowIcon(app_icon())
+    import argparse
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument('--db')                      # قاعدة أخرى (أرشيف سنة مقفلة)
+    ap.add_argument('--archive')                 # سنة الأرشيف: يفتح للعرض فقط
+    opts, _ = ap.parse_known_args(sys.argv[1:])
+    from .single_instance import SingleInstance
+    guard = SingleInstance(opts.db or DB_PATH)   # نسخة واحدة فقط لكل قاعدة بيانات
+    if not guard.acquire():
+        QMessageBox.information(None, S.APP_NAME, 'النظام قيد التشغيل بالفعل.\nتم إظهار النافذة المفتوحة.')
+        return 0
+    if not _license_gate():                      # بوابة الترخيص: بلا ملفي license.key/license.sig صالحين لهذا الجهاز تظهر نافذة التفعيل
+        return 1
+    from alhisabat.ui.components import watermark
+    prefs = Prefs()
+    from alhisabat.ui.design import tokens as _tok
+    _tok.set_active(prefs.get('mode'))
+    watermark.install(app, prefs.get('mode'), prefs.get('wm'))    # علامة الحسابات برو المائية الخافتة على كل النوافذ
+    app.setStyleSheet(qss.build_qss(prefs.get('mode'), prefs.get('density')))
+    from . import dialog_policy
+    from . import arabic_ui
+    arabic_ui.install(app)                       # قائمة شريط التمرير وبقية نصوص Qt بالعربية
+    dialog_policy.install(app)                   # توحيد حجم/موضع/أزرار كل النوافذ عند أول عرض
+    if opts.archive:
+        from alhisabat.system import year_archive
+        year_archive.set_archive_mode(opts.archive)
+    session = CoreSession(opts.db or DB_PATH)
+    restart = False
+    try:
+        if not session.has_users():
+            if BootstrapDialog(session, mode=prefs.get('mode')).exec() != QDialog.Accepted:
+                return 0
+        while True:                              # تسجيل الخروج يعود إلى شاشة الدخول
+            dlg = LoginDialog(session, mode=prefs.get('mode'), version=VERSION)
+            if dlg.exec() != QDialog.Accepted:
+                _mark_healthy()                  # إغلاق طبيعي لشاشة الدخول = الإقلاع سليم
+                return 0
+            try:                                 # تشخيص التعليق: إن لم تظهر النافذة خلال 40 ثانية يُكتب مكان التوقف في hang.log
+                import faulthandler
+                _hang = open(APP_DIR / 'hang.log', 'a', encoding='utf-8')
+                faulthandler.dump_traceback_later(40, repeat=False, file=_hang)
+            except Exception:  # noqa: BLE001
+                faulthandler = None
+            scr = splash.SplashScreen(prefs.get('mode'), VERSION)       # شاشة تحميل بدل الصمت بعد زر الدخول
+            scr.show()
+            prog = StartupProgress(scr.set_progress)
+            prog.report(0.02, 'جارٍ التحضير…')
+            registry.load_builtin(prog.span(0.05, 0.5, 'تحميل الصفحات'))
+            try:
+                w = MainWindow(session, prefs, progress=prog.report)
+            except BaseException:
+                scr.close()
+                raise
+            w.show()
+            guard.set_window(w)
+            try:
+                faulthandler.cancel_dump_traceback_later()
+            except Exception:  # noqa: BLE001
+                pass
+            _mark_healthy()                      # بعد ظهور النافذة الرئيسية يُعتمد التحديث المطبّق
+            watermark.attach(w)                  # صراحةً للنافذة الرئيسية (إضافة إلى الإرفاق التلقائي)
+            scr.close()
+            app.exec()
+            if getattr(w, 'restart_requested', False):      # «إغلاق وتحديث الآن»: يُفتح البرنامج من جديد بعد إغلاق القاعدة
+                restart = True
+                return 0
+            if not w.logout_requested:
+                return 0
+            session.logout()
+    finally:
+        guard.release()
+        try:
+            from alhisabat.messaging.transports.web import shutdown_shared_transports
+            shutdown_shared_transports()         # فصل Playwright فقط؛ نافذة واتساب تبقى مفتوحة بجلستها
+        except Exception:  # noqa: BLE001
+            pass
+        session.close()
+        if restart:
+            from .update_flow import restart_app
+            restart_app()
+
+
+if __name__ == '__main__':
+    raise SystemExit(run())

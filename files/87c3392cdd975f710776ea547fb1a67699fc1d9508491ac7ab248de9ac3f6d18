@@ -1,0 +1,286 @@
+"""قالب HTML للمستند الورقي بصيغة متوافقة مع محرك النص الغني في Qt (جداول + خصائص بسيطة؛ لا flex ولا @page).
+
+**قالب واحد للشاشة والطباعة (WYSIWYG)**: DocumentSheet يعرض هذا الـHTML بـQTextDocument، والطباعة/PDF تطبع المستند نفسه
+بـQPrinter. الورقة بيضاء دائمًا حتى في السمة الداكنة لأنها تحاكي المطبوع. بلا PySide6 (قابل للاختبار والمعاينة).
+"""
+from decimal import Decimal
+from html import escape
+from pathlib import Path
+
+from alhisabat import branding
+from alhisabat.reporting import words as report_words
+from alhisabat.ui.core import format as fmt, print_settings as PSET
+from alhisabat.ui.design import tokens as T
+
+from .document_model import PAPERS, column_tint, effective_dims
+
+_LINE = T.PALETTES['light']['paper_line']
+_TEXT = T.PALETTES['light']['paper_text']
+_STAMP = T.PALETTES['light']['stamp']
+_HEAD_BG = T.PALETTES['light']['paper_head_soft']      # ذهبي أفتح من ترويسة قالب الربيع الكلاسيكي
+_FONT = "'Segoe UI', Tahoma, 'Noto Sans Arabic', Arial"
+
+
+def _e(v):
+    return escape('' if v is None else str(v))
+
+
+def _cell_value(v, numeric):
+    if v is None:
+        return ''
+    if isinstance(v, Decimal):
+        return escape(fmt.fmt_money(v))
+    return _e(v)
+
+
+def _multiline(text):
+    return '<br>'.join(escape(line) for line in str(text).splitlines() if line.strip())
+
+
+def _logo_img(opts, height=48):
+    """شعار المستخدم إن فُعّل وكان الملف موجودًا؛ وإلا لا شيء (لا صورة وهمية)."""
+    if not opts.show_logo or not opts.logo_path:
+        return ''
+    try:
+        p = Path(opts.logo_path)
+        if not p.is_file():
+            return ''
+        return f'<img src="{p.resolve().as_uri()}" height="{height}"><br>'
+    except (OSError, ValueError):
+        return ''
+
+
+def header_image_file(opts):
+    """ملف صورة الترويسة الكاملة إن فُعّل النمط وكان الملف موجودًا؛ وإلا None (فيعود المستند للترويسة الافتراضية)."""
+    if getattr(opts, 'header_mode', 'default') != 'image' or not opts.header_image_path:
+        return None
+    try:
+        p = Path(opts.header_image_path)
+        return p if p.is_file() else None
+    except (OSError, ValueError):
+        return None
+
+
+def _image_only(opts):
+    """ترويسة الصورة وحدها (بلا عنوان المستند ورقمه وتاريخه وختمه) إن طلب المستخدم ذلك وكانت الصورة متاحة."""
+    return bool(getattr(opts, 'header_image_only', False)) and header_image_file(opts) is not None
+
+
+def _header_image(opts, paper):
+    """صورة الترويسة بعرض المساحة المطبوعة كاملًا (الارتفاع يتبع نسبة الصورة)؛ بلا صورة وهمية إن فُقد الملف."""
+    p = header_image_file(opts)
+    if p is None:
+        return ''
+    w_px, _h, m_px = paper_px(paper, 96, opts)
+    inner = max(w_px - 2 * m_px, 50)
+    return f'<p align="center" style="margin:0;"><img src="{p.resolve().as_uri()}" width="{inner}"></p>'
+
+
+def _stamp_box(doc, opts):
+    if not doc.stamp or not opts.show_stamp:
+        return ''
+    return (f'<table align="center" cellspacing="0" cellpadding="4" style="border: 2px solid {_STAMP}; border-collapse: collapse;">'
+            f'<tr><td align="center" style="color:{_STAMP}; font-weight:bold; font-size:12pt;">{_e(doc.stamp)}</td></tr></table>')
+
+
+def _header(doc, opts, small=False, paper='A4'):
+    img = _header_image(opts, paper)
+    meta_rows = ''
+    branch = doc.branch if opts.show_branch else ''
+    for label, val in (('الرقم', doc.number), ('التاريخ', doc.date), ('الفرع', branch), ('العملة', doc.currency), ('الفترة', doc.period)):
+        if val:
+            meta_rows += f'<tr><td style="color:#555;">{label}:</td><td><b>{_e(val)}</b></td></tr>'
+    if img:                                   # ترويسة الصورة الكاملة: صف مدمج تحتها (الرقم/التاريخ يمين، العنوان وسط، الختم يسار)
+        if _image_only(opts):
+            return img + '<p style="margin:0; font-size:4pt;">&nbsp;</p>'
+        stamp = _stamp_box(doc, opts)
+        return (img + '<p style="margin:0; font-size:4pt;">&nbsp;</p>'
+                '<table width="100%" cellspacing="0" cellpadding="2"><tr>'
+                f'<td width="32%" valign="middle"><table cellspacing="0" cellpadding="1">{meta_rows}</table></td>'
+                f'<td width="36%" align="center" valign="middle"><span style="font-size:{"14" if small else "17"}pt; font-weight:bold;">{_e(doc.title)}</span></td>'
+                f'<td width="32%" align="center" valign="middle">{stamp}</td>'
+                '</tr></table>')
+    else:
+        left = _logo_img(opts) + (f'<b style="font-size:13pt;">{_e(doc.company)}</b>' if doc.company else '')
+        if opts.header_note:
+            left += f'<br><span style="font-size:8pt; color:#555;">{_multiline(opts.header_note)}</span>'
+    return (
+        img + '<table width="100%" cellspacing="0" cellpadding="3"><tr>'
+        f'<td width="36%" valign="top">{left}</td>'
+        f'<td width="30%" align="center" valign="top"><span style="font-size:{"14" if small else "18"}pt; font-weight:bold;">{_e(doc.title)}</span><br>{_stamp_box(doc, opts)}</td>'
+        f'<td width="34%" valign="top"><table cellspacing="0" cellpadding="1">{meta_rows}</table></td>'
+        '</tr></table>')
+
+
+def _info_block(doc):
+    if not doc.info:
+        return ''
+    rows = ''
+    items = list(doc.info)
+    for i in range(0, len(items), 2):
+        pair = items[i:i + 2]
+        cells = ''.join(f'<td width="18%" style="color:#555;">{_e(k)}:</td><td width="32%"><b>{_e(v)}</b></td>' for k, v in pair)
+        if len(pair) == 1:
+            cells += '<td width="18%"></td><td width="32%"></td>'
+        rows += f'<tr>{cells}</tr>'
+    return (f'<table width="100%" cellspacing="0" cellpadding="3" style="border: 1px solid {_LINE}; border-collapse: collapse;">{rows}</table>'
+            '<p style="margin:0; font-size:4pt;">&nbsp;</p>')
+
+
+def _items_table(doc):
+    ths = ''.join(
+        f'<th style="background-color:{_HEAD_BG}; border: 1px solid {_LINE}; padding:4px;" align="{"left" if c.get("numeric") else "right"}">{_e(c.get("label", c.get("title", "")))}</th>'
+        for c in doc.columns)
+    body = ''
+    for n, r in enumerate(doc.rows):
+        tds = ''.join(
+            f'<td style="border: 1px solid {_LINE}; padding:3px 4px;{(" background-color:" + column_tint(c["key"], i) + ";") if column_tint(c["key"], i) else ""}" '
+            f'align="{"left" if c.get("numeric") else "right"}">{_cell_value(r.get(c["key"]), c.get("numeric"))}</td>'
+            for i, c in enumerate(doc.columns))
+        body += f'<tr>{tds}</tr>'
+    if not doc.rows:
+        body = f'<tr><td colspan="{max(len(doc.columns), 1)}" align="center" style="border: 1px solid {_LINE}; padding:8px; color:#777;">لا توجد بنود</td></tr>'
+    return (f'<table width="100%" cellspacing="0" cellpadding="0" border="1" style="border: 1px solid {_LINE}; border-collapse: collapse;">'
+            f'<thead><tr>{ths}</tr></thead><tbody>{body}</tbody></table>')
+
+
+def _totals_box(doc, opts):
+    if not doc.totals:
+        return ''
+    rows = ''
+    for t in doc.totals:
+        strong = doc.is_emphasis(t.get('label', ''))
+        w = 'bold' if strong else 'normal'
+        bg = f'background-color:{_HEAD_BG};' if strong else ''
+        rows += (f'<tr><td style="border: 1px solid {_LINE}; padding:3px 6px; font-weight:{w}; {bg}">{_e(t.get("label"))}</td>'
+                 f'<td align="left" style="border: 1px solid {_LINE}; padding:3px 6px; font-weight:{w}; {bg}">{_cell_value(t.get("value"), True)}</td></tr>')
+    return ('<p style="margin:0; font-size:4pt;">&nbsp;</p>'
+            '<table width="100%" cellspacing="0" cellpadding="0"><tr><td width="50%" valign="top">'
+            f'{_words_box(doc, opts)}</td><td width="50%" valign="top" align="left">'
+            f'<table width="100%" cellspacing="0" cellpadding="0" style="border: 1px solid {_LINE}; border-collapse: collapse;">{rows}</table>'
+            '</td></tr></table>')
+
+
+def _words_box(doc, opts):
+    if not doc.amount_words or not opts.show_amount_words:
+        return ''
+    body = '<br>'.join(f'<b>{_e(x)}</b>' for x in report_words.split_lines(doc.amount_words))
+    return (f'<p style="margin:0; padding:4px;"><span style="color:#555;">المبلغ كتابةً:</span><br>{body}</p>')
+
+
+def _notes_block(doc):
+    if not doc.notes:
+        return ''
+    return f'<p style="margin:6px 0 0 0;"><span style="color:#555;">ملاحظات:</span> {_e(doc.notes)}</p>'
+
+
+def _signatures(doc, opts):
+    if not doc.signatures or not opts.show_signatures:
+        return ''
+    w = int(100 / len(doc.signatures))
+    cells = ''.join(
+        f'<td width="{w}%" align="center" valign="bottom" style="padding-top:34px;">'
+        f'<table width="80%" cellspacing="0" cellpadding="0"><tr><td align="center" style="border-top: 1px solid {_LINE}; padding-top:2px; color:#555;">{_e(s)}</td></tr></table></td>'
+        for s in doc.signatures)
+    return f'<p style="margin:0; font-size:8pt;">&nbsp;</p><table width="100%" cellspacing="0" cellpadding="0"><tr>{cells}</tr></table>'
+
+
+def _footer(doc, opts):
+    parts = []
+    note = doc.footer_note or opts.footer_note
+    if note:
+        parts.append(_e(note))
+    if doc.printed_at and opts.show_printed_at:
+        parts.append(f'طُبع بتاريخ {_e(doc.printed_at)}')
+    if opts.show_brand_footer:
+        parts.append(_e(branding.BRAND_LINE))
+    if not parts:
+        return ''
+    return f'<p align="center" style="margin:10px 0 0 0; font-size:8pt; color:#666;">{" — ".join(parts)}</p>'
+
+
+def _a4a5(doc, paper, opts):
+    size = opts.font_pt or (10 if paper == 'A4' else 9)
+    return (f'<html dir="rtl"><head><meta charset="utf-8"></head>'
+            f'<body dir="rtl" style="font-family:{_FONT}; font-size:{size}pt; color:{_TEXT}; background-color:#ffffff;">'
+            f'{_header(doc, opts, paper=paper)}<hr>{_info_block(doc)}{_items_table(doc)}{_totals_box(doc, opts)}{_notes_block(doc)}'
+            f'{_signatures(doc, opts)}{_footer(doc, opts)}</body></html>')
+
+
+def _receipt(doc, opts):
+    """إيصال حراري 80مم: عمود واحد ضيق؛ كل بند سطران (الاسم، ثم الكمية × السعر = الإجمالي)."""
+    cols = {c['key']: c for c in doc.columns}
+    lines = ''
+    for r in doc.rows:
+        name = _e(r.get('item') or r.get('account') or r.get('desc') or '')
+        qty, price, tot = r.get('qty'), r.get('price'), r.get('total') if r.get('total') is not None else r.get('amount')
+        detail = ''
+        if qty is not None and price is not None:
+            detail = f'{fmt.fmt_money(qty, 3).rstrip("0").rstrip(".")} × {fmt.fmt_money(price)}'
+        lines += (f'<tr><td colspan="2" style="padding-top:3px;"><b>{name}</b></td></tr>'
+                  f'<tr><td style="color:#444;">{_e(detail)}</td><td align="left">{_cell_value(tot, True)}</td></tr>')
+    totals = ''.join(
+        f'<tr><td style="font-weight:{"bold" if doc.is_emphasis(t.get("label", "")) else "normal"};">{_e(t.get("label"))}</td>'
+        f'<td align="left" style="font-weight:{"bold" if doc.is_emphasis(t.get("label", "")) else "normal"};">{_cell_value(t.get("value"), True)}</td></tr>'
+        for t in doc.totals)
+    bal = ''
+    inv = getattr(doc, 'invoice', None) or {}
+    b = inv.get('balance')
+    if b:
+        def _l(lab, amt, side=''):
+            return (f'<tr><td>{lab}</td><td align="left">{_cell_value(abs(amt), True)}{(" " + _e(side)) if side else ""}</td></tr>')
+        bal = ('<tr><td colspan="2"><hr style="border: 0; border-top: 1px dashed ' + _LINE + ';"></td></tr>'
+               + _l('الرصيد السابق', b['previous'], b['previous_side']) + _l('الرصيد الحالي', b['current'], b['current_side']))
+    meta = ''.join(f'<div>{k}: {_e(v)}</div>' for k, v in (('الرقم', doc.number), ('التاريخ', doc.date), ('الفرع', doc.branch if opts.show_branch else '')) if v)
+    sep = f'<hr style="border: 0; border-top: 1px dashed {_LINE};">'
+    img = _header_image(opts, 'RECEIPT80')
+    logo = '' if img else _logo_img(opts, 40)
+    logo_html = img or (f'<p align="center" style="margin:0;">{logo}</p>' if logo else '')
+    note_html = (f'<p align="center" style="margin:0; font-size:8pt;">{_multiline(opts.header_note)}</p>'
+                 if opts.header_note and not img else '')
+    company_html = '' if img else f'<p align="center" style="margin:0;"><b style="font-size:12pt;">{_e(doc.company)}</b></p>'
+    only = _image_only(opts)
+    title_html = '' if only else (f'<p align="center" style="margin:2px 0;"><b>{_e(doc.title)}</b></p>{_stamp_box(doc, opts)}'
+                                  f'<div style="font-size:8pt;">{meta}</div>')
+    words = (f'{sep}<p align="center" style="margin:2px 0;"><b>{_e(doc.amount_words)}</b></p>'
+             if doc.amount_words and opts.show_amount_words else sep)
+    brand = (f'<p align="center" style="margin:2px 0 0 0; font-size:7pt; color:#666;">{_e(branding.BRAND_LINE)}</p>'
+             if opts.show_brand_footer else '')
+    return (f'<html dir="rtl"><head><meta charset="utf-8"></head>'
+            f'<body dir="rtl" style="font-family:{_FONT}; font-size:{opts.font_pt or 9}pt; color:{_TEXT}; background-color:#ffffff;">'
+            f'{logo_html}{company_html}{note_html}'
+            f'{title_html}{sep}'
+            f'<table width="100%" cellspacing="0" cellpadding="1">{lines}</table>{sep}'
+            f'<table width="100%" cellspacing="0" cellpadding="1">{totals}{bal}</table>'
+            f'{words}<p align="center" style="margin:4px 0 0 0; font-size:8pt;">{_e(doc.footer_note or opts.footer_note or "شكرًا لزيارتكم")}</p>{brand}</body></html>')
+
+
+def uses_classic(doc, paper, opts):
+    """«شكل 1» (قالب الربيع الكلاسيكي) لكل المستندات المطبوعة على A4/A5: التقارير والكشوف والفواتير والسندات والقيود.
+    إيصال 80 مم الحراري يبقى بقالبه الخاص لضيق عرضه. «شكل 2» (modern) يعيد القوالب الحديثة لكل المستندات."""
+    return paper != 'RECEIPT80' and getattr(opts, 'report_style', 'rabee') == 'rabee'
+
+
+def render_document_html(doc, paper='A4', opts=None, fill_px=0, pages=None):
+    """HTML المستند الكامل (بيضاء دائمًا). paper: A4 | A5 | RECEIPT80. opts: إعدادات الطباعة (الافتراضي: النشطة للمستخدم).
+    fill_px وpages لقالب الربيع فقط: مساحة تدفع التذييل لأسفل الصفحة ورقم الصفحة الأخيرة (تحسبهما خدمة الطباعة)."""
+    if paper not in PAPERS:
+        raise ValueError(f'قياس ورق غير معروف: {paper}')
+    opts = opts or PSET.active()
+    if paper != 'RECEIPT80' and getattr(doc, 'invoice', None):      # فاتورة/مرتجع بأسلوب أونكس برو (كل الأنماط)
+        from .document_invoice import render_invoice
+        return render_invoice(doc, paper, opts, _header_image(opts, paper), fill_px=fill_px, pages=pages)
+    if paper != 'RECEIPT80' and getattr(doc, 'voucher', None):      # سند قبض/صرف: قالب مخصص (كل الأنماط)
+        from .document_voucher import render_voucher
+        return render_voucher(doc, paper, opts, _header_image(opts, paper), fill_px=fill_px, pages=pages)
+    if uses_classic(doc, paper, opts):
+        from .document_classic import render_classic
+        return render_classic(doc, paper, opts, _header_image(opts, paper), fill_px=fill_px, pages=pages)
+    return _receipt(doc, opts) if paper == 'RECEIPT80' else _a4a5(doc, paper, opts)
+
+
+def paper_px(paper, dpi=96, opts=None):
+    """أبعاد الصفحة بالبكسل (العرض، الارتفاع أو None للإيصال، الهامش) عند dpi محددة، مع اتجاه وهامش المستخدم."""
+    w, h, m = effective_dims(paper, opts)
+    px = lambda mm: int(round(mm * dpi / 25.4))
+    return px(w), (px(h) if h else None), px(m)

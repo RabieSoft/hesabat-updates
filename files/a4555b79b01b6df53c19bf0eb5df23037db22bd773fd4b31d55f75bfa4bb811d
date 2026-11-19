@@ -1,0 +1,33 @@
+CREATE TABLE exchange_rates(
+  id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id),
+  currency TEXT NOT NULL REFERENCES currencies(code), rate_date TEXT NOT NULL,
+  rate TEXT NOT NULL CHECK(CAST(rate AS REAL)>0),          -- عدد وحدات العملة الأساسية مقابل وحدة واحدة أجنبية
+  created_by INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(company_id,currency,rate_date));
+CREATE INDEX ix_rates_lookup ON exchange_rates(company_id,currency,rate_date);
+CREATE TRIGGER rate_no_base BEFORE INSERT ON exchange_rates
+WHEN NEW.currency=(SELECT base_currency FROM companies WHERE id=NEW.company_id) BEGIN
+  SELECT RAISE(ABORT,'لا يوجد سعر صرف للعملة الأساسية');
+END;
+CREATE TRIGGER rate_no_delete BEFORE DELETE ON exchange_rates BEGIN SELECT RAISE(ABORT,'أسعار الصرف لا تُحذف'); END;
+CREATE TRIGGER rate_no_move BEFORE UPDATE OF company_id,currency,rate_date ON exchange_rates BEGIN
+  SELECT RAISE(ABORT,'لا يمكن تغيير عملة أو تاريخ سعر الصرف');
+END;
+
+CREATE TABLE company_currencies(
+  company_id INTEGER NOT NULL REFERENCES companies(id), currency TEXT NOT NULL REFERENCES currencies(code),
+  is_enabled INTEGER NOT NULL CHECK(is_enabled IN (0,1)), PRIMARY KEY(company_id,currency));
+
+ALTER TABLE accounts ADD COLUMN revalue_fx INTEGER NOT NULL DEFAULT 0 CHECK(revalue_fx IN (0,1));
+UPDATE accounts SET revalue_fx=1 WHERE id IN (SELECT account_id FROM parties);
+
+CREATE TABLE fx_revaluations(
+  id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), as_of TEXT NOT NULL,
+  entry_id INTEGER NOT NULL REFERENCES journal_entries(id), rates_json TEXT NOT NULL,
+  created_by INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+
+INSERT INTO permissions(code,name_ar,is_sensitive) VALUES
+ ('currency.rates','إدخال أسعار الصرف',0),('currency.manage','إدارة العملات',1),('fx.revalue','إعادة تقييم أرصدة العملات الأجنبية',1);
+INSERT INTO role_permissions SELECT r.id,'currency.rates' FROM roles r WHERE r.id IN (1,2,3);
+INSERT INTO role_permissions SELECT 1,'currency.manage';
+INSERT INTO role_permissions SELECT r.id,'fx.revalue' FROM roles r WHERE r.id IN (1,2);

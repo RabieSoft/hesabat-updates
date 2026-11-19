@@ -1,0 +1,55 @@
+"""أسهم أزرار شريط التمرير (أعلى/أسفل): ملفات PNG صغيرة تُولَّد بلا PySide6 (zlib فقط) وتُرجَع مساراتها لـ QSS.
+
+لونها من tokens (يُمرَّر من qss.py) فتتبع الوضع الفاتح/الداكن. الفشل في الكتابة لا يكسر الواجهة: تُرجَع قيمة فارغة.
+"""
+import os
+import struct
+import tempfile
+import zlib
+
+SIZE, SS = 10, 4                       # حجم الصورة وعامل التنعيم
+
+
+def _inside(x, y, up):
+    """هل النقطة داخل مثلث السهم؟ (قمة في الأعلى إن up، وإلا في الأسفل)."""
+    if not up:
+        y = SIZE - y
+    top, base = 2.0, 7.0
+    if y < top or y > base:
+        return False
+    half = (y - top) / (base - top) * 3.5       # نصف العرض يزداد نحو القاعدة
+    return abs(x - SIZE / 2) <= half
+
+
+def _png(rgb, up):
+    r, g, b = rgb
+    rows = b""
+    for py in range(SIZE):
+        rows += b"\x00"
+        for px in range(SIZE):
+            hit = sum(_inside(px + (i + .5) / SS, py + (j + .5) / SS, up) for i in range(SS) for j in range(SS))
+            rows += bytes((r, g, b, round(255 * hit / (SS * SS))))
+
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", SIZE, SIZE, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows, 9)) + chunk(b"IEND", b""))
+
+
+def arrow_urls(hex_color):
+    """{'up': مسار, 'down': مسار} بفواصل / (صالحة داخل url() في QSS)، أو قيم فارغة إن تعذّرت الكتابة."""
+    h = hex_color.lstrip("#")
+    out = {"up": "", "down": ""}
+    try:
+        rgb = tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+        d = os.path.join(tempfile.gettempdir(), "alhisabat_arrows")
+        os.makedirs(d, exist_ok=True)
+        for name, up in (("up", True), ("down", False)):
+            p = os.path.join(d, f"{name}_{h}.png")
+            if not os.path.isfile(p) or os.path.getsize(p) == 0:
+                with open(p, "wb") as fh:
+                    fh.write(_png(rgb, up))
+            out[name] = p.replace("\\", "/")
+    except Exception:  # noqa: BLE001
+        pass
+    return out

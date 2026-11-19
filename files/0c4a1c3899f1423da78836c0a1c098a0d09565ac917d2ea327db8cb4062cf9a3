@@ -1,0 +1,25 @@
+"""خدمة دفتر الملاحظات للواجهة (طبقة رفيعة فوق business.notebook)."""
+from alhisabat.business import notebook as nb
+
+
+class NotebookMixin:
+    def notes_list(self, mode='active', search='', tag='', color=''):
+        return nb.list_notes(self.conn, self.company_id, self.user_id, mode=mode, search=search, tag=tag, color=color)
+
+    def note_get(self, note_id):
+        return nb.get_note(self.conn, self.company_id, self.user_id, note_id)
+
+    def note_save(self, note_id, v):
+        return nb.save_note(self.conn, self.company_id, self.user_id, note_id, v)
+
+    def note_flags(self, note_id, **flags):
+        return nb.set_flags(self.conn, self.company_id, self.user_id, note_id, **flags)
+
+    def note_delete(self, note_id):
+        return nb.delete_note(self.conn, self.company_id, self.user_id, note_id)
+
+    def note_tags(self):
+        return nb.tag_counts(self.conn, self.company_id, self.user_id)
+
+    def note_counts(self):
+        return nb.counts(self.conn, self.company_id, self.user_id)

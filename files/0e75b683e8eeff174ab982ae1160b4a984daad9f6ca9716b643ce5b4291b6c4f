@@ -1,0 +1,888 @@
+"""محرك الطباعة والتصدير (Report Engine + Print Engine، §82).
+كل مستند/تقرير يُختزل إلى مواصفة طباعة موحّدة (ترويسة + أعمدة + صفوف + إجماليات)، ثم يُصدَّر بأي صيغة:
+- HTML: طباعة/معاينة كاملة بالعربية RTL (المتصفح يتولى تشكيل الحروف والاتجاه فعليا، فهذا يعمل بلا نواقص).
+- CSV / XLSX: بيانات جدولية حقيقية (openpyxl)، القيم أرقام حقيقية قابلة للجمع في إكسل، ليست نصوصا.
+- PDF (reportlab): محدودة فعليا — انظر render_pdf وIMPLEMENTATION_STATUS. لا تُستخدم في الإنتاج بعد.
+الصلاحيات: كل باني (builder) يستدعي دالة الاستعلام الحقيقية للمستند/التقرير (sales.get_invoice، le.ledger، ...)
+فتُفرض الصلاحيات هناك؛ لا تكرار لمنطق الصلاحيات هنا."""
+import csv
+import io
+from html import escape as html_escape
+import re
+import unicodedata
+from datetime import datetime, date as _date
+from decimal import Decimal
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.accounting import balance_engine as be, cost_center_reports as ccr, financial_statements as fs, journal_engine as je, ledger_engine as le
+from alhisabat.business import aging as ag, cash, inventory as inv, parties as pt, purchases as pu, sales
+from alhisabat.reporting import words as _wd
+
+
+def _company_header(conn, company_id, branch_id=None):
+    c = conn.execute("SELECT name FROM companies WHERE id=?", (company_id,)).fetchone()
+    b = conn.execute("SELECT name FROM branches WHERE id=?", (branch_id,)).fetchone() if branch_id else None
+    return c[0] if c else None, (b[0] if b else None)
+
+
+def _words(amount, currency):
+    """المبلغ كتابةً بنوع العملة (تفقيط). '' إن تعذّر أو كان المبلغ غير موجب."""
+    try:
+        from alhisabat.ui.core import format as _fmt
+        return _fmt.amount_in_words(amount, currency) if amount is not None and currency else ""
+    except Exception:
+        return ""
+
+
+def _base_cur(conn, company_id):
+    """العملة الأساسية للشركة (أساس التفقيط حين لا تحمل المواصفة عملة)."""
+    r = conn.execute("SELECT base_currency FROM companies WHERE id=?", (company_id,)).fetchone()
+    return r[0] if r else None
+
+
+def _with_words(conn, company_id, spec):
+    """يُلحق «المبلغ كتابةً» بإجماليات التقرير بعملته (أو الأساسية) — يُستدعى في آخر كل باني تقرير."""
+    return _wd.attach_words(spec, _base_cur(conn, company_id))
+
+
+def _u(minor):
+    return None if minor is None else Decimal(int(minor)) / 100
+
+
+def _spec(title, *, company=None, branch=None, currency=None, period=None, extra=None, columns, rows, totals=None):
+    return {"title": title, "company": company, "branch": branch, "currency": currency, "period": period,
+           "printed_at": datetime.now().isoformat(timespec="seconds"), "extra": extra or [],
+           "columns": columns, "rows": rows, "totals": totals or []}
+
+
+_SRC_LABELS = {"party_opening": "رصيد افتتاحي", "party_reconcile": "مطابقة", "stock_opening": "رصيد مخزون افتتاحي", "stock_adjustment": "تسوية مخزون",
+               "stock_count": "جرد مخزون", "cash_transfer": "تحويل نقدية", "cash_count": "جرد صندوق", "payroll_run": "مسير رواتب",
+               "asset_depreciation": "إهلاك أصول", "fixed_asset": "أصل ثابت", "fixed_asset_disposal": "استبعاد أصل",
+               "revaluation": "إعادة تقييم", "bank_statement": "كشف بنكي"}
+
+
+def _doc_info(conn, x, cache):
+    """(نوع المستند، رقمه، المرجع) لحركة دفتر الأستاذ، من المستند المصدر؛ والقيد اليدوي «قيد يومية» برقم ترحيله."""
+    st, sid = x.get("source_type"), x.get("source_id")
+    key = (st, sid)
+    if key in cache:
+        return cache[key]
+    out = None
+    try:
+        if st == "sales_invoice" and sid:
+            r = conn.execute("SELECT doc_type,invoice_no FROM sales_invoices WHERE id=?", (sid,)).fetchone()
+            if r:
+                out = ("مرتجع مبيعات" if r["doc_type"] == "return" else "فاتورة مبيعات", r["invoice_no"] or "", "")
+        elif st == "purchase_invoice" and sid:
+            r = conn.execute("SELECT doc_type,invoice_no,supplier_ref FROM purchase_invoices WHERE id=?", (sid,)).fetchone()
+            if r:
+                out = ("مرتجع مشتريات" if r["doc_type"] == "return" else "فاتورة مشتريات", r["invoice_no"] or "", r["supplier_ref"] or "")
+        elif st == "cash_voucher" and sid:
+            r = conn.execute("SELECT v.voucher_type,v.voucher_no,v.description,a.kind FROM cash_vouchers v LEFT JOIN cash_accounts a ON a.id=v.cash_account_id "
+                             "WHERE v.id=?", (sid,)).fetchone()
+            if r:
+                base = "سند قبض" if r["voucher_type"] == "receipt" else "سند صرف"
+                out = (f"{base} {'بنكي' if r['kind'] == 'bank' else 'نقدي'}", r["voucher_no"] or "", (r["description"] or "").strip())
+    except Exception:  # noqa: BLE001 — نوع المستند للعرض فقط؛ لا يُفشل الكشف
+        out = None
+    if out is None:
+        out = (_SRC_LABELS.get(st, "قيد يومية"), x.get("posted_no") or x.get("entry_no") or "", "")
+    cache[key] = out
+    return out
+
+
+def _voucher_note(conn, x, cache):
+    """بيان سند القبض/الصرف (الملاحظة/رقم السند الدفتري) لحركة الأستاذ، وإلا None. القيود القديمة خزّنت «سند قبض رقم N» فقط."""
+    if x.get("source_type") != "cash_voucher" or not x.get("source_id"):
+        return None
+    key = ("note", x["source_id"])
+    if key not in cache:
+        try:
+            r = conn.execute("SELECT description FROM cash_vouchers WHERE id=?", (x["source_id"],)).fetchone()
+            cache[key] = ((r[0] or "").strip() or None) if r else None
+        except Exception:  # noqa: BLE001 — للعرض فقط
+            cache[key] = None
+    return cache[key]
+
+
+# ---------------- المستندات ----------------
+def _party_owed(conn, company_id, party, upto_entry_id=None, upto_date=None, include_entry=True):
+    """ما **على الطرف لنا** (موجب = «عليكم»، سالب = «لكم») بالعملة الأساسية، من قيود الأستاذ المرحّلة: مدين − دائن لحساب الطرف
+    عميلًا كان أو موردًا (نحن مدينون للمورد ⇒ سالب ⇒ «لكم»). upto_entry_id: يشمل/يستثني هذا القيد وما بعده
+    (ترتيب التاريخ ثم رقم القيد) فيُحسب الرصيد السابق والحالي لنفس الفاتورة بثبات حتى لو طُبعت لاحقًا."""
+    q = ("SELECT COALESCE(SUM(l.debit_base - l.credit_base),0) FROM journal_lines l JOIN journal_entries e ON e.id=l.entry_id "
+         "WHERE e.company_id=? AND l.account_id=? AND e.status IN ('posted','reversed')")
+    args = [company_id, party["account_id"]]
+    if upto_entry_id is not None:
+        op = "<=" if include_entry else "<"
+        q += f" AND (e.entry_date < ? OR (e.entry_date = ? AND e.id {op} ?))"
+        args += [upto_date, upto_date, upto_entry_id]
+    elif upto_date is not None:
+        q += " AND e.entry_date <= ?"
+        args.append(upto_date)
+    return Decimal(int(conn.execute(q, args).fetchone()[0] or 0)) / 100
+
+
+def _side(owed):
+    return "عليكم" if owed > 0 else ("لكم" if owed < 0 else "")
+
+
+def _invoice_rate(conn, company_id, h, base):
+    """سعر صرف الفاتورة (أساسي لكل وحدة أجنبية): المرحّلة تحمل سعرها المخزّن، والمسودة سعر اليوم المسجّل؛ None إن لم يوجد."""
+    if h["currency"] == base:
+        return Decimal(1)
+    if h["status"] == "posted":
+        return Decimal(str(h["exchange_rate"]))
+    try:
+        from alhisabat.accounting import rates as fxr
+        return fxr.get_rate(conn, company_id, h["currency"], h["invoice_date"])
+    except Exception:  # noqa: BLE001 — لا سعر صرف: يُعرض الرصيد بالعملة الأساسية بدل رقم مضلِّل
+        return None
+
+
+def _invoice_balance(conn, company_id, party, h, kind):
+    """كتلة «كشف رصيد الطرف» أسفل الفاتورة: الرصيد السابق + أثر هذه الفاتورة = الرصيد الحالي، بصيغة «عليكم / لكم» وبالتفقيط.
+    تُعرض **بعملة الفاتورة** (فاتورة باليمني ⇒ أرصدة باليمني): أثر الفاتورة بمبلغها الأصلي بلا تقريب، والرصيد السابق = رصيد الأستاذ
+    (بالأساسي) ÷ سعر صرف الفاتورة؛ ويُضاف المعادل بالعملة الأساسية. فاتورة مرحّلة: السابق/الحالي من الأستاذ عند قيدها؛ مسودة: تقديري."""
+    base = _base_cur(conn, company_id)
+    cur = h["currency"]
+    rate = _invoice_rate(conn, company_id, h, base)
+    show_cur, rate_used = (cur, rate) if rate else (base, Decimal(1))        # لا سعر ⇒ نعرض بالأساسي صراحةً
+    eid, posted = h.get("journal_entry_id"), h["status"] == "posted"
+    sign = (-1 if h["doc_type"] == "return" else 1) * (1 if kind == "sales" else -1)
+    due_orig = _u(h["due_total"]) * sign                                       # أثر الفاتورة بعملتها (موجب = عليكم)
+    if posted and eid:
+        d = conn.execute("SELECT entry_date FROM journal_entries WHERE id=?", (eid,)).fetchone()[0]
+        prev_b = _party_owed(conn, company_id, party, eid, d, include_entry=False)
+        cur_b = _party_owed(conn, company_id, party, eid, d, include_entry=True)
+        estimated = False
+    else:
+        prev_b = _party_owed(conn, company_id, party, upto_date=h["invoice_date"])
+        cur_b = prev_b + due_orig * (rate or Decimal(1))
+        estimated = True
+    move_b = cur_b - prev_b
+    if show_cur == base:
+        prev, move = prev_b, move_b
+    else:
+        q = Decimal("0.01")
+        prev = (prev_b / rate_used).quantize(q)
+        move = due_orig                                                        # بمبلغ الفاتورة الأصلي تمامًا
+    now = prev + move
+    return {"currency": show_cur, "base_currency": base, "rate": rate_used, "estimated": estimated,
+            "previous": prev, "movement": move, "current": now,
+            "previous_side": _side(prev), "current_side": _side(now),
+            "current_words": _words(abs(now), show_cur) if now != 0 else "",
+            "base": {"previous": prev_b, "movement": move_b, "current": cur_b},
+            "party_kind": party["kind"]}
+
+
+def invoice_print(conn, user_id, invoice_id, kind="sales"):
+    get = sales.get_invoice if kind == "sales" else pu.get_purchase
+    h = get(conn, user_id, invoice_id)
+    company, branch = _company_header(conn, h["company_id"], h["branch_id"])
+    party_key = "customer_id" if kind == "sales" else "supplier_id"
+    party = None
+    if h.get(party_key):
+        party = conn.execute("SELECT name FROM parties WHERE id=?", (h[party_key],)).fetchone()
+    units = {r[0]: r[1] for r in conn.execute("SELECT id,name FROM units WHERE company_id=?", (h["company_id"],))}
+    cols = [{"key": "item", "label": "الصنف/الوصف"}, {"key": "qty", "label": "الكمية", "numeric": True},
+           {"key": "unit", "label": "الوحدة"}, {"key": "price", "label": "السعر", "numeric": True},
+           {"key": "total", "label": "الإجمالي", "numeric": True}]
+    rows = []
+    for n, l in enumerate(h["lines"], 1):
+        nm = l.get("item_name") or l.get("description", "") or ""
+        rows.append({"item": f"{l.get('item_code') or ''} {nm}".strip(),
+                     "qty": _u(l["qty_milli"]) / 10 if "qty_milli" in l.keys() else None,
+                     "unit": units.get(l.get("unit_id"), ""),
+                     "price": _u(l["unit_price_minor"]),
+                     "total": _u(l["total_minor"]),
+                     # حقول إضافية لقالب الفاتورة (لا تظهر في CSV/XLSX لأنها خارج columns)
+                     "no": n, "code": l.get("item_code") or "", "name": nm,
+                     "note": (l.get("description") or "") if l.get("item_name") else "",
+                     "discount": _u(l.get("discount_ex") or 0), "tax": _u(l.get("tax_minor") or 0),
+                     "net": _u(l.get("net_ex") or 0), "tax_pct": Decimal(int(l.get("tax_bps") or 0)) / 100})
+    totals = [{"label": "الإجمالي", "value": _u(h["grand_total"])}, {"label": "المدفوع", "value": _u(h["paid_total"])},
+             {"label": "المتبقي", "value": _u(h["due_total"])}]
+    extra = [("رقم المستند", h["invoice_no"] or "(مسودة)"), ("التاريخ", h["invoice_date"]), ("الحالة", h["status"]),
+            (("العميل" if kind == "sales" else "المورد"), party["name"] if party else "نقدي")]
+    title = {"invoice": "فاتورة مبيعات", "return": "مرتجع مبيعات"}.get(h["doc_type"], "مستند") if kind == "sales" else \
+        {"invoice": "فاتورة مشتريات", "return": "مرتجع مشتريات"}.get(h["doc_type"], "مستند")
+    spec = _spec(title, company=company, branch=branch, currency=h["currency"], period=h["invoice_date"], extra=extra, columns=cols, rows=rows, totals=totals)
+    spec["amount_words"] = _words(_u(h["grand_total"]), h["currency"])
+    spec["invoice"] = _invoice_meta(conn, h, kind, party_key)
+    return spec
+
+
+def _invoice_meta(conn, h, kind, party_key):
+    """بيانات قالب الفاتورة (أسلوب أونكس): الطرف، المستودع، نوع الدفع، المبالغ، وكشف الرصيد. لا تغيّر أرقام المحرك."""
+    p = conn.execute("SELECT * FROM parties WHERE id=?", (h[party_key],)).fetchone() if h.get(party_key) else None
+    wh = conn.execute("SELECT name FROM warehouses WHERE id=?", (h["warehouse_id"],)).fetchone() if h.get("warehouse_id") else None
+    by = conn.execute("SELECT full_name FROM users WHERE id=?", (h["created_by"],)).fetchone()
+    orig = None
+    if h.get("original_invoice_id"):
+        tbl = "sales_invoices" if kind == "sales" else "purchase_invoices"
+        orig = conn.execute(f"SELECT invoice_no FROM {tbl} WHERE id=?", (h["original_invoice_id"],)).fetchone()
+    grand, paid, due = h["grand_total"], h["paid_total"], h["due_total"]
+    payment = "نقدي" if due == 0 else ("آجل" if paid == 0 else "جزئي")
+    meta = {"kind": kind, "doc_type": h["doc_type"],
+            "party": ({"label": "العميل" if kind == "sales" else "المورد", "code": p["code"], "name": p["name"], "phone": p["phone"],
+                       "address": p["address"], "tax_no": p["tax_no"]} if p else
+                      {"label": "العميل" if kind == "sales" else "المورد", "code": "", "name": "نقدي", "phone": "", "address": "", "tax_no": ""}),
+            "warehouse": wh[0] if wh else "", "payment": payment, "due_date": h.get("due_date") or "",
+            "prepared_by": by[0] if by else "", "notes": h.get("notes") or "", "supplier_ref": h.get("supplier_ref") or "",
+            "original_no": (orig[0] if orig else "") or "", "invoice_no": h["invoice_no"] or "", "currency": h["currency"],
+            "amounts": {"gross": _u(h["gross_ex_total"]), "discount": _u(h["discount_ex_total"]), "net": _u(h["net_ex_total"]),
+                        "tax": _u(h["tax_total"]), "grand": _u(grand), "paid": _u(paid), "due": _u(due),
+                        "costs": _u(h["costs_total"]) if "costs_total" in h.keys() else None},
+            "balance": None}
+    if p:
+        try:
+            meta["balance"] = _invoice_balance(conn, h["company_id"], p, h, kind)
+        except Exception:  # noqa: BLE001 — الرصيد إضافة للعرض؛ لا يُفشل طباعة الفاتورة
+            meta["balance"] = None
+    return meta
+
+
+def voucher_print(conn, user_id, voucher_id):
+    v = cash.get_voucher(conn, user_id, voucher_id)
+    company, branch = _company_header(conn, v["company_id"], v["branch_id"])
+    party = conn.execute("SELECT name FROM parties WHERE id=?", (v["party_id"],)).fetchone() if v["party_id"] else None
+    ca = conn.execute("SELECT name FROM cash_accounts WHERE id=?", (v["cash_account_id"],)).fetchone()
+    cols = [{"key": "account", "label": "الحساب"}, {"key": "amount", "label": "المبلغ", "numeric": True}, {"key": "note", "label": "بيان"}]
+    if v["lines"]:
+        rows = [{"account": conn.execute("SELECT name FROM accounts WHERE id=?", (l["account_id"],)).fetchone()[0],
+                "amount": _u(l["amount_minor"]), "note": l["description"]} for l in v["lines"]]
+    else:
+        rows = [{"account": party["name"] if party else "", "amount": _u(v["amount_minor"]), "note": v["description"]}]
+    title = "سند قبض" if v["voucher_type"] == "receipt" else "سند صرف"
+    extra = [("رقم السند", v["voucher_no"] or "(مسودة)"), ("التاريخ", v["voucher_date"]), ("الحالة", v["status"]),
+            ("الصندوق/البنك", ca[0] if ca else "")]
+    spec = _spec(title, company=company, branch=branch, currency=v["currency"], period=v["voucher_date"], extra=extra,
+                 columns=cols, rows=rows, totals=[{"label": "الإجمالي", "value": _u(v["amount_minor"])}])
+    spec["amount_words"] = _words(_u(v["amount_minor"]), v["currency"])
+    spec["voucher"] = _voucher_details(conn, v, party, ca)
+    return spec
+
+
+def _voucher_details(conn, v, party, ca):
+    """تفاصيل السند للقالب المخصص (قبض/صرف): الطرف المقابل، الحساب المقابل، القيد، الفواتير المسددة، المُعِدّ/المُرحِّل. قراءة فقط."""
+    def one(sql, args):
+        r = conn.execute(sql, args).fetchone()
+        return r[0] if r else None
+    kind = conn.execute("SELECT kind FROM cash_accounts WHERE id=?", (v["cash_account_id"],)).fetchone()
+    ptype = one("SELECT kind FROM parties WHERE id=?", (v["party_id"],)) if v["party_id"] else None
+    je_no = one("SELECT COALESCE(posted_no,entry_no) FROM journal_entries WHERE id=?", (v["journal_entry_id"],)) if v["journal_entry_id"] else None
+    allocs = []
+    for a in v.get("allocations") or []:
+        tbl, lab = ("sales_invoices", "فاتورة مبيعات") if a["doc_type"] == "sales_invoice" else ("purchase_invoices", "فاتورة مشتريات")
+        r = conn.execute(f"SELECT invoice_no,invoice_date FROM {tbl} WHERE id=?", (a["doc_id"],)).fetchone()
+        allocs.append({"type": lab, "no": (r[0] if r else "") or "", "date": (r[1] if r else "") or "", "amount": _u(a["amount_minor"])})
+    return {"kind": v["voucher_type"], "party_name": party["name"] if party else "", "party_kind": ptype,
+            "counter_accounts": [r["account"] for r in ([{"account": conn.execute("SELECT name FROM accounts WHERE id=?", (l["account_id"],)).fetchone()[0]} for l in v["lines"]])],
+            "cash_name": ca[0] if ca else "", "cash_kind": kind[0] if kind else "", "amount": _u(v["amount_minor"]), "currency": v["currency"],
+            "description": v["description"] or "", "exchange_rate": v.get("exchange_rate") or "", "journal_no": je_no,
+            "allocations": allocs, "created_by": one("SELECT full_name FROM users WHERE id=?", (v["created_by"],)) or "",
+            "posted_by": one("SELECT full_name FROM users WHERE id=?", (v["posted_by"],)) if v.get("posted_by") else "",
+            "posted_at": v.get("posted_at") or "", "status": v["status"]}
+
+
+def journal_entry_print(conn, user_id, entry_id):
+    e = je.get_entry(conn, user_id, entry_id)
+    company, branch = _company_header(conn, e["company_id"], e["branch_id"])
+    cols = [{"key": "account", "label": "الحساب"}, {"key": "debit", "label": "مدين", "numeric": True},
+           {"key": "credit", "label": "دائن", "numeric": True}, {"key": "note", "label": "بيان"}]
+    rows = [{"account": f"{l['account_code']} {l['account_name']}", "debit": _u(l["debit_base"]) or Decimal(0),
+            "credit": _u(l["credit_base"]) or Decimal(0), "note": l["memo"]} for l in e["lines"]]
+    totals = [{"label": "الإجمالي", "value": sum(r["debit"] for r in rows)}]
+    extra = [("رقم القيد", e["posted_no"] or e["entry_no"]), ("التاريخ", e["entry_date"]), ("الحالة", e["status"]), ("البيان", _voucher_note(conn, e, {}) or e["description"])]
+    _ref = _voucher_note(conn, e, {})
+    if _ref:
+        extra.append(("المرجع", _ref))
+    base = conn.execute("SELECT base_currency FROM companies WHERE id=?", (e["company_id"],)).fetchone()
+    base = base[0] if base else None
+    spec = _spec("قيد محاسبي", company=company, branch=branch, currency=base, period=e["entry_date"], extra=extra, columns=cols, rows=rows, totals=totals)
+    spec["amount_words"] = _words(totals[0]["value"], base)
+    return spec
+
+
+# ---------------- التقارير ----------------
+def trial_balance_print(conn, user_id, company_id, date_from, date_to, **kw):
+    tb = be.trial_balance(conn, user_id, company_id, date_from, date_to, **kw)
+    company, branch = _company_header(conn, company_id, kw.get("branch_id"))
+    cols = [{"key": "code", "label": "الرقم"}, {"key": "name", "label": "الحساب"},
+           {"key": "opening", "label": "افتتاحي", "numeric": True}, {"key": "debit", "label": "مدين", "numeric": True},
+           {"key": "credit", "label": "دائن", "numeric": True}, {"key": "closing", "label": "ختامي", "numeric": True}]
+    rows = [{"code": r["code"], "name": ("  " * (r["level"] - 1)) + r["name"], "opening": _u(r["opening_debit"] - r["opening_credit"]),
+            "debit": _u(r["period_debit"]), "credit": _u(r["period_credit"]), "closing": _u(r["closing_debit"] - r["closing_credit"])}
+            for r in tb["rows"]]
+    totals = [{"label": "الإجماليات", "value": _u(tb["totals"]["period_debit"]), "words_label": "إجمالي المدين"},
+              {"label": "دائن", "value": _u(tb["totals"]["period_credit"]), "words_label": "إجمالي الدائن"}]
+    if totals[0]["value"] == totals[1]["value"]:          # ميزان متوازن: سطر تفقيط واحد للجانبين
+        totals[0]["words_label"], totals[1]["no_words"] = "إجمالي المدين والدائن", True
+    return _with_words(conn, company_id, _spec("ميزان المراجعة", company=company, branch=branch, period=f"{date_from} — {date_to}",
+                                               columns=cols, rows=rows, totals=totals))
+
+
+# ترتيب أعمدة كل كشوف الحساب (من اليمين لليسار): التاريخ، نوع المستند، رقم المستند، البيان، رقم المرجع، العملة، ثم المبلغ (مدين/دائن)، وأخيرًا الرصيد
+_STATEMENT_COLS_HEAD = [{"key": "date", "label": "التاريخ"}, {"key": "doc_type", "label": "نوع المستند"}, {"key": "doc_no", "label": "رقم المستند"},
+                        {"key": "desc", "label": "البيان"}, {"key": "ref", "label": "رقم المرجع"}, {"key": "currency", "label": "العملة"}]
+
+
+BALANCE_SIDES = {"all": "دائن ومدين", "debit": "مدينون فقط", "credit": "دائنون فقط"}
+
+
+def norm_side(side):
+    side = (side or "all").strip().lower()
+    if side not in BALANCE_SIDES:
+        raise AccountingError("قيمة ترشيح الرصيد غير معروفة")
+    return side
+
+
+def side_match(net, side):
+    """net = مدين − دائن (موجب = رصيد مدين، سالب = دائن). الرصيد الصفري لا يطابق «مدينون» ولا «دائنون»."""
+    if side == "debit":
+        return net > 0
+    if side == "credit":
+        return net < 0
+    return True
+
+
+def ledger_print(conn, user_id, company_id, account_id, date_from, date_to, **kw):
+    """كشف حساب. بلا currency: كل الحركات بمعادلها بالعملة الأساسية (والحركة الأجنبية يظهر مبلغها الأصلي في البيان).
+    مع currency=XXX: حركات تلك العملة وحدها بمبالغها وأرصدتها **بالعملة الأصلية** (كشف يمني/دولار…)."""
+    kw.setdefault("limit", 1000)                           # الحد الأقصى في المحرك؛ كان 200 فيُقتطع الكشف الطويل
+    multi = bool(kw.pop("multi_currency", False)) and not kw.get("currency")
+    side = norm_side(kw.pop("balance_side", None))
+    r = le.ledger(conn, user_id, company_id, account_id, date_from, date_to, **kw)
+    if side != "all":
+        _cl = r["closing_balance_orig"] if kw.get("currency") else r["closing_balance"]
+        _net = _cl if r["account"]["nature"] == "debit" else -_cl
+        if not side_match(_net, side):
+            raise AccountingError(f"رصيد هذا الحساب في الفترة المحددة ليس {'مدينًا' if side == 'debit' else 'دائنًا'}، فلا يطابق الترشيح «{BALANCE_SIDES[side]}».")
+    company, branch = _company_header(conn, company_id)
+    if multi:
+        return _ledger_multi_currency(conn, company_id, r, company, branch, date_from, date_to)
+    cur = r.get("currency")
+    sfx = f" ({cur})" if cur else ""
+    cols = _STATEMENT_COLS_HEAD + [{"key": "debit", "label": "مدين" + sfx, "numeric": True, "group": "المبلغ"},
+                                   {"key": "credit", "label": "دائن" + sfx, "numeric": True, "group": "المبلغ"},
+                                   {"key": "balance", "label": "الرصيد" + sfx, "numeric": True}]
+    base = conn.execute("SELECT base_currency FROM companies WHERE id=?", (company_id,)).fetchone()[0]
+    rows, _cache = [], {}
+    for x in r["rows"]:
+        _note = _voucher_note(conn, x, _cache)              # بيان السند (إن وُجد) بدل نص القيد العام «سند قبض رقم N»
+        desc = _note or x["description"]
+        if cur:
+            d, c, bal = x["debit_orig"], x["credit_orig"], x["running_balance_orig"]
+        else:
+            d, c, bal = x["debit_base"], x["credit_base"], x["running_balance"]
+            if x["currency"] != base:                       # حركة بعملة أجنبية داخل كشف بالأساسية: نُظهر مبلغها الأصلي
+                amt = _u(x["debit_orig"] or x["credit_orig"])
+                desc = f"{desc or ''} [{x['currency']} {amt:,.2f}]".strip()
+        dtype, dno, dref = _doc_info(conn, x, _cache)
+        rows.append({"entry_id": x.get("entry_id"), "source_type": x.get("source_type"), "source_id": x.get("source_id"),
+                     "date": x["entry_date"], "no": x["posted_no"], "desc": desc, "currency": cur or base,
+                     "debit": _u(d), "credit": _u(c), "balance": _u(bal), "doc_type": dtype, "doc_no": dno, "ref": dref})
+    opening, closing = (r["opening_balance_orig"], r["closing_balance_orig"]) if cur else (r["opening_balance"], r["closing_balance"])
+    extra = [("الحساب", f"{r['account']['code']} {r['account']['name']}")]
+    if cur:
+        extra.append(("العملة", cur))
+    extra.append(("الرصيد الافتتاحي" + sfx, str(_u(opening))))
+    spec = _spec("كشف حساب" + (f" — {cur}" if cur else ""), company=company, branch=branch, currency=cur or base,
+                 period=f"{date_from} — {date_to}", extra=extra, columns=cols, rows=rows,
+                 totals=[{"label": "الرصيد الختامي" + sfx, "value": _u(closing)}])
+    # بيانات قالب «كشف الربيع»: الرصيد الافتتاحي (مدين موجب) وإجماليات الفترة كلها (لا صفوف الصفحة وحدها) وعدد الحركات
+    nature = 1 if r["account"]["nature"] == "debit" else -1
+    open_net = opening * nature if cur else r["opening_net"]
+    spec["opening"] = _u(open_net)
+    spec["sums"] = {"sign": nature, "debit": _u(r["total_debit_orig"] if cur else r["total_debit"]),
+                    "credit": _u(r["total_credit_orig"] if cur else r["total_credit"]), "count": r["count"],
+                    "truncated": bool(r["has_more"])}
+    return _with_words(conn, company_id, spec)
+
+
+def _ledger_multi_currency(conn, company_id, r, company, branch, date_from, date_to):
+    """كشف «كل العملات»: كل حركة بعملتها الأصلية مع عمود «العملة»، بلا رصيد جارٍ مخلوط؛ والأرصدة الافتتاحية والإجماليات والختامي
+    تُعرض لكل عملة على حدة (لا يصح جمع يمني مع سعودي في رقم واحد). العملة الافتراضية للشركة أولًا ثم الأساسية ثم الباقي."""
+    from alhisabat.accounting import rates as _rates
+    base = _base_cur(conn, company_id)
+    dflt = _rates.default_currency(conn, company_id)
+    rank = {dflt: 0, base: 1}
+    cols = _STATEMENT_COLS_HEAD + [{"key": "debit", "label": "مدين", "numeric": True, "group": "المبلغ"},
+                                   {"key": "credit", "label": "دائن", "numeric": True, "group": "المبلغ"},
+                                   {"key": "balance", "label": "الرصيد", "numeric": True}]
+    sign = 1 if r["account"]["nature"] == "debit" else -1
+    run = {c["currency"]: c["opening_net_orig"] for c in (r.get("by_currency") or [])}     # رصيد جارٍ لكل عملة على حدة (لا يُخلط يمني بسعودي)
+    rows, _cache = [], {}
+    for x in r["rows"]:
+        dtype, dno, dref = _doc_info(conn, x, _cache)
+        run[x["currency"]] = run.get(x["currency"], 0) + x["debit_orig"] - x["credit_orig"]
+        rows.append({"entry_id": x.get("entry_id"), "source_type": x.get("source_type"), "source_id": x.get("source_id"),
+                     "date": x["entry_date"], "no": x["posted_no"], "desc": _voucher_note(conn, x, _cache) or x["description"], "currency": x["currency"],
+                     "debit": _u(x["debit_orig"]), "credit": _u(x["credit_orig"]), "balance": _u(sign * run[x["currency"]]),
+                     "doc_type": dtype, "doc_no": dno, "ref": dref})
+    per = sorted(r.get("by_currency") or [], key=lambda c: (rank.get(c["currency"], 2), c["currency"]))
+    per = [c for c in per if c["opening_net_orig"] or c["debit_orig"] or c["credit_orig"]]
+    by_cur = [{"currency": c["currency"], "opening": _u(c["opening_net_orig"]), "debit": _u(c["debit_orig"]),
+               "credit": _u(c["credit_orig"]), "closing": _u(c["closing_net_orig"]), "count": c["count"]} for c in per]
+    totals = [{"label": f"الرصيد الختامي ({c['currency']})", "value": _u(sign * c["closing_net_orig"]), "currency": c["currency"]}
+              for c in per]
+    spec = _spec("كشف حساب — كل العملات", company=company, branch=branch, currency=None,
+                 period=f"{date_from} — {date_to}",
+                 extra=[("الحساب", f"{r['account']['code']} {r['account']['name']}"), ("العملة", "كل العملات")],
+                 columns=cols, rows=rows, totals=totals)
+    spec["opening"] = None
+    spec["sums"] = {"sign": sign, "debit": None, "credit": None, "count": r["count"], "truncated": bool(r["has_more"]),
+                    "multi": True, "by_currency": by_cur}
+    return _with_words(conn, company_id, spec)
+
+
+def party_statement_print(conn, user_id, company_id, party_id, date_from, date_to, currency=None, multi_currency=False):
+    """كشف حساب الطرف. currency: كشف بعملة واحدة بمبالغها الأصلية. multi_currency=True (بلا currency): كشف «كل العملات» بعمود العملة
+    وأرصدة لكل عملة؛ وإلا (الافتراضي) كل الحركات بمعادلها بالعملة الأساسية."""
+    p = conn.execute("SELECT * FROM parties WHERE id=?", (party_id,)).fetchone()
+    r = pt.party_statement(conn, user_id, company_id, party_id, date_from, date_to)
+    kw = {"currency": currency.strip().upper()} if currency and currency.strip() else {}
+    spec = ledger_print(conn, user_id, company_id, p["account_id"], date_from, date_to, include_children=False,
+                        multi_currency=bool(multi_currency) and not kw, **kw)
+    kind = "عميل" if p["kind"] == "customer" else ("مورد" if p["kind"] == "supplier" else "موظف")
+    spec["title"] = f"كشف حساب {kind}" + (f" — {kw['currency']}" if kw else (" — كل العملات" if multi_currency else ""))
+    spec["extra"][0] = ("الاسم", f"{p['code']} {p['name']}")
+    spec["sums"]["party"] = p["kind"]
+    return spec
+
+
+def income_statement_print(conn, user_id, company_id, date_from, date_to, **kw):
+    r = fs.income_statement(conn, user_id, company_id, date_from, date_to, **kw)
+    cols = [{"key": "name", "label": "البند"}, {"key": "amount", "label": "المبلغ", "numeric": True}]
+    rows = []
+    for section, items, total in (("الإيرادات", r["revenue"], r["total_revenue"]), ("تكلفة النشاط", r["cogs"], r["total_cogs"])):
+        rows += [{"name": ("  " * (l["level"] - 1)) + l["name"], "amount": _u(l["amount"]),
+                  "account_id": l.get("account_id"), "code": l.get("code")} for l in items if not l["is_group"]]
+        rows.append({"name": f"إجمالي {section}", "amount": _u(total)})
+    rows.append({"name": "مجمل الربح", "amount": _u(r["gross_profit"])})
+    rows += [{"name": ("  " * (l["level"] - 1)) + l["name"], "amount": _u(l["amount"]),
+              "account_id": l.get("account_id"), "code": l.get("code")} for l in r["expenses"] if not l["is_group"]]
+    rows.append({"name": "إجمالي المصروفات", "amount": _u(r["total_expenses"])})
+    return _with_words(conn, company_id, _spec(r["report_title"], company=r["company"], branch=r["branch"], period=f"{date_from} — {date_to}",
+                                               columns=cols, rows=rows, totals=[{"label": "صافي النتيجة", "value": _u(r["net_result"])}]))
+
+
+def balance_sheet_print(conn, user_id, company_id, as_of, **kw):
+    r = fs.balance_sheet(conn, user_id, company_id, as_of, **kw)
+    cols = [{"key": "name", "label": "البند"}, {"key": "amount", "label": "المبلغ", "numeric": True}]
+    rows = []
+    for section, items, total in (("الأصول", r["assets"], r["total_assets"]), ("الخصوم", r["liabilities"], r["total_liabilities"]),
+                                  ("حقوق الملكية", r["equity"], r["total_equity"])):
+        rows += [{"name": ("  " * (l["level"] - 1)) + l["name"], "amount": _u(l["amount"]),
+                  "account_id": l.get("account_id"), "code": l.get("code")} for l in items if not l["is_group"]]
+        rows.append({"name": f"إجمالي {section}", "amount": _u(total)})
+    return _with_words(conn, company_id, _spec(r["report_title"], company=r["company"], branch=r["branch"], period=as_of, columns=cols, rows=rows,
+                                               totals=[{"label": "متوازنة" if r["balanced"] else "غير متوازنة!", "value": _u(r["total_assets"]),
+                                                        "words_label": "إجمالي الأصول"}]))
+
+
+
+def cash_flow_print(conn, user_id, company_id, date_from, date_to, **kw):
+    r = fs.cash_flow_statement(conn, user_id, company_id, date_from, date_to, **kw)
+    cols = [{"key": "name", "label": "البند"}, {"key": "amount", "label": "المبلغ", "numeric": True}]
+    rows = [{"name": "رصيد النقدية أول المدة", "amount": _u(r["opening_cash"])}]
+    rows += [{"name": k, "amount": _u(v)} for k, v in r["buckets"].items()]
+    rows.append({"name": "صافي التغير", "amount": _u(r["net_change"])})
+    return _with_words(conn, company_id, _spec(r["report_title"], company=r["company"], branch=r["branch"], period=f"{date_from} — {date_to}",
+                                               columns=cols, rows=rows, totals=[{"label": "رصيد النقدية آخر المدة", "value": _u(r["closing_cash"])}]))
+
+
+def aging_print(conn, user_id, company_id, kind, as_of, currency=None, balance_side=None, **kw):
+    """أعمار الديون مستندًا بمستند. الصف = (طرف، عملة) بمبالغ **العملة الأصلية** مع عمود «العملة» (لا يُخلط يمني بسعودي في عمود واحد
+    دون إشارة). currency تقصر التقرير على عملة واحدة؛ والإجماليات تُعرض لكل عملة على حدة (لا يصح جمع عملات مختلفة)."""
+    side = norm_side(balance_side)
+    r = ag.aging_documents(conn, user_id, company_id, kind, as_of, **kw)
+    company, _b = _company_header(conn, company_id)
+    cur = (currency or "").strip().upper() or None
+    cols = [{"key": "code", "label": "الرقم"}, {"key": "name", "label": "الاسم"}, {"key": "currency", "label": "العملة"}] + \
+        [{"key": f"b{i}", "label": lab, "numeric": True} for i, lab in enumerate(r["labels"])] + \
+        [{"key": "on_account", "label": "على الحساب", "numeric": True}, {"key": "balance", "label": "الرصيد", "numeric": True}]
+    src = [x for x in r["rows"] if (not cur or x["currency"] == cur)
+           and side_match(x["balance"] if kind == "customer" else -x["balance"], side)]     # balance بالاتجاه الطبيعي: مدين للعميل ودائن للمورد
+    rows = [{"code": x["code"], "name": x["name"], "currency": x["currency"], **{f"b{i}": _u(v) for i, v in enumerate(x["buckets"])},
+            "on_account": _u(x["on_account"]), "balance": _u(x["balance"])} for x in src]
+    if side == "all":
+        totals = [{"label": f"إجمالي الرصيد ({c})", "value": _u(t["balance"]), "currency": c}
+                  for c, t in sorted(r["totals_by_currency"].items()) if not cur or c == cur]
+    else:                                                    # إجماليات الصفوف المعروضة فقط
+        by_cur = {}
+        for x in src:
+            by_cur[x["currency"]] = by_cur.get(x["currency"], 0) + x["balance"]
+        totals = [{"label": f"إجمالي الرصيد ({c})", "value": _u(v), "currency": c} for c, v in sorted(by_cur.items())]
+    title = "أعمار الديون: " + ("العملاء" if kind == "customer" else "الموردون") + (f" — {cur}" if cur else "")
+    sp = {"extra": [("الرصيد", BALANCE_SIDES[side])]} if side != "all" else {}
+    return _with_words(conn, company_id, _spec(title, company=company, period=as_of, columns=cols, rows=rows, totals=totals, **sp))
+
+
+def stock_report_print(conn, user_id, company_id, **kw):
+    """تقرير المخزون. مع warehouse_id: تقرير مستقل لذلك المستودع وحده (اسمه في العنوان والترويسة)."""
+    rows_raw = inv.stock_report(conn, user_id, company_id, **kw)
+    company, _b = _company_header(conn, company_id)
+    wh_id = kw.get("warehouse_id")
+    wh = conn.execute("SELECT name FROM warehouses WHERE id=?", (wh_id,)).fetchone() if wh_id else None
+    cols = [{"key": "item", "label": "الصنف"}, {"key": "wh", "label": "المستودع"}, {"key": "qty", "label": "الكمية", "numeric": True},
+           {"key": "value", "label": "القيمة", "numeric": True}, {"key": "avg", "label": "متوسط التكلفة", "numeric": True}]
+    rows = [{"item": f"{r['item_code']} {r['item_name']}", "wh": r["warehouse_name"], "qty": Decimal(r["qty_milli"]) / 1000,
+            "value": _u(r["value_base"]), "avg": (r["avg_cost_per_unit_minor"] / 100)} for r in rows_raw]
+    base = conn.execute("SELECT base_currency FROM companies WHERE id=?", (company_id,)).fetchone()
+    base = base[0] if base else None
+    total = sum(r["value"] for r in rows) if rows else Decimal(0)
+    spec = _spec("تقرير المخزون" + (f" — {wh[0]}" if wh else ""), company=company, currency=base, columns=cols, rows=rows,
+                 extra=[("المستودع", wh[0])] if wh else [("المستودع", "كل المستودعات")],
+                 totals=[{"label": "إجمالي القيمة", "value": total}])
+    spec["amount_words"] = _words(total, base) if total and total > 0 else ""
+    return spec
+
+
+def cost_center_pl_print(conn, user_id, company_id, date_from, date_to):
+    data = ccr.cost_center_pl(conn, user_id, company_id, date_from, date_to)
+    company, _b = _company_header(conn, company_id)
+    cols = [{"key": "name", "label": "مركز التكلفة"}, {"key": "revenue", "label": "الإيراد", "numeric": True},
+           {"key": "expense", "label": "المصروف", "numeric": True}, {"key": "net", "label": "الصافي", "numeric": True}]
+    rows = [{"name": f"{v['code'] or ''} {v['name']}".strip(), "revenue": _u(v["revenue"]), "expense": _u(v["cogs"] + v["expense"]),
+            "net": _u(v["net_result"])} for v in data.values()]
+    return _with_words(conn, company_id, _spec("نتيجة مراكز التكلفة", company=company, period=f"{date_from} — {date_to}", columns=cols, rows=rows,
+                                               totals=[{"label": "الصافي الكلي", "value": sum(r["net"] for r in rows) if rows else Decimal(0)}]))
+
+
+# ---------------- التصدير ----------------
+_TOTAL_PREFIXES = ("إجمالي", "الإجمالي", "الإجماليات", "مجمل", "صافي", "الصافي", "رصيد النقدية", "الرصيد الختامي")
+_STATEMENT_TITLES = ("ميزان المراجعة", "قائمة الدخل", "المركز المالي", "التدفقات النقدية", "قائمة المركز المالي")
+_DEFAULT_SIGNATURES = ("أعدّه", "راجعه", "اعتمده")
+
+
+def _fmt(v):
+    if v is None:
+        return ""
+    if isinstance(v, Decimal):
+        return f"{v:,.2f}"
+    return str(v)
+
+
+def _extra_pairs(spec):
+    """extra قد تحوي أزواجًا (عنوان، قيمة) أو نصوصًا مفردة (ملاحظات)؛ نوحّدها دائمًا إلى أزواج كي لا ينهار التصدير."""
+    out = []
+    for e in spec.get("extra") or []:
+        if isinstance(e, (tuple, list)) and len(e) == 2:
+            out.append((str(e[0]), "" if e[1] is None else str(e[1])))
+        else:
+            out.append(("ملاحظة", str(e)))
+    return out
+
+
+def _is_total_row(row, columns):
+    first = next((c["key"] for c in columns if not c.get("numeric")), None)
+    label = str(row.get(first) or "").strip() if first else ""
+    return label.startswith(_TOTAL_PREFIXES)
+
+
+def _indent_of(text):
+    t = str(text or "")
+    return (len(t) - len(t.lstrip(" "))) // 2
+
+
+def _num_html(v, *, dash_zero=True):
+    """رقم للعرض: السالب بين قوسين وبالأحمر، والصفر شرطة خافتة (الأرقام الحقيقية تبقى كما هي في XLSX/CSV)."""
+    if v is None or v == "":
+        return ""
+    if not isinstance(v, (Decimal, int, float)):
+        return html_escape(str(v))
+    d = Decimal(str(v))
+    if d == 0:
+        return '<span class="z">&ndash;</span>' if dash_zero else "0.00"
+    txt = f"{abs(d):,.2f}"
+    return f'<span class="neg">({txt})</span>' if d < 0 else txt
+
+
+def _kpi_cards(spec):
+    """بطاقات ملخص لكشف الحساب (افتتاحي/مدين/دائن/ختامي/عدد الحركات) متى توفرت بيانات الكشف في المواصفة."""
+    sums = spec.get("sums")
+    if not sums or spec.get("opening") is None:
+        return ""
+    closing = next((t["value"] for t in spec.get("totals", []) if str(t["label"]).startswith("الرصيد الختامي")), None)
+    cards = [("الرصيد الافتتاحي", spec["opening"]), ("إجمالي المدين", sums.get("debit")), ("إجمالي الدائن", sums.get("credit")),
+             ("الرصيد الختامي", closing), ("عدد الحركات", sums.get("count"))]
+    out = []
+    for lab, val in cards:
+        if val is None:
+            continue
+        shown = str(val) if lab == "عدد الحركات" else _num_html(val, dash_zero=False)
+        out.append(f'<div class="kpi"><span>{lab}</span><b>{shown}</b></div>')
+    note = ""
+    if sums.get("truncated"):
+        note = '<div class="warn">تنبيه: الكشف يتجاوز الحد الأقصى للصفوف المعروضة؛ الإجماليات أعلاه تشمل كل الحركات.</div>'
+    return f'<div class="kpis">{"".join(out)}</div>{note}'
+
+
+def render_html(spec, signatures=None):
+    """HTML احترافي للطباعة والمعاينة: رأس بهوية الشركة، بطاقات ملخص، جدول بترويسة متكررة وتظليل متناوب وإبراز الإجماليات،
+    أرقام سالبة بين قوسين، مسافات بادئة للمستويات، توقيعات، وترقيم صفحات. يتحول تلقائيًا للعرض الأفقي إن كثرت الأعمدة.
+    كل القيم تُهرَّب (escape) فلا يكسر اسم يحوي رموز HTML الصفحة."""
+    cols = spec["columns"]
+    landscape = len(cols) > 7
+    meta = [(k, v) for k, v in (("الفرع", spec.get("branch")), ("العملة", spec.get("currency")), ("الفترة", spec.get("period"))) if v]
+    meta += _extra_pairs(spec)
+    meta_html = "".join(f"<div><span>{html_escape(str(k))}</span><b>{html_escape(str(v))}</b></div>" for k, v in meta)
+    ths = "".join(f"<th class='{'num' if c.get('numeric') else ''}'>{html_escape(str(c['label']))}</th>" for c in cols)
+    first_text = next((c["key"] for c in cols if not c.get("numeric")), None)
+    trs = []
+    for r in spec["rows"]:
+        tot = _is_total_row(r, cols)
+        tds = []
+        for c in cols:
+            v = r.get(c["key"])
+            cls = ["num"] if c.get("numeric") else []
+            if c["key"] in ("debit", "debit_base"):
+                cls.append("cd")
+            elif c["key"] in ("credit", "credit_base"):
+                cls.append("cc")
+            elif c["key"] in ("balance", "running_balance", "closing"):
+                cls.append("cb")
+            if tot:
+                cls.append("tot")
+            style = ""
+            if c["key"] == first_text:
+                ind = _indent_of(v)
+                style = f" style='padding-right:{8 + ind * 14}px'" if ind else ""
+                v = str(v).strip() if v is not None else v
+            cell = _num_html(v) if c.get("numeric") else html_escape(_fmt(v))
+            tds.append(f"<td class='{' '.join(cls)}'{style}>{cell}</td>")
+        trs.append(f"<tr>{''.join(tds)}</tr>")
+    if not trs:
+        trs.append(f"<tr><td colspan='{max(len(cols), 1)}' class='empty'>لا توجد بيانات في هذه الفترة</td></tr>")
+    totals_html = ""
+    if spec["totals"]:
+        items = "".join(f"<div class='trow'><span>{html_escape(str(t['label']))}</span><b>{_num_html(t['value'], dash_zero=False)}</b></div>"
+                        for t in spec["totals"])
+        totals_html = f"<div class='totals'>{items}</div>"
+    if spec.get("amount_words"):
+        wl = _wd.split_lines(spec["amount_words"])
+        if len(wl) > 1:
+            totals_html += ("<div class='words'><span>المبلغ كتابةً:</span>"
+                            + "".join(f"<div><b>{html_escape(x)}</b></div>" for x in wl) + "</div>")
+        else:
+            totals_html += f"<div class='words'><span>المبلغ كتابةً:</span> <b>{html_escape(wl[0] if wl else str(spec['amount_words']))}</b></div>"
+    inv = spec.get("invoice") or {}
+    bal = inv.get("balance")
+    if bal:                                                # كشف رصيد الطرف لفواتير التصدير بصيغة HTML (نفس منطق قالب الطباعة)
+        def _bl(lab, v, side):
+            return (f"<div class='trow'><span>{html_escape(lab)}</span><b>{_num_html(abs(v), dash_zero=False)}"
+                    f"{(' ' + html_escape(side)) if side else ''}</b></div>")
+        mv_side = "عليكم" if bal["movement"] > 0 else ("لكم" if bal["movement"] < 0 else "")
+        totals_html += (f"<div class='totals'><div class='trow'><span><b>كشف رصيد {html_escape(inv['party']['label'])}</b></span><span></span></div>"
+                        + _bl("الرصيد السابق", bal["previous"], bal["previous_side"]) + _bl("هذه الفاتورة (المتبقي)", bal["movement"], mv_side)
+                        + _bl("الرصيد الحالي" + (" (تقديري)" if bal["estimated"] else ""), bal["current"], bal["current_side"]) + "</div>")
+    sigs = signatures if signatures is not None else (_DEFAULT_SIGNATURES if str(spec["title"]).startswith(_STATEMENT_TITLES) else ())
+    sig_html = ("<div class='sigs'>" + "".join(f"<div><i></i>{html_escape(s)}</div>" for s in sigs) + "</div>") if sigs else ""
+    company = html_escape(spec.get("company") or "")
+    title = html_escape(spec["title"])
+    return f"""<!DOCTYPE html><html dir="rtl" lang="ar"><head><meta charset="utf-8">
+<title>{title}</title>
+<style>
+@page {{ size: A4 {'landscape' if landscape else 'portrait'}; margin: 14mm 12mm; @bottom-center {{ content: "صفحة " counter(page) " من " counter(pages); font-size: 9px; color: #666; }} }}
+* {{ box-sizing: border-box; }}
+body {{ font-family: 'Segoe UI', Tahoma, 'Noto Naskh Arabic', 'DejaVu Sans', sans-serif; direction: rtl; color: #1b2430; margin: 0; padding: 18px; font-size: 12px; }}
+.bar {{ display: flex; justify-content: space-between; align-items: flex-end; border-bottom: 3px solid #8a6508; padding-bottom: 8px; margin-bottom: 12px; }}
+.bar .co {{ font-size: 16px; font-weight: 700; color: #8a6508; }}
+.bar .ttl {{ font-size: 20px; font-weight: 700; text-align: center; flex: 1; }}
+.bar .pd {{ font-size: 11px; color: #555; text-align: left; min-width: 160px; }}
+.meta {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 4px 18px; background: #fbf7e8; border: 1px solid #e3d7ae; border-radius: 6px; padding: 8px 12px; margin-bottom: 12px; }}
+.meta span {{ color: #667; margin-left: 6px; }}
+.kpis {{ display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }}
+.kpi {{ flex: 1; min-width: 130px; border: 1px solid #e3d7ae; border-top: 3px solid #8a6508; border-radius: 6px; padding: 6px 10px; }}
+.kpi span {{ display: block; color: #667; font-size: 10px; }} .kpi b {{ font-size: 14px; }}
+.warn {{ background: #fff4e0; border: 1px solid #f0c36d; padding: 6px 10px; border-radius: 6px; margin-bottom: 10px; font-size: 11px; }}
+table {{ width: 100%; border-collapse: collapse; font-size: 11.5px; }}
+thead {{ display: table-header-group; }} tfoot {{ display: table-footer-group; }}
+th {{ background: #8a6508; color: #fff; padding: 6px 8px; text-align: right; border: 1px solid #8a6508; }}
+td {{ padding: 4px 8px; border: 1px solid #e9e0c3; text-align: right; }}
+tr {{ page-break-inside: avoid; }}
+tbody tr:nth-child(even) td {{ background: #fcfaf2; }}
+th.num, td.num {{ text-align: left; font-variant-numeric: tabular-nums; direction: ltr; white-space: nowrap; }}
+td.cd {{ background: #eaf4ec; }} td.cc {{ background: #fbeceb; }} td.cb {{ background: #fdf1c9; }}
+td.tot {{ background: #f6ecc8 !important; font-weight: 700; border-top: 1px solid #d9c47a; }}
+.neg {{ color: #b42318; }} .z {{ color: #9aa5b1; }}
+td.empty {{ text-align: center; color: #888; padding: 18px; }}
+.totals {{ margin: 12px 0 0 auto; width: 360px; max-width: 100%; border: 1px solid #8a6508; border-radius: 6px; overflow: hidden; page-break-inside: avoid; }}
+.trow {{ display: flex; justify-content: space-between; padding: 6px 12px; border-bottom: 1px solid #e1e7ef; }}
+.trow:last-child {{ background: #8a6508; color: #fff; font-size: 13px; border-bottom: 0; }}
+.trow b {{ direction: ltr; }} .trow:last-child .neg {{ color: #ffb4a8; }}
+.words {{ margin-top: 10px; padding: 8px 12px; border: 1px dashed #8a6508; border-radius: 6px; background: #fbf7e8; page-break-inside: avoid; }}
+.words span {{ color: #667; }}
+.sigs {{ display: flex; justify-content: space-around; margin-top: 48px; page-break-inside: avoid; }}
+.sigs div {{ text-align: center; width: 22%; color: #555; }} .sigs i {{ display: block; border-top: 1px solid #333; margin-bottom: 4px; }}
+.footer {{ margin-top: 22px; font-size: 10px; color: #666; display: flex; justify-content: space-between; border-top: 1px solid #e3d7ae; padding-top: 6px; }}
+.btn {{ position: fixed; top: 10px; left: 10px; padding: 6px 14px; background: #8a6508; color: #fff; border: 0; border-radius: 6px; cursor: pointer; font-family: inherit; }}
+@media print {{ .btn {{ display: none; }} body {{ padding: 0; }} }}
+</style></head><body>
+<button class="btn" onclick="window.print()">طباعة</button>
+<div class="bar"><div class="co">{company}</div><div class="ttl">{title}</div><div class="pd">{html_escape(str(spec.get('period') or ''))}</div></div>
+<div class="meta">{meta_html}</div>
+{_kpi_cards(spec)}
+<table><thead><tr>{ths}</tr></thead><tbody>{''.join(trs)}</tbody></table>
+{totals_html}
+{sig_html}
+<div class="footer"><span>عدد السطور: {len(spec['rows'])}</span><span>طُبع بتاريخ {html_escape(str(spec['printed_at']))}</span></div>
+</body></html>"""
+
+
+def render_csv(spec):
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow([spec["title"]])
+    if spec.get("company"):
+        w.writerow(["الشركة", spec["company"]])
+    if spec.get("period"):
+        w.writerow(["الفترة", spec["period"]])
+    for k, v in _extra_pairs(spec):
+        w.writerow([k, v])
+    w.writerow([])
+    w.writerow([c["label"] for c in spec["columns"]])
+    for r in spec["rows"]:
+        w.writerow([r.get(c["key"], "") for c in spec["columns"]])
+    for t in spec["totals"]:
+        w.writerow([t["label"], t["value"]])
+    for line in _wd.split_lines(spec.get("amount_words")):
+        w.writerow(["المبلغ كتابةً", line])
+    return buf.getvalue().encode("utf-8-sig")   # BOM: إكسل يعرض العربية بشكل صحيح عند فتح CSV مباشرة
+
+
+def render_xlsx(spec):
+    """XLSX احترافي: ترويسة بهوية الشركة، رأس جدول ملوّن مع تجميد وفلترة، أرقام حقيقية بتنسيق محاسبي (السالب أحمر بين قوسين)،
+    إبراز صفوف الإجماليات، مسافات بادئة للمستويات، وإعداد طباعة جاهز (تكرار الرأس، ملاءمة العرض، ترقيم الصفحات)."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+    NAVY, LIGHT, ZEBRA = "8A6508", "F6ECC8", "FCFAF2"
+    NUM_FMT = '#,##0.00;[Red](#,##0.00);"-"'
+    thin = Side(style="thin", color="E3D7AE")
+    box = Border(left=thin, right=thin, top=thin, bottom=thin)
+    cols = spec["columns"]
+    ncols = max(len(cols), 2)
+    wb = Workbook()
+    ws = wb.active
+    ws.sheet_view.rightToLeft = True
+    ws.title = (spec["title"][:31] or "تقرير").replace("/", "-").replace(":", "-")
+    wb.properties.title = spec["title"]
+    wb.properties.creator = spec.get("company") or "الحسابات برو"
+
+    ws.append([spec["title"]])
+    ws["A1"].font = Font(bold=True, size=16, color=NAVY)
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ncols)
+    ws["A1"].alignment = Alignment(horizontal="center")
+    meta = [("الشركة", spec.get("company")), ("الفرع", spec.get("branch")), ("العملة", spec.get("currency")), ("الفترة", spec.get("period"))]
+    for k, v in [m for m in meta if m[1]] + _extra_pairs(spec):
+        ws.append([k, v])
+        ws.cell(row=ws.max_row, column=1).font = Font(bold=True, color="445566")
+    ws.append([])
+    header_row = ws.max_row + 1
+    ws.append([c["label"] for c in cols])
+    for cell in ws[header_row]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor=NAVY)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = box
+    ws.row_dimensions[header_row].height = 22
+
+    first_text = next((c["key"] for c in cols if not c.get("numeric")), None)
+    widths = [len(str(c["label"])) + 4 for c in cols]
+    for n, r in enumerate(spec["rows"]):
+        vals = []
+        for c in cols:
+            v = r.get(c["key"], "")
+            if c.get("numeric") and isinstance(v, Decimal):
+                v = float(v)
+            elif c["key"] == first_text and isinstance(v, str):
+                v = v.strip()
+            vals.append(v)
+        ws.append(vals)
+        row_no = ws.max_row
+        tot = _is_total_row(r, cols)
+        for i, c in enumerate(cols):
+            cell = ws.cell(row=row_no, column=i + 1)
+            cell.border = box
+            if c.get("numeric"):
+                cell.number_format = NUM_FMT
+                cell.alignment = Alignment(horizontal="right")
+            elif c["key"] == first_text:
+                cell.alignment = Alignment(horizontal="right", indent=_indent_of(r.get(c["key"])))
+            if tot:
+                cell.font = Font(bold=True)
+                cell.fill = PatternFill("solid", fgColor=LIGHT)
+            elif n % 2:
+                cell.fill = PatternFill("solid", fgColor=ZEBRA)
+            widths[i] = max(widths[i], min(len(str(vals[i])) + 3, 60))
+    last_data = ws.max_row
+    for t in spec["totals"]:
+        ws.append([t["label"], float(t["value"]) if isinstance(t["value"], Decimal) else t["value"]])
+        for cell in ws[ws.max_row]:
+            cell.font = Font(bold=True)
+        ws.cell(row=ws.max_row, column=2).number_format = NUM_FMT
+        for i in (1, 2):
+            ws.cell(row=ws.max_row, column=i).fill = PatternFill("solid", fgColor=LIGHT)
+            ws.cell(row=ws.max_row, column=i).border = Border(top=Side(style="medium", color=NAVY))
+    for line in _wd.split_lines(spec.get("amount_words")):
+        ws.append(["المبلغ كتابةً", line])
+        ws.cell(row=ws.max_row, column=1).font = Font(bold=True)
+        ws.cell(row=ws.max_row, column=2).alignment = Alignment(horizontal="right")
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = max(12, min(w, 60))
+    if spec["rows"]:
+        ws.freeze_panes = ws.cell(row=header_row + 1, column=1)
+        ws.auto_filter.ref = f"A{header_row}:{get_column_letter(len(cols))}{last_data}"
+    ws.page_setup.orientation = "landscape" if len(cols) > 6 else "portrait"
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+    ws.page_setup.fitToWidth, ws.page_setup.fitToHeight = 1, 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.print_title_rows = f"{header_row}:{header_row}"
+    ws.oddFooter.center.text = "صفحة &P من &N"
+    ws.oddFooter.left.text = f"طُبع بتاريخ {spec.get('printed_at', '')}"
+    buf = io.BytesIO(); wb.save(buf)
+    return buf.getvalue()
+
+
+_ARABIC_RE = re.compile(r"[\u0600-\u06FF]")
+
+
+def _has_arabic(spec):
+    texts = [spec["title"], spec["company"] or "", spec["branch"] or ""] + [k for k, v in _extra_pairs(spec)] + \
+        [str(v) for _, v in _extra_pairs(spec)] + [c["label"] for c in spec["columns"]]
+    for r in spec["rows"]:
+        texts += [str(v) for v in r.values()]
+    return any(_ARABIC_RE.search(t) for t in texts)
+
+
+def render_pdf(spec):
+    """PDF حقيقي عبر reportlab — لكنه محدود فعليا حاليا: لا توجد في هذه البيئة مكتبتا تشكيل الحروف العربية وترتيب
+    الاتجاه (arabic_reshaper وpython-bidi)، فالنص العربي في PDF سيظهر بحروف منفصلة وبترتيب معكوس. لذلك هذه الدالة
+    تمنع صراحةً توليد PDF إن كان في المحتوى نص عربي (وهو كل تقرير تقريبا) بدل تسليم ملف يبدو صحيحا وهو مكسور
+    (خلاف مواصفة §91: منع الوظائف الوهمية). التصدير العملي حاليا: HTML للطباعة، وCSV/XLSX للبيانات."""
+    if _has_arabic(spec):
+        raise AccountingError("تصدير PDF للنصوص العربية غير مدعوم في هذه البيئة (تحتاج مكتبتي تشكيل الحروف والاتجاه: "
+                              "arabic-reshaper وpython-bidi). استخدم HTML للطباعة أو XLSX/CSV للبيانات حتى تتوفر.")
+    from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib import colors
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4)
+    styles = getSampleStyleSheet()
+    story = [Paragraph(spec["title"], styles["Title"]), Spacer(1, 8)]
+    for k, v in [("Company", spec["company"]), ("Period", spec["period"])] + _extra_pairs(spec):
+        if v:
+            story.append(Paragraph(f"<b>{k}:</b> {v}", styles["Normal"]))
+    story.append(Spacer(1, 8))
+    data = [[c["label"] for c in spec["columns"]]] + [[_fmt(r.get(c["key"])) for c in spec["columns"]] for r in spec["rows"]]
+    t = Table(data, repeatRows=1)
+    t.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.5, colors.grey), ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
+                          ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold")]))
+    story.append(t)
+    for tt in spec["totals"]:
+        story.append(Paragraph(f"<b>{tt['label']}:</b> {_fmt(tt['value'])}", styles["Normal"]))
+    doc.build(story)
+    return buf.getvalue()

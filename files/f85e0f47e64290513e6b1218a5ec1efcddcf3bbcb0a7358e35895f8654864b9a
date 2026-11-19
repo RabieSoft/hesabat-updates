@@ -1,0 +1,438 @@
+"""التشخيص والمطابقة المحاسبية: لا يكتفي برسالة «يوجد اختلاف» بل يبيّن لكل مشكلة:
+الاسم · الحساب/المستند المتأثر · المبلغ · السبب المحتمل (بعد فحص البيانات) · المعالجة المحاسبية الصحيحة ·
+الإجراء المقترح · الأثر قبل التنفيذ · معاينة القيد التصحيحي (إن وُجد قيد صحيح محدد).
+
+قواعد صارمة:
+- الفحص قراءة فقط: لا يكتب شيئًا ولا يعدّل قيدًا مرحّلًا.
+- لا قيود تصحيحية عشوائية ولا حساب وسيط لموازنة الميزان: المعالجات الآلية محصورة في ما له قيد صحيح محدد
+  (إعادة تقييم العملات عبر محركها، ترحيل مسودة، عكس قيد يدوي مكرر، إعادة توليد قيد الافتتاح) وكلها تتطلب موافقة صريحة وسببًا.
+- كل معالجة تُسجَّل في reconciliation_log وفي سجل التدقيق.
+- يُميَّز بين «خطأ مؤكد» (confirmed) و«يحتاج مراجعة بشرية» (review).
+"""
+import re
+from datetime import date
+
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.accounting import balance_engine as be, fx_engine, integrity, inventory_recon as ir, journal_engine as je, opening_engine as oe
+from alhisabat.audit import audit
+from alhisabat.database.tx import transaction
+from alhisabat.security import permissions
+
+CONFIRMED, REVIEW = "confirmed", "review"
+_NATURE = {"asset": "debit", "expense": "debit", "cogs": "debit", "liability": "credit", "equity": "credit", "revenue": "credit"}
+_REQUIRED_MAPPINGS = (("period_result", "نتيجة الفترة"), ("retained_earnings", "الأرباح المحتجزة"))
+
+
+def _f(code, title, severity, subject, amount, cause, treatment, action, impact, preview=None, fix=None, params=None, details=None):
+    return {"code": code, "title": title, "severity": severity, "subject": subject, "amount": int(amount or 0),
+            "cause": cause, "treatment": treatment, "action": action, "impact": impact, "preview": preview,
+            "fix": fix, "fix_params": params or {}, "details": details or []}
+
+
+def _acc_label(accs, aid):
+    a = accs.get(aid)
+    return f"{a['code']} — {a['name']}" if a else str(aid)
+
+
+def _lines_preview(conn, accs, lines):
+    out = []
+    for l in lines:
+        out.append({"account_id": l["account_id"], "code": accs[l["account_id"]]["code"], "name": accs[l["account_id"]]["name"],
+                    "currency": l.get("currency"), "debit": l.get("debit", 0), "credit": l.get("credit", 0), "memo": l.get("memo", "")})
+    return out
+
+
+# ───────────────────────── 1) أرصدة الحسابات مقابل دفتر الأستاذ ─────────────────────────
+def _ledger_vs_accounts(conn, company_id, day, accs):
+    ys = be.year_start(conn, company_id, day)
+    eff, counted, _x = be.frag("a")
+    args = {"c": company_id, "t": day, "ys": ys, "fl": be.perm_floor(conn, company_id, ys)}
+    direct = {}
+    for r in conn.execute(
+            f"SELECT l.account_id, SUM(l.debit_base-l.credit_base) n FROM journal_lines l JOIN journal_entries e ON e.id=l.entry_id "
+            f"JOIN accounts a ON a.id=l.account_id WHERE e.company_id=:c AND e.status IN {be.POSTED} AND e.entry_date<=:t AND {counted} "
+            f"GROUP BY l.account_id", args):
+        t = be.final_target(accs, r["account_id"])
+        direct[t] = direct.get(t, 0) + r["n"]
+    tot = be.aggregate(accs, be.movements(conn, company_id, ys, day, ys))
+    out = []
+    for aid, a in accs.items():
+        if a["is_group"] or a["merged_into_id"]:
+            continue
+        eng = tot[aid][0] + tot[aid][1] - tot[aid][2]
+        if eng != direct.get(aid, 0):
+            diff = eng - direct.get(aid, 0)
+            out.append(_f("ledger_vs_account", "اختلاف رصيد الحساب مع دفتر الأستاذ", CONFIRMED, _acc_label(accs, aid), abs(diff),
+                          "رصيد محرك الأرصدة يختلف عن مجموع سطور القيود المرحّلة للحساب نفسه: غالبًا قيد معدّل مباشرة في قاعدة البيانات خارج النظام، أو حساب مدموج/منقول بطريقة غير مكتملة.",
+                          "لا يُصحَّح بقيد: يجب تحديد القيد أو الحركة المسببة ومعالجة أصلها (عكس القيد الخاطئ وإعادة تسجيله صحيحًا).",
+                          "راجع كشف حساب هذا الحساب وقارنه بالقيود المرحّلة، وأعد النسخة الاحتياطية الأحدث إن ثبت تلاعب مباشر بالقاعدة.",
+                          f"رصيد المحرك {eng} مقابل مجموع القيود {direct.get(aid, 0)}"))
+    return out
+
+
+# ───────────────────────── 2) عدم توازن القيود ─────────────────────────
+def _unbalanced_entries(conn, company_id, day, accs):
+    rows = conn.execute(
+        f"SELECT e.id, e.posted_no, e.entry_date, e.entry_type, "
+        f"(SELECT COALESCE(SUM(debit_base),0) FROM journal_lines WHERE entry_id=e.id) d, "
+        f"(SELECT COALESCE(SUM(credit_base),0) FROM journal_lines WHERE entry_id=e.id) c, "
+        f"(SELECT COUNT(*) FROM journal_lines WHERE entry_id=e.id) n FROM journal_entries e "
+        f"WHERE e.company_id=? AND e.status IN {be.POSTED} AND e.entry_date<=?", (company_id, day)).fetchall()
+    out = []
+    for r in rows:
+        if r["d"] != r["c"] or r["n"] < 2:
+            out.append(_f("unbalanced_entry", "قيد غير متوازن", CONFIRMED, f"قيد رقم {r['posted_no'] or r['id']} بتاريخ {r['entry_date']} ({r['entry_type']})",
+                          abs(r["d"] - r["c"]),
+                          "مجموع المدين لا يساوي مجموع الدائن (أو القيد بسطر واحد): لا يمكن أن يحدث من الشاشات؛ يدل على تعديل مباشر للقاعدة أو سطور ناقصة.",
+                          "القيد المرحّل لا يُعدَّل: يُعكس بقيد عكسي ثم يُعاد تسجيل القيد الصحيح بعد معرفة السطر الناقص من المستند الأصلي.",
+                          "افتح القيد وراجع مستنده الأصلي لتحديد السطر الناقص، ولا تضف سطرًا بحساب وسيط.",
+                          f"يخلّ الميزان بمقدار {abs(r['d'] - r['c'])}", details=[{"entry_id": r["id"]}]))
+    return out
+
+
+# ───────────────────────── 3) ميزان المراجعة ─────────────────────────
+def _trial_balance(conn, company_id, day, accs, unbalanced_found):
+    d, c = conn.execute(f"SELECT COALESCE(SUM(l.debit_base),0),COALESCE(SUM(l.credit_base),0) FROM journal_lines l "
+                        f"JOIN journal_entries e ON e.id=l.entry_id WHERE e.company_id=? AND e.status IN {be.POSTED} AND e.entry_date<=?",
+                        (company_id, day)).fetchone()
+    if d == c:
+        return []
+    cause = ("سببه القيود غير المتوازنة المعروضة أعلاه." if unbalanced_found else
+             "لا توجد قيود غير متوازنة فرديًا، فالفرق ناتج عن سطور محذوفة أو مكررة مباشرة في القاعدة أو عن قيد مرحّل ناقص السطور.")
+    return [_f("trial_balance", "اختلاف ميزان المراجعة", CONFIRMED, f"إجمالي مدين={d} · إجمالي دائن={c} حتى {day}", abs(d - c), cause,
+               "لا يوجد قيد تصحيحي صحيح قبل معرفة الأصل؛ إدخال فرق على حساب وسيط يخفي الخطأ ولا يعالجه.",
+               "عالج القيود غير المتوازنة أولًا ثم أعد الفحص.", f"الميزان يختل بمقدار {abs(d - c)}")]
+
+
+# ───────────────────────── 4) العملاء/الموردون/الموظفون مقابل الحساب الرقابي ─────────────────────────
+def _amount_from(detail):
+    m = re.search(r"رقابي=(-?\d+)\s+مجموع الأطراف=(-?\d+)", detail or "")
+    return abs(int(m.group(1)) - int(m.group(2))) if m else 0
+
+
+def _control_accounts(conn, company_id, day, accs):
+    out = []
+    for ch in (integrity._control_checks(conn, company_id, day) or []):
+        if ch["status"] != "fail":
+            continue
+        det = ch["detail"]
+        causes, treat = [], []
+        if "فرق:" in det:
+            causes.append("رصيد الحساب الرقابي لا يساوي مجموع أرصدة الأطراف: غالبًا قيد يدوي مسَّ الحساب الرقابي مباشرة أو طرف نُقل خارج الرقابي")
+            treat.append("حدّد القيد الذي مسّ الحساب الرقابي أو الطرف الخارج عنه؛ ثم اعكسه وأعد تسجيله على حساب الطرف نفسه")
+        if "حركة مباشرة" in det:
+            causes.append("توجد حركة مرحّلة مباشرة على الحساب الرقابي بدل حسابات الأطراف")
+            treat.append("انقل الحركة إلى حساب الطرف الصحيح بعكس القيد وإعادة تسجيله")
+        if "حسابات بلا طرف" in det or "خارج الرقابي" in det or "نوع آخر" in det:
+            causes.append("ربط الحسابات ناقص: حساب تحت الرقابي بلا طرف أو طرف خارجه أو نوع طرف مختلط")
+            treat.append("صحّح ربط الطرف بحسابه أو مكان الحساب في الشجرة (لا يلزم قيد)")
+        out.append(_f("control_account", "اختلاف الحساب الرقابي مع الأطراف", CONFIRMED if "فرق:" in det else REVIEW, ch["name"], _amount_from(det),
+                      "؛ ".join(causes) or "غير محدد", "؛ ".join(treat) or "راجع الحسابات يدويًا",
+                      "افتح «ربط الحسابات» وكشف الأطراف وقارن؛ لا تُنشئ قيدًا لتسوية الفرق قبل معرفة سببه.", det))
+    return out
+
+
+# ───────────────────────── 5) الصناديق والبنوك ─────────────────────────
+def _cash_bank(conn, company_id, day, accs):
+    out = []
+    for ch in integrity._cash_checks(conn, company_id, day):
+        if ch["status"] != "fail":
+            continue
+        if "غير سالبة" in ch["name"]:
+            out.append(_f("cash_negative", "رصيد صندوق/بنك سالب", CONFIRMED, ch["detail"], 0,
+                          "صرف أو تحويل تجاوز الرصيد المتاح، أو سند قبض مفقود/مرحّل بتاريخ لاحق لتاريخ الصرف.",
+                          "الصحيح إثبات القبض الناقص بتاريخه الصحيح أو تصحيح الصرف الخاطئ؛ والسحب على المكشوف يُسمح به في إعدادات الحساب لا بقيد.",
+                          "راجع حركة الحساب بالتاريخ وحدد أول لحظة سالب.", ch["detail"]))
+        elif "مطابقة البنوك" in ch["name"]:
+            out.append(_f("bank_unmatched", "بنود كشف بنك غير مطابقة", REVIEW, ch["detail"], 0,
+                          "بنود في كشف البنك لا يقابلها قيد: عمولة أو حوالة لم تُسجَّل، أو قيد مسجّل بتاريخ/مبلغ مختلف.",
+                          "كل بند يُطابق بقيد قائم أو يُسجَّل بسند مستقل (عمولة مصرفية، إيداع...) ثم يُطابق.",
+                          "افتح شاشة مطابقة البنوك وعالج كل بند.", ch["detail"]))
+        else:
+            out.append(_f("cash_voucher_link", "سند/تحويل بلا قيد سليم أو بتخصيص زائد", CONFIRMED, ch["detail"], 0,
+                          "السند مرحّل بلا قيد مرتبط، أو القيد معدّل/معكوس، أو التخصيص على الفواتير يفوق مبلغ السند.",
+                          "تُعالج من السند نفسه (إلغاء وإعادة إصدار) لا بقيد يدوي.", "افتح السند المذكور وراجع حالته وقيده.", ch["detail"]))
+    return out
+
+
+# ───────────────────────── 6) المخزون مقابل الحسابات ─────────────────────────
+def _inventory(conn, company_id, day, accs):
+    out = []
+    if not ir.applicable(conn, company_id):
+        return out
+    rc = ir.reconcile(conn, company_id, day)
+    for r in rc["rows"]:
+        if not r["diff"]:
+            continue
+        direct = 0
+        if r["account_id"]:
+            direct = conn.execute(f"SELECT COUNT(*) FROM journal_lines l JOIN journal_entries e ON e.id=l.entry_id WHERE l.account_id=? AND e.status IN {be.POSTED} "
+                                  f"AND e.source_type IS NULL AND e.entry_type NOT IN ('opening','closing') AND e.entry_date<=?", (r["account_id"], day)).fetchone()[0]
+        causes = []
+        if rc["unlinked_movements"]:
+            causes.append(f"{rc['unlinked_movements']} حركة مخزون بقيمة بلا قيد محاسبي مرتبط")
+        if direct:
+            causes.append(f"{direct} سطر قيد يدوي على حساب المخزون بلا حركة مخزنية مقابلة")
+        if not causes:
+            causes.append("لم يُحدد مصدر مباشر: راجع التقييم (متوسط/FIFO/LIFO) وحركات التحويل بين المستودعات")
+        out.append(_f("inventory_vs_ledger", "اختلاف المخزون التشغيلي عن حساب المخزون", CONFIRMED if (rc["unlinked_movements"] or direct) else REVIEW,
+                      _acc_label(accs, r["account_id"]) if r["account_id"] else "أصناف بلا حساب مخزون", abs(r["diff"]), "؛ ".join(causes),
+                      "يُعالج بأصل الفرق: حركة مخزون بلا قيد تُرتَّب قيدها من مستندها؛ وقيد يدوي على المخزون يُعكس ويُسجَّل عبر مستند جرد/تسوية مخزون. قيد «تسوية المخزون» لا يُنشأ إلا من مستند جرد معتمد.",
+                      "افتح تقرير مطابقة المخزون وقارن الحركات بالقيود؛ استعمل مستند الجرد لأي فرق فعلي في الكميات.",
+                      f"تشغيلي={r['operational']} محاسبي={r['accounting']} الفرق={r['diff']}"))
+    vc = ir.verify_cache(conn, company_id)
+    if vc:
+        out.append(_f("stock_cache", "أرصدة المخزون المخزنة لا تطابق الحركات", CONFIRMED, f"{len(vc)} صنف/مستودع", 0,
+                      "جدول الأرصدة المخزنة اختلف عن مجموع الحركات.", "يُعاد بناء الأرصدة من الحركات (الحركات هي المرجع).",
+                      "لا تُعدّل الحركات؛ أبلغ الدعم لإعادة بناء الأرصدة.", "فروقات في الكمية/القيمة", details=vc[:20]))
+    return out
+
+
+# ───────────────────────── 7) الأرصدة الختامية والافتتاحية ─────────────────────────
+def _opening_closing(conn, company_id, day, accs):
+    out = []
+    for y in conn.execute("SELECT * FROM fiscal_years WHERE company_id=? ORDER BY start_date", (company_id,)).fetchall():
+        e = oe._active_opening(conn, company_id, y["id"], ("posted",))
+        prev = oe.prior_year_of(conn, company_id, y) if e else None
+        if not (e and prev and prev["status"] == "closed"):
+            continue
+        late = conn.execute("SELECT COUNT(*) FROM journal_entries WHERE fiscal_year_id=? AND status IN ('posted','reversed') AND posted_at>?",
+                            (prev["id"], e["posted_at"])).fetchone()[0]
+        for r in oe.compare(conn, company_id, prev, e["id"]):
+            if r["diff_orig"] or r["diff_base"]:
+                out.append(_f("opening_mismatch", "اختلاف الرصيد الختامي عن الافتتاحي", CONFIRMED, f"{_acc_label(accs, r['account_id'])} ({r['currency']}) — سنة {y['name']}",
+                              abs(r["diff_base"]),
+                              (f"رُحِّل {late} قيد في السنة السابقة بعد اعتماد قيد الافتتاح" if late else "قيد الافتتاح عُدّل أو وُلِّد من رصيد مختلف"),
+                              "تُعاد توليد قيد الافتتاح من الأرصدة الختامية الصحيحة (يُعكس القديم ويُولَّد الجديد) — لا يُعدَّل سطر الافتتاح يدويًا.",
+                              "استعمل «إعادة توليد قيد الافتتاح» بعد التأكد من صحة إقفال السنة السابقة.",
+                              f"ختامي={r['previous_base']} افتتاحي={r['opening_base']} الفرق={r['diff_base']}",
+                              fix="regenerate_opening", params={"from_year_id": prev["id"], "to_year_id": y["id"]}))
+    return out
+
+
+# ───────────────────────── 8) فروقات العملات المحققة وغير المحققة ─────────────────────────
+def _fx(conn, company_id, day, accs):
+    out = []
+    diffs, missing = fx_engine.unrevalued(conn, company_id, day)
+    if missing:
+        out.append(_f("fx_missing_rates", "عملات أجنبية بلا سعر صرف", CONFIRMED, "، ".join(missing), 0,
+                      "رصيد بعملة أجنبية ولا يوجد سعر لها بتاريخ التقييم.", "تُدخل أسعار الصرف لا قيد.",
+                      "أضف سعر الصرف لكل عملة ثم أعد الفحص.", "لا يمكن تقييم الأرصدة قبل توفر الأسعار"))
+    if diffs:
+        m = conn.execute("SELECT account_id FROM account_mappings WHERE company_id=? AND map_key='fx_differences'", (company_id,)).fetchone()
+        total = sum(d["diff"] for d in diffs)
+        preview, params = None, {"as_of": day}
+        if m:
+            lines = [{"account_id": d["account_id"], "currency": d["currency"], "debit": d["diff"] if d["diff"] > 0 else 0,
+                      "credit": -d["diff"] if d["diff"] < 0 else 0, "memo": f"إعادة تقييم {d['currency']} بسعر {d['rate']}"} for d in diffs]
+            dd, cc = sum(l["debit"] for l in lines), sum(l["credit"] for l in lines)
+            if dd != cc:
+                lines.append({"account_id": m[0], "currency": None, "debit": cc - dd if cc > dd else 0, "credit": dd - cc if dd > cc else 0,
+                              "memo": "فروقات إعادة تقييم العملات (حساب فروقات العملة المربوط)"})
+            preview = _lines_preview(conn, accs, lines)
+        out.append(_f("fx_unrealized", "فروقات عملة غير محققة (أرصدة بلا إعادة تقييم)", CONFIRMED, f"{len(diffs)} حساب/عملة حتى {day}", abs(total),
+                      "أرصدة نقدية/أطراف بعملة أجنبية قيمتها الأساسية الدفترية تختلف عن الرصيد الأصلي × سعر تاريخ الفحص.",
+                      "قيد إعادة تقييم واحد يمس القيمة الأساسية فقط مقابل حساب فروقات العملة المربوط، والرصيد الأصلي لا يتغير.",
+                      "اعتمد قيد إعادة التقييم المعروض في المعاينة.", f"أثر الفروقات على الربح: {-total}", preview=preview,
+                      fix="fx_revalue" if m else None, params=params, details=diffs))
+    return out
+
+
+def fx_summary(conn, company_id, day):
+    """المحقق = حركة حساب فروقات العملة من غير قيود إعادة التقييم؛ غير المحقق = من قيود إعادة التقييم."""
+    m = conn.execute("SELECT account_id FROM account_mappings WHERE company_id=? AND map_key='fx_differences'", (company_id,)).fetchone()
+    if not m:
+        return {"mapped": False, "realized": 0, "unrealized": 0}
+    ys = be.year_start(conn, company_id, day)
+    q = (f"SELECT COALESCE(SUM(l.debit_base-l.credit_base),0) FROM journal_lines l JOIN journal_entries e ON e.id=l.entry_id "
+         f"WHERE l.account_id=? AND e.company_id=? AND e.status IN {be.POSTED} AND e.entry_date BETWEEN ? AND ? AND e.entry_type NOT IN ('closing')")
+    tot = conn.execute(q, (m[0], company_id, ys, day)).fetchone()[0]
+    unr = conn.execute(q + " AND e.source_type='revaluation'", (m[0], company_id, ys, day)).fetchone()[0]
+    return {"mapped": True, "realized": tot - unr, "unrealized": unr}
+
+
+# ───────────────────────── 9) القيود المكررة وغير المرحّلة ─────────────────────────
+def _duplicates_unposted(conn, company_id, day, accs):
+    out = []
+    rows = conn.execute(
+        "SELECT e.id, e.posted_no, e.entry_date, e.entry_type, e.source_type, e.source_id, e.description, "
+        "(SELECT group_concat(x,'|') FROM (SELECT l.account_id||':'||l.debit_base||':'||l.credit_base AS x FROM journal_lines l "
+        " WHERE l.entry_id=e.id ORDER BY l.account_id,l.debit_base,l.credit_base)) sig "
+        "FROM journal_entries e WHERE e.company_id=? AND e.status='posted' AND e.entry_type NOT IN ('reversal','opening','closing') AND e.entry_date<=?",
+        (company_id, day)).fetchall()
+    by_src, by_sig = {}, {}
+    for r in rows:
+        if r["source_type"] and r["source_id"] and r["source_type"] not in ("revaluation",):
+            by_src.setdefault((r["source_type"], r["source_id"]), []).append(r)
+        elif not r["source_type"]:
+            by_sig.setdefault((r["entry_date"], r["sig"]), []).append(r)
+    for (st, sid), g in by_src.items():
+        if len(g) > 1:
+            out.append(_f("duplicate_source", "مستند له أكثر من قيد فعّال", CONFIRMED, f"{st} #{sid}: قيود " + "، ".join(str(x["posted_no"] or x["id"]) for x in g), 0,
+                          "المستند رُحِّل أكثر من مرة (تكرار ترحيل أو إعادة تشغيل عملية) فتضاعف أثره في الأرصدة.",
+                          "يُعالج من المستند: إلغاء/عكس القيد الزائد بسبب موثّق، ولا يُحذف شيء.",
+                          "راجع المستند وقيوده وأبقِ قيدًا واحدًا.", f"أثر مضاعف لقيود المستند {st}", details=[{"entry_id": x["id"]} for x in g]))
+    for (d, sig), g in by_sig.items():
+        if len(g) > 1 and sig and sig.count("|") >= 1:
+            g = sorted(g, key=lambda x: x["id"])
+            amt = conn.execute("SELECT COALESCE(SUM(debit_base),0) FROM journal_lines WHERE entry_id=?", (g[-1]["id"],)).fetchone()[0]
+            e = g[-1]
+            lines = [{"account_id": l["account_id"], "currency": l["currency"], "debit": l["credit_base"], "credit": l["debit_base"], "memo": "عكس قيد مكرر"}
+                     for l in conn.execute("SELECT * FROM journal_lines WHERE entry_id=? ORDER BY line_no", (e["id"],))]
+            out.append(_f("duplicate_manual", "قيد يدوي مرجّح التكرار", REVIEW, f"قيود {', '.join(str(x['posted_no'] or x['id']) for x in g)} بتاريخ {d}", amt,
+                          "قيدان يدويان أو أكثر بنفس التاريخ والحسابات والمبالغ؛ قد يكون تكرار إدخال، وقد يكون عملية متكررة مشروعة (دفعتان متساويتان).",
+                          "إن ثبت أنه تكرار: عكس القيد الأحدث بقيد عكسي بسبب موثّق، ويبقى الأول.",
+                          "راجع المرفقات/البيان مع صاحب العملية قبل العكس.", f"إن كان تكرارًا فالأرصدة مضاعفة بمقدار {amt}",
+                          preview=_lines_preview(conn, accs, lines), fix="reverse_duplicate",
+                          params={"entry_id": e["id"], "keep_entry_id": g[0]["id"], "reversal_date": e["entry_date"]}))
+    drafts = conn.execute("SELECT COUNT(*) FROM journal_entries WHERE company_id=? AND status='draft'", (company_id,)).fetchone()[0]
+    if drafts:
+        old = conn.execute("SELECT id FROM journal_entries WHERE company_id=? AND status='draft' ORDER BY entry_date LIMIT 20", (company_id,)).fetchall()
+        out.append(_f("unposted_drafts", "قيود غير مرحّلة (مسودات)", REVIEW, f"{drafts} قيد مسودة", 0,
+                      "قيود أُدخلت ولم تُرحَّل فلا تدخل في الأرصدة ولا الميزان.",
+                      "كل مسودة إما تُرحَّل إن كانت صحيحة أو تُحذف إن كانت خطأ — قرار المستخدم بعد المراجعة.",
+                      "افتح كل مسودة ورحّلها أو احذفها.", "الأرصدة المعروضة لا تشمل هذه القيود",
+                      fix="post_draft", params={"entry_ids": [r[0] for r in old]}))
+    unlinked = 0
+    for tbl in ("sales_invoices", "purchase_invoices", "cash_vouchers", "payroll_runs"):
+        unlinked += conn.execute(f"SELECT COUNT(*) FROM {tbl} WHERE company_id=? AND status='posted' AND journal_entry_id IS NULL", (company_id,)).fetchone()[0]
+    if unlinked:
+        out.append(_f("doc_without_entry", "مستندات مرحّلة بلا قيد", CONFIRMED, f"{unlinked} مستند", 0,
+                      "مستند حالته «مرحّل» ولا قيد مرتبط به: لا أثر له في الدفاتر.", "يُعاد ترحيله من شاشته أو يُلغى؛ لا يُنشأ قيد يدوي بديل.",
+                      "افتح المستند وراجع سبب انقطاع الربط.", "مبالغ المستندات غير مثبتة محاسبيًا"))
+    return out
+
+
+# ───────────────────────── 10) الحسابات غير المرتبطة أو غير المصنفة ─────────────────────────
+def _classification(conn, company_id, day, accs):
+    out = []
+    bad = [a for a in accs.values() if a["nature"] != _NATURE.get(a["account_type"])]
+    for a in bad:
+        out.append(_f("account_nature", "طبيعة الحساب لا تناسب تصنيفه", REVIEW, _acc_label(accs, a["id"]), 0,
+                      f"نوع الحساب «{a['account_type']}» طبيعته المعتادة {_NATURE.get(a['account_type'])} لكنها {a['nature']}: قد تظهر الأرصدة بإشارة معكوسة في القوائم.",
+                      "تُصحَّح الطبيعة/النوع من شجرة الحسابات بقرار المحاسب؛ لا قيد.", "راجع الحساب في شجرة الحسابات.", "قد يعكس عرض الرصيد في الميزانية"))
+    for key, label in _REQUIRED_MAPPINGS:
+        if not conn.execute("SELECT 1 FROM account_mappings WHERE company_id=? AND map_key=?", (company_id, key)).fetchone():
+            out.append(_f("mapping_missing", "حساب مطلوب للإقفال غير مربوط", CONFIRMED, label, 0,
+                          "الإقفال السنوي يحتاج هذا الحساب ولم يُربط في «ربط الحسابات».", "يُربط بحساب صالح للحركة؛ لا قيد.", "افتح «ربط الحسابات».", "الإقفال مرفوض حتى الربط"))
+    moved_group = conn.execute(f"SELECT DISTINCT a.id FROM journal_lines l JOIN journal_entries e ON e.id=l.entry_id JOIN accounts a ON a.id=l.account_id "
+                               f"WHERE e.company_id=? AND e.status IN {be.POSTED} AND a.is_group=1", (company_id,)).fetchall()
+    for r in moved_group:
+        out.append(_f("group_with_movement", "حركة مباشرة على حساب تجميعي", CONFIRMED, _acc_label(accs, r[0]), 0,
+                      "حساب تجميعي (أب) عليه قيود مباشرة بدل حسابات الأبناء.", "تُنقل الحركة إلى حساب فرعي مناسب بعكس القيد وإعادة تسجيله.",
+                      "حدد الحساب الفرعي الصحيح.", "الأرصدة غير موزعة على التصنيف الصحيح"))
+    inactive = conn.execute(f"SELECT DISTINCT a.id FROM journal_lines l JOIN journal_entries e ON e.id=l.entry_id JOIN accounts a ON a.id=l.account_id "
+                            f"WHERE e.company_id=? AND e.status IN {be.POSTED} AND a.is_active=0", (company_id,)).fetchall()
+    for r in inactive:
+        out.append(_f("inactive_with_movement", "حساب موقوف عليه حركة", REVIEW, _acc_label(accs, r[0]), 0,
+                      "حساب مُعطَّل لكن له أرصدة: قد يكون أُوقف قبل تصفية رصيده.", "يُصفَّى رصيده بقيد نقل إلى الحساب الصحيح بموافقة المحاسب.",
+                      "راجع رصيد الحساب وقرر.", "رصيد غير ظاهر في القوائم اليومية"))
+    return out
+
+
+# ───────────────────────── التشغيل ─────────────────────────
+def run_diagnostics(conn, user_id, company_id, as_of=None):
+    permissions.require(conn, user_id, company_id, "report.view", check_branch=False)
+    day = as_of or conn.execute("SELECT MAX(end_date) FROM fiscal_years WHERE company_id=?", (company_id,)).fetchone()[0]
+    if not day:
+        raise AccountingError("لا توجد سنة مالية")
+    accs = be.load_accounts(conn, company_id)
+    findings = []
+    findings += _ledger_vs_accounts(conn, company_id, day, accs)
+    ub = _unbalanced_entries(conn, company_id, day, accs)
+    findings += ub
+    findings += _trial_balance(conn, company_id, day, accs, bool(ub))
+    findings += _control_accounts(conn, company_id, day, accs)
+    findings += _cash_bank(conn, company_id, day, accs)
+    findings += _inventory(conn, company_id, day, accs)
+    findings += _opening_closing(conn, company_id, day, accs)
+    findings += _fx(conn, company_id, day, accs)
+    findings += _duplicates_unposted(conn, company_id, day, accs)
+    findings += _classification(conn, company_id, day, accs)
+    for i, f in enumerate(findings, 1):
+        f["id"] = i
+    return {"as_of": day, "findings": findings, "fx_summary": fx_summary(conn, company_id, day),
+            "summary": {"confirmed": sum(1 for f in findings if f["severity"] == CONFIRMED),
+                        "review": sum(1 for f in findings if f["severity"] == REVIEW), "total": len(findings)}}
+
+
+# ───────────────────────── المعالجة بموافقة صريحة ─────────────────────────
+SAFE_FIXES = ("fx_revalue", "post_draft", "reverse_duplicate", "regenerate_opening")
+
+
+def preview_fix(conn, user_id, company_id, fix, params):
+    """معاينة بلا أي كتابة: القيد/القيود التي ستنتج وأثرها."""
+    accs = be.load_accounts(conn, company_id)
+    if fix == "fx_revalue":
+        p = fx_engine.revaluation_preview(conn, user_id, company_id, params["as_of"])
+        if p["missing_rates"]:
+            raise AccountingError("لا توجد أسعار صرف للعملات: " + "، ".join(p["missing_rates"]))
+        return {"fix": fix, "description": f"قيد إعادة تقييم العملات الأجنبية بتاريخ {params['as_of']}",
+                "rows": p["rows"], "impact": f"إجمالي الفروقات على الحسابات: {p['total_diff']}"}
+    if fix in ("post_draft", "reverse_duplicate"):
+        ids = params.get("entry_ids") or [params["entry_id"]]
+        out = []
+        for eid in ids:
+            e = conn.execute("SELECT * FROM journal_entries WHERE id=? AND company_id=?", (eid, company_id)).fetchone()
+            if not e:
+                raise AccountingError("القيد غير موجود في هذه الشركة")
+            sw = fix == "reverse_duplicate"
+            ls = [{"account_id": l["account_id"], "currency": l["currency"], "debit": l["credit_base" if sw else "debit_base"],
+                   "credit": l["debit_base" if sw else "credit_base"], "memo": l["memo"] or ""}
+                  for l in conn.execute("SELECT * FROM journal_lines WHERE entry_id=? ORDER BY line_no", (eid,))]
+            out.append({"entry_id": eid, "date": e["entry_date"], "description": e["description"], "lines": _lines_preview(conn, accs, ls)})
+        return {"fix": fix, "entries": out, "impact": "ترحيل المسودات يضيفها للأرصدة" if fix == "post_draft" else "عكس القيد المكرر يلغي أثره بقيد عكسي"}
+    if fix == "regenerate_opening":
+        return {"fix": fix, "report": oe.opening_report(conn, user_id, company_id, params["from_year_id"], params["to_year_id"]),
+                "impact": "يُعكس قيد الافتتاح الحالي ويُولَّد قيد جديد مطابق للأرصدة الختامية"}
+    raise AccountingError("معالجة غير مدعومة")
+
+
+def apply_fix(conn, user_id, company_id, fix, params, *, reason, approved=False):
+    """تنفيذ معالجة آمنة. يشترط approved=True (موافقة المستخدم بعد رؤية المعاينة) وسببًا مكتوبًا. كل شيء في معاملة واحدة."""
+    if fix not in SAFE_FIXES:
+        raise AccountingError("هذه المشكلة تحتاج معالجة يدوية بعد المراجعة: لا توجد معالجة آلية آمنة لها")
+    if not approved:
+        raise AccountingError("لا تُنفَّذ المعالجة دون موافقة صريحة من المستخدم بعد معاينة الأثر")
+    if not reason or not reason.strip():
+        raise AccountingError("المعالجة تتطلب ذكر السبب")
+    prev = preview_fix(conn, user_id, company_id, fix, params)           # يتحقق أيضًا من الصلاحيات والبيانات قبل أي كتابة
+    done = []
+    with transaction(conn):
+        if fix == "fx_revalue":
+            r = fx_engine.revalue(conn, user_id, company_id, params["as_of"], post=True)
+            done.append((r["entry_id"], "إعادة تقييم عملات", sum(abs(x["diff"]) for x in r["rows"] if x["diff"]), prev["impact"]))
+        elif fix == "post_draft":
+            for eid in params.get("entry_ids") or [params["entry_id"]]:
+                je.post(conn, eid, user_id)
+                amt = conn.execute("SELECT COALESCE(SUM(debit_base),0) FROM journal_lines WHERE entry_id=?", (eid,)).fetchone()[0]
+                done.append((eid, "ترحيل مسودة", amt, "أُضيف أثر القيد للأرصدة"))
+        elif fix == "reverse_duplicate":
+            eid = params["entry_id"]
+            e = conn.execute("SELECT * FROM journal_entries WHERE id=? AND company_id=?", (eid, company_id)).fetchone()
+            if e["entry_type"] not in je.MANUAL_TYPES or e["source_type"] is not None:
+                raise AccountingError("قيد مولَّد من مستند يُصحَّح من مستنده لا بالعكس المباشر")
+            kid = params.get("keep_entry_id")
+            keep = conn.execute("SELECT status FROM journal_entries WHERE id=? AND company_id=?", (kid, company_id)).fetchone()
+            if not kid or kid == eid or not keep or keep["status"] != "posted":
+                raise AccountingError("لا يوجد قيد مرحّل آخر يُبقى: لن يُعكس القيد الوحيد")
+            sig = lambda i: sorted((r[0], r[1], r[2]) for r in conn.execute("SELECT account_id,debit_base,credit_base FROM journal_lines WHERE entry_id=?", (i,)))
+            if sig(kid) != sig(eid):
+                raise AccountingError("القيد المُبقى لا يطابق القيد المراد عكسه في الحسابات والمبالغ: ليس تكرارًا")
+            rid = je.reverse(conn, eid, user_id, params.get("reversal_date") or e["entry_date"], f"قيد مكرر — {reason}")
+            amt = conn.execute("SELECT COALESCE(SUM(debit_base),0) FROM journal_lines WHERE entry_id=?", (eid,)).fetchone()[0]
+            done.append((rid, "عكس قيد مكرر", amt, prev["impact"]))
+        elif fix == "regenerate_opening":
+            eid = oe.regenerate_opening_entry(conn, user_id, company_id, params["from_year_id"], params["to_year_id"], reason)
+            done.append((eid, "إعادة توليد قيد الافتتاح", 0, prev["impact"]))
+        for eid, action, amt, impact in done:
+            conn.execute("INSERT INTO reconciliation_log(company_id,finding_code,subject,amount_base,action,entry_id,reason,impact_before,impact_after,performed_by) "
+                         "VALUES(?,?,?,?,?,?,?,?,?,?)", (company_id, fix, str(params)[:300], amt, action, eid, reason, prev.get("impact", ""), impact, user_id))
+            audit.log(conn, user_id, "reconciliation_fix", "journal_entries", eid, {"fix": fix, "params": {k: v for k, v in params.items()}},
+                      {"action": action}, reason)
+    return {"fix": fix, "entries": [d[0] for d in done]}
+
+
+def history(conn, user_id, company_id, limit=100):
+    permissions.require(conn, user_id, company_id, "report.view", check_branch=False)
+    return conn.execute("SELECT * FROM reconciliation_log WHERE company_id=? ORDER BY id DESC LIMIT ?", (company_id, limit)).fetchall()

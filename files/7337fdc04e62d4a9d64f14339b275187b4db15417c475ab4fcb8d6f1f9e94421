@@ -1,0 +1,73 @@
+"""تعريب نصوص Qt الداخلية التي تظهر بالإنجليزية: قائمة شريط التمرير (Scroll here/Top/Bottom/Page up...) وقوائم الحقول القياسية.
+
+1) قائمة الفأرة الأيمن على أي شريط تمرير تُستبدل بقائمة عربية بنفس الأوامر (لا تعتمد على ملفات ترجمة Qt).
+2) تُحمَّل ترجمة Qt العربية الرسمية (qtbase_ar) إن وُجدت مع PySide6 لبقية النصوص (قص/نسخ/لصق، موافق/إلغاء...).
+يتطلب PySide6.
+"""
+from PySide6.QtCore import QEvent, QLibraryInfo, QObject, Qt, QTranslator
+from PySide6.QtWidgets import QAbstractSlider, QApplication, QMenu, QScrollBar
+
+
+class _ScrollBarMenu(QObject):
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.ContextMenu and isinstance(obj, QScrollBar):
+            try:
+                self._show(obj, event)
+                return True
+            except Exception:  # noqa: BLE001 — عند أي عطل تظهر قائمة Qt الأصلية
+                return False
+        return False
+
+    @staticmethod
+    def _show(bar, event):
+        vertical = bar.orientation() == Qt.Vertical
+        rtl = bar.layoutDirection() == Qt.RightToLeft and not bar.invertedAppearance()
+        m = QMenu(bar)
+        m.setLayoutDirection(Qt.RightToLeft)
+        pos = event.pos()
+        span = max(1, bar.height() if vertical else bar.width())
+        along = pos.y() if vertical else pos.x()
+        ratio = min(1.0, max(0.0, along / span))
+        if not vertical and rtl:
+            ratio = 1.0 - ratio
+
+        def here():
+            bar.setValue(bar.minimum() + round((bar.maximum() - bar.minimum()) * ratio))
+
+        def act(text, fn):
+            m.addAction(text).triggered.connect(lambda _c=False: fn())
+
+        act('تمرير إلى هنا', here)
+        m.addSeparator()
+        if vertical:
+            items = (('أعلى الصفحة', QAbstractSlider.SliderToMinimum), ('أسفل الصفحة', QAbstractSlider.SliderToMaximum), None,
+                     ('صفحة للأعلى', QAbstractSlider.SliderPageStepSub), ('صفحة للأسفل', QAbstractSlider.SliderPageStepAdd), None,
+                     ('تمرير للأعلى', QAbstractSlider.SliderSingleStepSub), ('تمرير للأسفل', QAbstractSlider.SliderSingleStepAdd))
+        else:
+            lo, hi = ('اليمين', 'اليسار') if rtl else ('اليسار', 'اليمين')
+            edge = {'اليمين': 'اليمنى', 'اليسار': 'اليسرى'}
+            items = ((f'الحافة {edge[lo]}', QAbstractSlider.SliderToMinimum), (f'الحافة {edge[hi]}', QAbstractSlider.SliderToMaximum), None,
+                     (f'صفحة إلى {lo}', QAbstractSlider.SliderPageStepSub), (f'صفحة إلى {hi}', QAbstractSlider.SliderPageStepAdd), None,
+                     (f'تمرير إلى {lo}', QAbstractSlider.SliderSingleStepSub), (f'تمرير إلى {hi}', QAbstractSlider.SliderSingleStepAdd))
+        for it in items:
+            if it is None:
+                m.addSeparator()
+            else:
+                act(it[0], lambda a=it[1]: bar.triggerAction(a))
+        m.exec(event.globalPos())
+
+
+def install(app=None):
+    app = app or QApplication.instance()
+    if app is None or getattr(app, '_arabic_ui', None) is not None:
+        return
+    app._arabic_ui = _ScrollBarMenu(app)
+    app.installEventFilter(app._arabic_ui)
+    try:
+        tr = QTranslator(app)
+        path = QLibraryInfo.path(QLibraryInfo.TranslationsPath)
+        if tr.load('qtbase_ar', path):
+            app.installTranslator(tr)
+            app._qt_ar = tr
+    except Exception:  # noqa: BLE001 — الترجمة اختيارية
+        pass

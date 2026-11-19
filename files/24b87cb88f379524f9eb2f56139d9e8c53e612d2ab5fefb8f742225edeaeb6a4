@@ -1,0 +1,12 @@
+INSERT INTO permissions(code,name_ar,is_sensitive) VALUES('opening.manage','إدارة قيود الأرصدة الافتتاحية',1);
+INSERT INTO role_permissions SELECT id,'opening.manage' FROM roles WHERE id IN (1,2);
+DROP TRIGGER IF EXISTS bank_statement_immutable_update;
+CREATE TRIGGER bank_statement_status_update BEFORE UPDATE ON bank_statement_lines
+WHEN NOT (OLD.status='matched' AND NEW.status='unmatched')
+     AND NOT (OLD.status='unmatched' AND NEW.status IN ('matched','ignored'))
+BEGIN SELECT RAISE(ABORT,'حالة سطر كشف البنك غير صالحة'); END;
+CREATE TRIGGER bank_statement_data_lock BEFORE UPDATE ON bank_statement_lines
+WHEN OLD.txn_date<>NEW.txn_date OR OLD.description<>NEW.description OR OLD.reference<>NEW.reference
+  OR OLD.amount_minor<>NEW.amount_minor OR COALESCE(OLD.balance_minor,0)<>COALESCE(NEW.balance_minor,0)
+  OR OLD.cash_account_id<>NEW.cash_account_id OR OLD.company_id<>NEW.company_id
+BEGIN SELECT RAISE(ABORT,'بيانات كشف البنك غير قابلة للتعديل'); END;

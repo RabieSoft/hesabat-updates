@@ -1,0 +1,261 @@
+"""متغيّرات الصنف (الألوان) للأقمشة والملابس.
+الفكرة: الصنف الأم «مجمِّع» (has_variants=1) لا تُسجَّل عليه حركات ولا فواتير؛ وكل لون صنف فرعي حقيقي في items
+(parent_item_id + color_id) له رصيده وتكلفته ودفعاته وجرده وباركوده. وبذلك تعمل كل محركات المخزون والمبيعات والمشتريات
+والجرد لكل لون دون تعديل. الألوان تُعرَّف مرة واحدة (colors) ويُربط بها أي عدد من الأصناف، وللدرجة اللونية shade_code.
+الكميات بالألف (milli)، والقيم بالوحدة الصغرى للعملة الأساسية، كبقية المخزون."""
+from decimal import Decimal
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.audit import audit
+from alhisabat.business import inventory as inv
+from alhisabat.database.tx import transaction
+
+
+def _norm(s):
+    return (s or "").strip()
+
+
+# ---------------- الألوان ----------------
+def _color(conn, color_id, company_id=None):
+    r = conn.execute("SELECT * FROM colors WHERE id=?", (color_id,)).fetchone()
+    if not r or (company_id is not None and r["company_id"] != company_id):
+        raise AccountingError("اللون غير موجود في هذه الشركة")
+    return r
+
+
+def create_color(conn, actor_id, company_id, name, *, code=None, shade_code="", color_family="", hex=""):
+    inv._req(conn, actor_id, company_id, "inventory.manage")
+    name, shade_code, color_family, hex = _norm(name), _norm(shade_code), _norm(color_family), _norm(hex)
+    if not name:
+        raise AccountingError("اسم اللون مطلوب")
+    code = _norm(code)
+    with transaction(conn):
+        if not code:
+            code = "C%04d" % conn.execute("SELECT COALESCE(MAX(CAST(substr(code,2) AS INTEGER)),0)+1 FROM colors "
+                                          "WHERE company_id=? AND code GLOB 'C[0-9]*'", (company_id,)).fetchone()[0]
+        if conn.execute("SELECT 1 FROM colors WHERE company_id=? AND code=?", (company_id, code)).fetchone():
+            raise AccountingError("رمز اللون مستخدم")
+        if conn.execute("SELECT 1 FROM colors WHERE company_id=? AND name=? COLLATE NOCASE AND shade_code=? COLLATE NOCASE",
+                        (company_id, name, shade_code)).fetchone():
+            raise AccountingError("اللون بنفس الاسم والدرجة موجود مسبقًا")
+        try:
+            cid = conn.execute("INSERT INTO colors(company_id,code,name,shade_code,color_family,hex,created_by) VALUES(?,?,?,?,?,?,?)",
+                               (company_id, code, name, shade_code, color_family, hex, actor_id)).lastrowid
+        except Exception as e:
+            if "hex" in str(e).lower() or "CHECK" in str(e):
+                raise AccountingError("قيمة اللون السداسية غير صالحة (مثال: #FFFFFF)")
+            raise
+        audit.log(conn, actor_id, "create_color", "colors", cid, after={"code": code, "name": name, "shade": shade_code})
+    return cid
+
+
+def list_colors(conn, user_id, company_id, *, family=None, search=None, active_only=True):
+    inv._req(conn, user_id, company_id, "inventory.view")
+    q, a = "SELECT * FROM colors WHERE company_id=?", [company_id]
+    if family:
+        q += " AND color_family=? COLLATE NOCASE"; a.append(family)
+    if search:
+        q += " AND (code LIKE ? OR name LIKE ? OR shade_code LIKE ?)"; a += [f"%{search}%"] * 3
+    if active_only:
+        q += " AND is_active=1"
+    return [dict(r) for r in conn.execute(q + " ORDER BY color_family,name,shade_code", a)]
+
+
+def set_color_active(conn, actor_id, color_id, active):
+    c = _color(conn, color_id)
+    inv._req(conn, actor_id, c["company_id"], "inventory.manage")
+    with transaction(conn):
+        conn.execute("UPDATE colors SET is_active=? WHERE id=?", (int(bool(active)), color_id))
+        audit.log(conn, actor_id, "color_active", "colors", color_id, after={"active": bool(active)})
+
+
+# ---------------- الصنف الأم والمتغيّرات ----------------
+def enable_variants(conn, actor_id, item_id):
+    """يحوّل صنفًا مخزنيًا بلا حركات إلى أم مجمِّعة للألوان."""
+    it = inv._item(conn, item_id)
+    inv._req(conn, actor_id, it["company_id"], "inventory.manage")
+    if it["item_type"] != "stock":
+        raise AccountingError("الألوان للأصناف المخزنية فقط")
+    if it["parent_item_id"] is not None:
+        raise AccountingError("هذا الصنف لون تابع لأم، لا يكون أمًّا")
+    if it["has_variants"]:
+        return item_id
+    if conn.execute("SELECT 1 FROM stock_movements WHERE item_id=? LIMIT 1", (item_id,)).fetchone():
+        raise AccountingError("لا يمكن تفعيل الألوان لصنف له حركات؛ أنشئ صنفًا جديدًا أمًّا ثم انقل الأرصدة لألوانها بحركات تسوية")
+    with transaction(conn):
+        conn.execute("UPDATE items SET has_variants=1 WHERE id=?", (item_id,))
+        audit.log(conn, actor_id, "enable_variants", "items", item_id, after={"has_variants": 1})
+    return item_id
+
+
+def add_variant(conn, actor_id, parent_id, color_id, *, barcode="", code=None):
+    """ينشئ لونًا للصنف الأم: صنف فرعي يرث الوحدات والحسابات والتصنيف وطريقة التكلفة وتتبع الصلاحية والفرع."""
+    p = inv._item(conn, parent_id)
+    inv._req(conn, actor_id, p["company_id"], "inventory.manage")
+    if not p["has_variants"]:
+        raise AccountingError("فعّل الألوان للصنف أولًا")
+    col = _color(conn, color_id, p["company_id"])
+    if not col["is_active"]:
+        raise AccountingError("اللون معطّل")
+    if conn.execute("SELECT 1 FROM items WHERE parent_item_id=? AND color_id=?", (parent_id, color_id)).fetchone():
+        raise AccountingError("هذا اللون مضاف للصنف مسبقًا")
+    label = col["name"] + (f" {col['shade_code']}" if col["shade_code"] else "")
+    with transaction(conn):
+        vid = inv.create_item(conn, actor_id, p["company_id"], f"{p['name']} - {label}", p["base_unit_id"],
+                              code=code or f"{p['code']}-{col['code']}", barcode=barcode, category="", category_id=p["category_id"],
+                              min_qty=Decimal(p["min_qty_milli"]) / 1000, inventory_account_id=p["inventory_account_id"],
+                              cogs_account_id=p["cogs_account_id"], revenue_account_id=p["revenue_account_id"], notes=p["notes"],
+                              cost_method=p["cost_method"], branch_id=p["branch_id"], track_expiry=bool(p["track_expiry"]),
+                              expiry_alert_days=p["expiry_alert_days"])
+        conn.execute("UPDATE items SET parent_item_id=?,color_id=?,brand=?,sale_price_minor=? WHERE id=?",
+                     (parent_id, color_id, p["brand"], p["sale_price_minor"], vid))
+        for r in conn.execute("SELECT unit_id,factor_milli FROM item_units WHERE item_id=?", (parent_id,)).fetchall():
+            conn.execute("INSERT OR IGNORE INTO item_units(item_id,unit_id,factor_milli) VALUES(?,?,?)", (vid, r[0], r[1]))
+        audit.log(conn, actor_id, "add_variant", "items", vid, after={"parent": parent_id, "color": color_id})
+    return vid
+
+
+def generate_variants(conn, actor_id, parent_id, color_ids):
+    """إضافة عدة ألوان دفعة واحدة (معاملة واحدة)، يتجاوز الألوان المضافة مسبقًا. يعيد {color_id: item_id}."""
+    out = {}
+    with transaction(conn):
+        for cid in color_ids:
+            ex = conn.execute("SELECT id FROM items WHERE parent_item_id=? AND color_id=?", (parent_id, cid)).fetchone()
+            out[cid] = ex[0] if ex else add_variant(conn, actor_id, parent_id, cid)
+    return out
+
+
+def list_variants(conn, user_id, company_id, parent_id, *, with_stock=True):
+    inv._req(conn, user_id, company_id, "inventory.view")
+    inv._item(conn, parent_id, company_id)
+    rows = conn.execute(
+        "SELECT i.id item_id,i.code,i.name,i.barcode,i.is_active,c.id color_id,c.code color_code,c.name color_name,c.shade_code,c.color_family,c.hex,"
+        "COALESCE((SELECT SUM(qty_milli) FROM stock_balances b WHERE b.item_id=i.id),0) qty_milli,"
+        "COALESCE((SELECT SUM(value_base) FROM stock_balances b WHERE b.item_id=i.id),0) value_base "
+        "FROM items i JOIN colors c ON c.id=i.color_id WHERE i.parent_item_id=? AND i.company_id=? ORDER BY c.color_family,c.name,c.shade_code",
+        (parent_id, company_id)).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ---------------- تقارير حسب اللون ----------------
+def stock_by_color(conn, user_id, company_id, *, parent_id=None, color_id=None, color_family=None, shade_code=None,
+                   warehouse_id=None, include_zero=False):
+    """رصيد وقيمة كل لون (لكل مستودع): لأم محددة، أو للون/درجة/عائلة عبر كل الأصناف
+    (مثل «كل المخزون من أبيض درجة 12»). يحترم قيود المستودعات للمستخدم."""
+    inv._req(conn, user_id, company_id, "inventory.view", warehouse_id)
+    allowed = inv._allowed_warehouses(conn, user_id)
+    q = ("SELECT p.id parent_id,p.code parent_code,p.name parent_name,i.id item_id,i.code item_code,i.name item_name,"
+         "c.id color_id,c.name color_name,c.shade_code,c.color_family,c.hex chex,w.id wid,w.name wname,b.qty_milli qty,b.value_base val "
+         "FROM stock_balances b JOIN items i ON i.id=b.item_id JOIN items p ON p.id=i.parent_item_id "
+         "JOIN colors c ON c.id=i.color_id JOIN warehouses w ON w.id=b.warehouse_id WHERE i.company_id=?")
+    a = [company_id]
+    for cond, v in (("p.id=?", parent_id), ("c.id=?", color_id), ("c.shade_code=? COLLATE NOCASE", shade_code),
+                    ("c.color_family=? COLLATE NOCASE", color_family), ("w.id=?", warehouse_id)):
+        if v not in (None, ""):
+            q += " AND " + cond; a.append(v)
+    if allowed:
+        q += " AND w.id IN (%s)" % ",".join("?" * len(allowed)); a += allowed
+    out = []
+    for r in conn.execute(q + " ORDER BY p.code,c.color_family,c.name,w.name", a):
+        if not include_zero and not r["qty"] and not r["val"]:
+            continue
+        out.append({"parent_id": r["parent_id"], "parent_code": r["parent_code"], "parent_name": r["parent_name"],
+                    "item_id": r["item_id"], "item_code": r["item_code"], "item_name": r["item_name"],
+                    "color_id": r["color_id"], "color_name": r["color_name"], "shade_code": r["shade_code"],
+                    "color_family": r["color_family"], "hex": r["chex"], "warehouse_id": r["wid"], "warehouse_name": r["wname"],
+                    "qty_milli": r["qty"], "value_base": r["val"]})
+    return out
+
+
+def parent_totals(conn, user_id, company_id, parent_id):
+    """إجمالي الأم = مجموع ألوانها (كمية وقيمة) للقراءة فقط؛ لا أرصدة مخزنة على الأم."""
+    rows = stock_by_color(conn, user_id, company_id, parent_id=parent_id, include_zero=True)
+    return {"parent_id": parent_id, "qty_milli": sum(r["qty_milli"] for r in rows), "value_base": sum(r["value_base"] for r in rows),
+            "colors": len({r["color_id"] for r in rows})}
+
+
+# ---------------- ربط صنف قائم بأم ولون ----------------
+def link_candidates(conn, user_id, company_id, parent_id, *, search=None, limit=200):
+    """أصناف قائمة صالحة للربط بالأم: مخزنية مفعّلة، بلا حركات، ليست أمًّا ولا لونًا، ووحدتها الأساسية كالأم."""
+    inv._req(conn, user_id, company_id, "inventory.view")
+    p = inv._item(conn, parent_id, company_id)
+    q = ("SELECT i.id,i.code,i.name FROM items i WHERE i.company_id=? AND i.item_type='stock' AND i.is_active=1 AND i.has_variants=0 "
+         "AND i.parent_item_id IS NULL AND i.id<>? AND i.base_unit_id=? "
+         "AND NOT EXISTS(SELECT 1 FROM stock_movements m WHERE m.item_id=i.id)")
+    a = [company_id, parent_id, p["base_unit_id"]]
+    if search:
+        q += " AND (i.code LIKE ? OR i.name LIKE ?)"; a += [f"%{search}%"] * 2
+    return [dict(r) for r in conn.execute(q + " ORDER BY i.name LIMIT ?", a + [int(limit)])]
+
+
+def link_to_parent(conn, actor_id, item_id, parent_id, color_id):
+    """يربط صنفًا قائمًا بلا حركات كلونٍ تابع لأم؛ يحتفظ باسمه وكوده وباركوده. بعد وجود حركات لا يمكن الربط."""
+    it = inv._item(conn, item_id)
+    inv._req(conn, actor_id, it["company_id"], "inventory.manage")
+    p = inv._item(conn, parent_id, it["company_id"])
+    col = _color(conn, color_id, it["company_id"])
+    if item_id == parent_id:
+        raise AccountingError("لا يُربط الصنف بنفسه")
+    if not p["has_variants"] or p["parent_item_id"] is not None:
+        raise AccountingError("الأم غير مفعّلة بالألوان")
+    if it["item_type"] != "stock" or it["has_variants"] or it["parent_item_id"] is not None:
+        raise AccountingError("الصنف غير صالح للربط (يجب أن يكون صنفًا مخزنيًا عاديًا غير مرتبط)")
+    if it["base_unit_id"] != p["base_unit_id"]:
+        raise AccountingError("وحدة الصنف الأساسية تختلف عن وحدة الأم")
+    if not col["is_active"]:
+        raise AccountingError("اللون معطّل")
+    if conn.execute("SELECT 1 FROM stock_movements WHERE item_id=? LIMIT 1", (item_id,)).fetchone():
+        raise AccountingError("للصنف حركات مخزنية؛ لا يمكن ربطه. أنشئ لونًا جديدًا ثم انقل الرصيد بتسوية")
+    if conn.execute("SELECT 1 FROM items WHERE parent_item_id=? AND color_id=?", (parent_id, color_id)).fetchone():
+        raise AccountingError("هذا اللون مضاف للأم مسبقًا")
+    with transaction(conn):
+        conn.execute("UPDATE items SET parent_item_id=?,color_id=? WHERE id=?", (parent_id, color_id, item_id))
+        audit.log(conn, actor_id, "link_variant", "items", item_id, after={"parent": parent_id, "color": color_id})
+    return item_id
+
+
+def unlink_from_parent(conn, actor_id, item_id):
+    """يفك ارتباط لون بأمه إن لم تكن له حركات (لتصحيح خطأ ربط)."""
+    it = inv._item(conn, item_id)
+    inv._req(conn, actor_id, it["company_id"], "inventory.manage")
+    if it["parent_item_id"] is None:
+        raise AccountingError("الصنف غير مرتبط بأم")
+    if conn.execute("SELECT 1 FROM stock_movements WHERE item_id=? LIMIT 1", (item_id,)).fetchone():
+        raise AccountingError("للصنف حركات؛ لا يمكن فك ارتباطه")
+    with transaction(conn):
+        conn.execute("UPDATE items SET parent_item_id=NULL,color_id=NULL WHERE id=?", (item_id,))
+        audit.log(conn, actor_id, "unlink_variant", "items", item_id, after={"parent": None})
+    return item_id
+
+
+# ---------------- مساعدات شاشات البيع والشراء (قراءة فقط) ----------------
+def _label(name, shade):
+    return f"{name} {shade}".strip() if shade else name
+
+
+def item_colors(conn, company_id, item_ids):
+    """{item_id: {color, parent_id, parent_name}} للأصناف الملوّنة فقط (عرض مساعد في الفواتير؛ لا يتطلب صلاحية مخزون)."""
+    ids = [int(i) for i in item_ids if i]
+    if not ids:
+        return {}
+    q = ("SELECT i.id,c.name,c.shade_code,c.hex,p.id pid,p.name pname FROM items i JOIN colors c ON c.id=i.color_id "
+         "JOIN items p ON p.id=i.parent_item_id WHERE i.company_id=? AND i.id IN (%s)" % ",".join("?" * len(ids)))
+    return {r["id"]: {"color": _label(r["name"], r["shade_code"]), "hex": r["hex"], "parent_id": r["pid"], "parent_name": r["pname"]}
+            for r in conn.execute(q, [company_id] + ids)}
+
+
+def color_balances(conn, company_id, parent_ids, warehouse_id=None):
+    """{parent_id: {parent_name, colors:[{item_id,color,qty_milli}]}}: رصيد كل لون من ألوان الأمهات (كل الألوان ولو برصيد صفر)،
+    في مستودع محدد أو مجموع المستودعات."""
+    ids = [int(i) for i in parent_ids if i]
+    if not ids:
+        return {}
+    wh, args = ("AND b.warehouse_id=?", [int(warehouse_id)]) if warehouse_id else ("", [])
+    q = ("SELECT p.id pid,p.name pname,i.id iid,c.name cname,c.shade_code shade,c.hex chex,"
+         "COALESCE((SELECT SUM(b.qty_milli) FROM stock_balances b WHERE b.item_id=i.id %s),0) qty "
+         "FROM items i JOIN items p ON p.id=i.parent_item_id JOIN colors c ON c.id=i.color_id "
+         "WHERE i.company_id=? AND i.parent_item_id IN (%s) ORDER BY p.name,c.color_family,c.name,c.shade_code" % (wh, ",".join("?" * len(ids))))
+    out = {}
+    for r in conn.execute(q, args + [company_id] + ids):
+        out.setdefault(r["pid"], {"parent_name": r["pname"], "colors": []})["colors"].append(
+            {"item_id": r["iid"], "color": _label(r["cname"], r["shade"]), "hex": r["chex"], "qty_milli": r["qty"]})
+    return out

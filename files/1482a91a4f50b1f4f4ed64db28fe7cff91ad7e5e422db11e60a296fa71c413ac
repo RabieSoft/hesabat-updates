@@ -1,0 +1,194 @@
+"""مطابقة كشف البنك: استيراد بنود الكشف، مطابقة تلقائية/يدوية مع سطور الأستاذ، ترحيل بنود الكشف غير المسجلة (رسوم/فوائد)،
+وتقرير المطابقة (رصيد الأستاذ، بنود معلّقة، الفرق)."""
+from datetime import date as _date, timedelta
+from decimal import Decimal
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.accounting import balance_engine as be, journal_engine as je, period_engine, rates as fxr
+from alhisabat.audit import audit
+from alhisabat.business import cash
+from alhisabat.database.tx import transaction
+from alhisabat.security import permissions
+
+
+def _bank(conn, user_id, cash_id, code="cash.reconcile"):
+    ca = cash._ca(conn, cash_id)
+    cash._req(conn, user_id, ca["company_id"], code, cash_id)
+    if ca["kind"] != "bank":
+        raise AccountingError("المطابقة للحسابات البنكية فقط")
+    return ca
+
+
+def import_statement(conn, actor_id, cash_id, lines):
+    """lines: [{date, amount (موجب إيداع/سالب سحب بعملة الحساب), description, reference, balance}]. يرجع عدد البنود المستوردة."""
+    ca = _bank(conn, actor_id, cash_id)
+    rows = []
+    for l in lines or []:
+        try:
+            _date.fromisoformat(l["date"])
+        except Exception:
+            raise AccountingError("تاريخ بند غير صالح في الكشف")
+        amt = je._minor(l["amount"])
+        if amt == 0:
+            raise AccountingError("مبلغ بند الكشف لا يكون صفرا")
+        bal = je._minor(l["balance"]) if l.get("balance") is not None else None
+        rows.append((l["date"], l.get("description", ""), l.get("reference", ""), amt, bal))
+    if not rows:
+        raise AccountingError("الكشف فارغ")
+    with transaction(conn):
+        for r in rows:
+            conn.execute("INSERT INTO bank_statement_lines(company_id,cash_account_id,txn_date,description,reference,amount_minor,balance_minor,created_by) "
+                         "VALUES(?,?,?,?,?,?,?,?)", (ca["company_id"], cash_id, *r, actor_id))
+        audit.log(conn, actor_id, "import_statement", "cash_accounts", cash_id, after={"lines": len(rows)})
+    return len(rows)
+
+
+def _gl_lines(conn, ca, as_of, only_unmatched=True):
+    ys = be.year_start(conn, ca["company_id"], as_of)
+    eff, counted, _x = be.frag("a")
+    q = (f"SELECT l.id,e.entry_date,e.description,e.source_type,e.source_id,l.debit_orig-l.credit_orig amt,l.currency FROM journal_lines l "
+         f"JOIN journal_entries e ON e.id=l.entry_id JOIN accounts a ON a.id=l.account_id WHERE l.account_id=:acc AND e.company_id=:c "
+         f"AND e.status IN {be.POSTED} AND e.entry_date<=:t AND {counted} AND l.currency=:cur")
+    if only_unmatched:
+        q += " AND NOT EXISTS(SELECT 1 FROM bank_matches m WHERE m.journal_line_id=l.id)"
+    return conn.execute(q + " ORDER BY e.entry_date,l.id", {"acc": ca["account_id"], "c": ca["company_id"], "t": as_of, "ys": ys,
+                                                            "fl": be.perm_floor(conn, ca["company_id"], ys), "cur": ca["currency"]}).fetchall()
+
+
+def unmatched_gl(conn, user_id, cash_id, as_of):
+    ca = _bank(conn, user_id, cash_id, "cash.view")
+    return [dict(r) for r in _gl_lines(conn, ca, as_of)]
+
+
+def unmatched_statement(conn, user_id, cash_id, as_of=None):
+    ca = _bank(conn, user_id, cash_id, "cash.view")
+    q, a = "SELECT * FROM bank_statement_lines WHERE cash_account_id=? AND status='unmatched'", [cash_id]
+    if as_of:
+        q += " AND txn_date<=?"; a.append(as_of)
+    return [dict(r) for r in conn.execute(q + " ORDER BY txn_date,id", a)]
+
+
+def _do_match(conn, actor_id, sid, jid):
+    conn.execute("INSERT INTO bank_matches(statement_line_id,journal_line_id,matched_by) VALUES(?,?,?)", (sid, jid, actor_id))
+    conn.execute("UPDATE bank_statement_lines SET status='matched' WHERE id=?", (sid,))
+
+
+def match(conn, actor_id, statement_line_id, journal_line_id):
+    s = conn.execute("SELECT * FROM bank_statement_lines WHERE id=?", (statement_line_id,)).fetchone()
+    if not s:
+        raise AccountingError("بند الكشف غير موجود")
+    ca = _bank(conn, actor_id, s["cash_account_id"])
+    if s["status"] != "unmatched":
+        raise AccountingError("بند الكشف مطابق أو مستبعد بالفعل")
+    j = conn.execute("SELECT l.*,e.status es,e.entry_date FROM journal_lines l JOIN journal_entries e ON e.id=l.entry_id WHERE l.id=?", (journal_line_id,)).fetchone()
+    if not j or j["account_id"] != ca["account_id"] or j["es"] not in ("posted", "reversed"):
+        raise AccountingError("سطر الأستاذ لا يخص هذا الحساب البنكي أو غير مرحّل")
+    if j["currency"] != ca["currency"] or j["debit_orig"] - j["credit_orig"] != s["amount_minor"]:
+        raise AccountingError("مبلغ سطر الأستاذ لا يطابق مبلغ بند الكشف")
+    if conn.execute("SELECT 1 FROM bank_matches WHERE journal_line_id=?", (journal_line_id,)).fetchone():
+        raise AccountingError("سطر الأستاذ مطابق مع بند آخر")
+    with transaction(conn):
+        _do_match(conn, actor_id, statement_line_id, journal_line_id)
+        audit.log(conn, actor_id, "bank_match", "bank_statement_lines", statement_line_id, after={"journal_line": journal_line_id})
+
+
+def auto_match(conn, actor_id, cash_id, window_days=3):
+    """مطابقة تلقائية: نفس المبلغ بإشارته وفرق تاريخ ≤ window_days، الأقرب تاريخا أولا، وكل سطر مرة واحدة."""
+    ca = _bank(conn, actor_id, cash_id)
+    stmt = conn.execute("SELECT * FROM bank_statement_lines WHERE cash_account_id=? AND status='unmatched' ORDER BY txn_date,id", (cash_id,)).fetchall()
+    if not stmt:
+        return []
+    as_of = max(s["txn_date"] for s in stmt)
+    as_of = max(as_of, conn.execute("SELECT MAX(end_date) FROM fiscal_years WHERE company_id=?", (ca["company_id"],)).fetchone()[0])
+    gl = [dict(r) for r in _gl_lines(conn, ca, as_of)]
+    used, out = set(), []
+    with transaction(conn):
+        for s in stmt:
+            sd = _date.fromisoformat(s["txn_date"])
+            best = None
+            for g in gl:
+                if g["id"] in used or g["amt"] != s["amount_minor"]:
+                    continue
+                dd = abs((_date.fromisoformat(g["entry_date"]) - sd).days)
+                if dd <= window_days and (best is None or dd < best[0]):
+                    best = (dd, g)
+            if best:
+                used.add(best[1]["id"]); _do_match(conn, actor_id, s["id"], best[1]["id"]); out.append((s["id"], best[1]["id"]))
+        audit.log(conn, actor_id, "bank_auto_match", "cash_accounts", cash_id, after={"matched": len(out)})
+    return out
+
+
+def unmatch(conn, actor_id, statement_line_id, reason):
+    s = conn.execute("SELECT * FROM bank_statement_lines WHERE id=?", (statement_line_id,)).fetchone()
+    if not s:
+        raise AccountingError("بند الكشف غير موجود")
+    _bank(conn, actor_id, s["cash_account_id"])
+    if not reason or not reason.strip():
+        raise AccountingError("إلغاء المطابقة يتطلب ذكر السبب")
+    if s["status"] != "matched":
+        raise AccountingError("البند غير مطابق")
+    with transaction(conn):
+        m = conn.execute("SELECT * FROM bank_matches WHERE statement_line_id=?", (statement_line_id,)).fetchone()
+        conn.execute("DELETE FROM bank_matches WHERE statement_line_id=?", (statement_line_id,))
+        conn.execute("UPDATE bank_statement_lines SET status='unmatched' WHERE id=?", (statement_line_id,))
+        audit.log(conn, actor_id, "bank_unmatch", "bank_statement_lines", statement_line_id, {"journal_line": m["journal_line_id"]}, None, reason)
+
+
+def ignore_line(conn, actor_id, statement_line_id, reason):
+    s = conn.execute("SELECT * FROM bank_statement_lines WHERE id=?", (statement_line_id,)).fetchone()
+    if not s:
+        raise AccountingError("بند الكشف غير موجود")
+    _bank(conn, actor_id, s["cash_account_id"])
+    if not reason or not reason.strip():
+        raise AccountingError("الاستبعاد يتطلب ذكر السبب")
+    if s["status"] != "unmatched":
+        raise AccountingError("البند مطابق أو مستبعد بالفعل")
+    with transaction(conn):
+        conn.execute("UPDATE bank_statement_lines SET status='ignored',ignore_reason=? WHERE id=?", (reason, statement_line_id))
+        audit.log(conn, actor_id, "bank_ignore", "bank_statement_lines", statement_line_id, reason=reason)
+
+
+def book_statement_line(conn, actor_id, statement_line_id, counter_account_id, description=""):
+    """بند في الكشف غير مسجَّل في الدفاتر (رسوم/فوائد): ينشئ قيدا آليا (بنك ↔ حساب مقابل) ويطابقه فورا."""
+    s = conn.execute("SELECT * FROM bank_statement_lines WHERE id=?", (statement_line_id,)).fetchone()
+    if not s:
+        raise AccountingError("بند الكشف غير موجود")
+    ca = _bank(conn, actor_id, s["cash_account_id"])
+    cid = ca["company_id"]
+    permissions.require(conn, actor_id, cid, "journal.create", check_branch=False)
+    permissions.require(conn, actor_id, cid, "journal.post", check_branch=False)
+    if s["status"] != "unmatched":
+        raise AccountingError("البند مطابق أو مستبعد بالفعل")
+    cash._counter_ok(conn, cid, counter_account_id, ca["account_id"])
+    per = period_engine.find_period(conn, cid, s["txn_date"])
+    je._assert_open(per)
+    base = fxr.base_currency(conn, cid)
+    amt = abs(s["amount_minor"])
+    rate = fxr.get_rate(conn, cid, ca["currency"], s["txn_date"])
+    bb = amt if ca["currency"] == base else int((Decimal(amt) * rate).quantize(Decimal(1)))
+    dep = s["amount_minor"] > 0
+    lines = [{"account_id": ca["account_id"], "currency": ca["currency"], "side": "debit" if dep else "credit", "orig": amt, "base": bb},
+             {"account_id": counter_account_id, "currency": base, "side": "credit" if dep else "debit", "orig": bb, "base": bb}]
+    with transaction(conn):
+        eid = je.create_draft_explicit(conn, cid, actor_id, s["txn_date"], lines, description or f"بند كشف بنك: {s['description']}", "auto",
+                                       source_type="bank_statement", source_id=statement_line_id)
+        je.post(conn, eid, actor_id)
+        jl = conn.execute("SELECT id FROM journal_lines WHERE entry_id=? AND account_id=?", (eid, ca["account_id"])).fetchone()[0]
+        _do_match(conn, actor_id, statement_line_id, jl)
+        audit.log(conn, actor_id, "bank_book_line", "bank_statement_lines", statement_line_id, after={"entry": eid})
+    return eid
+
+
+def reconciliation_report(conn, user_id, cash_id, as_of, statement_balance):
+    """رصيد الكشف = رصيد الأستاذ − سطور أستاذ غير مطابقة + بنود كشف غير مطابقة (عدا المستبعدة). الفرق يجب أن يكون صفرا."""
+    ca = _bank(conn, user_id, cash_id, "cash.view")
+    gl_all = _gl_lines(conn, ca, as_of, only_unmatched=False)
+    gl_un = _gl_lines(conn, ca, as_of)
+    st_un = [r for r in conn.execute("SELECT * FROM bank_statement_lines WHERE cash_account_id=? AND status='unmatched' AND txn_date<=?", (cash_id, as_of))]
+    gl_bal = sum(r["amt"] for r in gl_all)
+    un_gl_net = sum(r["amt"] for r in gl_un)
+    un_st_net = sum(r["amount_minor"] for r in st_un)
+    stmt = je._minor(statement_balance)
+    diff = stmt - (gl_bal - un_gl_net + un_st_net)
+    return {"as_of": as_of, "gl_balance": gl_bal, "statement_balance": stmt, "unmatched_gl": [dict(r) for r in gl_un],
+            "unmatched_statement": [dict(r) for r in st_un], "unmatched_gl_net": un_gl_net, "unmatched_statement_net": un_st_net,
+            "difference": diff, "reconciled": diff == 0 and not gl_un and not st_un}

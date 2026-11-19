@@ -1,0 +1,186 @@
+"""إضافات القيد اليومي: قوالب القيود، مرفقات القيد، واستيراد سطور القيد من CSV.
+
+نُقلت من `ui/services.py` (حيث كانت SQL مباشرًا داخل الواجهة) إلى طبقة الأعمال في المرحلة 3 **بنفس السلوك والصلاحيات**،
+مع إزالة `float` من المبالغ (تُخزَّن/تُقرأ نصوص Decimal). لا تمسّ قيودًا ولا أرصدة: القيد نفسه يُنشأ عبر journal_engine فقط.
+"""
+import json
+import uuid
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.security import permissions
+
+from .importer import parse_csv
+
+MIME = {'.pdf': 'application/pdf', '.txt': 'text/plain', '.csv': 'text/plain'}
+
+
+def _dec(v):
+    if v in (None, ''):
+        return Decimal(0)
+    return v if isinstance(v, Decimal) else Decimal(str(v))
+
+
+# ------------------------------------------------------------------ القوالب
+def list_templates(conn, user_id, company_id):
+    permissions.require(conn, user_id, company_id, 'journal.view', check_branch=False)
+    return [dict(r) for r in conn.execute(
+        "SELECT id,name,description,valuation_method,lines_json,created_at FROM journal_templates WHERE company_id=? ORDER BY name",
+        (company_id,))]
+
+
+def get_template(conn, user_id, company_id, template_id):
+    permissions.require(conn, user_id, company_id, 'journal.view', check_branch=False)
+    r = conn.execute("SELECT * FROM journal_templates WHERE id=? AND company_id=?", (int(template_id), company_id)).fetchone()
+    if not r:
+        raise AccountingError('القالب غير موجود')
+    d = dict(r)
+    d['lines'] = [{**x, 'debit': _dec(x.get('debit')), 'credit': _dec(x.get('credit'))} for x in json.loads(d['lines_json'] or '[]')]
+    return d
+
+
+def _validate_template_lines(conn, company_id, name, lines):
+    """تحقق محاسبي عند حفظ القالب: حسابات صالحة، سطر بجهة واحدة، توازن عند تحديد المبالغ، ومنع قالب مكرر الأثر باسم آخر."""
+    d = c = Decimal(0)
+    for x in lines:
+        a = conn.execute("SELECT code,is_group,is_active FROM accounts WHERE id=? AND company_id=?", (int(x['account_id']), company_id)).fetchone()
+        if not a:
+            raise AccountingError('القالب يحتوي حسابًا غير موجود في هذه الشركة')
+        if a['is_group']:
+            raise AccountingError(f"الحساب {a['code']} تجميعي ولا يقبل حركة: اختر حسابًا فرعيًا")
+        dv, cv = _dec(x.get('debit')), _dec(x.get('credit'))
+        if dv < 0 or cv < 0 or (dv > 0 and cv > 0):
+            raise AccountingError('كل سطر في القالب يجب أن يكون مدينًا أو دائنًا فقط وبمبلغ غير سالب')
+        d, c = d + dv, c + cv
+    if (d or c) and d != c:
+        raise AccountingError(f'القالب غير متوازن: مدين={d} دائن={c}')
+    from alhisabat.accounting.template_audit import _signature
+    sig = _signature(lines)
+    for r in conn.execute("SELECT name,lines_json FROM journal_templates WHERE company_id=? AND name<>?", (company_id, name)):
+        if _signature(json.loads(r['lines_json'] or '[]')) == sig:
+            raise AccountingError(f"يوجد قالب بنفس الحسابات والمبالغ باسم «{r['name']}»: لا تنشئ قالبًا مكررًا")
+
+
+def save_template(conn, user_id, company_id, name, description, lines, valuation_method='weighted_avg'):
+    permissions.require(conn, user_id, company_id, 'journal.create', check_branch=False)
+    name = (name or '').strip()
+    if not name:
+        raise AccountingError('اسم القالب مطلوب')
+    if not lines:
+        raise AccountingError('القالب يحتاج سطرًا واحدًا على الأقل')
+    _validate_template_lines(conn, company_id, name, lines)
+    payload = json.dumps([{'account_id': int(x['account_id']), 'debit': str(_dec(x.get('debit'))), 'credit': str(_dec(x.get('credit'))),
+                           'memo': x.get('memo') or ''} for x in lines], ensure_ascii=False)
+    ex = conn.execute("SELECT id FROM journal_templates WHERE company_id=? AND name=?", (company_id, name)).fetchone()
+    if ex:
+        conn.execute("UPDATE journal_templates SET description=?,valuation_method=?,lines_json=? WHERE id=?",
+                     (description or '', valuation_method or 'weighted_avg', payload, ex['id']))
+        return ex['id']
+    return conn.execute(
+        "INSERT INTO journal_templates(company_id,name,description,valuation_method,lines_json,created_by) VALUES(?,?,?,?,?,?)",
+        (company_id, name, description or '', valuation_method or 'weighted_avg', payload, user_id)).lastrowid
+
+
+def delete_template(conn, user_id, company_id, template_id):
+    permissions.require(conn, user_id, company_id, 'journal.create', check_branch=False)
+    conn.execute("DELETE FROM journal_templates WHERE id=? AND company_id=?", (int(template_id), company_id))
+
+
+# ------------------------------------------------------------------ المرفقات
+def _dir(base_dir, company_id, entry_id=None):
+    p = Path(base_dir) / 'attachments' / str(company_id)
+    if entry_id is not None:
+        p = p / str(entry_id)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def add_attachment(conn, user_id, company_id, base_dir, entry_id, file_path, display_name=None):
+    permissions.require(conn, user_id, company_id, 'journal.create', check_branch=False)
+    entry_id = int(entry_id)
+    if not conn.execute("SELECT id FROM journal_entries WHERE id=? AND company_id=?", (entry_id, company_id)).fetchone():
+        raise AccountingError('القيد غير موجود')
+    src = Path(file_path)
+    if not src.is_file():
+        raise AccountingError(f'الملف غير موجود: {file_path}')
+    name = display_name or src.name
+    stored = f'{uuid.uuid4().hex}_{name}'
+    dest = _dir(base_dir, company_id, entry_id) / stored
+    dest.write_bytes(src.read_bytes())
+    low = name.lower()
+    ext = '.' + low.rsplit('.', 1)[-1] if '.' in low else ''
+    mime = MIME.get(ext) or ('image/' + ext[1:].replace('jpg', 'jpeg') if ext in ('.png', '.jpg', '.jpeg', '.gif', '.webp') else 'application/octet-stream')
+    return conn.execute(
+        "INSERT INTO journal_attachments(entry_id,company_id,file_name,stored_name,mime_type,size_bytes,uploaded_by) VALUES(?,?,?,?,?,?,?)",
+        (entry_id, company_id, name, stored, mime, dest.stat().st_size, user_id)).lastrowid
+
+
+def list_attachments(conn, user_id, company_id, entry_id):
+    permissions.require(conn, user_id, company_id, 'journal.view', check_branch=False)
+    return [dict(r) for r in conn.execute(
+        "SELECT id,file_name,stored_name,mime_type,size_bytes,uploaded_at FROM journal_attachments WHERE entry_id=? AND company_id=? ORDER BY id",
+        (int(entry_id), company_id))]
+
+
+def attachment_path(conn, user_id, company_id, base_dir, attachment_id):
+    permissions.require(conn, user_id, company_id, 'journal.view', check_branch=False)
+    r = conn.execute("SELECT * FROM journal_attachments WHERE id=? AND company_id=?", (int(attachment_id), company_id)).fetchone()
+    if not r:
+        raise AccountingError('المرفق غير موجود')
+    path = _dir(base_dir, company_id, r['entry_id']) / r['stored_name']
+    if not path.is_file():
+        raise AccountingError('ملف المرفق مفقود من القرص')
+    return path, r['file_name']
+
+
+def delete_attachment(conn, user_id, company_id, base_dir, attachment_id):
+    permissions.require(conn, user_id, company_id, 'journal.create', check_branch=False)
+    r = conn.execute("SELECT * FROM journal_attachments WHERE id=? AND company_id=?", (int(attachment_id), company_id)).fetchone()
+    if not r:
+        return
+    path = _dir(base_dir, company_id, r['entry_id']) / r['stored_name']
+    if path.is_file():
+        path.unlink()
+    conn.execute("DELETE FROM journal_attachments WHERE id=?", (int(attachment_id),))
+
+
+# ------------------------------------------------------------------ استيراد CSV
+def parse_lines_csv(conn, user_id, company_id, text_or_path):
+    """(lines, errors) من نص/ملف CSV. الحسابات النشطة غير التجميعية فقط؛ المبالغ Decimal."""
+    permissions.require(conn, user_id, company_id, 'journal.view', check_branch=False)
+    text = Path(text_or_path).read_text(encoding='utf-8-sig') if Path(str(text_or_path)).is_file() else str(text_or_path)
+    rows = parse_csv(text)
+
+    def cell(r, *keys):
+        for k in keys:
+            for rk, rv in r.items():
+                if rk and rk.strip().lower().replace(' ', '_') == k.lower():
+                    return (rv or '').strip()
+        return ''
+
+    accounts = {a['code']: a for a in conn.execute(
+        "SELECT id,code,name FROM accounts WHERE company_id=? AND is_active=1 AND is_group=0", (company_id,))}
+    by_name = {a['name']: a for a in accounts.values()}
+    lines, errors = [], []
+    for i, r in enumerate(rows, start=2):
+        code = cell(r, 'account_code', 'code', 'رقم_الحساب', 'كود')
+        name = cell(r, 'account_name', 'name', 'الحساب', 'اسم_الحساب')
+        acc = accounts.get(code) if code else None
+        if not acc and name:
+            acc = by_name.get(name)
+        if not acc:
+            errors.append(f'سطر {i}: حساب غير معروف ({code or name or "فارغ"})')
+            continue
+        try:
+            d = Decimal((cell(r, 'debit', 'مدين', 'debit_amount') or '0').replace(',', ''))
+            c = Decimal((cell(r, 'credit', 'دائن', 'credit_amount') or '0').replace(',', ''))
+        except InvalidOperation:
+            errors.append(f'سطر {i}: مبلغ غير رقمي')
+            continue
+        if (d > 0) == (c > 0):
+            errors.append(f'سطر {i}: أدخل مدينًا أو دائنًا فقط')
+            continue
+        lines.append({'account_id': acc['id'], 'account_code': acc['code'], 'account_name': acc['name'], 'debit': d, 'credit': c,
+                      'memo': cell(r, 'memo', 'البيان', 'description', 'desc')})
+    return lines, errors

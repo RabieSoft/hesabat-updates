@@ -1,0 +1,572 @@
+"""النافذة الرئيسية: شريط علوي ثابت (أزرار بقوائم منسدلة) + شريط سياق + Ribbon سياقي + تبويبات متعددة بعرض كامل + شريط حالة.
+
+مسؤوليات: التنقل بالصلاحيات، الحالة المشتركة (AppState) والتحديث التفاعلي بين الصفحات، السمة/الكثافة/الأرقام، الإشعارات،
+لوحة الأوامر، اختصارات لوحة المفاتيح، وسجل الأخطاء المحلي. لا منطق محاسبي هنا. يتطلب PySide6.
+"""
+import os
+from datetime import datetime
+from pathlib import Path
+
+from PySide6.QtCore import QEvent, QObject, QTimer, Qt
+from PySide6.QtGui import QAction, QActionGroup, QColor, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
+from PySide6.QtWidgets import QApplication, QLabel, QMainWindow, QMenu, QMessageBox, QVBoxLayout, QWidget
+
+from alhisabat import branding
+from alhisabat.ui.design import tokens as T
+from alhisabat.ui.components.brand_widgets import logo_pixmap
+from alhisabat.ui.core import errors, format as fmt, print_settings, readmodel, source_nav as SN, startup, strings_ar as S
+from alhisabat.ui.core.permissions import Access
+from alhisabat.ui.core.prefs import Prefs
+from alhisabat.ui.core.state import AppState
+from alhisabat.ui.core.tasks import TaskRunner
+from alhisabat.ui.design import qss
+from alhisabat.ui.pages import registry
+
+from . import navigation as N
+from . import quick_launch
+from .command_palette import CommandPalette
+from .context_bar import ContextBar
+from .ribbon import RibbonBar
+from .tabs import TabWorkspace
+from .topbar import TopNavBar
+
+APP_DIR = Path(os.getenv('APPDATA') or Path.home()) / 'AlhisabatPro'
+VERSION = '2.1.13'
+
+
+class _DblClickGuard(QObject):
+    """يبتلع النقر المزدوج لحظة بعد الانتقال بنقرة على رابط، حتى لا يصيب الصفحةَ الجديدة التي ظهرت تحت المؤشر."""
+
+    def eventFilter(self, obj, ev):
+        return ev.type() == QEvent.MouseButtonDblClick
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, session, prefs=None, progress=None):
+        super().__init__()
+        report = progress or startup.noop                    # progress(fraction, text) من شاشة التحميل
+        self.session = session
+        self.prefs = prefs or Prefs()
+        self.state = AppState()
+        self.access = Access(session.can)
+        self.runner = TaskRunner(session, self)
+        from .update_flow import UpdateController
+        self.updates = UpdateController(self)                # زر «البحث عن تحديثات»
+        from .auto_backup import AutoBackup
+        self.auto_backup = AutoBackup(self)                  # يجب أن يُنشأ قبل استعادة التبويبات: صفحة «النسخ الاحتياطي» تستعمله عند بنائها
+        self.logout_requested = False
+        self.restart_requested = False                       # إغلاق من أجل تطبيق تحديث (يقرأه launcher)
+        self._features = {}
+        from alhisabat.ui.core.drafts import DraftStore
+        self.drafts = DraftStore(APP_DIR / 'drafts', session.username())     # مسودات الإدخال (استئناف بعد انقطاع التيار)
+        from alhisabat.system import year_archive
+        self.is_archive = bool(year_archive.archive_label())
+        self.setWindowTitle(S.APP_TITLE + (f' — {branding.PRODUCT_NAME} {year_archive.archive_label()} (أرشيف)' if year_archive.archive_label() else ''))
+        self.resize(1500, 920)
+        self.setMinimumSize(1100, 700)
+        self.setLayoutDirection(Qt.RightToLeft)
+
+        self.state.update(mode=self.prefs.get('mode'), density=self.prefs.get('density'), digits=self.prefs.get('digits'))
+        T.set_active(self.state.get('mode'))
+        fmt.configure(digits=self.state.get('digits'))
+        session.load_context(self.state)
+        report(0.55, 'تحميل بيانات الشركة…')
+        self._detect_features()
+        opts = print_settings.load(self.prefs, session.username())      # إعدادات طباعة هذا المستخدم
+        print_settings.apply(opts)
+        print_settings.set_user(session.username())
+        self.prefs.set('paper', opts.paper)
+
+        root = QWidget()
+        self.setCentralWidget(root)
+        col = QVBoxLayout(root)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(0)
+        self.context_bar = ContextBar(self.state)
+        self.context_bar.branchSelected.connect(self._switch_branch)
+        self.ribbon = RibbonBar(self.access)
+        self.topbar = TopNavBar(self, self._build_user_menu())
+        self.notif_btn, self.notif_menu = self.topbar.notif_btn, self.topbar.notif_menu
+        self.tabs = TabWorkspace(lambda key, params: registry.create(key, self, params))
+        self.tabs.currentPageChanged.connect(self._on_page_changed)
+        self.tabs.limitReached.connect(lambda msg: QMessageBox.information(self, S.APP_NAME, msg))
+        for w in (self.topbar, self.context_bar, self.ribbon):
+            col.addWidget(w)
+        col.addWidget(self.tabs, 1)
+
+        report(0.65, 'بناء الواجهة…')
+        self._build_statusbar()
+        self._shortcuts()
+        self.state.subscribe(self._on_state)
+        self.palette = CommandPalette(self)
+        registry.load_builtin()
+        report(0.78, 'تطبيق المظهر…')
+        self.apply_theme()
+        self._restoring = True                                   # أخطاء الصفحات أثناء الاستعادة لا تُظهر نوافذ مشروطة
+        try:
+            self._restore_tabs(report)
+        finally:
+            self._restoring = False
+        report(1.0, 'اكتمل')
+        QTimer.singleShot(400, self.refresh_notifications)
+        QTimer.singleShot(1300, self._offer_draft_recovery)
+        self.auto_backup.start()
+
+    # ------------------------------------------------------------------ ميزات/صلاحيات
+    def features(self):
+        return self._features
+
+    def _detect_features(self):
+        try:
+            self._features = {'multi_currency': self.session.multi_currency_enabled()}
+        except Exception:  # noqa: BLE001
+            self._features = {}
+
+    # ------------------------------------------------------------------ قائمة المستخدم (بديل شريط القوائم)
+    def _build_user_menu(self):
+        m = QMenu(self)
+        who = m.addAction((self.state.get('user') or {}).get('name') or 'المستخدم')
+        who.setEnabled(False)
+        m.addSeparator()
+        view = m.addMenu('المظهر والعرض')
+        self.act_theme = view.addAction(S.ACTION['theme'] + '\tCtrl+Shift+D', self.toggle_theme)
+        self._build_theme_menu(view)
+        dens = view.addMenu(S.ACTION['density'])
+        grp = QActionGroup(self)
+        for key, label in (('compact', 'مضغوط (الافتراضي)'), ('comfortable', 'مريح')):
+            a = dens.addAction(label)
+            a.setCheckable(True)
+            a.setChecked(self.state.get('density') == key)
+            grp.addAction(a)
+            a.triggered.connect(lambda _c=False, k=key: self.set_density(k))
+        digs = view.addMenu('الأرقام')
+        grp2 = QActionGroup(self)
+        for key, label in (('latin', 'لاتينية 1234'), ('arabic', 'عربية ١٢٣٤')):
+            a = digs.addAction(label)
+            a.setCheckable(True)
+            a.setChecked(self.state.get('digits') == key)
+            grp2.addAction(a)
+            a.triggered.connect(lambda _c=False, k=key: self.set_digits(k))
+        self.act_adv = view.addAction('إظهار الخيارات المتقدمة')
+        self.act_adv.setCheckable(True)
+        self.act_adv.setChecked(self.prefs.get('show_advanced'))
+        self.act_adv.toggled.connect(self.set_show_advanced)
+        self.act_inline = view.addAction('عرض نماذج الإدخال داخل الصفحة (بدل النوافذ)')
+        self.act_inline.setCheckable(True)
+        self.act_inline.setChecked(bool(self.prefs.get('inline_forms')))
+        self.act_inline.toggled.connect(lambda f: self.prefs.set('inline_forms', bool(f)))
+        m.addAction('تحديث الصفحة\tF5', self.refresh_current)
+        m.addSeparator()
+        m.addAction('البحث عن تحديثات…', self.updates.check_now)
+        m.addAction('حول البرنامج', self._about)
+        m.addSeparator()
+        m.addAction(S.ACTION['logout'], self.logout)
+        m.addAction(S.ACTION['exit'], self.close)
+        return m
+
+    def _about(self):
+        box = QMessageBox(self)
+        box.setWindowTitle(S.APP_NAME)
+        box.setText(f'{branding.PRODUCT_NAME}\nالإصدار {VERSION}\nمن تطوير {branding.COMPANY_NAME}')
+        pm = logo_pixmap(self.state.get('mode'), 150)
+        if pm is not None:
+            box.setIconPixmap(pm)
+        box.exec()
+
+    def _build_statusbar(self):
+        sb = self.statusBar()
+        self.msg = QLabel('جاهز')
+        sb.addWidget(self.msg, 1)
+
+        self.sb_backup = QLabel('النسخ: —')
+        self.sb_backup.setObjectName('ctxKey')
+        sb.addPermanentWidget(self.sb_backup)
+
+        self.sb_integrity = QLabel('السلامة: ✔')
+        self.sb_integrity.setObjectName('ctxKey')
+        sb.addPermanentWidget(self.sb_integrity)
+
+        self.sb_tasks = QLabel('')
+        self.sb_tasks.setObjectName('ctxKey')
+        sb.addPermanentWidget(self.sb_tasks)
+
+        self.ver = QLabel(f'{branding.BRAND_LINE} — الإصدار {VERSION}')
+        sb.addPermanentWidget(self.ver)
+
+    def _shortcuts(self):
+        for keys, fn in (('Ctrl+W', self.tabs.close_current), ('Ctrl+Tab', self._next_tab), ('Ctrl+K', self.palette_popup),
+                     ('F5', self.refresh_current), ('Ctrl+Shift+D', self.toggle_theme)):
+            QShortcut(QKeySequence(keys), self, activated=fn)
+
+    def _next_tab(self):
+        n = self.tabs.count()
+        if n:
+            self.tabs.setCurrentIndex((self.tabs.currentIndex() + 1) % n)
+
+    # ------------------------------------------------------------------ الصفحات والتحديث التفاعلي
+    def open_page(self, key, params=None):
+        spec = N.get(key)
+        if spec is None:
+            return None
+        if not N.allowed(spec, self.access):
+            QMessageBox.warning(self, S.APP_NAME, S.GENERIC['no_permission'])
+            return None
+        page = self.tabs.open(key, params, unique=True)
+        if page is not None and not getattr(page, '_wired', False):
+            page._wired = True
+            page.status_message.connect(self.msg.setText)
+            page.open_page_requested.connect(self.open_page)
+            page.open_entry_requested.connect(self.open_entry_source)
+            page.actions_changed.connect(self.ribbon.refresh_states)
+            page.set_read_only(self.state.is_read_only)
+            self._on_page_changed(page)
+        return page
+
+    # ------------------------------------------------------------------ من رقم القيد إلى المستند الأصلي
+    def open_entry_source(self, info):
+        """يفتح شاشة المستند الأصلي (فاتورة/سند/تحويل/مسير/قيد…) ويحدّد سجله. info: {entry_id, source_type, source_id}.
+        إن تعذّرت الشاشة التفصيلية يُفتح القيد المحاسبي نفسه. يُرجع True عند النجاح."""
+        info = dict(info or {})
+        eid = info.get('entry_id')
+        st, sid, et = info.get('source_type'), info.get('source_id'), None
+        if eid:
+            try:
+                meta = readmodel.entry_source(self.session.conn, int(eid)) or {}
+            except Exception:  # noqa: BLE001 — القراءة للتوجيه فقط
+                meta = {}
+            if meta:
+                st, sid, et = meta.get('source_type'), meta.get('source_id'), meta.get('entry_type')
+        tgt = SN.journal_target(eid) if (info.get('force_journal') and eid) else SN.resolve(st, sid, eid, et)
+        if tgt is None:
+            self.msg.setText('لا يوجد مستند أصلي لهذا السطر')
+            return False
+        before = self.tabs.currentWidget()
+        page = self.open_page(tgt.page)
+        ok = False
+        if page is not None:
+            try:
+                ok = bool(page.show_source(tgt))
+            except Exception:  # noqa: BLE001
+                ok = False
+        fallback = False
+        if not ok and not tgt.is_journal and tgt.entry_id:
+            jt = SN.journal_target(tgt.entry_id)
+            jp = self.open_page('journal')
+            if jp is not None:
+                page, ok, fallback = jp, bool(jp.show_source(jt)), True
+        if page is not None and page is not before:
+            app = QApplication.instance()
+            guard = _DblClickGuard(self)
+            app.installEventFilter(guard)
+            QTimer.singleShot(QApplication.doubleClickInterval() + 100, lambda: (app.removeEventFilter(guard), guard.deleteLater()))
+        if ok:
+            self.msg.setText(f'فُتح القيد المحاسبي (لا شاشة تفصيلية لـ{tgt.label})' if fallback else f'فُتح: {tgt.label}')
+        elif page is not None:
+            self.msg.setText(f'فُتحت الشاشة وتعذّر تحديد السجل (قد يكون خارج الفلتر أو الفترة الحالية): {tgt.label}')
+        return ok
+
+    def _on_page_changed(self, page):
+        self.topbar.set_active(page.key if page is not None else None)
+        if page is None:
+            self.ribbon.set_groups([], self.state.read_only_reason, self.state.get('mode'))
+            return
+        self.ribbon.set_groups(page.ribbon_groups(), self.state.read_only_reason, self.state.get('mode'))
+
+    def refresh_current(self):
+        p = self.tabs.current_page()
+        if p:
+            p.refresh()
+            self.msg.setText('تم التحديث')
+
+    def data_changed(self, source_key=None):
+        """بعد أي كتابة: تُحدَّث كل الصفحات المفتوحة والإشعارات (التحديث التفاعلي بين الصفحات)."""
+        for p in self.tabs.pages():
+            if p._built and p.key != source_key:
+                p.refresh()
+        self.refresh_notifications()
+        self.ribbon.refresh_states()
+
+    def _on_state(self, keys):
+        if {'branch', 'year', 'period'} & set(keys):
+            self.access.invalidate()
+            self.topbar.rebuild()                              # الصلاحيات قد تختلف بين الفروع
+            for p in self.tabs.pages():
+                p.on_context_changed(keys)
+            self.ribbon.set_groups(self.tabs.current_page().ribbon_groups() if self.tabs.current_page() else [],
+                                   self.state.read_only_reason, self.state.get('mode'))
+            self.refresh_notifications()
+
+    def _switch_branch(self, branch_id):
+        try:
+            self.session.switch_branch(self.state, branch_id)
+        except Exception as exc:  # noqa: BLE001
+            msg = errors.translate(exc)
+            QMessageBox.warning(self, msg.title, msg.full_text())
+            self.context_bar.refresh()
+
+    # ------------------------------------------------------------------ الإشعارات
+    def refresh_notifications(self):
+        try:
+            items = self.session.notifications(self.state)
+        except Exception:  # noqa: BLE001
+            items = []
+        self.notif_menu.clear()
+        self.notif_btn.setText(f'🔔 {len(items)}' if items else '🔔')
+        if not items:
+            self.notif_menu.addAction('لا توجد إشعارات').setEnabled(False)
+        for n in items:
+            mark = {'error': '⛔', 'warning': '⚠', 'info': 'ℹ'}.get(n.severity, '')
+            a = self.notif_menu.addAction(f'{mark} {n.text}')
+            if n.target:
+                a.triggered.connect(lambda _c=False, t=n.target: self.open_page(t))
+
+        # تحديث شريط الحالة
+        if hasattr(self, 'sb_backup'):
+            b_item = next((it for it in items if it.key.startswith('backup')), None)
+            if b_item:
+                self.sb_backup.setText("النسخ: ⚠️")
+                self.sb_backup.setToolTip(b_item.text)
+            else:
+                self.sb_backup.setText("النسخ: ✔")
+                self.sb_backup.setToolTip("النسخة الاحتياطية مسجلة وحديثة")
+
+        if hasattr(self, 'sb_integrity'):
+            i_item = next((it for it in items if it.key == 'integrity'), None)
+            if i_item:
+                self.sb_integrity.setText("السلامة: ⛔")
+                self.sb_integrity.setToolTip(i_item.text)
+            else:
+                self.sb_integrity.setText("السلامة: ✔")
+                self.sb_integrity.setToolTip("فحص السلامة المالية سليم")
+
+        if hasattr(self, 'sb_tasks') and hasattr(self, 'runner'):
+            live_cnt = len(self.runner._live) if hasattr(self.runner, '_live') else 0
+            self.sb_tasks.setText(f"مهام: {live_cnt}" if live_cnt else "")
+
+    # ------------------------------------------------------------------ السمة والتفضيلات
+    def apply_theme(self):
+        mode, dens = self.state.get('mode'), self.state.get('density')
+        T.set_active(mode)
+        QApplication.instance().setStyleSheet(qss.build_qss(mode, dens))
+        try:
+            from alhisabat.ui.components import watermark
+            watermark.set_mode(mode)
+        except Exception:  # noqa: BLE001
+            pass
+        self.ribbon.set_mode(mode)
+        for p in self.tabs.pages():
+            for w in p.findChildren(QWidget):
+                if hasattr(w, 'set_mode'):
+                    w.set_mode(mode)
+        self.topbar.rebuild()
+
+    # ---- الثيمات: الاختيار يحفظ ثم يُغلق البرنامج ويُفتح من جديد (بدل التبديل الحي الذي كان يعلّق الواجهة)
+    @staticmethod
+    def _swatch(mode):
+        pal = T.palette(mode)
+        pm = QPixmap(40, 16)
+        pm.fill(QColor(0, 0, 0, 0))
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        for i, key in enumerate(('nav_bg', 'accent', 'surface')):
+            p.setBrush(QColor(pal[key]))
+            p.setPen(QColor(pal['border_strong']))
+            p.drawRoundedRect(1 + i * 13, 1, 12, 14, 3, 3)
+        p.end()
+        return QIcon(pm)
+
+    def _build_theme_menu(self, view):
+        menu = view.addMenu('الثيم (ألوان البرنامج)')
+        self._theme_group = QActionGroup(self)
+        self._theme_actions = {}
+        cur = self.state.get('mode')
+        for key in T.THEME_ORDER:
+            a = menu.addAction(self._swatch(key), T.theme_label(key))
+            a.setCheckable(True)
+            a.setChecked(key == cur)
+            self._theme_group.addAction(a)
+            self._theme_actions[key] = a
+            a.triggered.connect(lambda _c=False, k=key: self.set_theme(k))
+        wm = view.addMenu('الشعار المائي')
+        self._wm_group = QActionGroup(self)
+        self._wm_actions = {}
+        cur_wm = self.prefs.get('wm')
+        for key, label in (('off', 'مخفي'), ('faint', 'خافت (الافتراضي)'), ('normal', 'أوضح قليلًا')):
+            a = wm.addAction(label)
+            a.setCheckable(True)
+            a.setChecked(key == cur_wm)
+            self._wm_group.addAction(a)
+            self._wm_actions[key] = a
+            a.triggered.connect(lambda _c=False, k=key: self.set_watermark(k))
+
+    def set_watermark(self, level):
+        self.prefs.set('wm', level)
+        try:
+            from alhisabat.ui.components import watermark
+            watermark.set_level(level)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def set_theme(self, key, confirm=True, restart=True):
+        """يحفظ الثيم ثم يُغلق البرنامج ليُفتح من جديد بالثيم الجديد. restart=False للاختبارات فقط (تطبيق حي)."""
+        old = self.state.get('mode')
+        if key == old or key not in T.PALETTES:
+            self._sync_theme_checks()
+            return False
+        if confirm:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Question)
+            box.setWindowTitle('تغيير الثيم')
+            box.setText(f'سيُطبَّق ثيم «{T.theme_label(key)}» بإغلاق البرنامج ثم فتحه من جديد تلقائيًا.')
+            box.setInformativeText('سيُسأل عن أي عمل غير محفوظ قبل الإغلاق. هل تريد المتابعة؟')
+            box.setLayoutDirection(Qt.RightToLeft)
+            b_y = box.addButton('نعم، أعد التشغيل', QMessageBox.AcceptRole)
+            box.addButton('إلغاء', QMessageBox.RejectRole)
+            box.setDefaultButton(b_y)
+            box.exec()
+            if box.clickedButton() is not b_y:
+                self._sync_theme_checks()
+                return False
+        self.prefs.set('mode', key)
+        self.state.update(mode=key)
+        if not restart:
+            T.set_active(key)
+            self.apply_theme()
+            return True
+        self.restart_requested = True
+        if not self.close():                       # أُلغي الإغلاق (عمل غير محفوظ) ⇒ يبقى الثيم القديم
+            self.restart_requested = False
+            self.prefs.set('mode', old)
+            self.state.update(mode=old)
+            self._sync_theme_checks()
+            return False
+        return True
+
+    def _sync_theme_checks(self):
+        a = getattr(self, '_theme_actions', {}).get(self.state.get('mode'))
+        if a is not None:
+            a.setChecked(True)
+
+    def toggle_theme(self):
+        """اختصار Ctrl+Shift+D: من أي ثيم فاتح إلى «ليلي كحلي»، ومن أي داكن إلى «الأصلي»."""
+        return self.set_theme('light' if T.is_dark(self.state.get('mode')) else 'dark')
+
+    def set_density(self, key):
+        self.prefs.set('density', key)
+        self.state.update(density=key)
+        self.apply_theme()
+
+    def set_digits(self, key):
+        self.prefs.set('digits', key)
+        self.state.update(digits=key)
+        fmt.configure(digits=key)
+        self.refresh_current()
+
+    def set_show_advanced(self, flag):
+        self.prefs.set('show_advanced', bool(flag))
+        self.topbar.rebuild()
+
+    def palette_popup(self):
+        self.palette.popup()
+
+    # ------------------------------------------------------------------ التشغيل السريع: تنفيذ النتيجة المختارة
+    def check_updates(self):
+        self.updates.check_now()
+
+    def run_quick_hit(self, hit):
+        """يفتح شاشة، أو سجلًا (يفتح صفحته ويحدّده في الشبكة إن أمكن)، أو ينفّذ مهمة. صلاحيات الصفحة يفرضها open_page."""
+        if hit.kind == 'screen':
+            self.open_page(hit.page)
+        elif hit.kind == 'record':
+            page = self.open_page(hit.page, hit.params)
+            rid = hit.params.get('id') if isinstance(hit.params, dict) else None
+            if page is not None and rid is not None and not page.focus_record(rid):
+                self.msg.setText('فُتحت الصفحة، وتعذّر تحديد السجل (قد يكون خارج الفلتر أو الفترة الحالية)')
+        elif hit.kind == 'task':
+            self.run_task(hit.task)
+
+    def run_task(self, key):
+        t = quick_launch.task(key)
+        if t is None:
+            return
+        if t.window_method:
+            getattr(self, t.window_method)()
+            return
+        if t.writes and self.state.is_read_only:
+            QMessageBox.information(self, S.APP_NAME, self.state.read_only_reason or 'الوضع الحالي للقراءة فقط.')
+            return
+        page = self.open_page(t.page)
+        fn = getattr(page, t.method, None) if page is not None else None
+        if page is None:
+            return
+        if fn is None:
+            self.msg.setText('هذه المهمة غير متاحة في الصفحة الحالية')
+            return
+        QTimer.singleShot(0, lambda: fn(*t.args))      # بعد ظهور الصفحة، وصلاحيات الإجراء تتحقق منها الصفحة نفسها
+
+    # ------------------------------------------------------------------ جلسة التبويبات
+    def _restore_tabs(self, report=None):
+        keys = self.prefs.open_tabs() or ['dashboard']
+        keys = [k for k in keys if N.get(k) and N.allowed(N.get(k), self.access)]
+        if not keys:                                              # لا صلاحية للوحة التحكم: صفحة بلا صلاحية مطلوبة
+            keys = ['print_guide']
+        keys = keys[:self.tabs.max_tabs]                         # الجلسة القديمة قد تحوي أكثر من الحد
+        for i, k in enumerate(keys, 1):
+            if report:
+                report(0.78 + 0.2 * (i - 1) / len(keys), f'فتح «{N.get(k).title}»…')
+            self.open_page(k)
+
+    def _offer_draft_recovery(self):
+        """عند فتح البرنامج: إن بقي إدخال غير محفوظ (انقطاع تيار/إغلاق مفاجئ) اعرض استئنافه من حيث توقف."""
+        try:
+            found = self.drafts.list()
+        except Exception:  # noqa: BLE001
+            return
+        for key, meta, saved_at in found:
+            page_key = (meta or {}).get('page')
+            title = (meta or {}).get('title') or key
+            if not page_key or not N.get(page_key) or not N.allowed(N.get(page_key), self.access):
+                continue
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Question)
+            box.setWindowTitle('استئناف العمل')
+            box.setText(f'توقف البرنامج قبل حفظ إدخال في «{title}» (آخر حفظ تلقائي {saved_at}).')
+            box.setInformativeText('هل تريد استئناف العمل من حيث توقفت؟')
+            box.setLayoutDirection(Qt.RightToLeft)
+            b_y = box.addButton('استئناف', QMessageBox.AcceptRole)
+            b_l = box.addButton('لاحقًا', QMessageBox.RejectRole)
+            b_d = box.addButton('حذف المسودة', QMessageBox.DestructiveRole)
+            box.setDefaultButton(b_y)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is b_d:
+                self.drafts.clear(key)
+            elif clicked is b_y:
+                page = self.open_page(page_key)
+                if page is not None and hasattr(page, 'resume_draft'):
+                    page.resume_draft(key)
+
+    def closeEvent(self, e):
+        if not self.tabs.can_close_all():
+            self.restart_requested = False
+            e.ignore()
+            return
+        self.prefs.set_open_tabs(self.tabs.keys())
+        if getattr(self, 'auto_backup', None) is not None:
+            self.auto_backup.on_close()                          # نسخة قبل الإغلاق (لا تمنعه عند الفشل)
+        super().closeEvent(e)
+
+    def logout(self):
+        if not self.tabs.can_close_all():
+            return
+        self.logout_requested = True
+        self.close()
+
+    # ------------------------------------------------------------------ سجل الأخطاء المحلي
+    def log_error(self, msg, where=''):
+        try:
+            APP_DIR.mkdir(parents=True, exist_ok=True)
+            with open(APP_DIR / 'ui_errors.log', 'a', encoding='utf-8') as f:
+                f.write(errors.log_entry(msg, where) + '\n')
+        except OSError:
+            pass

@@ -1,0 +1,377 @@
+"""أرصدة أول المدة للمخزون (v1.7): جدول إدخال سريع قابل للتكبير، حساب تلقائي للتكلفة، وتاريخ الانتهاء/رقم الدفعة.
+
+- الكمية × تكلفة الوحدة = الإجمالي في الاتجاهين: اكتب الكمية ثم الإجمالي فتظهر تكلفة الحبة، أو اكتب تكلفة الحبة فيظهر الإجمالي.
+  عند ارتكاز الإجمالي يُرسل الإجمالي نفسه للمحرك (بلا فاقد تقريب).
+- الصنف المفعَّل عليه تتبع الصلاحية يتطلب تاريخ انتهاء؛ ويمكن تكرار الصنف بسطور بدفعات/تواريخ مختلفة.
+- المنطق الخالص في core/calc_logic.py، والمحرك هو الحَكَم النهائي عند الحفظ.
+"""
+from decimal import Decimal
+
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtWidgets import (
+    QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
+    QMessageBox, QPushButton, QTableWidget, QTableWidgetItem, QHeaderView, QTabWidget, QVBoxLayout, QWidget
+)
+
+from alhisabat.ui.components.basic import CompactForm, DateField, DialogGuardMixin, make_resizable
+from alhisabat.ui.components.entry_table import Col, EntryTable
+from alhisabat.ui.core import calc_logic as CL
+
+ANCHOR_ROLE = Qt.UserRole + 2
+
+
+class OpeningStockDialog(DialogGuardMixin, QDialog):
+    draft_key = 'opening_stock'
+    draft_title = 'أرصدة أول المدة — المخزون'
+    draft_page = 'inventory'
+
+    def __init__(self, page, resume=False):
+        super().__init__(page)
+        self.page = page
+        self.setWindowTitle('أرصدة أول المدة — المخزون')
+        self.setLayoutDirection(Qt.RightToLeft)
+        make_resizable(self, 1100, 640, min_size=(720, 420))
+        lay = QVBoxLayout(self)
+        self.add_minimize_button(lay)
+        tabs = QTabWidget(); lay.addWidget(tabs, 1)
+
+        w = QWidget(); v = QVBoxLayout(w)
+        form = CompactForm(None, 4); form.setContentsMargins(0, 0, 0, 0)      # الرأس في صف واحد بدل أربعة
+        self.date = DateField()
+        self.counter = QComboBox()
+        self.default_wh = QComboBox()
+        self.note = QLineEdit()
+        self._whs, self._items, self._by_id = [], [], {}
+        try:
+            for aid, label in page.svc.opening_counter_accounts():
+                self.counter.addItem(label, aid)
+            self._whs = [x for x in page.svc.warehouses() if x.get('is_active')]
+            for x in self._whs:
+                self.default_wh.addItem(x['name'], x['id'])
+            self._items = [i for i in page.svc.items(limit=20000) if i.get('kind') == 'stock' and i.get('is_active') and not i.get('has_variants')]
+            self._by_id = {i['id']: i for i in self._items}
+        except Exception as e:  # noqa: BLE001 — تُعرض الرسالة وتبقى النافذة قابلة للإغلاق
+            page.show_error(e)
+        form.addRow('تاريخ الرصيد الافتتاحي', self.date)
+        form.addRow('الحساب المقابل (دائن) *', self.counter)
+        form.addRow('المستودع الافتراضي', self.default_wh)
+        form.addRow('ملاحظة', self.note)
+        v.addLayout(form)
+        self.date.setMinimumWidth(128)
+
+        self.table = EntryTable([
+            Col('item', 'الصنف', 'item', 280, stretch=True), Col('wh', 'المستودع', 'combo', 140),
+            Col('qty', 'الكمية', 'qty', 90), Col('total', 'الإجمالي', 'money', 110), Col('unit', 'تكلفة الوحدة', 'money', 110),
+            Col('lot', 'رقم الدفعة', 'text', 100), Col('exp', 'تاريخ الانتهاء', 'date', 130)])
+        self.table.set_choices('item', [(i['id'], f"{i['code']} — {i['name']}") for i in self._items])
+        self.table.set_choices('wh', [(x['id'], x['name']) for x in self._whs])
+        self.table.cellEdited.connect(self._on_edit)
+        self.table.rowsChanged.connect(self._defaults_last)
+        v.addWidget(self.table, 1)
+        self.hint = QLabel('اكتب الصنف (بحث بالاسم أو الكود) ثم الكمية ثم الإجمالي: تظهر تكلفة الحبة تلقائيًا. Enter ينتقل للخلية التالية.')
+        self.hint.setObjectName('ctxKey'); self.hint.setWordWrap(True)
+        v.addWidget(self.hint)
+
+        bar = QHBoxLayout()
+        b_add = QPushButton('+ سطر'); b_add.clicked.connect(lambda: self.table.add_row())
+        b_del = QPushButton('حذف السطر'); b_del.clicked.connect(self.table.remove_current)
+        b_all = QPushButton('تحميل كل الأصناف التي بلا حركات'); b_all.clicked.connect(self._load_all)
+        b_exp = QPushButton('تعميم تاريخ انتهاء'); b_exp.setToolTip('يضع تاريخًا واحدًا في كل سطر لا تاريخ له'); b_exp.clicked.connect(self._bulk_expiry)
+        for b in (b_add, b_del, b_all, b_exp):
+            b.setAutoDefault(False); bar.addWidget(b)
+        bar.addStretch(1)
+        self.lbl_total = QLabel('الإجمالي: 0.00'); self.lbl_total.setObjectName('totInline')
+        bar.addWidget(self.lbl_total)
+        v.addLayout(bar)
+        b_save = QPushButton('حفظ الأرصدة الافتتاحية وإنشاء القيد (Ctrl+S)')
+        b_save.setProperty('primary', True); b_save.setAutoDefault(False); b_save.clicked.connect(lambda *_: self._save())
+        v.addWidget(b_save)
+        tabs.addTab(w, 'إدخال الأرصدة')
+        QShortcut(QKeySequence('Ctrl+S'), self, activated=self._save)
+        tabs.addTab(self._link_tab(), 'ربط حركات قديمة')
+
+        bb = QDialogButtonBox(QDialogButtonBox.Close); bb.rejected.connect(self.reject)
+        _cb = bb.button(QDialogButtonBox.Close); _cb.setAutoDefault(False); _cb.setDefault(False)   # Enter لا يغلق النافذة بنص العمل
+        lay.addWidget(bb)
+        self.table.add_row()
+        self._defaults_last()
+        self._load_link()
+        self.setup_drafts(page)                 # حفظ تلقائي كل بضع ثوانٍ لاستئناف العمل بعد انقطاع التيار
+        self.offer_draft_restore(auto=resume)   # resume=True: بعد موافقة المستخدم عند بدء البرنامج؛ وإلا يُسأل إن وُجدت مسودة
+
+    # ---------------------------------------------------------------- حماية الإغلاق
+    def has_unsaved(self):
+        """تعديلات غير محفوظة: ملاحظة، أو سطر فيه صنف مع كمية/تكلفة/دفعة/انتهاء (التحميل التلقائي للأصناف وحده لا يُعدّ إدخالًا)."""
+        if self.note.text().strip():
+            return True
+        t = self.table
+        for r in range(t.rowCount()):
+            if any(t.text(r, k) for k in ('qty', 'total', 'unit', 'lot', 'exp')):
+                return True
+        return False
+
+    def draft_state(self):
+        t = self.table
+        rows = []
+        for r in range(t.rowCount()):
+            if not any(t.text(r, k) for k in ('qty', 'total', 'unit', 'lot', 'exp')):
+                continue                         # أسطر الأصناف المحمّلة بلا إدخال لا تُحفظ
+            rows.append({'item': t.text(r, 'item'), 'item_id': t.rid(r, 'item'), 'wh': t.text(r, 'wh'), 'wh_id': t.rid(r, 'wh'),
+                         'qty': t.text(r, 'qty'), 'total': t.text(r, 'total'), 'unit': t.text(r, 'unit'),
+                         'lot': t.text(r, 'lot'), 'exp': t.text(r, 'exp'),
+                         'anchor': t.item(r, t.col('total')).data(ANCHOR_ROLE)})
+        return {'date': self.date.iso(), 'counter_id': self.counter.currentData(), 'wh_id': self.default_wh.currentData(),
+                'note': self.note.text(), 'rows': rows}
+
+    def restore_state(self, st):
+        t = self.table
+        if st.get('date'):
+            self.date.set_iso(st['date'])
+        for combo, key in ((self.counter, 'counter_id'), (self.default_wh, 'wh_id')):
+            i = combo.findData(st.get(key))
+            if i >= 0:
+                combo.setCurrentIndex(i)
+        self.note.setText(st.get('note', ''))
+        t.setUpdatesEnabled(False)
+        t.blockSignals(True)
+        try:
+            t.clear_rows()
+            for d in st.get('rows', []):
+                r = t.add_row()
+                t.set_value(r, 'item', d.get('item', ''), d.get('item_id'))
+                t.set_value(r, 'wh', d.get('wh', ''), d.get('wh_id'))
+                for k in ('qty', 'total', 'unit', 'lot', 'exp'):
+                    t.set_value(r, k, d.get(k, ''))
+                if d.get('anchor') is not None:
+                    t.item(r, t.col('total')).setData(ANCHOR_ROLE, d['anchor'])
+                self._on_item(r)
+            t.add_row()
+        finally:
+            t.blockSignals(False)
+            t.setUpdatesEnabled(True)
+        self._defaults_last()
+        self._retotal()
+
+    def save_from_guard(self, close):
+        return self._save(close=close)
+
+    def _reset_after_save(self):
+        self.clear_draft()
+        self.table.clear_rows(); self.table.add_row(); self._defaults_last(); self.note.clear(); self._retotal()
+        try:
+            self._items = [i for i in self.page.svc.items(limit=20000) if i.get('kind') == 'stock' and i.get('is_active') and not i.get('has_variants')]
+            self._by_id = {i['id']: i for i in self._items}
+        except Exception:  # noqa: BLE001 — التحديث اختياري؛ المحرك هو الحَكَم عند الحفظ
+            pass
+
+    # ---------------------------------------------------------------- مساعدات
+    def _defaults_last(self):
+        r = self.table.rowCount() - 1
+        if r >= 0 and not self.table.text(r, 'wh') and self.default_wh.currentIndex() >= 0:
+            self.table.set_value(r, 'wh', self.default_wh.currentText(), self.default_wh.currentData())
+
+    def _dec(self, r, key):
+        try:
+            return CL.to_dec(self.table.text(r, key))
+        except ValueError:
+            return None
+
+    def _on_edit(self, r, key):
+        t = self.table
+        if key in ('qty', 'unit', 'total'):
+            it = t.item(r, t.col('total'))
+            q, u, tot, anchor = CL.solve_line(self._dec(r, 'qty'), self._dec(r, 'unit'), self._dec(r, 'total'), it.data(ANCHOR_ROLE), key)
+            it.setData(ANCHOR_ROLE, anchor)
+            if key != 'unit':
+                t.set_value(r, 'unit', CL.fmt_num(u, CL.UNIT_PLACES))
+            if key != 'total':
+                t.set_value(r, 'total', CL.fmt_num(tot, CL.TOTAL_PLACES, trim=False))
+        elif key == 'item':
+            self._on_item(r)
+        self._retotal()
+
+    def _on_item(self, r):
+        t = self.table
+        item = self._by_id.get(t.rid(r, 'item'))
+        t.mark(r, 'item', '')
+        t.tone(r, 'exp', '')
+        if not item:
+            return
+        if item.get('has_moves'):
+            t.mark(r, 'item', 'للصنف حركات سابقة: الرصيد الافتتاحي يجب أن يكون أول حركة له')
+        if item.get('track_expiry'):
+            t.tone(r, 'exp', 'warning')
+            t.item(r, t.col('exp')).setToolTip('هذا الصنف مفعَّل عليه تتبع الصلاحية: تاريخ الانتهاء مطلوب')
+        if not t.text(r, 'wh') and self.default_wh.currentIndex() >= 0:
+            t.set_value(r, 'wh', self.default_wh.currentText(), self.default_wh.currentData())
+
+    def _retotal(self):
+        total = Decimal(0)
+        for r in range(self.table.rowCount()):
+            v = self._dec(r, 'total')
+            if v is not None:
+                total += v
+        self.lbl_total.setText(f'الإجمالي: {total:,.2f}')
+
+    def _load_all(self):
+        t = self.table
+        todo = [i for i in self._items if not i.get('has_moves')]
+        if not todo:
+            return QMessageBox.information(self, 'تحميل الأصناف', 'لا توجد أصناف بلا حركات.')
+        have = {t.rid(r, 'item') for r in range(t.rowCount())}
+        t.setUpdatesEnabled(False)
+        t.blockSignals(True)
+        try:
+            if t.rowCount() and t.is_blank(t.rowCount() - 1):
+                t.removeRow(t.rowCount() - 1)
+            wh_txt, wh_id = self.default_wh.currentText(), self.default_wh.currentData()
+            for i in todo:
+                if i['id'] in have:
+                    continue
+                r = t.add_row({'wh': wh_txt})
+                t.set_value(r, 'item', f"{i['code']} — {i['name']}", i['id'])
+                t.set_value(r, 'wh', wh_txt, wh_id)
+                if i.get('track_expiry'):
+                    t.tone(r, 'exp', 'warning')
+            t.add_row()
+        finally:
+            t.blockSignals(False)
+            t.setUpdatesEnabled(True)
+        self._defaults_last()
+
+    def _bulk_expiry(self):
+        txt, ok = QInputDialog.getText(self, 'تعميم تاريخ الانتهاء', 'التاريخ (بأي ترتيب مثل 31/05/2027 أو 05/2027) — يُطبَّق على السطور التي بلا تاريخ:')
+        if not ok or not txt.strip():
+            return
+        try:
+            iso = CL.parse_expiry_input(txt)
+        except ValueError as e:
+            return QMessageBox.warning(self, 'تاريخ غير صالح', str(e))
+        for r in range(self.table.rowCount()):
+            if not self.table.is_blank(r) and not self.table.text(r, 'exp'):
+                self.table.set_value(r, 'exp', iso); self.table.mark(r, 'exp', '')
+
+    # ---------------------------------------------------------------- الحفظ
+    def _collect(self):
+        """(rows، أخطاء، أصناف_تحتاج_تفعيل_الصلاحية). لا يُرسل شيء للمحرك هنا."""
+        t, rows, errs, enable = self.table, [], [], {}
+        for r in range(t.rowCount()):
+            if t.is_blank(r):
+                continue
+            n, bad = r + 1, []
+            item = self._by_id.get(t.rid(r, 'item'))
+            wh = t.rid(r, 'wh')
+            if not item:
+                bad.append('اختر الصنف من القائمة')
+            elif item.get('has_moves'):
+                bad.append('للصنف حركات سابقة')
+            if wh is None:
+                bad.append('اختر المستودع')
+            try:
+                q, u, tot = self._dec_strict(r, 'qty'), self._dec_strict(r, 'unit'), self._dec_strict(r, 'total')
+            except ValueError as e:
+                errs.append(f'السطر {n}: {e}'); continue
+            if not q or q <= 0:
+                bad.append('أدخل كمية أكبر من صفر')
+            if u is None and tot is None:
+                bad.append('أدخل الإجمالي أو تكلفة الوحدة')
+            try:
+                exp = CL.parse_expiry_input(t.text(r, 'exp'))
+            except ValueError as e:
+                exp = ''; bad.append(str(e))
+            if item and item.get('track_expiry') and not exp:
+                bad.append('تاريخ الانتهاء مطلوب لهذا الصنف')
+            if item and exp and not item.get('track_expiry'):
+                enable[item['id']] = item['name']
+            if bad:
+                errs.append(f'السطر {n}: ' + ' · '.join(bad)); continue
+            anchor = t.item(r, t.col('total')).data(ANCHOR_ROLE)
+            rows.append({'item_id': item['id'], 'warehouse_id': wh, 'qty': str(q), **CL.cost_args(q, u, tot, anchor),
+                         'expiry_date': exp, 'lot_no': t.text(r, 'lot')})
+        return rows, errs, enable
+
+    def _dec_strict(self, r, key):
+        try:
+            return CL.to_dec(self.table.text(r, key))
+        except ValueError:
+            raise ValueError(f'«{self.table.cols[self.table.col(key)].label}» ليست رقمًا')
+
+    def _save(self, *_, close=True):
+        """يعيد True عند نجاح الحفظ. close=False: تبقى النافذة مفتوحة وتُفرَّغ للإدخال التالي."""
+        rows, errs, enable = self._collect()
+        if errs:
+            more = f'\n… و{len(errs) - 8} أخطاء أخرى' if len(errs) > 8 else ''
+            QMessageBox.warning(self, 'راجع الأسطر', '\n'.join(errs[:8]) + more)
+
+            return False
+        if not rows:
+            QMessageBox.warning(self, 'خطأ', 'أدخل صنفًا واحدًا على الأقل.')
+
+            return False
+        if self.counter.currentData() is None:
+            QMessageBox.warning(self, 'خطأ', 'اختر الحساب المقابل (مثل رأس المال).')
+
+            return False
+        if enable:
+            names = '، '.join(list(enable.values())[:5]) + (' …' if len(enable) > 5 else '')
+            ans = QMessageBox.question(self, 'تفعيل تتبع الصلاحية',
+                                       f'أدخلت تاريخ انتهاء لأصناف غير مفعَّل عليها تتبع الصلاحية ({names}).\nهل تفعّل التتبع لها الآن؟ (بدون التفعيل يُتجاهل التاريخ)')
+            if ans == QMessageBox.Yes:
+                for iid in enable:
+                    ok, _ = self.page.guarded(self.page.svc.edit_item, iid, {'track_expiry': True}, reload=False)
+                    if not ok:
+                        return False
+            else:
+                for r in rows:
+                    if r['item_id'] in enable:
+                        r['expiry_date'] = ''
+        ok, _res = self.page.guarded(self.page.svc.post_opening_stock,
+                                     {'date': self.date.iso(), 'rows': rows, 'note': self.note.text().strip(),
+                                      'counter_account_id': self.counter.currentData()}, reload=False)
+        if ok:
+            self.page.notify('تم تسجيل الأرصدة الافتتاحية وإنشاء قيد مسودة — رحّله من شاشة القيود')
+            self.page.refresh(); self.page.window_.data_changed(self.page.key)
+            if close:
+                self._force_close = True
+                self.accept()
+            else:
+                self._reset_after_save()
+            return True
+        return False
+
+    # ---------------------------------------------------------------- ربط الحركات القديمة
+    def _link_tab(self):
+        w2 = QWidget(); l2 = QVBoxLayout(w2)
+        l2.addWidget(QLabel('حركات افتتاحية غير مرتبطة بقيد (مثل المستوردة):'))
+        self.link_table = QTableWidget(0, 3)
+        self.link_table.setHorizontalHeaderLabels(['معرف الحساب', 'مدين', 'دائن'])
+        self.link_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.link_table.horizontalHeader().setStretchLastSection(True)
+        for i in range(3):
+            self.link_table.setColumnWidth(i, 160)
+        l2.addWidget(self.link_table, 1)
+        gb = QGroupBox('ربط بقيد الافتتاح'); g = QHBoxLayout(gb)
+        self.txt_entry = QLineEdit(); self.txt_entry.setPlaceholderText('معرف قيد الافتتاح...')
+        btn_link = QPushButton('ربط بالقيد'); btn_link.clicked.connect(self._link)
+        g.addWidget(QLabel('رقم القيد:')); g.addWidget(self.txt_entry, 1); g.addWidget(btn_link)
+        l2.addWidget(gb)
+        return w2
+
+    def _load_link(self):
+        try:
+            lines = self.page.svc.opening_stock_lines()
+            self.link_table.setRowCount(len(lines))
+            for i, l in enumerate(lines):
+                for j, k in enumerate(('account_id', 'debit', 'credit')):
+                    self.link_table.setItem(i, j, QTableWidgetItem(str(l.get(k, ''))))
+        except Exception as e:  # noqa: BLE001
+            self.page.show_error(e)
+
+    def _link(self):
+        t = self.txt_entry.text().strip()
+        if not t.isdigit():
+            return QMessageBox.warning(self, 'خطأ', 'معرف القيد يجب أن يكون رقمًا صحيحًا.')
+        ok, _ = self.page.guarded(self.page.svc.link_opening_movements, int(t), reload=False)
+        if ok:
+            self.page.notify('تم ربط حركات الافتتاح بالقيد بنجاح'); self._load_link()

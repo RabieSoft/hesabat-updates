@@ -1,0 +1,65 @@
+"""تفضيلات المستخدم المحلية (السمة، الكثافة، الأرقام، الخيارات المتقدمة، التبويبات المفتوحة).
+
+المخزن الافتراضي QSettings (يُستورد كسولًا)، ويمكن تمرير dict للاختبار. بلا PySide6 عند الاستيراد.
+"""
+from alhisabat.ui.design import tokens as _T
+
+DEFAULTS = {'mode': 'light', 'density': 'compact', 'digits': 'latin', 'show_advanced': False, 'open_tabs': '', 'paper': 'A4', 'inline_forms': True, 'wm': 'faint'}
+ALLOWED = {'mode': _T.THEME_IDS,      # معرّف الثيم (light/dark الأصليان + ثيمات الألوان الجديدة)
+           'wm': ('off', 'faint', 'normal'), 'density': ('compact', 'comfortable'), 'digits': ('latin', 'arabic'),
+           'paper': ('A4', 'A5', 'RECEIPT80')}
+
+
+class Prefs:
+    def __init__(self, store=None):
+        if store is None:
+            from PySide6.QtCore import QSettings
+            q = QSettings('AlhisabatPro', 'ui')
+            store = _QStore(q)
+        self._s = store
+
+    def get(self, key):
+        v = self._s.get(key, DEFAULTS[key])
+        if key in ALLOWED and v not in ALLOWED[key]:
+            return DEFAULTS[key]
+        if key in ('show_advanced', 'inline_forms'):
+            return v in (True, 'true', 'True', 1, '1')
+        return v
+
+    def set(self, key, value):
+        if key not in DEFAULTS:
+            raise KeyError(key)
+        if key in ALLOWED and value not in ALLOWED[key]:
+            raise ValueError(f'قيمة غير مسموحة للتفضيل {key}: {value}')
+        self._s.set(key, value)
+
+    def get_raw(self, key, default=''):
+        """قيمة نصية حرة بمفتاح اختياري (إعدادات لكل مستخدم مثل الطباعة)؛ لا تمر على قائمة DEFAULTS."""
+        v = self._s.get(key, default)
+        return default if v is None else str(v)
+
+    def set_raw(self, key, value):
+        self._s.set(key, str(value))
+
+    def open_tabs(self):
+        raw = self.get('open_tabs')
+        return [k for k in str(raw).split(',') if k]
+
+    def set_open_tabs(self, keys):
+        self.set('open_tabs', ','.join(keys))
+
+
+class _QStore:
+    def __init__(self, q):
+        self._q = q
+
+    def get(self, key, default):
+        return self._q.value(key, default)
+
+    def set(self, key, value):
+        self._q.setValue(key, value)
+
+
+class DictStore(dict):
+    def set(self, key, value):
+        self[key] = value

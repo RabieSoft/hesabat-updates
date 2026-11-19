@@ -1,0 +1,460 @@
+"""محرر عميل/مورد، وحوار الرصيد الافتتاحي لطرف واحد. بلا float.
+"""
+from decimal import Decimal, InvalidOperation
+
+from alhisabat.ui.components.basic import CompactForm, DialogGuardMixin
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox,
+    QLabel, QLineEdit, QScrollArea, QVBoxLayout, QWidget,
+)
+
+from alhisabat.ui.core import strings_ar as S
+
+_HINT_STYLE = "color: var(--color-text-muted); font-size: 11px;"
+_ERR_STYLE = "color: var(--color-danger); font-weight: bold;"
+_REQ_STYLE = "color: var(--color-danger);"
+
+
+def _section(title, per_row=2):
+    """QGroupBox موحّد الشكل لأقسام الحوار؛ حقوله بصفوف أفقية مضغوطة (عنوان فوق كل حقل) بدل عمود طويل."""
+    gb = QGroupBox(title)
+    form = CompactForm(gb, per_row)
+    form.setContentsMargins(10, 4, 10, 8)
+    return gb, form
+
+
+class PartyEditor(DialogGuardMixin, QDialog):
+    """محرر عميل/مورد (v1.6): تحقق لحظي بنص الخطأ تحت الحقل، تنبيه من تكرار الاسم، Enter ينقل للحقل التالي ولا يحفظ،
+    Ctrl+S يحفظ، و«حفظ وإضافة آخر» للإدخال المتتابع. الرصيد الافتتاحي عند الإضافة فقط
+    (التعديل اللاحق من زر «رصيد افتتاحي» في الصفحة حتى لا يُخلط برصيد له حركات فعلية).
+    المنطق في core/entry_logic.py، والمحرك هو الحَكَم النهائي عند الحفظ."""
+
+    guard_save_stay = False             # الحفظ يتم في الصفحة بعد القبول
+    nonmodal_exec = True                # تصغير «–» والعمل في شاشات أخرى
+
+    def __init__(self, page, kind, existing=None):
+        super().__init__(page)
+        from PySide6.QtGui import QKeySequence, QShortcut
+        from PySide6.QtWidgets import QSpinBox
+        from alhisabat.ui.components.basic import DateField, MoneyEdit
+        self.page, self.kind, self.existing = page, kind, existing
+        self.add_another = False
+        label = 'عميل' if kind == 'customer' else 'مورد'
+        self.setWindowTitle(('تعديل بيانات ' if existing else 'إضافة ') + label)
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.setMinimumWidth(680)
+        # التخطيط الخارجي: منطقة تمرير للأقسام + شريط ثابت (تنبيه/خطأ/أزرار) أسفلها، فلا تتجاوز النافذة الشاشة
+        outer = QVBoxLayout(self)
+        outer.setSpacing(8)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QScrollArea.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll.setStyleSheet('QScrollArea { background: transparent; border: none; }'
+                                   ' QScrollArea > QWidget > QWidget { background: transparent; }')
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(0, 0, 6, 0)
+        lay.setSpacing(8)
+        self._scroll.setWidget(body)
+        outer.addWidget(self._scroll, 1)
+        ex = existing or {}
+
+        title = QLabel(('تعديل بيانات ' if existing else 'إضافة ') + label + (f" — {ex.get('name', '')}" if existing else ''))
+        title.setStyleSheet("font-size: 14px; font-weight: bold;")
+        lay.addWidget(title)
+
+        gb_basic, f_basic = _section('البيانات الأساسية')
+        self.name = QLineEdit(ex.get('name', ''))
+        self.name.setPlaceholderText(f'اسم {label} (مطلوب)')
+        self.phone = QLineEdit(ex.get('phone', ''))
+        self.phone.setPlaceholderText('مثال: 777123456 (يقبل الأرقام العربية)')
+        self.phone.setLayoutDirection(Qt.LeftToRight)
+        self.email = QLineEdit(ex.get('email', ''))
+        self.email.setPlaceholderText('اختياري')
+        self.email.setLayoutDirection(Qt.LeftToRight)
+        self.addr = QLineEdit(ex.get('address', ''))
+        self.addr.setPlaceholderText('اختياري')
+        lbl_name = QLabel('الاسم *')
+        lbl_name.setStyleSheet(_REQ_STYLE)
+        f_basic.addWide(lbl_name.text(), self.name)
+        f_basic.addRow('الهاتف', self.phone)
+        f_basic.addRow('البريد الإلكتروني', self.email)
+        f_basic.addWide('العنوان', self.addr)
+        self.group_combo = None
+        if not existing:
+            self.group_combo = QComboBox()
+            self.group_combo.addItem('بلا مجموعة', None)
+            try:
+                from alhisabat.ui.core.party_groups_service import PartyGroupsService
+                for g in PartyGroupsService(page.session).list(kind):
+                    if g.get('is_active'): self.group_combo.addItem(g['name'], g['id'])
+            except Exception: pass
+            pre_g = getattr(page, 'current_group_id', None) or ex.get('group_id')
+            if pre_g:
+                idx = self.group_combo.findData(pre_g)
+                if idx >= 0: self.group_combo.setCurrentIndex(idx)
+            f_basic.addRow('المجموعة', self.group_combo)
+        lay.addWidget(gb_basic)
+
+        gb_terms, f_terms = _section('الشروط التجارية')
+        cred_minor = (ex.get('credit_limit_minor') or 0) if existing else 0
+        self.credit = MoneyEdit()
+        if existing and kind == 'customer' and cred_minor:
+            self.credit.set_value(Decimal(cred_minor) / 100)
+        self.credit.setPlaceholderText('0 = بلا حد ائتماني')
+        self.terms = QSpinBox()
+        self.terms.setRange(0, 3650)
+        self.terms.setSuffix(' يوم')
+        self.terms.setSpecialValueText('نقدًا (0)')
+        self.terms.setValue(int(ex.get('payment_terms_days') or 0))
+        self.terms.setLayoutDirection(Qt.LeftToRight)
+        if kind == 'customer':
+            f_terms.addRow('الحد الائتماني', self.credit)
+        f_terms.addRow('أيام السداد (آجل)', self.terms)
+        lay.addWidget(gb_terms)
+
+        self.id_type = self.id_number = self.id_issuer = self.id_issue_date = None
+        if kind == 'customer':
+            gb_id, f_id = _section('بيانات الهوية (تظهر في اتفاقية فتح الحساب — اختيارية)')
+            self.id_type = QComboBox(); self.id_type.setEditable(True)
+            self.id_type.addItems(['', 'بطاقة شخصية', 'جواز سفر', 'بطاقة عسكرية', 'سجل تجاري'])
+            self.id_type.setCurrentText(ex.get('id_type', '') or '')
+            self.id_number = QLineEdit(ex.get('id_number', '') or ''); self.id_number.setLayoutDirection(Qt.LeftToRight)
+            self.id_issuer = QLineEdit(ex.get('id_issuer', '') or '')
+            self.id_issue_date = QLineEdit(ex.get('id_issue_date', '') or ''); self.id_issue_date.setLayoutDirection(Qt.LeftToRight)
+            self.id_issue_date.setPlaceholderText('YYYY-MM-DD')
+            f_id.addRow('نوع الهوية', self.id_type); f_id.addRow('رقم الهوية', self.id_number)
+            f_id.addRow('جهة الإصدار', self.id_issuer); f_id.addRow('تاريخ الإصدار', self.id_issue_date)
+            lay.addWidget(gb_id)
+
+        self.gb_opening = None
+        if not existing:
+            self.gb_opening, f_open = _section('الرصيد الافتتاحي (اختياري)')
+            hint = QLabel('إن كان لهذا الطرف رصيد حالي قبل بدء العمل بالنظام، أدخله هنا. سيُسجَّل كقيد مسودة'
+                          ' بانتظار ترحيله من شاشة القيود، ولن يُنشأ أي قيد إن تُرك المبلغ فارغًا.')
+            hint.setWordWrap(True)
+            hint.setStyleSheet(_HINT_STYLE)
+            f_open.addRow(hint)
+            self.opening_amount = MoneyEdit()
+            self.opening_dir = QComboBox()
+            if kind == 'customer':
+                self.opening_dir.addItem('مدين — مستحق لنا على العميل (الوضع المعتاد)', 1)
+                self.opening_dir.addItem('دائن — رصيد له (دفعة مقدمة)', -1)
+            else:
+                self.opening_dir.addItem('دائن — مستحق علينا للمورد (الوضع المعتاد)', 1)
+                self.opening_dir.addItem('مدين — رصيد لنا عنده (دفعنا مقدمًا)', -1)
+            self.opening_date = DateField()
+            f_open.addRow('المبلغ', self.opening_amount)
+            f_open.addRow('نوع الرصيد', self.opening_dir)
+            f_open.addRow('بتاريخ', self.opening_date)
+            lay.addWidget(self.gb_opening)
+
+        self.warn = QLabel('')
+        self.warn.setWordWrap(True)
+        self.warn.setStyleSheet("color: var(--color-warning);")
+        self.warn.setVisible(False)
+        self.err = QLabel('')
+        self.err.setWordWrap(True)
+        self.err.setStyleSheet(_ERR_STYLE)
+        self.err.setVisible(False)
+        outer.addWidget(self.warn)
+        outer.addWidget(self.err)
+
+        bb = QDialogButtonBox()
+        self.ok = bb.addButton('حفظ التعديل' if existing else 'حفظ', QDialogButtonBox.AcceptRole)
+        self.ok.setProperty('primary', True)
+        self.ok.setAutoDefault(False)
+        self.btn_more = None
+        if not existing:
+            self.btn_more = bb.addButton('حفظ وإضافة آخر', QDialogButtonBox.ActionRole)
+            self.btn_more.setAutoDefault(False)
+            self.btn_more.clicked.connect(self._save_and_new)
+        cancel = bb.addButton(S.ACTION['cancel'], QDialogButtonBox.RejectRole)
+        cancel.setAutoDefault(False)
+        bb.accepted.connect(self._accept)
+        bb.rejected.connect(self.reject)
+        outer.addWidget(bb)
+
+        # Enter ينقل للحقل التالي (لا يحفظ)، Ctrl+S يحفظ
+        for w in (self.name, self.phone, self.email, self.addr):
+            w.returnPressed.connect(self.focusNextChild)
+        QShortcut(QKeySequence('Ctrl+S'), self, activated=self._accept)
+
+        # تنبيه التكرار: أسماء الأطراف من نفس النوع (تُحمَّل مرة واحدة؛ تعذُّر التحميل لا يعطّل النافذة)
+        try:
+            self._names = [n for n in page.svc.names(kind) if not existing or n != ex.get('name')]
+        except Exception:  # noqa: BLE001
+            self._names = []
+        watched = [self.name, self.phone, self.email, self.credit]
+        if self.gb_opening is not None:
+            watched.append(self.opening_amount)
+        for w in watched:
+            w.textChanged.connect(self._validate)
+        self.terms.valueChanged.connect(self._validate)
+        self._validate()
+        self.name.setFocus()
+        self._fit_to_screen(body)
+
+    def _fit_to_screen(self, body):
+        """حجم ابتدائي معقول: عرض ثابت تقريبًا، وارتفاع بقدر المحتوى بحد أقصى 85% من الشاشة المتاحة (والباقي بالتمرير)."""
+        from PySide6.QtGui import QGuiApplication
+        scr = (self.parent().screen() if self.parent() is not None else None) or QGuiApplication.primaryScreen()
+        avail = scr.availableGeometry() if scr is not None else None
+        want_h = body.sizeHint().height() + 130          # + العنوان/التحذير/الأزرار/الهوامش
+        want_w = max(520, body.sizeHint().width() + 40)
+        if avail is not None:
+            want_h = min(want_h, int(avail.height() * 0.85))
+            want_w = min(want_w, int(avail.width() * 0.9), 620)
+        self.resize(want_w, want_h)
+
+    # ---------------------------------------------------------------- التحقق اللحظي
+    def _raw(self):
+        out = {'name': self.name.text(), 'phone': self.phone.text(), 'email': self.email.text(), 'address': self.addr.text(),
+               'terms': str(self.terms.value())}
+        if self.kind == 'customer':
+            out['credit'] = self.credit.text()
+        if self.gb_opening is not None:
+            out['opening_amount'] = self.opening_amount.text()
+        return out
+
+    def _validate(self, *_):
+        from alhisabat.ui.components.basic import repolish
+        from alhisabat.ui.core import entry_logic as EL
+        self._errs = EL.party_errors(self.kind, self._raw())
+        fields = {'name': self.name, 'phone': self.phone, 'email': self.email, 'credit': self.credit}
+        if self.gb_opening is not None:
+            fields['opening_amount'] = self.opening_amount
+        for key, w in fields.items():
+            bad = key in self._errs and bool(w.text().strip())
+            w.setProperty('invalid', bad)
+            w.setToolTip(self._errs.get(key, '') if bad else '')
+            repolish(w)
+        shown = [m for k, m in self._errs.items() if not (k == 'name' and not self.name.text().strip())]
+        self.err.setText('\n'.join(shown))
+        self.err.setVisible(bool(shown))
+        dup = EL.find_similar_name(self.name.text(), self._names)
+        self.warn.setText(f'⚠ يوجد طرف بنفس الاسم مسبقًا: «{dup}». تأكد أنه ليس تكرارًا.' if dup else '')
+        self.warn.setVisible(bool(dup))
+        self.ok.setEnabled(not self._errs)
+        if self.btn_more is not None:
+            self.btn_more.setEnabled(not self._errs)
+
+    def _save_and_new(self):
+        self.add_another = True
+        self._accept()
+
+    def _accept(self):
+        if self._errs:
+            self.add_another = False
+            first = next(iter(self._errs.values()))
+            self.err.setText(first)
+            self.err.setVisible(True)
+            return
+        self.accept()
+
+    def values(self):
+        from alhisabat.ui.core import entry_logic as EL
+        out = EL.clean_party_values(self.kind, self._raw())
+        if self.id_type is not None:
+            out.update(id_type=self.id_type.currentText().strip(), id_number=self.id_number.text().strip(),
+                       id_issuer=self.id_issuer.text().strip(), id_issue_date=self.id_issue_date.text().strip())
+        if self.group_combo is not None:
+            out['group_id'] = self.group_combo.currentData()
+        if self.gb_opening is not None:
+            out['opening_direction'] = self.opening_dir.currentData()
+            out['opening_date'] = self.opening_date.iso()
+        return out
+
+
+class PartyOpeningBalanceDialog(QDialog):
+    """رصيد افتتاحي لطرف موجود، **بعدة عملات** إن لزم (مثلًا ريال سعودي + ريال يمني + دولار): صف لكل عملة بمبلغها واتجاهها وسعر صرفها
+    الاختياري (فارغ = سعر الجدول بتاريخ الرصيد). الكل يُسجَّل في قيد مسودة واحد بانتظار الترحيل من شاشة القيود.
+    تنبيه: كل ضغطة «حفظ» تنشئ قيد مسودة جديدًا؛ راجع المسودات قبل الترحيل لتفادي التكرار."""
+
+    def __init__(self, page, party):
+        super().__init__(page)
+        from PySide6.QtWidgets import QGridLayout, QPushButton
+        self.party = party
+        self._kind = party.get('kind')
+        label = 'عميل' if self._kind == 'customer' else 'مورد'
+        try:
+            self._cur = page.svc.currency_options()
+        except Exception:  # noqa: BLE001 — تعذّرت القراءة: العملة الأساسية وحدها
+            self._cur = []
+        self.setWindowTitle(f"رصيد افتتاحي — {party.get('name', '')}")
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.setMinimumWidth(640)
+        lay = QVBoxLayout(self)
+
+        title = QLabel(f"تسجيل رصيد افتتاحي لـ{label} «{party.get('name', '')}»")
+        title.setStyleSheet("font-size: 13px; font-weight: bold;")
+        lay.addWidget(title)
+        hint = QLabel('أضف صفًّا لكل عملة عليها رصيد (سعودي، يمني، دولار…). تُسجَّل كل عملة بمبلغها الأصلي ويُحسب معادلها بالعملة الأساسية '
+                      'بسعر الصرف؛ اتركه فارغًا لاستعمال سعر الجدول بتاريخ الرصيد (يجب تسجيله أولًا في «العملات»). '
+                      'تُسجَّل كقيد مسودة متوازن مع «الأرصدة الافتتاحية المعلّقة» بانتظار الترحيل من شاشة القيود.')
+        hint.setWordWrap(True); hint.setStyleSheet(_HINT_STYLE)
+        lay.addWidget(hint)
+
+        gb, form = _section('الأرصدة')
+        self._grid = QGridLayout()
+        for col, head in enumerate(('العملة', 'المبلغ', 'نوع الرصيد', 'سعر الصرف (اختياري)')):
+            h = QLabel(head); h.setStyleSheet('font-weight: bold;')
+            self._grid.addWidget(h, 0, col)
+        self._rows = []
+        form.addRow(self._grid)
+        add = QPushButton('＋ عملة أخرى')
+        add.clicked.connect(self._add_row)
+        form.addRow(add)
+        from alhisabat.ui.components.basic import DateField
+        self.date = DateField()
+        self.note = QLineEdit(); self.note.setPlaceholderText('اختياري')
+        form.addRow('بتاريخ', self.date)
+        form.addRow('بيان القيد', self.note)
+        lay.addWidget(gb)
+        self._add_row()
+
+        self.err = QLabel(''); self.err.setStyleSheet(_ERR_STYLE); self.err.setVisible(False)
+        lay.addWidget(self.err)
+
+        bb = QDialogButtonBox()
+        self.ok = bb.addButton('حفظ', QDialogButtonBox.AcceptRole); self.ok.setProperty('primary', True)
+        bb.addButton(S.ACTION['cancel'], QDialogButtonBox.RejectRole)
+        bb.accepted.connect(self._accept); bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def _add_row(self):
+        cur = QComboBox()
+        if self._cur:
+            for c in self._cur:
+                cur.addItem(f"{c.get('name_ar') or c['code']} ({c['code']})" + (' — الأساسية' if c.get('is_base') else ''),
+                            '' if c.get('is_base') else c['code'])
+        else:
+            cur.addItem('العملة الأساسية', '')
+        used = {r[0].currentData() for r in self._rows}
+        dflt = next((('' if c.get('is_base') else c['code']) for c in self._cur if c.get('is_default')), None)
+        order = list(range(cur.count()))
+        di = cur.findData(dflt) if dflt is not None else -1
+        if di >= 0:                                      # العملة الافتراضية (اليمني) أولًا ثم بقية العملات
+            order = [di] + [i for i in order if i != di]
+        for i in order:                                  # أول عملة لم تُستعمل بعد في صف آخر
+            if cur.itemData(i) not in used:
+                cur.setCurrentIndex(i)
+                break
+        amount = QLineEdit(); amount.setPlaceholderText('0.00'); amount.setLayoutDirection(Qt.LeftToRight)
+        direction = QComboBox()
+        if self._kind == 'customer':
+            direction.addItem('عليه (مستحق لنا)', 1)
+            direction.addItem('له (رصيد دائن)', -1)
+        else:
+            direction.addItem('له (مستحق علينا)', 1)
+            direction.addItem('عليه (رصيد مدين)', -1)
+        rate = QLineEdit(); rate.setPlaceholderText('سعر الجدول'); rate.setLayoutDirection(Qt.LeftToRight)
+        cur.currentIndexChanged.connect(lambda _i, c=cur, r=rate: r.setEnabled(bool(c.currentData())))
+        rate.setEnabled(bool(cur.currentData()))
+        row = len(self._rows) + 1
+        for col, w in enumerate((cur, amount, direction, rate)):
+            self._grid.addWidget(w, row, col)
+        self._rows.append((cur, amount, direction, rate))
+
+    def _read(self):
+        """[(currency, signed Decimal, rate_text)] للصفوف المعبّأة، أو ValueError برسالة مفهومة."""
+        out, seen = [], set()
+        for cur, amount, direction, rate in self._rows:
+            txt = amount.text().strip().replace(',', '')
+            if not txt:
+                continue
+            try:
+                amt = Decimal(txt)
+            except InvalidOperation:
+                raise ValueError('أدخل مبلغًا صحيحًا في كل صف.')
+            if amt <= 0:
+                raise ValueError('المبلغ يجب أن يكون أكبر من صفر (اتجاه الرصيد يُختار من «نوع الرصيد»).')
+            code = cur.currentData() or ''
+            if code in seen:
+                raise ValueError('عملة مكررة: ادمج مبالغها في صف واحد.')
+            seen.add(code)
+            r = rate.text().strip().replace(',', '') if code else ''
+            if r:
+                try:
+                    if Decimal(r) <= 0:
+                        raise InvalidOperation
+                except InvalidOperation:
+                    raise ValueError('سعر الصرف غير صالح.')
+            out.append((code, amt * int(direction.currentData()), r))
+        if not out:
+            raise ValueError('أدخل مبلغًا واحدًا على الأقل.')
+        return out
+
+    def _accept(self):
+        self.err.setVisible(False)
+        try:
+            self._read()
+        except ValueError as e:
+            self.err.setText(str(e))
+            self.err.setVisible(True)
+            return
+        self.accept()
+
+    def values(self):
+        items = [{'currency': c, 'amount': a, 'rate': r} for c, a, r in self._read()]
+        return items, self.date.iso(), self.note.text().strip()
+
+
+class PartyCreditDialog(QDialog):
+    """عرض تفاصيل الحد الائتماني وأرصدة العملات للطرف."""
+    def __init__(self, parent, party, credit_status=None, currencies=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"الائتمان والعملات — {party.get('name', '')}")
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.setMinimumWidth(500)
+        lay = QVBoxLayout(self)
+
+        from alhisabat.ui.components.datagrid import format_minor
+        from PySide6.QtWidgets import QGroupBox, QTableWidget, QTableWidgetItem, QHeaderView
+
+        if credit_status:
+            gb = QGroupBox("حالة الائتمان")
+            gl = QFormLayout(gb)
+            lim = credit_status.get('limit')
+            bal = credit_status.get('balance', 0)
+            avail = credit_status.get('available')
+            exceeds = credit_status.get('exceeds', False)
+
+            gl.addRow("الحد الائتماني:", QLabel(format_minor(lim) if lim else "غير محدد (مفتوح)"))
+            gl.addRow("الرصيد الحالي:", QLabel(format_minor(bal)))
+            if avail is not None:
+                lbl_avail = QLabel(format_minor(avail))
+                if avail < 0:
+                    lbl_avail.setStyleSheet("color: var(--color-danger); font-weight: bold;")
+                gl.addRow("المتبقي من الحد:", lbl_avail)
+            if exceeds:
+                lbl_warn = QLabel("⚠️ تم تجاوز الحد الائتماني المسموح به!")
+                lbl_warn.setStyleSheet("color: var(--color-danger); font-weight: bold;")
+                gl.addRow("", lbl_warn)
+            lay.addWidget(gb)
+
+        gb_cur = QGroupBox("الأرصدة بحسب العملات")
+        cur_lay = QVBoxLayout(gb_cur)
+        table = QTableWidget()
+        table.setColumnCount(4)
+        table.setHorizontalHeaderLabels(["العملة", "مدين", "دائن", "الصافي"])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        rows = currencies or []
+        table.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            c_name = str(r.get('currency', ''))
+            d_amt = format_minor(r.get('debit_orig', 0))
+            c_amt = format_minor(r.get('credit_orig', 0))
+            net_amt = format_minor(r.get('net_orig', 0))
+            table.setItem(i, 0, QTableWidgetItem(c_name))
+            table.setItem(i, 1, QTableWidgetItem(d_amt))
+            table.setItem(i, 2, QTableWidgetItem(c_amt))
+            table.setItem(i, 3, QTableWidgetItem(net_amt))
+        cur_lay.addWidget(table)
+        lay.addWidget(gb_cur)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok)
+        bb.accepted.connect(self.accept)
+        lay.addWidget(bb)

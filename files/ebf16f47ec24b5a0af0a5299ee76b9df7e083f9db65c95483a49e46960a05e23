@@ -1,0 +1,136 @@
+"""التقارير المالية الرسمية: قائمة الدخل، المركز المالي، التدفقات النقدية — كلها مبنية على Ledger/Balance Engine
+(§52: كل تقرير محاسبي يعتمد على الأستاذ لا على بيانات المستندات مباشرة)، وكل رقم قابل للنقر (§53): كل سطر يحمل
+account_ids فيمكن تمريرها إلى ledger_engine.ledger أو balance_engine.account_summary للوصول إلى الحركة فالقيد فالمستند.
+مقارنة السنوات (§51) عبر compare_income_statement/compare_balance_sheet."""
+from alhisabat.accounting import balance_engine as be, closing_engine as ce
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.security import permissions
+
+STATEMENT_TYPES = {"revenue": "الإيرادات", "cogs": "تكلفة النشاط", "expense": "المصروفات",
+                   "asset": "الأصول", "liability": "الخصوم", "equity": "حقوق الملكية"}
+
+
+def _header(conn, company_id, title, date_from, date_to, branch_id=None):
+    c = conn.execute("SELECT name FROM companies WHERE id=?", (company_id,)).fetchone()
+    b = conn.execute("SELECT name FROM branches WHERE id=?", (branch_id,)).fetchone() if branch_id else None
+    return {"company": c[0] if c else None, "branch": b[0] if b else None, "report_title": title,
+           "date_from": date_from, "date_to": date_to}
+
+
+def _rows_by_type(tb, types, max_level=None):
+    return [r for r in tb["rows"] if r["account_type"] in types and (max_level is None or r["level"] <= max_level)]
+
+
+def _line(r, sign=1, field="closing"):
+    net = sign * (r[f"{field}_debit"] - r[f"{field}_credit"])
+    return {"account_id": r["account_id"], "code": r["code"], "name": r["name"], "level": r["level"], "is_group": r["is_group"], "amount": net}
+
+
+# ---------------- قائمة الدخل ----------------
+def income_statement(conn, user_id, company_id, date_from, date_to, *, branch_id=None, max_level=None):
+    permissions.require(conn, user_id, company_id, "report.view", check_branch=False)
+    tb = be.trial_balance(conn, user_id, company_id, date_from, date_to, branch_id=branch_id, max_level=max_level, hide_zero=True)
+    revenue = [_line(r, -1, "period") for r in _rows_by_type(tb, ("revenue",), max_level)]
+    cogs = [_line(r, 1, "period") for r in _rows_by_type(tb, ("cogs",), max_level)]
+    expense = [_line(r, 1, "period") for r in _rows_by_type(tb, ("expense",), max_level)]
+    total_revenue = sum(l["amount"] for l in revenue if not l["is_group"])
+    total_cogs = sum(l["amount"] for l in cogs if not l["is_group"])
+    total_expense = sum(l["amount"] for l in expense if not l["is_group"])
+    gross_profit = total_revenue - total_cogs
+    return {**_header(conn, company_id, "قائمة الدخل", date_from, date_to, branch_id),
+           "revenue": revenue, "total_revenue": total_revenue, "cogs": cogs, "total_cogs": total_cogs,
+           "gross_profit": gross_profit, "expenses": expense, "total_expenses": total_expense,
+           "net_result": gross_profit - total_expense, "period_balanced": tb["period_balanced"]}
+
+
+def compare_income_statement(conn, user_id, company_id, periods, **kw):
+    """periods: [(date_from,date_to,label), ...] — كل فترة داخل سنة مالية واحدة (قد تختلف السنوات بين الفترات)."""
+    return [{"label": p[2], **income_statement(conn, user_id, company_id, p[0], p[1], **kw)} for p in periods]
+
+
+# ---------------- المركز المالي ----------------
+def balance_sheet(conn, user_id, company_id, as_of, *, branch_id=None, max_level=None):
+    """أصول = خصوم + حقوق ملكية + نتيجة الفترة الجارية (غير مقفلة). نتيجة الفترة تُضاف كسطر حقوق ملكية اصطناعي
+    (بلا account_id، فلا يقبل Drill Down) حتى تتوازن القائمة قبل الإقفال — بعد الإقفال تصبح صفرا وتُحذف تلقائيا."""
+    permissions.require(conn, user_id, company_id, "report.view", check_branch=False)
+    ys = be.year_start(conn, company_id, as_of)
+    tb = be.trial_balance(conn, user_id, company_id, ys, as_of, branch_id=branch_id, max_level=max_level, hide_zero=True)
+    assets = [_line(r, 1) for r in _rows_by_type(tb, ("asset",), max_level)]
+    liabilities = [_line(r, -1) for r in _rows_by_type(tb, ("liability",), max_level)]
+    equity = [_line(r, -1) for r in _rows_by_type(tb, ("equity",), max_level)]
+    total_assets = sum(l["amount"] for l in assets if not l["is_group"])
+    total_liabilities = sum(l["amount"] for l in liabilities if not l["is_group"])
+    total_equity_book = sum(l["amount"] for l in equity if not l["is_group"])
+    current_result = ce.year_result(conn, user_id, company_id, _year_id_of(conn, company_id, as_of), include_closing=True)["net_result"]
+    equity_with_result = equity + [{"account_id": None, "code": None, "name": "نتيجة الفترة الحالية (غير مقفلة)",
+                                    "level": 1, "is_group": False, "amount": current_result}] if current_result else equity
+    total_equity = total_equity_book + current_result
+    return {**_header(conn, company_id, "قائمة المركز المالي", ys, as_of, branch_id),
+           "assets": assets, "total_assets": total_assets, "liabilities": liabilities, "total_liabilities": total_liabilities,
+           "equity": equity_with_result, "total_equity": total_equity, "current_period_result": current_result,
+           "balanced": total_assets == total_liabilities + total_equity}
+
+
+def _year_id_of(conn, company_id, as_of):
+    r = conn.execute("SELECT id FROM fiscal_years WHERE company_id=? AND ? BETWEEN start_date AND end_date", (company_id, as_of)).fetchone()
+    if not r:
+        raise AccountingError("التاريخ خارج السنوات المالية المعرّفة")
+    return r[0]
+
+
+def compare_balance_sheet(conn, user_id, company_id, dates, **kw):
+    """dates: [(as_of,label), ...]."""
+    return [{"label": d[1], **balance_sheet(conn, user_id, company_id, d[0], **kw)} for d in dates]
+
+
+# ---------------- التدفقات النقدية ----------------
+BUCKETS = {"sales_invoice": "operating", "purchase_invoice": "operating", "payroll_run": "operating",
+          "cash_voucher": "operating", "cash_count": "operating", "bank_statement": "operating",
+          "fixed_asset": "investing", "fixed_asset_disposal": "investing",
+          "revaluation": None, "stock_adjustment": None, "stock_count": None}
+BUCKET_LABELS = {"operating": "الأنشطة التشغيلية", "investing": "الأنشطة الاستثمارية", "financing": "الأنشطة التمويلية",
+                 "other": "أخرى (غير مصنَّفة)"}
+
+
+def cash_flow_statement(conn, user_id, company_id, date_from, date_to, *, branch_id=None):
+    """طريقة مباشرة: صافي حركة حسابات الصناديق/البنوك المسجَّلة، مصنَّفة حسب مصدر القيد على الطرف الآخر من كل سطر.
+    التحويلات بين الصناديق مستبعدة (لا أثر صافٍ على إجمالي النقدية). حد معروف: القيود العامة (رأس مال، قروض) تقع في
+    «أخرى» لعدم وجود تصنيف تمويل/استثمار صريح لها بعد."""
+    permissions.require(conn, user_id, company_id, "report.view", check_branch=False)
+    cash_accounts = [r[0] for r in conn.execute("SELECT account_id FROM cash_accounts WHERE company_id=?", (company_id,)).fetchall()]
+    if not cash_accounts:
+        raise AccountingError("لا توجد صناديق أو بنوك مسجَّلة لهذه الشركة")
+    ids = ",".join("?" * len(cash_accounts))
+    where_branch = " AND e.branch_id=?" if branch_id else ""
+    args = [company_id, date_from, date_to, *cash_accounts]
+    if branch_id:
+        args.append(branch_id)
+    rows = conn.execute(
+        f"SELECT e.source_type,e.entry_type,SUM(l.debit_base-l.credit_base) net FROM journal_lines l JOIN journal_entries e ON e.id=l.entry_id "
+        f"WHERE e.company_id=? AND e.status IN ('posted','reversed') AND e.entry_date BETWEEN ? AND ? AND l.account_id IN ({ids}) {where_branch} "
+        f"AND e.source_type IS NOT 'cash_transfer' GROUP BY e.source_type,e.entry_type", args).fetchall()
+    buckets = {"operating": 0, "investing": 0, "financing": 0, "other": 0}
+    detail = []
+    for r in rows:
+        b = BUCKETS.get(r["source_type"])
+        if b is None:
+            b = "other"
+        buckets[b] += r["net"]
+        detail.append({"source_type": r["source_type"], "bucket": b, "amount": r["net"]})
+    ys = be.year_start(conn, company_id, date_from)
+    if be.year_start(conn, company_id, date_to) != ys:
+        raise AccountingError("الفترة يجب أن تقع داخل سنة مالية واحدة")
+    opening = sum(be.movements(conn, company_id, ys, date_from, ys, [branch_id] if branch_id else None, None, [a])
+                  .get(a, [0, 0, 0])[0] for a in cash_accounts)
+    net_change = sum(buckets.values())
+    closing = opening + net_change
+    # تحقق مستقل: الرصيد الفعلي في الأستاذ عند date_to (يشمل كل الحركات، بما فيها التحويلات التي تتعادل صفرا داخل المجموعة)
+    independent_closing = 0
+    for a in cash_accounts:
+        m = be.movements(conn, company_id, ys, date_to, ys, [branch_id] if branch_id else None, None, [a])
+        o, pd, pc = m.get(a, [0, 0, 0])
+        independent_closing += o + pd - pc
+    return {**_header(conn, company_id, "قائمة التدفقات النقدية", date_from, date_to, branch_id),
+           "opening_cash": opening, "net_change": net_change, "closing_cash": closing,
+           "buckets": {BUCKET_LABELS[k]: v for k, v in buckets.items()}, "detail": detail,
+           "reconciles": closing == independent_closing}

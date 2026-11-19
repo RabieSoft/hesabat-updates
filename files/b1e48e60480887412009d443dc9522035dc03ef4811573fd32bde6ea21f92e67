@@ -1,0 +1,649 @@
+"""DataGrid: جدول كثيف بخطوط شبكة واضحة، فرز، بحث سريع + تصفية لكل عمود، تجميع، صف إجماليات مثبّت، تحديد متعدد بمجموع المحدد،
+تصدير CSV، حفظ تخصيص الأعمدة، نموذج افتراضي للكميات الكبيرة، قائمة سياق، وDrill-down بالنقر المزدوج. يتطلب PySide6.
+
+المنطق (تصفية/فرز/مجاميع/تصدير) في grid_logic.py الخالص والمختبَر؛ هذا الملف ربط عرض فقط.
+"""
+from PySide6.QtCore import QAbstractTableModel, QEvent, QModelIndex, QSettings, Qt, Signal
+from PySide6.QtGui import QBrush, QColor, QFont, QGuiApplication
+from PySide6.QtWidgets import (
+    QAbstractItemView, QFileDialog, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMenu, QTableView,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget
+)
+
+from alhisabat.ui.core import format as fmt, strings_ar as S
+from alhisabat.ui.design import tokens as T, total_colors as TC
+
+from . import grid_logic as G
+
+
+class _Model(QAbstractTableModel):
+    """نموذج افتراضي: data() تُحسب عند الطلب، فلا تُعبَّأ الخلايا كلها (يتحمل عشرات آلاف الصفوف)."""
+
+    def __init__(self, columns, parent=None):
+        super().__init__(parent)
+        self.columns = columns
+        self.rows = []
+        self.view = []              # فهارس الصفوف الظاهرة
+        self.group_key = None
+        self._items = []            # عناصر العرض: ('row', i) أو ('group', نص, عدد)
+        self.mode = 'light'
+        self.row_tone = None        # دالة row → نغمة أو None (تلوين خفيف للصف)
+
+    def set_data(self, rows, view):
+        self.beginResetModel()
+        self.rows, self.view = rows, view
+        self._rebuild()
+        self.endResetModel()
+
+    def _rebuild(self):
+        if self.group_key:
+            self._items = []
+            for label, idxs in G.group(self.rows, self.view, self.group_key, self.columns):
+                self._items.append(('group', label, len(idxs)))
+                self._items += [('row', i) for i in idxs]
+        else:
+            self._items = [('row', i) for i in self.view]
+
+    def item(self, r):
+        return self._items[r]
+
+    def row_index(self, r):
+        it = self._items[r]
+        return it[1] if it[0] == 'row' else None
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self._items)
+
+    def columnCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self.columns)
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if orientation == Qt.Horizontal and role == Qt.DisplayRole:
+            return self.columns[section].label
+        if orientation == Qt.Vertical and role == Qt.DisplayRole:
+            return str(section + 1)
+        return None
+
+    def data(self, index, role=Qt.DisplayRole):
+        it = self._items[index.row()]
+        col = self.columns[index.column()]
+        pal = T.palette(self.mode)
+        if it[0] == 'group':
+            if role == Qt.DisplayRole and index.column() == 0:
+                return f'{it[1]}  ({it[2]})'
+            if role == Qt.BackgroundRole:
+                return QBrush(QColor(pal['accent_soft']))
+            if role == Qt.ForegroundRole:
+                return QBrush(QColor(pal['accent_soft_text']))
+            return None
+        row = self.rows[it[1]]
+        v = row.get(col.key)
+        if role == Qt.DisplayRole:
+            return G.display(v, col)
+        if role == Qt.TextAlignmentRole:
+            return int((Qt.AlignLeft if col.numeric else Qt.AlignRight) | Qt.AlignVCenter)
+        if col.link and v not in (None, ''):
+            if role == Qt.ForegroundRole:
+                return QBrush(QColor(pal['accent']))
+            if role == Qt.FontRole:                          # خط الجدول نفسه (قد يكون مضغوطًا) مع خط سفلي
+                g = self.parent()
+                f = QFont(g.table.font()) if g is not None and hasattr(g, 'table') else QFont()
+                f.setUnderline(True)
+                return f
+            if role == Qt.ToolTipRole:
+                return 'انقر للانتقال إلى المستند الأصلي'
+        if role == Qt.ForegroundRole:
+            tone = G.tone_of(v, col)
+            if tone:
+                return QBrush(QColor(pal[tone]))
+            n = G.to_number(v, col) if col.numeric else None
+            if n is not None and n < 0:
+                return QBrush(QColor(pal['danger']))     # اللون مع الأقواس، لا اللون وحده
+            return None
+        if role == Qt.BackgroundRole and self.row_tone:
+            tone = self.row_tone(row)
+            if tone:
+                return QBrush(QColor(pal[f'{tone}_soft']))
+        if role == Qt.DecorationRole and col.kind == 'swatch':
+            from alhisabat.ui.design.color_swatch import swatches_icon
+            return swatches_icon(row.get(col.key + '_hexes'))
+        if role == Qt.UserRole:
+            return v
+        return None
+
+    def flags(self, index):
+        if self._items[index.row()][0] == 'group':
+            return Qt.ItemIsEnabled
+        return Qt.ItemIsEnabled | Qt.ItemIsSelectable
+
+
+class DataGrid(QWidget):
+    rowActivated = Signal(dict)              # نقر مزدوج على سجل
+    drilldown = Signal(dict, str)            # (السجل، مفتاح العمود) — للانتقال إلى الحساب/القيد/المستند
+    linkClicked = Signal(dict, str)          # نقرة واحدة على خلية عمود رابط (Column.link) — (السجل، مفتاح العمود)
+    selectionChangedRows = Signal(list)      # قائمة dict للمحدد
+
+    def __init__(self, columns, grid_id='', quick_search=True, parent=None):
+        super().__init__(parent)
+        self.columns = columns
+        self.grid_id = grid_id
+        self._rows, self._quick, self._col_filters = [], '', {}
+        self._sort_key, self._desc = None, False
+        self._context_provider = None
+        self.setLayoutDirection(Qt.RightToLeft)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        top = QHBoxLayout()
+        top.setContentsMargins(4, 4, 4, 4)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText('بحث سريع في كل الأعمدة…')
+        self.search.setClearButtonEnabled(True)
+        self.search.setVisible(quick_search)
+        self.search.textChanged.connect(self._on_quick)
+        self.filters_lbl = QLabel('')
+        self.filters_lbl.setObjectName('ctxKey')
+        top.addWidget(self.search, 1)
+        top.addWidget(self.filters_lbl)
+        lay.addLayout(top)
+
+        self.model = _Model(columns, self)
+        self.table = QTableView()
+        self.table.setModel(self.model)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setShowGrid(True)
+        self.table.setSortingEnabled(False)
+        self.table.verticalHeader().setDefaultSectionSize(T.ROW_HEIGHT['compact'])
+        self.table.verticalHeader().setVisible(False)
+        h = self.table.horizontalHeader()
+        h.setSectionsClickable(True)
+        h.setSectionsMovable(True)
+        h.setStretchLastSection(True)
+        h.setContextMenuPolicy(Qt.CustomContextMenu)
+        h.customContextMenuRequested.connect(self._header_menu)
+        h.sectionClicked.connect(self._on_header_click)
+        h.sectionResized.connect(lambda *_: self._sync_footer())
+        h.sectionMoved.connect(lambda *_: self._sync_footer())
+        self.table.horizontalScrollBar().valueChanged.connect(self._sync_scroll)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._context_menu)
+        self.table.doubleClicked.connect(self._on_double)
+        self.table.clicked.connect(self._on_clicked)
+        self.table.setMouseTracking(True)
+        self.table.viewport().installEventFilter(self)       # مؤشر اليد فوق خلايا الروابط
+        self.table.selectionModel().selectionChanged.connect(self._on_selection)
+        lay.addWidget(self.table, 1)
+
+        self.footer = QTableWidget(1, len(columns))        # صف الإجماليات المثبّت
+        self.footer.setObjectName('gridFooter')
+        self.footer.horizontalHeader().setVisible(False)
+        self.footer.verticalHeader().setVisible(False)
+        self.footer.setFixedHeight(T.ROW_HEIGHT['compact'] + 4)
+        self.footer.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.footer.setSelectionMode(QAbstractItemView.NoSelection)
+        self.footer.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.footer.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        lay.addWidget(self.footer)
+
+        self.summary = QTableWidget(1, len(columns))       # صف «الإجمالي» (أرقام + تفقيط عند تمرير الماوس) — يُملأ عبر set_summary_row
+        self.summary.setObjectName('gridFooter')
+        self.summary.horizontalHeader().setVisible(False)
+        self.summary.verticalHeader().setVisible(False)
+        self.summary.setFixedHeight(T.ROW_HEIGHT['compact'] + 4)
+        self.summary.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.summary.setSelectionMode(QAbstractItemView.NoSelection)
+        self.summary.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.summary.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.summary.setVisible(False)
+        lay.addWidget(self.summary)
+
+        self.info = QLabel('')
+        self.info.setObjectName('ctxKey')
+        self.info.setContentsMargins(6, 2, 6, 2)
+        lay.addWidget(self.info)
+
+        for i, c in enumerate(columns):
+            if c.hidden:
+                self.table.setColumnHidden(i, True)
+            if c.width:
+                self.table.setColumnWidth(i, c.width)
+        self._restore_state()
+        self._refresh_footer_visibility()
+
+    # ---------------------------------------------------------------- واجهة عامة
+    def set_dense(self, row_h=22, font_pt=8.5):
+        """عرض مضغوط للجداول الكثيفة (شاشة القيود): صفوف أقصر، خط أصغر، حشوة أقل، وحدود أنحف."""
+        from PySide6.QtGui import QFont
+        f = QFont(self.table.font())
+        f.setPointSizeF(font_pt)
+        for w in (self.table, self.footer):
+            w.setFont(f)
+        hf = QFont(f)
+        hf.setBold(True)
+        self.table.horizontalHeader().setFont(hf)
+        self.table.verticalHeader().setDefaultSectionSize(row_h)
+        self.table.horizontalHeader().setFixedHeight(row_h + 2)
+        self.footer.verticalHeader().setDefaultSectionSize(row_h)
+        self.footer.setFixedHeight(row_h + 4)
+        self.table.setStyleSheet(
+            'QTableView::item { padding: 0 3px; }'
+            'QHeaderView::section { padding: 1px 4px; }')       # الألوان من القالب العام (يعمل في الوضعين الفاتح والداكن)
+        self.search.setMaximumHeight(row_h + 2)
+        self._sync_footer()
+
+    def set_free_resize(self):
+        """كل الأعمدة قابلة للسحب بحرية ولا عمود يتمدد تلقائيًا: يتبع حدّ العمود المؤشر في الاتجاهين.
+        (عمود «Stretch» في جدول من اليمين لليسار يجعل الحد يتحرك عكس السحب.)"""
+        from PySide6.QtWidgets import QHeaderView
+        h = self.table.horizontalHeader()
+        h.setStretchLastSection(False)
+        for i in range(len(self.columns)):
+            h.setSectionResizeMode(i, QHeaderView.Interactive)
+        self._sync_footer()
+
+    def set_summary_row(self, cells, label='الإجمالي'):
+        """صف ملخص مسطّر أسفل الجدول: cells = {مفتاح العمود: (نص الرقم، تلميح التفقيط)}؛ None/فارغ يُخفي الصف.
+        الرقم يُعرض بخط عريض، ويظهر المبلغ كتابةً عند تمرير الماوس فوقه."""
+        if not cells:
+            self.summary.setVisible(False)
+            return
+        pal = T.palette(self.model.mode)
+        for i, c in enumerate(self.columns):
+            if i == 0:
+                it = QTableWidgetItem(label)
+            elif c.key in cells:
+                txt, tip = cells[c.key]
+                it = QTableWidgetItem(txt)
+                it.setTextAlignment(int(Qt.AlignLeft | Qt.AlignVCenter))
+                if tip:
+                    it.setToolTip(tip)
+            else:
+                it = QTableWidgetItem('')
+            bg, fg = TC.summary_value_colors(pal) if (i != 0 and c.key in cells) else TC.total_label_colors(pal)
+            it.setBackground(QBrush(QColor(bg if (i == 0 or c.key in cells) else pal['surface2']))); it.setForeground(QBrush(QColor(fg)))
+            f = it.font(); f.setBold(True); it.setFont(f)
+            self.summary.setItem(0, i, it)
+        self.summary.setVisible(True)
+        self._sync_footer()
+
+    def set_stretch_column(self, key):
+        """يجعل عمودًا واحدًا (عادةً الاسم/البيان) يتمدد ليملأ العرض، وبقية الأعمدة بعرضها المحدد؛
+        بدل السلوك الافتراضي الذي يمدّد آخر عمود (فيتضخم عمود «نشط» مثلًا)."""
+        from PySide6.QtWidgets import QHeaderView
+        idx = next((i for i, c in enumerate(self.columns) if c.key == key), None)
+        if idx is None:
+            return
+        h = self.table.horizontalHeader()
+        h.setStretchLastSection(False)
+        for i in range(len(self.columns)):
+            h.setSectionResizeMode(i, QHeaderView.Interactive)
+        h.setSectionResizeMode(idx, QHeaderView.Stretch)
+        self._sync_footer()
+
+    def set_rows(self, rows):
+        self._rows = list(rows)
+        self._reapply()
+
+    def set_context_provider(self, fn):
+        """fn(rows: list[dict]) → list[(نص، callable)] لإجراءات قائمة السياق الخاصة بالصفحة."""
+        self._context_provider = fn
+
+    def set_row_tone(self, fn):
+        self.model.row_tone = fn
+        self.table.viewport().update()
+
+    def set_mode(self, mode):
+        self.model.mode = mode
+        self.table.viewport().update()
+
+    def set_group(self, key):
+        self.model.group_key = key
+        self._reapply()
+
+    def selected_rows(self):
+        out, seen = [], set()
+        for ix in sorted(self.table.selectionModel().selectedIndexes(), key=lambda i: i.row()):
+            ri = self.model.row_index(ix.row())
+            if ri is not None and ri not in seen:
+                seen.add(ri)
+                out.append(self._rows[ri])
+        return out
+
+    # ---------------------------------------------------------------- تحديد الخلايا وطباعة المحدد
+    def enable_cell_selection(self, on=True):
+        """تحديد خلايا/أعمدة/صفوف (نقر على رأس العمود يحدّد العمود، وعلى رقم الصف يحدّد الصف، وسحب أو Ctrl لمتعدد).
+        في هذا الوضع لا يفرز نقر الرأس؛ الفرز من قائمة الرأس (زر يمين)."""
+        self._cell_mode = bool(on)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectItems if on else QAbstractItemView.SelectRows)
+        self.table.verticalHeader().setVisible(bool(on))
+
+    def cell_mode(self):
+        return getattr(self, '_cell_mode', False)
+
+    def set_print_context(self, fn):
+        """fn() → مواصفة التقرير الأصلية (للترويسة: شركة/فرع/فترة/عنوان) أو None."""
+        self._print_ctx = fn
+
+    def print_base(self):
+        try:
+            return (getattr(self, '_print_ctx', None) or (lambda: None))() or {}
+        except Exception:  # noqa: BLE001 — الترويسة مساعدة؛ تُطبع الطباعة بدونها
+            return {}
+
+    def print_title(self):
+        return self.grid_id.replace('_', ' ') if self.grid_id else 'جدول'
+
+    def visible_keys(self):
+        h = self.table.horizontalHeader()
+        out = []
+        for v in range(len(self.columns)):
+            i = h.logicalIndex(v)
+            if not self.table.isColumnHidden(i):
+                out.append(self.columns[i].key)
+        return out
+
+    def saved_print_keys(self):
+        v = self._qs().value(f'printcols/{self.grid_id}') if self.grid_id else None
+        if isinstance(v, str):
+            v = [v]
+        return list(v) if v else []
+
+    def displayed_rows(self):
+        return [self._rows[i] for i in self.model.view]
+
+    def selection_picks(self):
+        """(الصفوف المحددة بترتيب العرض، مفاتيح الخلايا المحددة لكل صف، مجموعة مفاتيح الأعمدة المحددة)."""
+        by_row = {}
+        for ix in self.table.selectionModel().selectedIndexes():
+            if self.model.row_index(ix.row()) is None:
+                continue
+            by_row.setdefault(ix.row(), set()).add(self.columns[ix.column()].key)
+        order = sorted(by_row)
+        rows = [self._rows[self.model.row_index(r)] for r in order]
+        cells = [by_row[r] for r in order]
+        used = set().union(*cells) if cells else set()
+        return rows, cells, used
+
+    def print_selected(self):
+        from .grid_print import PrintSelectionDialog
+        PrintSelectionDialog(self).exec()
+
+    def select_where(self, pred):
+        """يحدّد أول صف ظاهر يحقق pred(row) ويمرّر إليه. يُرجع True إن وُجد."""
+        for disp in range(self.model.rowCount()):
+            ri = self.model.row_index(disp)
+            if ri is None:
+                continue
+            try:
+                hit = bool(pred(self._rows[ri]))
+            except Exception:  # noqa: BLE001 — صف ناقص المفتاح لا يوقف التحديد
+                hit = False
+            if hit:
+                self.table.selectRow(disp)
+                ix = self.model.index(disp, 0)
+                self.table.setCurrentIndex(ix)
+                self.table.scrollTo(ix)
+                return True
+        return False
+
+    def current_row(self):
+        ix = self.table.currentIndex()
+        if not ix.isValid():
+            return None
+        ri = self.model.row_index(ix.row())
+        return self._rows[ri] if ri is not None else None
+
+    def export_csv(self, path=None, only_selected=False):
+        if path is None:
+            path, _ = QFileDialog.getSaveFileName(self, 'تصدير CSV', f'{self.grid_id or "data"}.csv', 'CSV (*.csv)')
+            if not path:
+                return None
+        idx = None
+        if only_selected:
+            idx = [self._rows.index(r) for r in self.selected_rows()]
+        else:
+            idx = list(self.model.view)
+        with open(path, 'wb') as f:
+            f.write(G.to_csv(self._rows, self.columns, idx))
+        return path
+
+    # ---------------------------------------------------------------- داخلي
+    def _reapply(self):
+        view = G.apply(self._rows, self.columns, self._quick, self._col_filters, self._sort_key, self._desc)
+        self.model.set_data(self._rows, view)
+        self._update_info()
+        self._update_footer()
+        names = {c.key: c.label for c in self.columns}
+        self.filters_lbl.setText('  '.join(f'[{names.get(k, k)}: {v}]' for k, v in self._col_filters.items() if v))
+
+    def _on_quick(self, text):
+        self._quick = text.strip()
+        self._reapply()
+
+    def _on_header_click(self, section):
+        if self.cell_mode():
+            return                                  # نقر الرأس = تحديد العمود
+        self._sort_by(section, None)
+
+    def _sort_by(self, section, desc):
+        key = self.columns[section].key
+        self._desc = (not self._desc) if desc is None and self._sort_key == key else bool(desc)
+        self._sort_key = key
+        self.table.horizontalHeader().setSortIndicator(section, Qt.DescendingOrder if self._desc else Qt.AscendingOrder)
+        self.table.horizontalHeader().setSortIndicatorShown(True)
+        self._reapply()
+
+    def _header_menu(self, pos):
+        sec = self.table.horizontalHeader().logicalIndexAt(pos)
+        if sec < 0:
+            return
+        col = self.columns[sec]
+        m = QMenu(self)
+        a_f = m.addAction(f'تصفية «{col.label}»…')
+        a_c = m.addAction('إلغاء كل المرشحات')
+        a_g = m.addAction(f'تجميع حسب «{col.label}»')
+        a_n = m.addAction('إلغاء التجميع')
+        a_sa = m.addAction(f'فرز تصاعدي «{col.label}»')
+        a_sd = m.addAction(f'فرز تنازلي «{col.label}»')
+        m.addSeparator()
+        a_pp = m.addAction('طباعة المحدد…')
+        a_all = m.addAction('إظهار كل الأعمدة')
+        m.addSeparator()
+        cols_menu = m.addMenu('الأعمدة الظاهرة')
+        for i, c in enumerate(self.columns):
+            act = cols_menu.addAction(c.label)
+            act.setCheckable(True)
+            act.setChecked(not self.table.isColumnHidden(i))
+            act.toggled.connect(lambda on, i=i: (self.table.setColumnHidden(i, not on), self._save_state(), self._sync_footer()))
+        chosen = m.exec(self.table.horizontalHeader().mapToGlobal(pos))
+        if chosen is a_f:
+            text, ok = QInputDialog.getText(self, 'تصفية', f'القيمة المطلوبة في «{col.label}»:', text=self._col_filters.get(col.key, ''))
+            if ok:
+                self._col_filters[col.key] = text.strip()
+                self._reapply()
+        elif chosen is a_c:
+            self._col_filters.clear()
+            self.search.clear()
+            self._reapply()
+        elif chosen is a_g:
+            self.set_group(col.key)
+        elif chosen is a_n:
+            self.set_group(None)
+        elif chosen is a_sa:
+            self._sort_by(sec, False)
+        elif chosen is a_sd:
+            self._sort_by(sec, True)
+        elif chosen is a_pp:
+            self.print_selected()
+        elif chosen is a_all:
+            for i in range(len(self.columns)):
+                self.table.setColumnHidden(i, False)
+            self._save_state()
+            self._sync_footer()
+
+    def _context_menu(self, pos):
+        rows = self.selected_rows()
+        m = QMenu(self)
+        extra = self._context_provider(rows) if (self._context_provider and rows) else []
+        for text, fn in extra:
+            m.addAction(text).triggered.connect(lambda _c=False, fn=fn: fn())
+        if extra:
+            m.addSeparator()
+        a_cell = m.addAction('نسخ الخلية')
+        a_row = m.addAction('نسخ السجل')
+        a_exp = m.addAction('تصدير المعروض إلى CSV…')
+        a_sel = m.addAction('تصدير المحدد إلى CSV…')
+        a_sel.setEnabled(bool(rows))
+        m.addSeparator()
+        a_prn = m.addAction('طباعة المحدد…')
+        a_prn.setEnabled(bool(rows))
+        a_prn_all = m.addAction('طباعة المعروض / اختيار الأعمدة…')
+        chosen = m.exec(self.table.viewport().mapToGlobal(pos))
+        cb = QGuiApplication.clipboard()
+        ix = self.table.indexAt(pos)
+        if chosen is a_cell and ix.isValid():
+            cb.setText(str(self.model.data(ix, Qt.DisplayRole) or ''))
+        elif chosen is a_row and rows:
+            cb.setText('\t'.join(G.display(rows[0].get(c.key), c) for c in self.columns if not c.hidden))
+        elif chosen is a_exp:
+            self.export_csv()
+        elif chosen is a_sel:
+            self.export_csv(only_selected=True)
+        elif chosen is a_prn or chosen is a_prn_all:
+            self.print_selected()
+
+    def eventFilter(self, obj, ev):
+        if obj is self.table.viewport() and ev.type() == QEvent.MouseMove and any(c.link for c in self.columns):
+            ix = self.table.indexAt(ev.position().toPoint())
+            hand = False
+            if ix.isValid() and self.columns[ix.column()].link:
+                ri = self.model.row_index(ix.row())
+                hand = ri is not None and self._rows[ri].get(self.columns[ix.column()].key) not in (None, '')
+            if hand:
+                self.table.viewport().setCursor(Qt.PointingHandCursor)
+            else:
+                self.table.viewport().unsetCursor()
+        return super().eventFilter(obj, ev)
+
+    def _on_clicked(self, ix):
+        """نقرة واحدة على خلية رابط (بلا Ctrl/Shift حتى لا يتعطل التحديد المتعدد) ← linkClicked."""
+        if not ix.isValid() or not self.columns[ix.column()].link:
+            return
+        if QGuiApplication.keyboardModifiers() & (Qt.ControlModifier | Qt.ShiftModifier):
+            return
+        ri = self.model.row_index(ix.row())
+        if ri is None:
+            return
+        row, key = self._rows[ri], self.columns[ix.column()].key
+        if row.get(key) in (None, ''):
+            return
+        self.linkClicked.emit(row, key)
+
+    def _on_double(self, ix):
+        ri = self.model.row_index(ix.row())
+        if ri is None:
+            return
+        row = self._rows[ri]
+        self.drilldown.emit(row, self.columns[ix.column()].key)
+        self.rowActivated.emit(row)
+
+    def _on_selection(self, *_):
+        rows = self.selected_rows()
+        self._update_info()
+        self.selectionChangedRows.emit(rows)
+
+    def _update_info(self):
+        n = len(self.model.view)
+        sel = self.selected_rows()
+        txt = f'{n} {S.GENERIC["records"]}'
+        if self._quick or any(self._col_filters.values()):
+            txt += f' (من {len(self._rows)})'
+        if sel:
+            txt += f'  |  {S.GENERIC["selected"]}: {len(sel)}'
+            tots = G.totals(self._rows, self.columns, [self._rows.index(r) for r in sel])
+            if tots:
+                first = next(iter(tots))
+                label = next(c.label for c in self.columns if c.key == first)
+                txt += f'  |  {S.GENERIC["sum_selected"]} ({label}): {fmt.fmt_money(tots[first])}'
+        self.info.setText(txt)
+
+    def _refresh_footer_visibility(self):
+        self.footer.setVisible(any(c.total for c in self.columns))
+
+    def _update_footer(self):
+        tots = G.totals(self._rows, self.columns, list(self.model.view))
+        pal = T.palette(self.model.mode)
+        for i, c in enumerate(self.columns):
+            if i == 0:
+                it = QTableWidgetItem('الإجماليات')
+            elif c.key in tots:
+                it = QTableWidgetItem(fmt.fmt_money(tots[c.key], c.places if c.kind == 'money' else 3))
+                it.setTextAlignment(int(Qt.AlignLeft | Qt.AlignVCenter))
+            else:
+                it = QTableWidgetItem('')
+            if i == 0:
+                bg, fg = TC.total_label_colors(pal)
+            elif c.key in tots:
+                bg, fg = TC.total_cell_colors(c.key, pal)
+            else:
+                bg, fg = pal['surface2'], pal['text']
+            it.setBackground(QBrush(QColor(bg))); it.setForeground(QBrush(QColor(fg)))
+            f = it.font()
+            f.setBold(True)
+            it.setFont(f)
+            self.footer.setItem(0, i, it)
+        self._sync_footer()
+
+    def _sync_footer(self):
+        if not hasattr(self, 'footer'):
+            return
+        h = self.table.horizontalHeader()
+        for ft in (self.footer, getattr(self, 'summary', None)):
+            if ft is None:
+                continue
+            for i in range(len(self.columns)):
+                ft.setColumnHidden(i, self.table.isColumnHidden(i))
+                ft.setColumnWidth(i, self.table.columnWidth(i))
+            fh = ft.horizontalHeader()
+            for visual in range(len(self.columns)):
+                logical = h.logicalIndex(visual)
+                fh.moveSection(fh.visualIndex(logical), visual)
+
+    def _sync_scroll(self, value):
+        self.footer.horizontalScrollBar().setValue(value)
+        if hasattr(self, 'summary'):
+            self.summary.horizontalScrollBar().setValue(value)
+
+    # ---- حفظ تخصيص الأعمدة
+    def _qs(self):
+        return QSettings('AlhisabatPro', 'ui')
+
+    def _save_state(self):
+        if self.grid_id:
+            self._qs().setValue(f'grid/{self.grid_id}', self.table.horizontalHeader().saveState())
+
+    def _restore_state(self):
+        if self.grid_id:
+            st = self._qs().value(f'grid/{self.grid_id}')
+            if st:
+                self.table.horizontalHeader().restoreState(st)
+
+    def closeEvent(self, e):
+        self._save_state()
+        super().closeEvent(e)
+
+    def hideEvent(self, e):
+        self._save_state()
+        super().hideEvent(e)
+
+
+def format_minor(value, places=2):
+    """تنسيق مبلغ مخزَّن بالوحدة الصغرى (قروش/هللات) كنص عملة؛ None أو '' يُعرضان فارغين."""
+    from alhisabat.ui.core.format import fmt_money
+    if value is None or value == '':
+        return ''
+    return fmt_money(value, places=places, minor=True)

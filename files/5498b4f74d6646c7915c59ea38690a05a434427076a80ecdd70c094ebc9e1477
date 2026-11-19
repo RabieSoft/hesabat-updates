@@ -1,0 +1,84 @@
+"""بطاقة القيد البسيط (تصميم 2.1.8): الحساب المدين والدائن بالتوازي (المدين يمين)، ثم صف المبلغ وإلى جانبه زر «حفظ»
+مباشرة (المبلغ كبير وواضح + رمز العملة + حفظ + عكس الطرفين) لتسريع الإدخال المتتابع، ثم بيان السطرين."""
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton
+
+from alhisabat.ui.components.basic import MoneyEdit
+from alhisabat.ui.components.pickers import SearchPicker
+
+_AMOUNT_QSS = 'QLineEdit { font-size: 17px; font-weight: bold; padding: 4px 10px; }'
+
+
+def make_save_button(ed, text='💾 حفظ'):
+    """زر «حفظ» (يحفظ ويُبقي النافذة مفتوحة): يُنشأ مخفيًا ويظهر عند `enable_stay_save` في المحرر."""
+    b = QPushButton(text)
+    b.setProperty('primary', True)
+    b.setAutoDefault(False)
+    b.setMinimumHeight(38)
+    b.setMinimumWidth(120)
+    b.setCursor(Qt.PointingHandCursor)
+    b.setToolTip('يحفظ القيد كمسودة ويبقي النافذة مفتوحة لإدخال القيد التالي (Ctrl+S أو Enter في خانة المبلغ)')
+    b.setVisible(False)
+    b.clicked.connect(ed._save_stay)
+    return b
+
+
+def build_simple_card(ed, session):
+    """يُنشئ الحقول على المحرر ed (s_from, s_to, s_amount, s_cur_lbl, btn_stay, s_memo, lbl_from, lbl_to, btn_swap) ويعيد البطاقة."""
+    card = QFrame()
+    card.setObjectName('panel')
+    card.setFrameShape(QFrame.StyledPanel)
+    card.setMaximumWidth(820)
+    g = QGridLayout(card)
+    g.setContentsMargins(22, 18, 22, 18)
+    g.setHorizontalSpacing(18)
+    g.setVerticalSpacing(8)
+    g.setColumnStretch(0, 1)
+    g.setColumnStretch(1, 1)
+    ed.s_from = SearchPicker(lambda: session.lookup_accounts(), placeholder='ابحث عن الحساب المدين…')
+    ed.s_to = SearchPicker(lambda: session.lookup_accounts(), placeholder='ابحث عن الحساب الدائن…')
+    for p in (ed.s_from, ed.s_to):
+        p.setMinimumHeight(34)
+    ed.s_amount = MoneyEdit()
+    ed.s_amount.setMinimumHeight(38)
+    ed.s_amount.setMinimumWidth(200)
+    ed.s_amount.setMaximumWidth(260)
+    ed.s_amount.setStyleSheet(_AMOUNT_QSS)
+    ed.s_cur_lbl = QLabel('')                       # رمز عملة القيد بجانب المبلغ
+    ed.s_cur_lbl.setObjectName('ctxKey')
+    ed.btn_stay = make_save_button(ed)
+    ed.s_memo = QLineEdit()
+    ed.s_memo.setMinimumHeight(32)
+    ed.s_memo.setPlaceholderText('اختياري')
+    ed.lbl_from, ed.lbl_to = QLabel('من حساب (مدين) *'), QLabel('إلى حساب (دائن) *')
+    for lb in (ed.lbl_from, ed.lbl_to):
+        lb.setObjectName('panelTitle')
+    ed.btn_swap = QPushButton('⇄ عكس الطرفين')
+    ed.btn_swap.setAutoDefault(False)
+    ed.btn_swap.setMinimumHeight(34)
+    ed.btn_swap.setToolTip('يبدّل الحساب المدين بالدائن')
+    ed.btn_swap.clicked.connect(ed._swap_simple)
+    g.addWidget(ed.lbl_from, 0, 0)
+    g.addWidget(ed.lbl_to, 0, 1)
+    g.addWidget(ed.s_from, 1, 0)
+    g.addWidget(ed.s_to, 1, 1)
+    lbl_amt = QLabel('العملة والمبلغ *' if getattr(ed, 'cur', None) is not None else 'المبلغ *')
+    lbl_amt.setObjectName('panelTitle')
+    g.addWidget(lbl_amt, 2, 0, 1, 2)
+    row = QHBoxLayout()                              # (العملة ← ) المبلغ ← حفظ ← عكس (من اليمين في الاتجاه العربي)
+    row.setSpacing(10)
+    ed._simple_amount_row = row                      # يضع المحرر فيه صندوق العملة في أول موضع (يمين المبلغ)
+    row.addWidget(ed.s_amount)
+    if getattr(ed, 'cur', None) is None:             # محرر بلا صندوق عملة: نُبقي رمز العملة نصًا بجانب المبلغ كما كان
+        row.addWidget(ed.s_cur_lbl)
+    else:
+        ed.s_cur_lbl.setVisible(False)
+    row.addWidget(ed.btn_stay)
+    row.addStretch(1)
+    row.addWidget(ed.btn_swap)
+    g.addLayout(row, 3, 0, 1, 2)
+    lbl_memo = QLabel('بيان السطرين')
+    lbl_memo.setObjectName('ctxKey')
+    g.addWidget(lbl_memo, 4, 0, 1, 2)
+    g.addWidget(ed.s_memo, 5, 0, 1, 2)
+    return card

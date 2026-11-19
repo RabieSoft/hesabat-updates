@@ -1,0 +1,32 @@
+"""إعدادات الهاتف (الإصدار 8): ما يعرضه المكتبي لشاشة «الإعدادات» في الهاتف.
+
+- `policies`: سياسات المكتبي للعرض فقط (يفرضها المكتبي لا الهاتف): بيع بدون رصيد، الحد الائتماني، قيد يدوي على الأطراف،
+  مراجعة القيود. لا تُعدَّل من الهاتف أبدًا.
+- `defaults`: افتراضيات مقترحة يمكن للهاتف اعتمادها محليًا (العملة الأساسية، مفتاح الدولة لواتساب).
+  المخزن والصندوق الافتراضيان وتفضيلات العرض يحفظها الهاتف على جهازه ولا تُرسل للمكتبي.
+"""
+from alhisabat.accounting import journal_engine as je
+from alhisabat.business import sales
+
+_CREDIT_LABELS = {"block": "منع التجاوز", "warn": "تنبيه فقط", "off": "بلا حد"}
+
+
+def phone_settings(conn, company_id, branch_id, base_currency=""):
+    sp = sales.get_settings(conn, company_id)
+    js = je.get_settings(conn, company_id)
+    try:
+        from alhisabat.messaging import queue as wa_queue
+        cc = wa_queue.get_settings(conn, branch_id).get("country_code", "+967") or "+967"
+    except Exception:
+        cc = "+967"
+    mode = sp.get("credit_limit_mode", "block")
+    return {
+        "policies": {
+            "allow_negative_stock": bool(sp.get("allow_negative_stock")),
+            "credit_limit_mode": mode,
+            "credit_limit_label": _CREDIT_LABELS.get(mode, mode),
+            "allow_manual_party_entries": bool(js.get("allow_manual_party_entries")),
+            "require_review": bool(js.get("require_review")),
+        },
+        "defaults": {"base_currency": base_currency, "wa_country_code": cc},
+    }

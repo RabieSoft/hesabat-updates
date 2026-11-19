@@ -1,0 +1,159 @@
+import hashlib, hmac, os
+from datetime import datetime, timedelta, timezone
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.audit import audit
+from alhisabat.database.tx import transaction
+from alhisabat.security import permissions
+
+ITERATIONS = 200_000
+MAX_ATTEMPTS = 5
+LOCK_MINUTES = 15
+MIN_PASSWORD = 8
+
+
+def hash_password(pw: str) -> str:
+    salt = os.urandom(16)
+    h = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, ITERATIONS)
+    return f"pbkdf2_sha256${ITERATIONS}${salt.hex()}${h.hex()}"
+
+
+def verify_password(pw: str, stored: str) -> bool:
+    try:
+        algo, it, salt, h = stored.split("$")
+        calc = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), int(it))
+        return algo == "pbkdf2_sha256" and hmac.compare_digest(calc.hex(), h)
+    except Exception:
+        return False
+
+
+def _check_pw(pw):
+    if len(pw or "") < MIN_PASSWORD:
+        raise AccountingError(f"كلمة المرور يجب ألا تقل عن {MIN_PASSWORD} أحرف")
+
+
+def bootstrap_admin(conn, company_id, username, full_name, password):
+    """إنشاء أول مدير للنظام؛ مسموح فقط إذا لم يوجد أي مستخدم."""
+    _check_pw(password)
+    if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]:
+        raise AccountingError("يوجد مستخدمون بالفعل: استخدم إنشاء مستخدم بصلاحية إدارية")
+    with transaction(conn):
+        uid = conn.execute("INSERT INTO users(username,full_name,password_hash) VALUES(?,?,?)",
+                           (username, full_name, hash_password(password))).lastrowid
+        conn.execute("INSERT INTO user_roles VALUES(?,?,1)", (uid, company_id))
+        audit.log(conn, uid, "bootstrap_admin", "users", uid, after={"username": username})
+    return uid
+
+
+def create_user(conn, actor_id, company_id, username, full_name, password, role_id):
+    permissions.require(conn, actor_id, company_id, "user.manage")
+    _check_pw(password)
+    with transaction(conn):
+        uid = conn.execute("INSERT INTO users(username,full_name,password_hash) VALUES(?,?,?)",
+                           (username, full_name, hash_password(password))).lastrowid
+        conn.execute("INSERT INTO user_roles VALUES(?,?,?)", (uid, company_id, role_id))
+        audit.log(conn, actor_id, "create_user", "users", uid, after={"username": username, "role": role_id})
+    return uid
+
+
+def assign_role(conn, actor_id, company_id, user_id, role_id):
+    permissions.require(conn, actor_id, company_id, "user.manage")
+    with transaction(conn):
+        conn.execute("INSERT OR IGNORE INTO user_roles VALUES(?,?,?)", (user_id, company_id, role_id))
+        audit.log(conn, actor_id, "assign_role", "user_roles", user_id, after={"role": role_id, "company": company_id})
+
+
+def restrict_to_branch(conn, actor_id, company_id, user_id, branch_id):
+    permissions.require(conn, actor_id, company_id, "user.manage")
+    with transaction(conn):
+        conn.execute("INSERT OR IGNORE INTO user_branch_access VALUES(?,?)", (user_id, branch_id))
+        audit.log(conn, actor_id, "restrict_branch", "user_branch_access", user_id, after={"branch": branch_id})
+
+
+def set_active(conn, actor_id, company_id, user_id, active: bool):
+    permissions.require(conn, actor_id, company_id, "user.manage")
+    if not active:
+        # حماية من القفل الذاتي: تعطيل المستخدم الحالي أو آخر مدير فعّال يُسقط كل صلاحيات النظام
+        if actor_id == user_id:
+            raise AccountingError("لا يمكنك تعطيل حسابك الحالي. سجّل الدخول بمدير آخر لتعطيله.")
+        target_manages = conn.execute(
+            "SELECT 1 FROM user_roles ur JOIN role_permissions rp ON rp.role_id=ur.role_id AND rp.permission_code='user.manage' "
+            "WHERE ur.user_id=? AND ur.company_id=? LIMIT 1", (user_id, company_id)).fetchone()
+        if target_manages:
+            others = conn.execute(
+                "SELECT COUNT(DISTINCT u.id) FROM users u JOIN user_roles ur ON ur.user_id=u.id AND ur.company_id=? "
+                "JOIN role_permissions rp ON rp.role_id=ur.role_id AND rp.permission_code='user.manage' "
+                "WHERE u.is_active=1 AND u.id<>?", (company_id, user_id)).fetchone()[0]
+            if not others:
+                raise AccountingError("لا يمكن تعطيل آخر مدير فعّال في النظام؛ أنشئ مديرًا آخر أولًا.")
+    with transaction(conn):
+        conn.execute("UPDATE users SET is_active=? WHERE id=?", (int(active), user_id))
+        audit.log(conn, actor_id, "set_active", "users", user_id, after={"active": active})
+
+
+def update_user(conn, actor_id, company_id, user_id, username, full_name, new_password=None):
+    """تعديل بيانات مستخدم (اسم الدخول، الاسم الكامل، وكلمة مرور جديدة اختيارية) بصلاحية إدارة المستخدمين. كلمة المرور لا تُسجَّل في التدقيق."""
+    permissions.require(conn, actor_id, company_id, "user.manage")
+    username, full_name = (username or "").strip(), (full_name or "").strip()
+    if not username:
+        raise AccountingError("اسم المستخدم مطلوب")
+    if not full_name:
+        raise AccountingError("الاسم الكامل مطلوب")
+    cur = conn.execute("SELECT username, full_name FROM users WHERE id=?", (user_id,)).fetchone()
+    if cur is None:
+        raise AccountingError("المستخدم غير موجود")
+    if conn.execute("SELECT 1 FROM users WHERE username=? AND id<>?", (username, user_id)).fetchone():
+        raise AccountingError("اسم المستخدم مستخدم لحساب آخر")
+    if new_password:
+        _check_pw(new_password)
+    with transaction(conn):
+        conn.execute("UPDATE users SET username=?, full_name=? WHERE id=?", (username, full_name, user_id))
+        if new_password:
+            conn.execute("UPDATE users SET password_hash=?, failed_attempts=0, locked_until=NULL WHERE id=?", (hash_password(new_password), user_id))
+        audit.log(conn, actor_id, "update_user", "users", user_id,
+                  before={"username": cur["username"], "full_name": cur["full_name"]},
+                  after={"username": username, "full_name": full_name, "password_changed": bool(new_password)})
+
+
+def update_own_profile(conn, user_id, full_name, current_password, new_password=None):
+    """تعديل المستخدم لبياناته (الاسم الكامل وكلمة المرور) بعد التحقق من كلمة مروره الحالية؛ لا يغيّر اسم الدخول ولا الدور."""
+    full_name = (full_name or "").strip()
+    if not full_name:
+        raise AccountingError("الاسم الكامل مطلوب")
+    u = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    if u is None or not u["is_active"]:
+        raise AccountingError("المستخدم غير موجود أو معطّل")
+    if not u["password_hash"] or not verify_password(current_password or "", u["password_hash"]):
+        raise AccountingError("كلمة المرور الحالية غير صحيحة")
+    if new_password:
+        _check_pw(new_password)
+    with transaction(conn):
+        conn.execute("UPDATE users SET full_name=? WHERE id=?", (full_name, user_id))
+        if new_password:
+            conn.execute("UPDATE users SET password_hash=? WHERE id=?", (hash_password(new_password), user_id))
+        audit.log(conn, user_id, "update_own_profile", "users", user_id,
+                  before={"full_name": u["full_name"]}, after={"full_name": full_name, "password_changed": bool(new_password)})
+
+
+def authenticate(conn, username, password, now=None):
+    """يرجع user_id أو يرفع AccountingError. قفل مؤقت بعد محاولات فاشلة متكررة."""
+    now = now or datetime.now(timezone.utc)
+    u = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+    generic = AccountingError("اسم المستخدم أو كلمة المرور غير صحيحة")
+    if u is None:
+        audit.log(conn, None, "login_failed", "users", None, after={"username": username})
+        raise generic
+    if not u["is_active"]:
+        audit.log(conn, u["id"], "login_denied_inactive", "users", u["id"])
+        raise AccountingError("الحساب معطّل")
+    if u["locked_until"] and u["locked_until"] > now.isoformat():
+        audit.log(conn, u["id"], "login_denied_locked", "users", u["id"])
+        raise AccountingError("الحساب مقفل مؤقتًا بسبب محاولات فاشلة متكررة")
+    if not u["password_hash"] or not verify_password(password, u["password_hash"]):
+        n = u["failed_attempts"] + 1
+        lock = (now + timedelta(minutes=LOCK_MINUTES)).isoformat() if n >= MAX_ATTEMPTS else None
+        conn.execute("UPDATE users SET failed_attempts=?,locked_until=? WHERE id=?", (0 if lock else n, lock, u["id"]))
+        audit.log(conn, u["id"], "login_failed", "users", u["id"])
+        raise generic
+    conn.execute("UPDATE users SET failed_attempts=0,locked_until=NULL WHERE id=?", (u["id"],))
+    audit.log(conn, u["id"], "login_ok", "users", u["id"])
+    return u["id"]

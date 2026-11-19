@@ -1,0 +1,115 @@
+from datetime import date, timedelta
+from alhisabat.database.tx import transaction
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.audit import audit
+from alhisabat.security import permissions
+
+AR_MONTHS = ["يناير", "فبراير", "مارس", "أبريل", "مايو", "يونيو",
+             "يوليو", "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر"]
+
+
+def _add_month(d, n=1):
+    m = d.month - 1 + n
+    return date(d.year + m // 12, m % 12 + 1, 1)
+
+
+def create_fiscal_year(conn, company_id, name, start: date, end: date, user_id=None):
+    """ينشئ سنة مالية وفتراتها الشهرية (حسب تاريخ البداية)."""
+    permissions.require(conn, user_id, company_id, "fiscalyear.create")
+    if start > end:
+        raise AccountingError("تاريخ بداية السنة يجب أن يسبق تاريخ نهايتها")
+    overlap = conn.execute(
+        "SELECT 1 FROM fiscal_years WHERE company_id=? AND start_date<=? AND end_date>=? LIMIT 1",
+        (company_id, end.isoformat(), start.isoformat())).fetchone()
+    if overlap:
+        raise AccountingError("توجد سنة مالية متداخلة مع الفترة المطلوبة")
+    with transaction(conn):
+        y = conn.execute("INSERT INTO fiscal_years(company_id,name,start_date,end_date) VALUES(?,?,?,?)",
+                         (company_id, name, start.isoformat(), end.isoformat())).lastrowid
+        cur, no = start, 1
+        while cur <= end:
+            nxt = _add_month(cur.replace(day=1))
+            if cur.day != 1:  # بداية غير أول الشهر: تنتهي الفترة قبل نفس اليوم من الشهر التالي
+                try:
+                    nxt = nxt.replace(day=cur.day)
+                except ValueError:
+                    nxt = _add_month(nxt)
+            p_end = min(nxt - timedelta(days=1), end)
+            conn.execute("INSERT INTO fiscal_periods(fiscal_year_id,period_no,name,start_date,end_date) VALUES(?,?,?,?,?)",
+                         (y, no, AR_MONTHS[cur.month - 1], cur.isoformat(), p_end.isoformat()))
+            cur, no = p_end + timedelta(days=1), no + 1
+        audit.log(conn, user_id, "create_fiscal_year", "fiscal_years", y, after={"name": name})
+    return y
+
+
+def find_period(conn, company_id, entry_date: str):
+    r = conn.execute(
+        "SELECT p.id pid, y.id yid, p.status ps, y.status ys FROM fiscal_periods p "
+        "JOIN fiscal_years y ON y.id=p.fiscal_year_id "
+        "WHERE y.company_id=? AND ? BETWEEN p.start_date AND p.end_date", (company_id, entry_date)).fetchone()
+    if not r:
+        raise AccountingError("التاريخ خارج أي سنة/فترة مالية معرّفة")
+    return r
+
+
+def _company_of(conn, period_id):
+    r = conn.execute("SELECT y.company_id FROM fiscal_periods p JOIN fiscal_years y ON y.id=p.fiscal_year_id WHERE p.id=?", (period_id,)).fetchone()
+    if not r:
+        raise AccountingError("الفترة غير موجودة")
+    return r[0]
+
+
+def close_period(conn, period_id, user_id, allow_drafts=False):
+    """إغلاق فترة: يمنع الترحيل فيها. وجود مسودات يمنع الإغلاق ما لم يُسمح صراحةً (ويُسجَّل العدد في التدقيق)."""
+    permissions.require(conn, user_id, _company_of(conn, period_id), "period.close")
+    drafts = conn.execute("SELECT COUNT(*) FROM journal_entries WHERE period_id=? AND status='draft'", (period_id,)).fetchone()[0]
+    if drafts and not allow_drafts:
+        raise AccountingError(f"توجد {drafts} قيود مسودة في الفترة: رحّلها أو احذفها، أو أغلق مع السماح بالمسودات")
+    with transaction(conn):
+        conn.execute("UPDATE fiscal_periods SET status='closed',closed_by=?,closed_at=CURRENT_TIMESTAMP WHERE id=?",
+                     (user_id, period_id))
+        audit.log(conn, user_id, "close_period", "fiscal_periods", period_id, {"status": "open"},
+                  {"status": "closed", "drafts_left": drafts})
+
+
+def reopen_period(conn, period_id, user_id, reason):
+    if not reason or not reason.strip():
+        raise AccountingError("إعادة فتح الفترة تتطلب ذكر السبب")
+    permissions.require(conn, user_id, _company_of(conn, period_id), "period.reopen")
+    with transaction(conn):
+        conn.execute("UPDATE fiscal_periods SET status='open',closed_by=NULL,closed_at=NULL WHERE id=?", (period_id,))
+        audit.log(conn, user_id, "reopen_period", "fiscal_periods", period_id,
+                  {"status": "closed"}, {"status": "open"}, reason)
+
+
+def _year_after(prev_name, prev_end: date):
+    """(اسم، بداية، نهاية) للسنة التالية بنفس طول السنة السابقة (سنة كاملة من اليوم التالي)."""
+    start = prev_end + timedelta(days=1)
+    try:
+        nxt = start.replace(year=start.year + 1)
+    except ValueError:                       # 29 فبراير
+        nxt = start.replace(year=start.year + 1, day=28)
+    end = nxt - timedelta(days=1)
+    name = str(int(prev_name) + 1) if str(prev_name).strip().isdigit() else f"{prev_name} (التالية)"
+    return name, start, end
+
+
+def create_next_year(conn, company_id, user_id=None):
+    """ينشئ السنة التالية لآخر سنة معرّفة (إن وُجدت سنة). يعيد id السنة الجديدة أو None."""
+    last = conn.execute("SELECT * FROM fiscal_years WHERE company_id=? ORDER BY end_date DESC LIMIT 1", (company_id,)).fetchone()
+    if not last:
+        return None
+    name, start, end = _year_after(last["name"], date.fromisoformat(last["end_date"]))
+    return create_fiscal_year(conn, company_id, name, start, end, user_id=user_id)
+
+
+def ensure_year_covering(conn, company_id, user_id, on_date: date, max_years=2):
+    """إن كان التاريخ بعد نهاية آخر سنة معرّفة: تُنشأ السنوات اللازمة تلقائيًا (حتى max_years) كي لا يبقى البرنامج بلا سنة للتاريخ الحالي.
+    لا تفعل شيئًا إن كان التاريخ داخل سنة معرّفة أو قبل أولها. تُرجع قائمة ids السنوات المنشأة (فارغة إن لم يلزم/لم تُسمح)."""
+    made = []
+    for _ in range(max_years):
+        last = conn.execute("SELECT end_date FROM fiscal_years WHERE company_id=? ORDER BY end_date DESC LIMIT 1", (company_id,)).fetchone()
+        if not last or on_date.isoformat() <= last["end_date"]:
+            break
+        made.append(create_next_year(conn, company_id, user_id))
+    return made

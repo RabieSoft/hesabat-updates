@@ -1,0 +1,40 @@
+"""سعر الصنف للهاتف (عمود «السعر» في ملف الأصناف): سعر بيع الحبة إن وُجد، وإلا آخر سعر بيع، وإلا آخر سعر شراء.
+
+كل الأسعار بالوحدة الأساسية (الحبة) وبالعملة الأساسية: unit_price_minor × سعر صرف الفاتورة × 1000 ÷ معامل وحدة السطر.
+تُستخدم فواتير البيع/الشراء المرحّلة من نوع invoice فقط (المرتجعات والملغاة لا تحدد سعرًا).
+"""
+from decimal import Decimal, ROUND_HALF_UP
+
+_LAST = ("SELECT item_id, unit_price_minor, factor_milli, exchange_rate FROM ("
+         " SELECT l.item_id, l.unit_price_minor, l.factor_milli, i.exchange_rate,"
+         "  ROW_NUMBER() OVER (PARTITION BY l.item_id ORDER BY i.invoice_date DESC, i.id DESC, l.id DESC) AS rn"
+         " FROM {lines} l JOIN {inv} i ON i.id=l.invoice_id"
+         " WHERE i.company_id=? AND i.status='posted' AND i.doc_type='invoice' AND l.item_id IS NOT NULL"
+         "  AND l.factor_milli>0 AND l.unit_price_minor>0) WHERE rn=1")
+
+
+def _per_base_unit(r):
+    v = Decimal(r["unit_price_minor"]) * Decimal(str(r["exchange_rate"] or 1)) * Decimal(1000) / Decimal(r["factor_milli"])
+    return int(v.quantize(Decimal(1), ROUND_HALF_UP))
+
+
+def item_prices(conn, company_id):
+    """{item_id: {price_minor, price_kind, last_sale_minor, last_purchase_minor}} للأصناف التي لها سعر."""
+    out = {}
+    last_sale = {r["item_id"]: _per_base_unit(r) for r in conn.execute(_LAST.format(lines="sales_invoice_lines", inv="sales_invoices"), (company_id,))}
+    last_buy = {r["item_id"]: _per_base_unit(r) for r in conn.execute(_LAST.format(lines="purchase_invoice_lines", inv="purchase_invoices"), (company_id,))}
+    fixed = {r["id"]: r["sale_price_minor"] for r in conn.execute("SELECT id, sale_price_minor FROM items WHERE company_id=? AND sale_price_minor>0", (company_id,))}
+    for iid in set(fixed) | set(last_sale) | set(last_buy):
+        d = {}
+        if iid in last_sale:
+            d["last_sale_minor"] = last_sale[iid]
+        if iid in last_buy:
+            d["last_purchase_minor"] = last_buy[iid]
+        if iid in fixed:
+            d["price_minor"], d["price_kind"] = fixed[iid], "sale"
+        elif iid in last_sale:
+            d["price_minor"], d["price_kind"] = last_sale[iid], "last_sale"
+        elif iid in last_buy:
+            d["price_minor"], d["price_kind"] = last_buy[iid], "last_purchase"
+        out[iid] = d
+    return out

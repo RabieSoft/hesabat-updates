@@ -1,0 +1,80 @@
+-- سياسات المبيعات القابلة للتفعيل من الإعدادات (لمدير النظام فقط):
+--  1) السماح بتعديل فاتورة مبيعات مرحّلة (أصنافها/أسعارها/كمياتها/دفعاتها): تُعكس آثارها القديمة بقيد عكسي وحركات عكسية ثم تُرحَّل بالقيم الجديدة بنفس رقمها، ويُوثَّق ذلك في سجل التعديلات والتدقيق.
+--  2) السماح ببيع كمية تتجاوز الرصيد (رصيد سالب): الكمية الزائدة تُقيَّم بآخر تكلفة معروفة، وعند الشراء اللاحق تُوازَن الكمية تلقائيًا ويُسوَّى فرق التكلفة على تكلفة المبيعات.
+ALTER TABLE sales_settings ADD COLUMN allow_edit_posted_invoice INTEGER NOT NULL DEFAULT 0 CHECK(allow_edit_posted_invoice IN (0,1));
+ALTER TABLE sales_settings ADD COLUMN allow_negative_stock INTEGER NOT NULL DEFAULT 0 CHECK(allow_negative_stock IN (0,1));
+
+INSERT INTO permissions(code,name_ar,is_sensitive) VALUES
+ ('sales.edit_posted','تعديل فاتورة مبيعات مرحّلة (أصنافها/أسعارها) وتفعيله من الإعدادات',1),
+ ('stock.allow_negative','السماح ببيع كمية سالبة من المخزون وتفعيله من الإعدادات',1);
+INSERT INTO role_permissions SELECT 1,'sales.edit_posted';
+INSERT INTO role_permissions SELECT 1,'stock.allow_negative';
+
+-- سجل تعديلات الفواتير المرحّلة (قيد قديم معكوس + قيد جديد)
+CREATE TABLE sales_invoice_edits(
+  id INTEGER PRIMARY KEY, invoice_id INTEGER NOT NULL REFERENCES sales_invoices(id),
+  old_entry_id INTEGER NOT NULL REFERENCES journal_entries(id), reversal_entry_id INTEGER NOT NULL REFERENCES journal_entries(id),
+  new_entry_id INTEGER NOT NULL REFERENCES journal_entries(id), old_total INTEGER NOT NULL, new_total INTEGER NOT NULL,
+  reason TEXT NOT NULL CHECK(length(trim(reason))>0), edited_by INTEGER NOT NULL REFERENCES users(id),
+  edited_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX ix_sie_invoice ON sales_invoice_edits(invoice_id);
+CREATE TRIGGER sie_no_update BEFORE UPDATE ON sales_invoice_edits BEGIN SELECT RAISE(ABORT,'سجل تعديل الفواتير لا يُعدَّل'); END;
+CREATE TRIGGER sie_no_delete BEFORE DELETE ON sales_invoice_edits BEGIN SELECT RAISE(ABORT,'سجل تعديل الفواتير لا يُحذف'); END;
+
+-- حارس تعديل المستند المرحّل: لا يُفعَّل إلا من محرك المبيعات داخل معاملة التعديل نفسها
+CREATE TABLE doc_edit_guard(id INTEGER PRIMARY KEY CHECK(id=1), active INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0,1)));
+INSERT INTO doc_edit_guard VALUES(1,0);
+
+DROP TRIGGER sil_lock_ins; DROP TRIGGER sil_lock_upd; DROP TRIGGER sil_lock_del;
+DROP TRIGGER pay_lock_ins; DROP TRIGGER pay_lock_del; DROP TRIGGER si_upd_rules;
+CREATE TRIGGER sil_lock_ins BEFORE INSERT ON sales_invoice_lines
+WHEN (SELECT status FROM sales_invoices WHERE id=NEW.invoice_id)<>'draft' AND (SELECT active FROM doc_edit_guard)=0 BEGIN SELECT RAISE(ABORT,'المستند مرحّل: لا يمكن تعديل بنوده'); END;
+CREATE TRIGGER sil_lock_upd BEFORE UPDATE ON sales_invoice_lines
+WHEN (SELECT status FROM sales_invoices WHERE id=OLD.invoice_id)<>'draft' AND (SELECT active FROM doc_edit_guard)=0 BEGIN
+  SELECT RAISE(ABORT,'المستند مرحّل: لا يمكن تعديل بنوده'); END;
+CREATE TRIGGER sil_lock_del BEFORE DELETE ON sales_invoice_lines
+WHEN (SELECT status FROM sales_invoices WHERE id=OLD.invoice_id)<>'draft' AND (SELECT active FROM doc_edit_guard)=0 BEGIN SELECT RAISE(ABORT,'المستند مرحّل: لا يمكن تعديل بنوده'); END;
+CREATE TRIGGER pay_lock_ins BEFORE INSERT ON invoice_payments
+WHEN (SELECT status FROM sales_invoices WHERE id=NEW.invoice_id)<>'draft' AND (SELECT active FROM doc_edit_guard)=0 BEGIN SELECT RAISE(ABORT,'المستند مرحّل: لا يمكن تعديل دفعاته'); END;
+CREATE TRIGGER pay_lock_del BEFORE DELETE ON invoice_payments
+WHEN (SELECT status FROM sales_invoices WHERE id=OLD.invoice_id)<>'draft' AND (SELECT active FROM doc_edit_guard)=0 BEGIN SELECT RAISE(ABORT,'المستند مرحّل: لا يمكن تعديل دفعاته'); END;
+CREATE TRIGGER si_upd_rules BEFORE UPDATE ON sales_invoices WHEN OLD.status<>'draft' AND (SELECT active FROM doc_edit_guard)=0 BEGIN
+  SELECT RAISE(ABORT,'لا يمكن تعديل مستند مرحّل أو ملغى: التصحيح بالإلغاء أو بمرتجع')
+   WHERE NOT (OLD.status='posted' AND NEW.status='cancelled' AND NEW.company_id=OLD.company_id AND NEW.doc_type=OLD.doc_type
+     AND NEW.invoice_no IS OLD.invoice_no AND NEW.invoice_date=OLD.invoice_date AND NEW.customer_id IS OLD.customer_id
+     AND NEW.currency=OLD.currency AND NEW.exchange_rate=OLD.exchange_rate AND NEW.gross_ex_total=OLD.gross_ex_total
+     AND NEW.discount_ex_total=OLD.discount_ex_total AND NEW.net_ex_total=OLD.net_ex_total AND NEW.tax_total=OLD.tax_total
+     AND NEW.grand_total=OLD.grand_total AND NEW.paid_total=OLD.paid_total AND NEW.due_total=OLD.due_total
+     AND NEW.journal_entry_id IS OLD.journal_entry_id AND NEW.original_invoice_id IS OLD.original_invoice_id
+     AND NEW.cancel_reason IS NOT NULL AND length(trim(NEW.cancel_reason))>0);
+END;
+
+-- أرصدة المخزون: السماح بكمية سالبة (يُمنع افتراضيًا بفحص المحرك ما لم يُفعَّل الخيار). تبقى الأرصدة مشتقة من الحركات فقط.
+DROP TRIGGER sm_ai;
+CREATE TABLE stock_balances_new(
+  item_id INTEGER NOT NULL REFERENCES items(id), warehouse_id INTEGER NOT NULL REFERENCES warehouses(id),
+  qty_milli INTEGER NOT NULL DEFAULT 0, value_base INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(item_id,warehouse_id));
+INSERT INTO stock_balances_new(item_id,warehouse_id,qty_milli,value_base) SELECT item_id,warehouse_id,qty_milli,value_base FROM stock_balances;
+DROP TABLE stock_balances;
+ALTER TABLE stock_balances_new RENAME TO stock_balances;
+CREATE TRIGGER bal_guard_ins BEFORE INSERT ON stock_balances BEGIN
+  SELECT RAISE(ABORT,'أرصدة المخزون تُحسب من الحركات فقط') WHERE (SELECT active FROM stock_guard)=0; END;
+CREATE TRIGGER bal_guard_upd BEFORE UPDATE ON stock_balances BEGIN
+  SELECT RAISE(ABORT,'أرصدة المخزون تُحسب من الحركات فقط') WHERE (SELECT active FROM stock_guard)=0; END;
+CREATE TRIGGER bal_guard_del BEFORE DELETE ON stock_balances BEGIN
+  SELECT RAISE(ABORT,'أرصدة المخزون تُحسب من الحركات فقط') WHERE (SELECT active FROM stock_guard)=0; END;
+-- حارس على مستوى القاعدة: لا يزيد الرصيد سالبيةً إلا إذا فُعِّل خيار البيع بالسالب للشركة (يبقى الفحص الأول في المحرك)
+CREATE TRIGGER bal_no_negative BEFORE UPDATE OF qty_milli ON stock_balances
+WHEN NEW.qty_milli<0 AND NEW.qty_milli<OLD.qty_milli
+ AND NOT EXISTS(SELECT 1 FROM items i JOIN sales_settings s ON s.company_id=i.company_id WHERE i.id=NEW.item_id AND s.allow_negative_stock=1) BEGIN
+  SELECT RAISE(ABORT,'الرصيد المخزني لا يكون سالبا: خيار البيع بكمية سالبة غير مفعّل'); END;
+CREATE TRIGGER sm_ai AFTER INSERT ON stock_movements BEGIN
+  UPDATE stock_guard SET active=1;
+  INSERT OR IGNORE INTO stock_balances(item_id,warehouse_id,qty_milli,value_base) VALUES(NEW.item_id,NEW.warehouse_id,0,0);
+  UPDATE stock_balances SET
+     qty_milli=qty_milli+CASE NEW.direction WHEN 'in' THEN NEW.qty_milli ELSE -NEW.qty_milli END,
+     value_base=value_base+CASE NEW.direction WHEN 'in' THEN NEW.value_base ELSE -NEW.value_base END
+   WHERE item_id=NEW.item_id AND warehouse_id=NEW.warehouse_id;
+  UPDATE stock_guard SET active=0;
+END;

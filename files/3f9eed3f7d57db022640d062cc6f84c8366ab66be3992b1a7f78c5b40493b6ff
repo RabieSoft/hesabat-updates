@@ -1,0 +1,114 @@
+"""طبقة FastAPI الرفيعة فوق SyncService. كل المنطق في service.py؛ هنا فقط التوجيه والمصادقة وتحويل الأخطاء إلى HTTP.
+
+الدوال عادية (def لا async) ليشغّلها FastAPI في مجمع خيوط؛ وكل طلب يفتح اتصال SQLite خاصًا به.
+"""
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.security.permissions import PermissionDenied
+
+from .service import SyncAuthError, SyncService
+
+
+def create_app(db_path):
+    from fastapi import Depends, FastAPI, Header, Request
+    from fastapi.responses import JSONResponse
+    from pydantic import BaseModel
+
+    svc = SyncService(db_path)
+    app = FastAPI(title="Alhisabat Pro Sync API", version="1")
+
+    class PairIn(BaseModel):
+        code: str
+        device_uid: str
+        device_name: str
+
+    class LoginIn(BaseModel):
+        username: str
+        password: str
+        device_uid: str
+        device_name: str
+        company_id: int | None = None
+        branch_id: int | None = None
+
+    class RequestIn(BaseModel):
+        client_uid: str
+        type: str
+        post: bool = False
+        data: dict = {}
+
+    @app.exception_handler(SyncAuthError)
+    async def _auth(_r, e):
+        return JSONResponse({"error": str(e)}, status_code=401)
+
+    @app.exception_handler(PermissionDenied)
+    async def _perm(_r, e):
+        return JSONResponse({"error": str(e)}, status_code=403)
+
+    @app.exception_handler(AccountingError)
+    async def _acc(_r, e):
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    def device(authorization: str = Header(default="")):
+        scheme, _, token = authorization.partition(" ")
+        return svc.authenticate_token(token.strip() if scheme.lower() == "bearer" else "")
+
+    @app.get("/v1/health")
+    def health():
+        return {"ok": True, "api_version": 1}
+
+    @app.post("/v1/pair")
+    def pair(b: PairIn):
+        return svc.pair(b.code, b.device_uid, b.device_name)
+
+    @app.post("/v1/login")
+    def login(b: LoginIn):
+        return svc.login(b.username, b.password, b.device_uid, b.device_name, b.company_id, b.branch_id)
+
+    @app.post("/v1/logout")
+    def logout(d=Depends(device)):
+        return svc.logout(d)
+
+    @app.get("/v1/me")
+    def me(d=Depends(device)):
+        return svc.me(d)
+
+    @app.get("/v1/bootstrap")
+    def bootstrap(d=Depends(device)):
+        return svc.bootstrap(d)
+
+    @app.get("/v1/dashboard")
+    def dashboard(d=Depends(device)):
+        return svc.dashboard(d)
+
+    @app.get("/v1/invoices/{kind}")
+    def invoices(kind: str, limit: int = 100, d=Depends(device)):
+        return svc.invoices(d, kind, limit)
+
+    @app.get("/v1/invoices/{kind}/{invoice_id}")
+    def invoice(kind: str, invoice_id: int, d=Depends(device)):
+        return svc.get_invoice(d, kind, invoice_id)
+
+    @app.get("/v1/vouchers")
+    def vouchers(limit: int = 100, d=Depends(device)):
+        return svc.vouchers(d, limit)
+
+    @app.get("/v1/stock")
+    def stock(warehouse_id: int | None = None, item_id: int | None = None, d=Depends(device)):
+        return svc.stock(d, warehouse_id, item_id)
+
+    @app.get("/v1/aging/{kind}")
+    def aging(kind: str, d=Depends(device)):
+        return svc.aging(d, kind)
+
+    @app.get("/v1/parties/{party_id}/statement")
+    def party_statement(party_id: int, date_from: str | None = None, date_to: str | None = None, currency: str | None = None, d=Depends(device)):
+        return svc.party_statement(d, party_id, date_from, date_to, currency)
+
+    @app.get("/v1/reports/{code}")
+    def report(code: str, request: Request, d=Depends(device)):
+        return svc.report(d, code, dict(request.query_params))
+
+    @app.post("/v1/requests")
+    def submit(b: RequestIn, d=Depends(device)):
+        return svc.submit(d, b.model_dump())
+
+    return app

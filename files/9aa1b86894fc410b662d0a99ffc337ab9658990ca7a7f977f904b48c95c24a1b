@@ -1,0 +1,90 @@
+"""أساسيات الترخيص: بصمة الجهاز (HWID)، الترميز، والمفتاح العام. بلا PySide6.
+
+نظام الترخيص الوحيد هو ملفا license.key / license.sig (انظر keyfile.py).
+"""
+import base64
+import hashlib
+import os
+import sys
+import uuid
+
+
+class LicenseError(Exception):
+    """بيانات ترخيص غير صالحة."""
+
+
+def _b32(raw):
+    return base64.b32encode(raw).decode().rstrip('=')
+
+
+def _unb32(text):
+    s = ''.join(ch for ch in str(text).upper() if ch.isalnum())
+    if not s:
+        raise LicenseError('الكود فارغ.')
+    try:
+        return base64.b32decode(s + '=' * (-len(s) % 8))
+    except Exception as e:  # noqa: BLE001
+        raise LicenseError('الكود يحتوي رموزًا غير صحيحة.') from e
+
+
+def _group(s, n):
+    return '-'.join(s[i:i + n] for i in range(0, len(s), n))
+
+
+def _raw_machine_id():
+    parts = []
+    if sys.platform.startswith('win'):
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\Microsoft\Cryptography', 0,
+                                winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as k:
+                parts.append(str(winreg.QueryValueEx(k, 'MachineGuid')[0]))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            import ctypes
+            serial = ctypes.c_uint32(0)
+            drive = (os.environ.get('SystemDrive') or 'C:') + '\\'
+            if ctypes.windll.kernel32.GetVolumeInformationW(ctypes.c_wchar_p(drive), None, 0, ctypes.byref(serial),
+                                                            None, None, None, 0):
+                parts.append('%08X' % serial.value)
+        except Exception:  # noqa: BLE001
+            pass
+    else:
+        for p in ('/etc/machine-id', '/var/lib/dbus/machine-id'):
+            try:
+                with open(p, encoding='utf-8') as f:
+                    parts.append(f.read().strip())
+                    break
+            except OSError:
+                continue
+    if not parts:
+        parts.append('%012X' % uuid.getnode())
+    return '|'.join(parts)
+
+
+_MACHINE_CACHE = {}
+
+
+def _machine_bytes():
+    if 'b' not in _MACHINE_CACHE:
+        _MACHINE_CACHE['b'] = hashlib.sha256(b'AH-HW1|' + _raw_machine_id().encode('utf-8')).digest()[:10]
+    return _MACHINE_CACHE['b']
+
+
+def machine_code():
+    """بصمة هذا الجهاز بصيغة XXXX-XXXX-XXXX-XXXX."""
+    return _group(_b32(_machine_bytes()), 4)
+
+
+def key_configured():
+    from . import public_key as pk
+    return bool(pk.PUBLIC_KEY_B64)
+
+
+def _public_key():
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    from . import public_key as pk
+    if not pk.PUBLIC_KEY_B64:
+        raise LicenseError('مفتاح التحقق من الترخيص غير مضبوط في هذه النسخة.')
+    return Ed25519PublicKey.from_public_bytes(base64.b64decode(pk.PUBLIC_KEY_B64))

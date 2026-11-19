@@ -1,0 +1,387 @@
+"""دليل الطباعة + إعدادات الطباعة الخاصة بالمستخدم (قسم النظام). متاحة لكل مستخدم مسجَّل دخوله.
+
+التبويب الأول شرح الطباعة؛ الثاني نموذج إعدادات بمعاينة حية على مستند نموذجي. التعديل يُطبَّق على المعاينة فورًا،
+ولا يُحفظ إلا بزر «حفظ» (وإلا يُستعاد المحفوظ عند إغلاق الصفحة)."""
+import os
+import re
+import shutil
+from datetime import date, datetime
+from decimal import Decimal
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QCheckBox, QComboBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
+    QPushButton, QScrollArea, QSizePolicy, QSpinBox, QSplitter, QTabWidget, QTextBrowser, QVBoxLayout, QWidget
+)
+
+from alhisabat import branding
+from alhisabat.ui.components import document_model as DM
+from alhisabat.ui.components.document_sheet import DocumentSheet
+from alhisabat.ui.core import print_settings as PSET, strings_ar as S
+from alhisabat.ui.core.actions import Action, ActionGroup
+from alhisabat.ui.core.base_page import BasePage
+from alhisabat.ui.core.print_guide_content import guide_html
+
+ORIENT_LABELS = {'portrait': 'عمودي', 'landscape': 'أفقي'}
+HEADER_LABELS = {'default': 'افتراضية (شعار + اسم الشركة + نص)', 'image': 'صورة ترويسة كاملة (قالب جاهز)'}
+TOGGLES = (
+    ('show_branch', 'إظهار اسم الفرع'),
+    ('show_stamp', 'إظهار ختم الحالة (مسودة/مرحّل…)'),
+    ('show_amount_words', 'إظهار المبلغ كتابةً'),
+    ('show_signatures', 'إظهار خانات التوقيع'),
+    ('show_printed_at', 'إظهار تاريخ الطباعة'),
+    ('show_brand_footer', f'إظهار سطر «{branding.BRAND_LINE}» أسفل المستند'),
+)
+
+
+def sample_document(company=''):
+    """مستند نموذجي للمعاينة فقط (بيانات وهمية معنونة صراحةً بـ«نموذج»)."""
+    cols = [{'key': 'item', 'label': 'الصنف/الوصف'}, {'key': 'qty', 'label': 'الكمية', 'numeric': True},
+            {'key': 'price', 'label': 'السعر', 'numeric': True}, {'key': 'total', 'label': 'الإجمالي', 'numeric': True}]
+    rows = [{'item': 'صنف نموذجي أ', 'qty': Decimal('2'), 'price': Decimal('50'), 'total': Decimal('100')},
+            {'item': 'صنف نموذجي ب', 'qty': Decimal('1'), 'price': Decimal('110'), 'total': Decimal('110')}]
+    spec = {'title': 'فاتورة مبيعات (نموذج للمعاينة)', 'company': company or branding.PRODUCT_NAME, 'branch': 'الفرع الرئيسي',
+            'currency': '', 'period': '', 'printed_at': datetime.now().isoformat(timespec='minutes'),
+            'extra': [('رقم المستند', 'نموذج-0001'), ('التاريخ', date.today().isoformat()), ('الحالة', 'posted'), ('العميل', 'عميل نموذجي')],
+            'columns': cols, 'rows': rows,
+            'totals': [{'label': 'الإجمالي', 'value': Decimal('210')}, {'label': 'المدفوع', 'value': Decimal('100')},
+                       {'label': 'المتبقي', 'value': Decimal('110')}]}
+    return DM.from_print_spec(spec, 'invoice', amount_words='مائتان وعشرة فقط لا غير (مثال)')
+
+
+def sample_statement(company=''):
+    """كشف حساب نموذجي للمعاينة (شكل التقارير والكشوف لا يظهر إلا على التقارير والكشوف لا على الفواتير)."""
+    cols = [{'key': 'date', 'label': 'التاريخ'}, {'key': 'no', 'label': 'رقم القيد'}, {'key': 'desc', 'label': 'البيان'},
+            {'key': 'debit', 'label': 'مدين', 'numeric': True}, {'key': 'credit', 'label': 'دائن', 'numeric': True},
+            {'key': 'balance', 'label': 'الرصيد', 'numeric': True}]
+    today = date.today().isoformat()
+    rows = [{'date': today, 'no': '1', 'desc': 'فاتورة مبيعات (نموذج)', 'debit': Decimal('210'), 'credit': Decimal('0'), 'balance': Decimal('1210')},
+            {'date': today, 'no': '2', 'desc': 'سند قبض (نموذج)', 'debit': Decimal('0'), 'credit': Decimal('100'), 'balance': Decimal('1110')}]
+    spec = {'title': 'كشف حساب (نموذج للمعاينة)', 'company': company or branding.PRODUCT_NAME, 'branch': 'الفرع الرئيسي',
+            'currency': '', 'period': f'{today} — {today}', 'printed_at': datetime.now().isoformat(timespec='minutes'),
+            'extra': [('الحساب', '1101 عميل نموذجي')], 'columns': cols, 'rows': rows,
+            'totals': [{'label': 'الرصيد الختامي', 'value': Decimal('1110')}],
+            'opening': Decimal('1000'), 'sums': {'debit': Decimal('210'), 'credit': Decimal('100'), 'count': 2}}
+    return DM.from_print_spec(spec, 'statement')
+
+
+class PrintGuidePage(BasePage):
+    key = 'print_guide'
+    title = 'دليل الطباعة'
+    icon = 'print'
+    required_permission = None            # لكل مستخدم: الإعدادات خاصة بحسابه
+
+    def build(self):
+        self._username = self.session.username()
+        self._saved = PSET.load(self.window_.prefs, self._username)
+        self._loading = False
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(6, 6, 6, 6)
+        self.tabs = QTabWidget()
+        lay.addWidget(self.tabs)
+
+        self.guide = QTextBrowser()
+        self.guide.setLayoutDirection(Qt.RightToLeft)
+        self.guide.setHtml(guide_html())
+        self.tabs.addTab(self.guide, 'دليل الطباعة')
+
+        holder = QSplitter(Qt.Horizontal)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setLayoutDirection(Qt.RightToLeft)
+        scroll.setMinimumWidth(400)
+        scroll.setMaximumWidth(500)
+        scroll.setWidget(self._build_form())
+        holder.addWidget(scroll)
+        self.preview = DocumentSheet(self._saved.paper)
+        self.preview.paperChanged.connect(self._on_preview_paper)
+        holder.addWidget(self.preview)
+        holder.setStretchFactor(0, 0)
+        holder.setStretchFactor(1, 1)
+        self.tabs.addTab(holder, 'إعدادات الطباعة الخاصة بي')
+        self._fill(self._saved)
+        PSET.apply(self._saved)
+        self._rerender()
+
+    # ---------------------------------------------------------------- النموذج
+    def _build_form(self):
+        box = QWidget()
+        box.setLayoutDirection(Qt.RightToLeft)
+        box.setMinimumWidth(380)
+        outer = QVBoxLayout(box)
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        form.setRowWrapPolicy(QFormLayout.DontWrapRows)
+        form.setVerticalSpacing(8)
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.paper = QComboBox()
+        for k in PSET.PAPERS:
+            self.paper.addItem(DM.PAPER_LABELS[k], k)
+        self.orient = QComboBox()
+        for k in PSET.ORIENTATIONS:
+            self.orient.addItem(ORIENT_LABELS[k], k)
+        self.margin = QSpinBox()
+        self.margin.setRange(0, PSET.MARGIN_MAX)
+        self.margin.setSpecialValueText('تلقائي')
+        self.margin.setSuffix(' مم')
+        self.font = QComboBox()
+        for v in PSET.FONT_SIZES:
+            self.font.addItem('تلقائي' if v == 0 else f'{v} نقطة', v)
+        self.copies = QSpinBox()
+        self.copies.setRange(1, PSET.COPIES_MAX)
+        self.printer = QComboBox()
+        self.printer.addItem('الطابعة الافتراضية للنظام', '')
+        for name in self._available_printers():
+            self.printer.addItem(name, name)
+        form.addRow('الورق:', self.paper)
+        form.addRow('الاتجاه:', self.orient)
+        form.addRow('الهامش:', self.margin)
+        form.addRow('حجم الخط:', self.font)
+        form.addRow('عدد النسخ:', self.copies)
+        form.addRow('الطابعة المفضلة:', self.printer)
+
+        self.header_mode = QComboBox()
+        for k in PSET.HEADER_MODES:
+            self.header_mode.addItem(HEADER_LABELS[k], k)
+        self.header_image = QLineEdit()
+        self.header_image.setReadOnly(True)
+        self.header_image.setPlaceholderText('لم تُختر صورة ترويسة')
+        pick_h = QPushButton('اختيار…')
+        pick_h.clicked.connect(self._pick_header_image)
+        clear_h = QPushButton('إزالة')
+        clear_h.clicked.connect(lambda: self.header_image.setText(''))
+        self._header_btns = (pick_h, clear_h)
+        row_h = QHBoxLayout()
+        for w in (self.header_image, pick_h, clear_h):
+            row_h.addWidget(w)
+        form.addRow('ترويسة الصفحة:', self.header_mode)
+        form.addRow('صورة الترويسة:', row_h)
+        self.header_only = QCheckBox('الترويسة فقط (إخفاء عنوان المستند ورقمه وتاريخه وختمه من الرأس)')
+        form.addRow(self.header_only)
+        self.header_hint = QLabel('تُطبع الصورة بعرض الصفحة كاملًا أعلى كل مستند، وتحل محل الشعار واسم الشركة ونص الترويسة. '
+                                  'يُفضَّل صورة عريضة (مثل 1600×250) بخلفية بيضاء.')
+        self.header_hint.setWordWrap(True)
+        form.addRow(self.header_hint)
+
+        self.show_logo = QCheckBox('إظهار الشعار')
+        self.logo_path = QLineEdit()
+        self.logo_path.setReadOnly(True)
+        self.logo_path.setPlaceholderText('لم يُختر شعار')
+        pick = QPushButton('اختيار…')
+        pick.clicked.connect(self._pick_logo)
+        clear = QPushButton('إزالة')
+        clear.clicked.connect(lambda: self.logo_path.setText(''))
+        row = QHBoxLayout()
+        for w in (self.logo_path, pick, clear):
+            row.addWidget(w)
+        form.addRow(self.show_logo)
+        form.addRow('ملف الشعار:', row)
+        self.header_note = QPlainTextEdit()
+        self.header_note.setMinimumHeight(64)
+        self.header_note.setMaximumHeight(64)
+        self.header_note.setPlaceholderText('مثال: العنوان — الهاتف — الرقم الضريبي')
+        self.footer_note = QLineEdit()
+        self.footer_note.setPlaceholderText('مثال: البضاعة المباعة لا تُسترد بعد 7 أيام')
+        form.addRow('نص الترويسة:', self.header_note)
+        form.addRow('نص التذييل:', self.footer_note)
+        self._show_statement = QCheckBox('معاينة كشف حساب (لرؤية شكل التقارير والكشوف)')
+        self._show_statement.setChecked(True)
+        self.report_style = QComboBox()
+        self.report_style.addItem('شكل 1', 'rabee')
+        self.report_style.addItem('شكل 2', 'modern')
+        form.addRow('شكل التقارير والكشوف:', self.report_style)
+        form.addRow(self._show_statement)
+        self._contact = {}
+        for key, label, ph in (('company_name_en', 'الاسم الإنجليزي للشركة:', 'Al-Mahyoob Group for Trading - Main Branch'),
+                               ('phone', 'Tele No.:', ''), ('fax', 'Fax No.:', ''), ('pobox', 'P.O.Box:', '')):
+            ed = QLineEdit()
+            ed.setPlaceholderText(ph)
+            ed.setLayoutDirection(Qt.LeftToRight)
+            self._contact[key] = ed
+            form.addRow(label, ed)
+        self._toggles = {}
+        for key, label in TOGGLES:
+            cb = QCheckBox(label)
+            self._toggles[key] = cb
+            form.addRow(cb)
+        for cls in (QComboBox, QSpinBox, QLineEdit):          # كل صنف على حدة (بعض إصدارات PySide6 لا تقبل tuple)
+            for w in box.findChildren(cls):
+                w.setMinimumHeight(30)
+                w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        for lbl in (self.header_hint,):
+            lbl.setMinimumHeight(lbl.sizeHint().height() + 24)
+        outer.addLayout(form)
+
+        btns = QHBoxLayout()
+        save = QPushButton('حفظ')
+        save.setProperty('primary', True)
+        save.clicked.connect(self.save)
+        reset = QPushButton('استعادة الافتراضي')
+        reset.clicked.connect(self.reset_defaults)
+        test = QPushButton('طباعة صفحة اختبار')
+        test.clicked.connect(self.preview_print)
+        for b in (save, reset, test):
+            btns.addWidget(b)
+        outer.addLayout(btns)
+        self.state_lbl = QLabel('')
+        self.state_lbl.setWordWrap(True)
+        outer.addWidget(self.state_lbl)
+        outer.addStretch(1)
+
+        for sig in (self.paper.currentIndexChanged, self.orient.currentIndexChanged, self.font.currentIndexChanged,
+                    self.printer.currentIndexChanged, self.margin.valueChanged, self.copies.valueChanged,
+                    self.show_logo.toggled, self.logo_path.textChanged, self.header_mode.currentIndexChanged,
+                    self.header_image.textChanged, self.header_only.toggled, self.header_note.textChanged,
+                    self.footer_note.textChanged, self.report_style.currentIndexChanged, self._show_statement.toggled):
+            sig.connect(self._on_change)
+        for cb in self._toggles.values():
+            cb.toggled.connect(self._on_change)
+        for ed in self._contact.values():
+            ed.textChanged.connect(self._on_change)
+        return box
+
+    @staticmethod
+    def _available_printers():
+        try:
+            from PySide6.QtPrintSupport import QPrinterInfo
+            return list(QPrinterInfo.availablePrinterNames())
+        except Exception:  # noqa: BLE001 — لا دعم طباعة في هذه البيئة: تبقى الطابعة الافتراضية فقط
+            return []
+
+    # ---------------------------------------------------------------- القراءة/الكتابة
+    def _collect(self):
+        data = {'paper': self.paper.currentData(), 'orientation': self.orient.currentData(),
+                'margin_mm': self.margin.value(), 'font_pt': self.font.currentData(), 'copies': self.copies.value(),
+                'printer_name': self.printer.currentData() or '', 'show_logo': self.show_logo.isChecked(),
+                'logo_path': self.logo_path.text(), 'header_mode': self.header_mode.currentData(),
+                'header_image_path': self.header_image.text(), 'header_image_only': self.header_only.isChecked(), 'header_note': self.header_note.toPlainText(),
+                'footer_note': self.footer_note.text(), 'report_style': self.report_style.currentData()}
+        data.update({k: ed.text() for k, ed in self._contact.items()})
+        data.update({k: cb.isChecked() for k, cb in self._toggles.items()})
+        return PSET.from_dict(data)
+
+    def _fill(self, o):
+        self._loading = True
+        try:
+            for combo, val in ((self.paper, o.paper), (self.orient, o.orientation), (self.font, o.font_pt)):
+                i = combo.findData(val)
+                combo.setCurrentIndex(max(i, 0))
+            j = self.printer.findData(o.printer_name)
+            if j < 0 and o.printer_name:                      # طابعة محفوظة لم تعد موجودة: تبقى ظاهرة ولا تُفقد
+                self.printer.addItem(f'{o.printer_name} (غير متصلة)', o.printer_name)
+                j = self.printer.count() - 1
+            self.printer.setCurrentIndex(max(j, 0))
+            self.margin.setValue(o.margin_mm)
+            self.copies.setValue(o.copies)
+            self.show_logo.setChecked(o.show_logo)
+            self.logo_path.setText(o.logo_path)
+            self.header_mode.setCurrentIndex(max(self.header_mode.findData(o.header_mode), 0))
+            self.header_image.setText(o.header_image_path)
+            self.header_only.setChecked(o.header_image_only)
+            self.header_note.setPlainText(o.header_note)
+            self.footer_note.setText(o.footer_note)
+            self.report_style.setCurrentIndex(max(self.report_style.findData(o.report_style), 0))
+            for k, ed in self._contact.items():
+                ed.setText(getattr(o, k))
+            for k, cb in self._toggles.items():
+                cb.setChecked(getattr(o, k))
+        finally:
+            self._loading = False
+        self._sync_header_mode()
+
+    def _pick_header_image(self):
+        path, _ = QFileDialog.getOpenFileName(self, 'اختيار صورة الترويسة', '', 'صور (*.png *.jpg *.jpeg)')
+        if not path:
+            return
+        self.header_image.setText(self._store_header_copy(path))
+        if self.header_mode.currentData() != 'image':
+            self.header_mode.setCurrentIndex(self.header_mode.findData('image'))
+
+    def _store_header_copy(self, path):
+        """نسخة من الصورة داخل مجلد بيانات التطبيق ليبقى القالب سليمًا لو نُقل الأصل أو حُذف؛ وعند الفشل يُستعمل المسار الأصلي."""
+        try:
+            base = os.path.join(os.environ.get('APPDATA') or os.path.expanduser('~'), 'AlhisabatPro', 'print_headers')
+            os.makedirs(base, exist_ok=True)
+            user = re.sub(r'[^\w\-]+', '_', str(self._username or 'default'), flags=re.UNICODE)
+            dest = os.path.join(base, f'{user}{os.path.splitext(path)[1].lower()}')
+            if os.path.abspath(path) != os.path.abspath(dest):
+                shutil.copyfile(path, dest)
+            return dest
+        except OSError:
+            return path
+
+    def _sync_header_mode(self):
+        on = self.header_mode.currentData() == 'image'
+        self.header_image.setEnabled(on)
+        self.header_only.setEnabled(on)
+        for b in self._header_btns:
+            b.setEnabled(on)
+        for w in (self.show_logo, self.logo_path, self.header_note):
+            w.setEnabled(not on)
+
+    def _pick_logo(self):
+        path, _ = QFileDialog.getOpenFileName(self, 'اختيار الشعار', '', 'صور (*.png *.jpg *.jpeg)')
+        if path:
+            self.logo_path.setText(path)
+
+    def _on_change(self, *_a):
+        if self._loading:
+            return
+        self._sync_header_mode()
+        PSET.apply(self._collect())
+        self._rerender()
+
+    def _on_preview_paper(self, paper):
+        i = self.paper.findData(paper)
+        if i >= 0 and self.paper.currentIndex() != i:
+            self.paper.setCurrentIndex(i)
+
+    def _rerender(self):
+        o = PSET.active()
+        self.preview.set_paper(o.paper)
+        company = self.state.get('company', {}).get('name', '')
+        self.preview.set_document(sample_statement(company) if self._show_statement.isChecked() else sample_document(company))
+        self.state_lbl.setText('تعديلات لم تُحفظ بعد.' if self.is_dirty() else 'الإعدادات المعروضة هي المحفوظة.')
+        self.actions_changed.emit()
+
+    # ---------------------------------------------------------------- الإجراءات
+    def save(self):
+        try:
+            self._saved = PSET.save(self.window_.prefs, self._username, self._collect())
+        except ValueError as e:
+            QMessageBox.warning(self, S.APP_NAME, str(e))
+            return
+        PSET.apply(self._saved)
+        self.window_.prefs.set('paper', self._saved.paper)
+        self._rerender()
+        self.notify('تم حفظ إعدادات الطباعة الخاصة بك.')
+
+    def reset_defaults(self):
+        self._fill(PSET.PrintOptions())
+        self._on_change()
+
+    def preview_print(self):
+        self.preview.print_()
+
+    def refresh(self):
+        pass
+
+    def is_dirty(self):
+        if getattr(self, 'preview', None) is None:                # لم تكتمل بنية الصفحة بعد
+            return False
+        return self._collect() != self._saved
+
+    def can_close(self):
+        if not super().can_close():
+            return False
+        if getattr(self, '_saved', None) is not None:
+            PSET.apply(self._saved)                           # ما لم يُحفظ لا يبقى فعّالًا بعد الإغلاق
+        return True
+
+    def ribbon_groups(self):
+        return [ActionGroup('الطباعة', [
+            Action('save', 'حفظ إعداداتي', 'save', handler=self.save),
+            Action('reset', 'استعادة الافتراضي', 'refresh', handler=self.reset_defaults),
+            Action('test', 'طباعة صفحة اختبار', 'print', handler=self.preview_print)])]

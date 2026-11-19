@@ -1,0 +1,300 @@
+"""لوحة التحكم: بطاقات مؤشرات (إيرادات/مصروفات/صافي الربح/إجمالي الأرصدة) مع مقارنة الفترة السابقة،
+مخطط حركة التدفق النقدي الشهري، وآخر القيود اليومية. الفلاتر: الفرع + من/إلى.
+
+كل الأرقام من المحرك عبر session.dashboard_overview (وحدات صغرى) وتُحمَّل في الخلفية؛ لا منطق محاسبي هنا. يتطلب PySide6.
+"""
+from datetime import date
+from decimal import Decimal
+
+from PySide6.QtCore import QDate, Qt
+from PySide6.QtWidgets import (
+    QAbstractItemView, QComboBox, QDateEdit, QFrame, QHBoxLayout, QHeaderView, QLabel, QPushButton,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+)
+
+from alhisabat.ui.components.basic import StatusBadge
+from alhisabat.ui.components.charts import CashFlowChart
+from alhisabat.ui.components.dash_card import DashCard
+from alhisabat.ui.core import format as fmt
+from alhisabat.ui.core.base_page import BasePage
+from alhisabat.ui.design import tokens as T
+from alhisabat.ui.design.icons import qicon
+
+_CUR = {'SAR': 'ر.س', 'YER': 'ر.ي', 'USD': '$', 'AED': 'د.إ', 'EUR': '€'}
+_KIND = {'revenue': 'إيراد', 'expense': 'مصروف', 'misc': 'متنوع'}
+_ALL = 0          # معرّف «كل الفروع» في القائمة
+
+
+def _money(minor, cur=''):
+    if minor is None:
+        return '—'
+    s = fmt.fmt_money(minor, minor=True)
+    return f'{cur} {s}'.strip()
+
+
+class DashboardPage(BasePage):
+    key = 'dashboard'
+    title = 'لوحة التحكم'
+    icon = 'home'
+    required_permission = 'report.view'
+
+    # ------------------------------------------------------------------ البناء
+    def build(self):
+        self._seq = 0
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 6)
+        root.setSpacing(10)
+        root.addWidget(self._build_header())
+
+        cards = QHBoxLayout()
+        cards.setSpacing(10)
+        self.c_rev = DashCard('إجمالي الإيرادات', 'chart')
+        self.c_gross = DashCard('مجمل الربح (بعد تكلفة البضاعة)', 'coins')
+        self.c_exp = DashCard('المصروفات التشغيلية', 'cash')
+        self.c_net = DashCard('صافي الربح', 'coins')
+        self.c_bal = DashCard('إجمالي الأرصدة', 'bank')
+        for c in (self.c_rev, self.c_gross, self.c_exp, self.c_net, self.c_bal):
+            cards.addWidget(c, 1)
+        root.addLayout(cards)
+
+        bottom = QHBoxLayout()
+        bottom.setSpacing(10)
+        bottom.addWidget(self._build_recent(), 1)
+        bottom.addWidget(self._build_chart(), 1)
+        root.addLayout(bottom, 1)
+        root.addLayout(self._update_bar())
+        self._apply_mode()
+
+    def _build_header(self):
+        box = QFrame()
+        box.setObjectName('dashHeader')
+        h = QHBoxLayout(box)
+        h.setContentsMargins(14, 8, 14, 8)
+        h.setSpacing(8)
+        ti = QLabel()
+        ti.setPixmap(qicon('home', T.palette(self.state.get('mode'))['accent'], 26).pixmap(26, 26))
+        h.addWidget(ti)
+        title = QLabel('لوحة التحكم')
+        title.setObjectName('dashPageTitle')
+        h.addWidget(title)
+        h.addSpacing(18)
+        h.addWidget(QLabel('الفرع'))
+        self.branch = QComboBox()
+        self.branch.setMinimumWidth(190)
+        h.addWidget(self.branch)
+        h.addStretch(1)
+        today = date.today()
+        h.addWidget(QLabel('من'))
+        self.d_from = self._date_edit(QDate(today.year, today.month, 1))
+        h.addWidget(self.d_from)
+        h.addWidget(QLabel('إلى'))
+        self.d_to = self._date_edit(QDate(today.year, today.month, today.day))
+        h.addWidget(self.d_to)
+        self._fill_branches()
+        self.branch.currentIndexChanged.connect(lambda _i: self.refresh())
+        self.d_from.dateChanged.connect(lambda _d: self.refresh())
+        self.d_to.dateChanged.connect(lambda _d: self.refresh())
+        return box
+
+    @staticmethod
+    def _date_edit(qd):
+        e = QDateEdit(qd)
+        e.setCalendarPopup(True)
+        e.setDisplayFormat('yyyy-MM-dd')
+        e.setMinimumWidth(130)
+        return e
+
+    def _fill_branches(self):
+        """«كل الفروع» لمن لا تقييد عليه + فروع المستخدم؛ يبقى الاختيار الحالي أو الفرع النشط افتراضيًا."""
+        keep = self.branch.currentData() if self.branch.count() else None
+        branches = self.state.get('branches', []) or []
+        self.branch.blockSignals(True)
+        self.branch.clear()
+        try:
+            restricted = self.session.is_branch_restricted()
+        except Exception:  # noqa: BLE001
+            restricted = True
+        if len(branches) > 1 and not restricted:
+            self.branch.addItem('كل الفروع', _ALL)
+        for b in branches:
+            self.branch.addItem(b['name'], b['id'])
+        want = keep if keep is not None else self.state.branch_id
+        i = self.branch.findData(want)
+        self.branch.setCurrentIndex(i if i >= 0 else 0)
+        self.branch.blockSignals(False)
+
+    def _panel(self, title, link=None):
+        box = QFrame()
+        box.setObjectName('dashPanel')
+        v = QVBoxLayout(box)
+        v.setContentsMargins(14, 10, 14, 10)
+        v.setSpacing(8)
+        head = QHBoxLayout()
+        ic = QLabel()
+        ic.setPixmap(qicon('chart' if link is None else 'journal', T.palette(self.state.get('mode'))['accent'], 20).pixmap(20, 20))
+        head.addWidget(ic)
+        t = QLabel(title)
+        t.setObjectName('dashPanelTitle')
+        head.addWidget(t)
+        head.addStretch(1)
+        v.addLayout(head)
+        return box, v
+
+    def _build_chart(self):
+        box, v = self._panel('حركة التدفق النقدي')
+        self.chart = CashFlowChart()
+        v.addWidget(self.chart, 1)
+        return box
+
+    def _build_recent(self):
+        box, v = self._panel('القيود اليومية الأخيرة', link=True)
+        self.table = QTableWidget(0, 6)
+        self.table.setObjectName('dashTable')
+        self.table.setHorizontalHeaderLabels(['التاريخ', 'رقم القيد', 'البيان', 'النوع', 'المبلغ', 'الحالة'])
+        self.table.setLayoutDirection(Qt.RightToLeft)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(38)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(True)
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(QHeaderView.Interactive)
+        hh.setSectionResizeMode(2, QHeaderView.Stretch)
+        for col, w in enumerate((92, 80, 0, 64, 110, 96)):
+            if w:
+                self.table.setColumnWidth(col, w)
+        self.table.cellDoubleClicked.connect(self._open_journal)
+        v.addWidget(self.table, 1)
+        link = QPushButton('عرض جميع القيود')
+        link.setObjectName('dashLink')
+        link.setCursor(Qt.PointingHandCursor)
+        link.clicked.connect(lambda: self.open_page_requested.emit('journal', None))
+        v.addWidget(link, 0, Qt.AlignRight)
+        return box
+
+    def _update_bar(self):
+        """شريط التحديث: رقم الإصدار + «البحث عن تحديثات» (+ ⚙ إعداد الرابط لمن يملك إدارة الإعدادات)."""
+        from alhisabat.ui.shell.main_window import VERSION
+        bar = QHBoxLayout()
+        bar.addWidget(QLabel(f'الإصدار {VERSION}'))
+        bar.addStretch(1)
+        self.upd_btn = QPushButton(self.window_.updates.LABEL)
+        self.upd_btn.clicked.connect(self.window_.updates.check_now)
+        self.window_.updates.busyChanged.connect(self._on_update_busy)
+        bar.addWidget(self.upd_btn)
+        if self.access.has('settings.manage'):
+            cfg = QPushButton('⚙ إعداد التحديثات')
+            cfg.clicked.connect(self.window_.updates.configure)
+            bar.addWidget(cfg)
+        return bar
+
+    def _on_update_busy(self, busy, text):
+        try:
+            self.upd_btn.setEnabled(not busy)
+            self.upd_btn.setText(text)
+        except RuntimeError:                      # الصفحة أُغلقت أثناء التنزيل
+            pass
+
+    # ------------------------------------------------------------------ البيانات
+    def on_context_changed(self, keys):
+        if self._built:
+            self._fill_branches()
+        super().on_context_changed(keys)
+
+    def _apply_mode(self):
+        mode = self.state.get('mode')
+        for c in (self.c_rev, self.c_gross, self.c_exp, self.c_net, self.c_bal):
+            c.set_mode(mode)
+        self.chart.set_mode(mode)
+
+    def _cur(self):
+        return _CUR.get((self.state.get('company', {}) or {}).get('base_currency', ''),
+                        (self.state.get('company', {}) or {}).get('base_currency', ''))
+
+    def refresh(self):
+        if not getattr(self, '_built', False):
+            return
+        a, b = self.d_from.date(), self.d_to.date()
+        if a > b:
+            self.notify('تاريخ «من» بعد تاريخ «إلى»')
+            return
+        bid = self.branch.currentData()
+        bid = None if bid in (None, _ALL) else int(bid)
+        d1, d2 = a.toString('yyyy-MM-dd'), b.toString('yyyy-MM-dd')
+        self._seq += 1
+        seq = self._seq
+        self._same_month = (a.year(), a.month()) == (b.year(), b.month())
+
+        def _bg(sess, _ctx):
+            return sess.dashboard_overview(d1, d2, branch_id=bid)
+
+        def _done(data):
+            if seq == self._seq:                  # تجاهل نتيجة قديمة تجاوزها طلب أحدث
+                self._show(data)
+
+        def _fail(exc):
+            if seq == self._seq:
+                self._show(None)
+                self.notify('تعذّر تحميل بيانات لوحة التحكم')
+                try:
+                    self.window_.log_error(exc, self.key)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        try:
+            self.run_task(_bg, on_done=lambda r: self._safe(_done, r), on_error=lambda e: self._safe(_fail, e))
+        except Exception as e:  # noqa: BLE001
+            self.show_error(e)
+
+    @staticmethod
+    def _safe(fn, arg):
+        try:
+            fn(arg)
+        except RuntimeError:                      # الصفحة أُغلقت قبل وصول النتيجة
+            pass
+
+    def _show(self, d):
+        cur = self._cur()
+        cmp_text = 'مقارنة بالشهر السابق' if self._same_month else 'مقارنة بالفترة السابقة'
+        if not d:
+            for c in (self.c_rev, self.c_gross, self.c_exp, self.c_net, self.c_bal):
+                c.set_value('—')
+                c.set_note('')
+            self.table.setRowCount(0)
+            self.chart.set_data([], [], [], [])
+            return
+        now, prev = d.get('current'), d.get('previous')
+        for card, key, good in ((self.c_rev, 'revenue', True), (self.c_gross, 'gross', True), (self.c_exp, 'opex', False), (self.c_net, 'net', True)):
+            card.set_value(_money(now[key], cur) if now else '—')
+            card.set_delta(now[key] if now else None, prev[key] if prev else None, good, cmp_text)
+        by = d.get('cash_by_cur') or {}
+        self.c_bal.set_value(' | '.join(_money(v, c) for c, v in sorted(by.items())) if by else _money(d['cash_total'], cur))
+        self.c_bal.set_note('متاح في جميع الحسابات')
+
+        m = lambda k: [Decimal(int(x[k])) / 100 for x in d['flow']]
+        self.chart.set_data([x['month'] for x in d['flow']], m('revenue'), m('expense'), m('net'))
+        self._fill_recent(d.get('recent') or [], cur)
+
+    def _fill_recent(self, rows, cur):
+        self.table.setRowCount(len(rows))
+        for r, e in enumerate(rows):
+            vals = [fmt.fmt_date(e['entry_date']), str(e['entry_no'] if e['entry_no'] is not None else '—'),
+                    e['description'] or '—', _KIND.get(e['kind'], ''), _money(e['total_minor'], cur)]
+            for c, v in enumerate(vals):
+                it = QTableWidgetItem(v)
+                it.setTextAlignment(Qt.AlignCenter if c != 2 else (Qt.AlignRight | Qt.AlignVCenter))
+                if c == 0:
+                    it.setData(Qt.UserRole, e['id'])
+                self.table.setItem(r, c, it)
+            holder = QWidget()
+            hl = QHBoxLayout(holder)
+            hl.setContentsMargins(4, 0, 4, 0)
+            hl.addWidget(StatusBadge(e['state']), 0, Qt.AlignCenter)
+            self.table.setCellWidget(r, 5, holder)
+
+    def _open_journal(self, row, _col):
+        it = self.table.item(row, 0)
+        if it is not None:
+            self.open_page_requested.emit('journal', {'entry_id': it.data(Qt.UserRole)})

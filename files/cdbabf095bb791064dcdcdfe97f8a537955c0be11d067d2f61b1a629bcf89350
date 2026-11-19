@@ -1,0 +1,28 @@
+ALTER TABLE users ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN locked_until TEXT;
+
+CREATE TABLE permissions(code TEXT PRIMARY KEY, name_ar TEXT NOT NULL, is_sensitive INTEGER NOT NULL DEFAULT 0 CHECK(is_sensitive IN (0,1)));
+CREATE TABLE roles(id INTEGER PRIMARY KEY, name_ar TEXT NOT NULL UNIQUE, is_system INTEGER NOT NULL DEFAULT 1);
+CREATE TABLE role_permissions(
+  role_id INTEGER NOT NULL REFERENCES roles(id), permission_code TEXT NOT NULL REFERENCES permissions(code),
+  PRIMARY KEY(role_id,permission_code));
+CREATE TABLE user_roles(
+  user_id INTEGER NOT NULL REFERENCES users(id), company_id INTEGER NOT NULL REFERENCES companies(id),
+  role_id INTEGER NOT NULL REFERENCES roles(id), PRIMARY KEY(user_id,company_id,role_id));
+-- إن وُجد أي سجل هنا للمستخدم في الشركة فهو مقيّد بهذه الفروع فقط
+CREATE TABLE user_branch_access(
+  user_id INTEGER NOT NULL REFERENCES users(id), branch_id INTEGER NOT NULL REFERENCES branches(id),
+  PRIMARY KEY(user_id,branch_id));
+
+INSERT INTO permissions(code,name_ar,is_sensitive) VALUES
+ ('account.view','عرض الحسابات',0),('account.create','إضافة حساب',0),('account.edit','تعديل حساب',0),
+ ('account.system_edit','تعديل الحسابات النظامية',1),('account.deactivate','تعطيل حساب',1),
+ ('journal.view','عرض القيود',0),('journal.create','إنشاء قيد',0),('journal.post','ترحيل قيد',0),
+ ('journal.reverse','عكس قيد',1),('period.close','إغلاق فترة',1),('period.reopen','إعادة فتح فترة',1),
+ ('fiscalyear.create','إنشاء سنة مالية',1),('user.manage','إدارة المستخدمين والصلاحيات',1),('audit.view','عرض سجل التدقيق',0);
+INSERT INTO roles(id,name_ar) VALUES(1,'مدير النظام'),(2,'مدير مالي'),(3,'محاسب'),(4,'مراجع');
+INSERT INTO role_permissions SELECT 1,code FROM permissions;
+INSERT INTO role_permissions SELECT 2,code FROM permissions WHERE code NOT IN ('user.manage','account.system_edit');
+INSERT INTO role_permissions SELECT 3,code FROM permissions WHERE code IN
+ ('account.view','account.create','account.edit','journal.view','journal.create','journal.post');
+INSERT INTO role_permissions SELECT 4,code FROM permissions WHERE code IN ('account.view','journal.view','audit.view');

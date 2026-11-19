@@ -1,0 +1,15 @@
+-- 0053: مطابقة أرصدة العملاء والموردين — مفتاح ربط جديد reconcile_diff («فروقات مطابقة الأرصدة»، حقوق ملكية مؤقت).
+-- لا يمكن تعديل قيد CHECK في SQLite، فيُعاد بناء الجدول بنفس الأعمدة والبيانات (بلا مساس بالتريجرات التي تذكره).
+PRAGMA legacy_alter_table=ON;
+CREATE TABLE account_mappings_new(
+  company_id INTEGER NOT NULL REFERENCES companies(id),
+  map_key TEXT NOT NULL CHECK(map_key IN ('customers','suppliers','inventory','sales','cogs','cash','bank',
+      'retained_earnings','period_result','fx_differences','inventory_adjustment','sales_discount','sales_returns',
+      'cash_difference','employees','payroll_expense','payroll_deductions','accum_depreciation','depreciation_expense',
+      'disposal_gain_loss','opening_suspense','reconcile_diff')),
+  account_id INTEGER NOT NULL REFERENCES accounts(id),
+  PRIMARY KEY(company_id,map_key));
+INSERT INTO account_mappings_new SELECT company_id,map_key,account_id FROM account_mappings;
+DROP TABLE account_mappings;
+ALTER TABLE account_mappings_new RENAME TO account_mappings;
+PRAGMA legacy_alter_table=OFF;

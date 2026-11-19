@@ -1,0 +1,458 @@
+"""مُساعد لصفحة نهاية الفترة: تبويبات التسويات والمطابقة وفحص السلامة المالية وتصدير التقرير.
+
+مُستخرج لإبقاء الملفات ضمن حد الحجم. لا منطق محاسبي، لا float، لا ألوان ثابتة، Decimal فقط.
+"""
+from datetime import datetime
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QFileDialog, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+    QPushButton, QVBoxLayout, QWidget,
+)
+
+from alhisabat.ui.components.datagrid import DataGrid
+from alhisabat.ui.components.grid_logic import Column
+
+
+def build_fx_tab(page):
+    """تبويب إعادة تقييم العملات الأجنبية (المعاينة والترحيل)."""
+    w = QWidget()
+    lay = QVBoxLayout(w)
+    lay.setContentsMargins(8, 12, 8, 8)
+    lay.setSpacing(6)
+
+    page.lbl_fx_notice = QLabel("")
+    page.lbl_fx_notice.setWordWrap(True)
+    page.lbl_fx_notice.setObjectName('fxNotice')
+    lay.addWidget(page.lbl_fx_notice)
+
+    frow = QHBoxLayout()
+    frow.addWidget(QLabel("بتاريخ التقييم:"))
+    page.fx_as_of = QLineEdit()
+    page.fx_as_of.setPlaceholderText("YYYY-MM-DD")
+    frow.addWidget(page.fx_as_of, 1)
+
+    page.btn_fx_prev = QPushButton("معاينة الفروقات")
+    page.btn_fx_post = QPushButton("ترحيل قيد التقييم")
+    page.btn_fx_prev.clicked.connect(lambda: page._fx(False))
+    page.btn_fx_post.clicked.connect(lambda: page._fx(True))
+
+    frow.addWidget(page.btn_fx_prev)
+    frow.addWidget(page.btn_fx_post)
+    frow.addStretch(1)
+    lay.addLayout(frow)
+
+    page.grid_fx = DataGrid([
+        Column('code', 'الحساب', width=90),
+        Column('name', 'الاسم', width=160),
+        Column('currency', 'العملة', width=70),
+        Column('net_orig', 'الرصيد الأصلي', 'money', 110, minor=True),
+        Column('carrying_base', 'الدفترية', 'money', 110, minor=True),
+        Column('target_base', 'المستهدفة', 'money', 110, minor=True),
+        Column('diff', 'الفرق', 'money', 110, minor=True),
+        Column('rate', 'السعر', width=110),
+    ], grid_id='period_end_fx')
+    lay.addWidget(page.grid_fx, 1)
+
+    page.lbl_fx = QLabel("إعادة التقييم تمس القيمة الأساسية فقط للبنود النقدية مقابل حساب فروقات العملة.")
+    page.lbl_fx.setObjectName('hint')
+    lay.addWidget(page.lbl_fx)
+
+    return w
+
+
+def build_recon_tab(page):
+    """تبويب مطابقة المخزون مع الأستاذ العام وفحص سلامة الأرصدة."""
+    w = QWidget()
+    lay = QVBoxLayout(w)
+    lay.setContentsMargins(8, 12, 8, 8)
+    lay.setSpacing(6)
+
+    rrow = QHBoxLayout()
+    rrow.addWidget(QLabel("بتاريخ:"))
+    page.recon_as_of = QLineEdit()
+    page.recon_as_of.setPlaceholderText("YYYY-MM-DD")
+    rrow.addWidget(page.recon_as_of, 1)
+
+    page.btn_recon = QPushButton("تشغيل المطابقة")
+    page.btn_recon.clicked.connect(page._recon)
+    rrow.addWidget(page.btn_recon)
+    rrow.addStretch(1)
+    lay.addLayout(rrow)
+
+    page.grid_recon = DataGrid([
+        Column('code', 'حساب المخزون', width=110),
+        Column('operational', 'المخزون التشغيلي', 'money', 120, minor=True),
+        Column('accounting', 'المخزون المحاسبي (الأستاذ)', 'money', 120, minor=True),
+        Column('diff', 'الفرق', 'money', 110, minor=True),
+    ], grid_id='period_end_recon')
+    lay.addWidget(page.grid_recon, 1)
+
+    page.lbl_recon = QLabel("")
+    lay.addWidget(page.lbl_recon)
+
+    lay.addWidget(QLabel("فروقات الأرصدة المخزنة (stock_balances ≠ مجموع حركات الصنف):"))
+    page._grid_cache = DataGrid([
+        Column('item_id', 'معرف الصنف', 'int', 90),
+        Column('warehouse_id', 'المستودع', 'int', 90),
+        Column('calculated', 'المجموع المحسوب', width=160),
+        Column('stored', 'الرصيد المخزن', width=160),
+    ], grid_id='period_end_cache')
+    lay.addWidget(page._grid_cache, 1)
+
+    return w
+
+
+def build_integrity_tab(page):
+    """تبويب فحص السلامة المالية الكامل مع تاريخ التشغيل وتصدير التقرير."""
+    w = QWidget()
+    lay = QVBoxLayout(w)
+    lay.setContentsMargins(8, 12, 8, 8)
+    lay.setSpacing(6)
+
+    top = QHBoxLayout()
+    top.addWidget(QLabel("تاريخ الفحص:"))
+    page.integ_as_of = QLineEdit()
+    page.integ_as_of.setPlaceholderText("YYYY-MM-DD (اختياري)")
+    top.addWidget(page.integ_as_of, 1)
+
+    page.btn_integ = QPushButton("تشغيل فحص السلامة")
+    page.btn_integ.clicked.connect(page._run_integrity)
+    top.addWidget(page.btn_integ)
+
+    page.btn_export_integ = QPushButton("تصدير التقرير")
+    page.btn_export_integ.clicked.connect(lambda: export_integrity_report(page))
+    top.addWidget(page.btn_export_integ)
+
+    top.addStretch(1)
+    lay.addLayout(top)
+
+    page.lbl_integ_time = QLabel("لم يُشغَّل بعد في هذه الجلسة.")
+    page.lbl_integ_time.setObjectName('ctxKey')
+    lay.addWidget(page.lbl_integ_time)
+
+    page.grid_integ = DataGrid([
+        Column('name', 'فحص السلامة', width=300),
+        Column('status', 'النتيجة', 'status', 90),
+        Column('detail', 'التفاصيل والملاحظات', width=380),
+    ], grid_id='period_end_integ')
+    lay.addWidget(page.grid_integ, 1)
+
+    page.lbl_integ = QLabel("")
+    page.lbl_integ.setWordWrap(True)
+    lay.addWidget(page.lbl_integ)
+
+    return w
+
+
+def export_integrity_report(page):
+    """تصدير تقرير فحص السلامة المالية بتنسيق منظم أو طباعته."""
+    rows = getattr(page.grid_integ, '_rows', [])
+    if not rows:
+        return QMessageBox.information(page, "تصدير التقرير", "شغّل فحص السلامة المالية أولاً لتوليد البيانات.")
+
+    path, _ = QFileDialog.getSaveFileName(
+        page, "تصدير تقرير السلامة المالية", "financial_integrity_report.html",
+        "HTML Files (*.html);;CSV Files (*.csv)"
+    )
+    if not path:
+        return
+
+    company_name = (page.state.get('company') or {}).get('name', 'شركة الحسابات برو')
+    as_of = page.integ_as_of.text().strip() or "الكل"
+    run_time = getattr(page, '_last_integ_time', datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    if path.endswith('.csv'):
+        import csv
+        with open(path, 'w', encoding='utf-8-sig', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(["تقرير فحص السلامة المالية", company_name])
+            w.writerow(["تاريخ الفحص", as_of, "وقت التشغيل", run_time])
+            w.writerow([])
+            w.writerow(["البند", "النتيجة", "التفاصيل"])
+            for r in rows:
+                status_txt = "ناجح" if r.get('status') == 'pass' else ("فاشل" if r.get('status') == 'fail' else "غير منفذ")
+                w.writerow([r.get('name', ''), status_txt, r.get('detail', '')])
+        QMessageBox.information(page, "تم التصدير", f"تم حفظ تقرير السلامة المالية بصيغة CSV:\n{path}")
+    else:
+        lines_html = []
+        for r in rows:
+            st = r.get('status')
+            color = "green" if st == 'pass' else ("red" if st == 'fail' else "orange")
+            status_txt = "ناجح" if st == 'pass' else ("فاشل" if st == 'fail' else "غير منفذ")
+            lines_html.append(
+                f"<tr><td style='border:1px solid #ccc;padding:8px;'>{r.get('name','')}</td>"
+                f"<td style='border:1px solid #ccc;padding:8px;color:{color};font-weight:bold;'>{status_txt}</td>"
+                f"<td style='border:1px solid #ccc;padding:8px;'>{r.get('detail','')}</td></tr>"
+            )
+        html = f"""<!DOCTYPE html>
+<html dir="rtl" lang="ar">
+<head>
+<meta charset="utf-8">
+<title>تقرير فحص السلامة المالية — {company_name}</title>
+<style>
+body {{ font-family: 'Segoe UI', Tahoma, Arial, sans-serif; margin: 24px; direction: rtl; color: #222; }}
+h1 {{ color: navy; margin-bottom: 4px; }}
+.meta {{ color: #555; margin-bottom: 18px; }}
+table {{ width: 100%; border-collapse: collapse; margin-top: 12px; }}
+th {{ background-color: #eee; border: 1px solid #ccc; padding: 10px; text-align: right; }}
+</style>
+</head>
+<body>
+<h1>تقرير فحص السلامة المالية</h1>
+<div class="meta">
+<strong>المنشأة:</strong> {company_name} | <strong>تاريخ الفحص:</strong> {as_of} | <strong>وقت التشغيل:</strong> {run_time}
+</div>
+<table>
+<thead>
+<tr><th>فحص السلامة</th><th>النتيجة</th><th>التفاصيل والملاحظات</th></tr>
+</thead>
+<tbody>
+{''.join(lines_html)}
+</tbody>
+</table>
+</body>
+</html>"""
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(html)
+        QMessageBox.information(page, "تم التصدير", f"تم حفظ تقرير السلامة المالية بنجاح:\n{path}")
+
+
+def run_fx(page, post):
+    from alhisabat.ui.components.basic import ask_reason
+    as_of = page.fx_as_of.text().strip()
+    if not as_of:
+        return QMessageBox.information(page, page.title, "أدخل تاريخ التقييم YYYY-MM-DD.")
+    if post and ask_reason(page, "ترحيل إعادة التقييم", [f"سيتم إنشاء وترحيل قيد تسوية بتاريخ {as_of} مقابل حساب فروقات العملة."], False, "ترحيل") is None:
+        return
+    from alhisabat.ui.core.period_end_service import PeriodEndService
+    page.lbl_fx.setText("جارٍ الحساب...")
+
+    def _done(data):
+        rows = data.get('rows', []) if isinstance(data, dict) else []
+        page.grid_fx.set_rows(rows)
+        missing = (data.get('missing_rates') or []) if isinstance(data, dict) else []
+        page.lbl_fx.setText(("عملات بلا سعر: " + ",".join(missing)) if missing else f"مجموع الفروق المحسوبة: {data.get('total_diff', 0)}")
+        if post:
+            page.notify("تم ترحيل قيد إعادة تقييم العملات بنجاح.")
+            page.refresh()
+            page.window_.data_changed(page.key)
+
+    if post:
+        page.run_service(PeriodEndService, 'revalue', as_of, post, on_done=_done)
+    else:
+        page.run_service(PeriodEndService, 'revaluation_preview', as_of, on_done=_done)
+
+
+def run_recon(page):
+    as_of = page.recon_as_of.text().strip()
+    if not as_of:
+        return QMessageBox.information(page, page.title, "أدخل تاريخ المطابقة YYYY-MM-DD.")
+    from alhisabat.ui.core.period_end_service import PeriodEndService
+    page.lbl_recon.setText("جارٍ المطابقة...")
+
+    def _bg(s, ctx):
+        svc = PeriodEndService(s)
+        return svc.inventory_recon(as_of), svc.inventory_verify()
+
+    def _done(res):
+        data, bad = res
+        rows = data.get('rows', []) if isinstance(data, dict) else []
+        page.grid_recon.set_rows(rows)
+        ok_all = data.get('ok', False) if isinstance(data, dict) else False
+        page.lbl_recon.setText("المخزون مطابق بالكامل مع الأستاذ." if ok_all else f"توجد فروقات — حركات بلا قيد مرتبط: {data.get('unlinked_movements',0)}")
+        page._grid_cache.set_rows([{'item_id': r['item_id'], 'warehouse_id': r['warehouse_id'], 'calculated': str(r['calculated']), 'stored': str(r['stored'])} for r in (bad or [])])
+
+    page.run_task(_bg, on_done=_done)
+
+
+def run_integrity(page):
+    as_of = page.integ_as_of.text().strip() or None
+    from alhisabat.ui.core.period_end_service import PeriodEndService
+    page.lbl_integ.setText("جارٍ الفحص...")
+
+    def _done(data):
+        page._last_integ_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        page.lbl_integ_time.setText(f"تاريخ ووقت آخر تشغيل: {page._last_integ_time}")
+        rows = data.get('checks', []) if isinstance(data, dict) else []
+        page.grid_integ.set_rows(rows)
+        ok_all = data.get('ok', False) if isinstance(data, dict) else False
+        page.lbl_integ.setText("✔ النظام سليم ماليًا ومحاسبيًا (كل الفحوص ناجحة)." if ok_all else "✖ توجد بنود تتطلب المعالجة — راجع التفاصيل.")
+
+    page.run_service(PeriodEndService, 'integrity', as_of, on_done=_done)
+
+
+def load_year_result(page):
+    """تحميل نتيجة السنة وتحديث ورقة ملخص الأداء المالي وإعدادات الإقفال."""
+    if not page._sel_year_id:
+        page.lbl_result.setText("—")
+        return
+    try:
+        r = page.svc.year_result(page._sel_year_id, include_closing=False)
+        from alhisabat.ui.core.format import fmt_money
+        from alhisabat.ui.components import document_model as DM
+        net = r.get('net_result', 0)
+        rev_fmt = fmt_money(r.get('revenue', 0), minor=True)
+        cogs_fmt = fmt_money(r.get('cogs', 0), minor=True)
+        exp_fmt = fmt_money(r.get('expenses', 0), minor=True)
+        net_fmt = fmt_money(net, minor=True)
+        page.lbl_result.setText(f"إيرادات: {rev_fmt} | تكلفة: {cogs_fmt} | مصروفات: {exp_fmt} ➔ صافي النتيجة: {net_fmt}")
+        s = page.svc.closing_settings()
+        page.chk_retained.setChecked(bool(s.get('transfer_to_retained')))
+
+        y = next((x for x in page._overview if x['id'] == page._sel_year_id), None)
+        spec = {
+            'title': f"ملخص الأداء المالي لسنة {y['name']}" if y else "ملخص السنة",
+            'company': (page.state.get('company') or {}).get('name', ''),
+            'extra': [('السنة المالية', y['name'] if y else ''), ('حالة السنة', 'مقفلة' if y and y['status'] == 'closed' else 'مفتوحة'), ('صافي النتيجة', net_fmt)],
+            'columns': [{'key': 'label', 'label': 'البند المحاسبي'}, {'key': 'value', 'label': 'المبلغ', 'numeric': True}],
+            'rows': [
+                {'label': 'إجمالي الإيرادات', 'value': rev_fmt},
+                {'label': 'تكلفة النشاط والمبيعات', 'value': cogs_fmt},
+                {'label': 'إجمالي المصروفات التشغيلية', 'value': exp_fmt},
+                {'label': 'صافي نتيجة السنة (ربح/خسارة)', 'value': net_fmt},
+            ],
+            'totals': [],
+        }
+        page.sheet_year.set_document(DM.from_print_spec(spec, 'report', status=y['status'] if y else ''))
+    except Exception as exc:
+        page.lbl_result.setText(f"تعذر قراءة النتيجة: {exc}")
+
+
+def handle_fix_action(page):
+    """توجيه المستخدم مباشرة إلى الشاشة أو التبويب المناسب لإصلاح البند الفاشل."""
+    rows = page.grid_checks.selected_rows() if hasattr(page.grid_checks, 'selected_rows') else []
+    row = rows[0] if rows else getattr(page, '_selected_check_row', None)
+    if not row:
+        return
+    name = row.get('name', '')
+    if "مسودة" in name or "قيود" in name:
+        if hasattr(page, 'window_') and hasattr(page.window_, 'open_page'):
+            page.window_.open_page('journal')
+    elif "مستندات" in name:
+        if hasattr(page, 'window_') and hasattr(page.window_, 'open_page'):
+            page.window_.open_page('sales')
+    elif "مربوط" in name or "حساب" in name:
+        if hasattr(page, 'window_') and hasattr(page.window_, 'open_page'):
+            page.window_.open_page('mappings')
+    elif "العملات" in name:
+        page.tabs.setCurrentIndex(1)
+        if hasattr(page, 'adj_tabs'):
+            page.adj_tabs.setCurrentIndex(0)
+    elif "المخزون" in name:
+        page.tabs.setCurrentIndex(1)
+        if hasattr(page, 'adj_tabs'):
+            page.adj_tabs.setCurrentIndex(1)
+    elif "فترات" in name or "الفترات" in name:
+        page.tabs.setCurrentIndex(0)
+    elif "السلامة" in name:
+        page.tabs.setCurrentIndex(5)
+    elif "الأقدم" in name:
+        detail = row.get('detail', '')
+        for i in range(page.cb_year.count()):
+            if detail and detail in page.cb_year.itemText(i):
+                page.cb_year.setCurrentIndex(i)
+                page.tabs.setCurrentIndex(0)
+                break
+    else:
+        QMessageBox.information(page, "إصلاح", f"راجع تفاصيل البند: {row.get('detail', '')}")
+
+
+def build_ribbon_groups(page):
+    from alhisabat.ui.core.actions import Action, ActionGroup
+    from alhisabat.ui.core.permissions import ActionState
+
+    def act(key, label, icon, perm, handler, state_fn=None, danger=False):
+        def state():
+            if perm and not page._can(perm):
+                from alhisabat.ui.core.permissions import PERMISSION_LABELS
+                return ActionState(False, f"تتطلب صلاحية {PERMISSION_LABELS.get(perm, perm)}")
+            if state_fn is not None:
+                res = state_fn()
+                if isinstance(res, ActionState):
+                    return res
+                if not res:
+                    return ActionState(False, "غير متاح لهذه الحالة")
+            return ActionState(True)
+        return Action(key, label, icon, state_fn=state, handler=handler, danger=danger)
+
+    def _period_close_state():
+        if page._sel_period_id is None:
+            return ActionState(False, "اختر فترة من الجدول لإقفالها")
+        y = next((x for x in page._overview if x['id'] == page._sel_year_id), None)
+        p = next((pp for pp in (y.get('periods', []) if y else []) if pp['id'] == page._sel_period_id), None)
+        if p and p.get('status') == 'closed':
+            return ActionState(False, "الفترة مقفلة بالفعل")
+        return ActionState(True)
+
+    def _period_reopen_state():
+        if page._sel_period_id is None:
+            return ActionState(False, "اختر فترة من الجدول لإعادة فتحها")
+        y = next((x for x in page._overview if x['id'] == page._sel_year_id), None)
+        p = next((pp for pp in (y.get('periods', []) if y else []) if pp['id'] == page._sel_period_id), None)
+        if p and p.get('status') == 'open':
+            return ActionState(False, "الفترة مفتوحة بالفعل ولا تحتاج لإعادة فتح")
+        return ActionState(True)
+
+    def _year_close_state():
+        if not page._sel_year_id:
+            return ActionState(False, "اختر سنة مالية أولاً")
+        y = next((x for x in page._overview if x['id'] == page._sel_year_id), None)
+        if y and y.get('status') == 'closed':
+            return ActionState(False, "السنة المالية مقفلة بالفعل")
+        return ActionState(True, "إقفال السنة بخطوة واحدة")
+
+    def _year_reopen_state():
+        if not page._sel_year_id:
+            return ActionState(False, "اختر سنة مالية أولاً")
+        y = next((x for x in page._overview if x['id'] == page._sel_year_id), None)
+        if y and y.get('status') == 'open':
+            return ActionState(False, "السنة المالية مفتوحة بالفعل ولا تحتاج لإعادة فتح")
+        return ActionState(True)
+
+    def _fx_post_state():
+        if not page._sel_year_id:
+            return ActionState(False, "اختر سنة مالية أولاً")
+        y = next((x for x in page._overview if x['id'] == page._sel_year_id), None)
+        if y and y.get('status') == 'closed':
+            return ActionState(False, "لا يمكن ترحيل قيد التقييم في سنة مالية مقفلة")
+        has_fx = page.session.multi_currency_enabled() if hasattr(page.session, 'multi_currency_enabled') else False
+        if not has_fx:
+            return ActionState(False, "لا توجد عملات أجنبية مفعلة تتطلب إعادة تقييم")
+        return ActionState(True)
+
+    def _fx_prev_state():
+        if not page._sel_year_id:
+            return ActionState(False, "اختر سنة مالية أولاً")
+        has_fx = page.session.multi_currency_enabled() if hasattr(page.session, 'multi_currency_enabled') else False
+        if not has_fx:
+            return ActionState(False, "لا توجد عملات أجنبية مفعلة")
+        return ActionState(True)
+
+    has_year = lambda: bool(page._sel_year_id)
+
+    return [
+        ActionGroup("الفترات", [
+            act('close_period', "إقفال الفترة", 'lock', 'period.close', page._close_period, _period_close_state),
+            act('reopen_period', "إعادة فتح الفترة", 'unlock', 'period.reopen', page._reopen_period, _period_reopen_state),
+        ]),
+        ActionGroup("الإقفال السنوي", [
+            act('pre_close', "فحوصات ما قبل الإقفال", 'check', 'report.view', page._run_preclose, has_year),
+            act('close_year', "إقفال السنة", 'lock', 'fiscalyear.close', page._close_year, _year_close_state, True),
+            act('reopen_year', "إعادة فتح السنة", 'unlock', 'fiscalyear.reopen', page._reopen_year, _year_reopen_state, True),
+        ]),
+        ActionGroup("الافتتاحية والتقييم", [
+            act('opening_prev', "معاينة الافتتاحية", 'book', 'opening.manage', page._opening_preview, has_year),
+            act('opening_gen', "توليد الافتتاحية", 'new', 'opening.manage', page._opening_generate, has_year),
+            act('fx_prev', "معاينة التقييم", 'coins', 'fx.revalue', lambda: page._fx(False), _fx_prev_state),
+            act('fx_post', "ترحيل التقييم", 'coins', 'fx.revalue', lambda: page._fx(True), _fx_post_state, True),
+        ]),
+        ActionGroup("السلامة والمطابقة", [
+            act('integ_run', "فحص السلامة", 'check', 'report.view', page._run_integrity),
+            act('recon_run', "مطابقة المخزون", 'box', 'inventory.view', page._recon),
+        ]),
+        ActionGroup("عرض", [
+            Action('refresh', "تحديث", 'refresh', handler=page.refresh),
+            Action('print', "طباعة", 'print', handler=lambda: page.sheet_year.print_()),
+        ]),
+    ]
+

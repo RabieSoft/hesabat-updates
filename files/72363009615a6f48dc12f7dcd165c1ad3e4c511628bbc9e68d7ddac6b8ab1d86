@@ -1,0 +1,207 @@
+"""علامة مائية خافتة بشعار «الحسابات برو» على كل النوافذ الرئيسية والحوارات.
+
+بلا paintEvent بايثوني (تفاديًا لـ Recursive repaint): الشعار يُرسم مرة واحدة في صورة جاهزة ثم يُعرض في QLabel شفاف للفأرة.
+الشعار يُرسم بلون واحد هادئ مأخوذ من لوحة الثيم (بلا ألوانه الأصلية) وبشفافية منخفضة جدًا كي لا يؤثر على قراءة الجداول والأرقام.
+الشدة: off (مخفي) / faint (خافت — الافتراضي) / normal (أوضح قليلًا) من قائمة المظهر.
+تُسجَّل أي أخطاء في watermark.log بجانب error.log بدل ابتلاعها بصمت.
+إيقاف: WATERMARK_ENABLED=False أو متغير البيئة ALHISABAT_NO_WATERMARK=1.
+"""
+import os
+import weakref
+
+from PySide6.QtCore import QEvent, QObject, Qt
+from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPixmap, QLinearGradient
+from PySide6.QtWidgets import QDialog, QLabel, QMainWindow, QMessageBox
+
+from alhisabat import branding
+from alhisabat.ui.design import tokens as T
+
+WATERMARK_ENABLED = not os.environ.get('ALHISABAT_NO_WATERMARK')
+LEVEL_FACTOR = {'off': 0.0, 'faint': 1.0, 'normal': 2.2}   # تُضرب في شفافية الثيم (tokens.THEMES[..]['wm'])
+FADE_BOTTOM = 0.62            # شفافية أسفل الشعار نسبةً لأعلاه: تدرج رأسي ناعم دون قصّ أي جزء
+LOGO_FRACTION = 0.52          # حجم الشعار نسبةً لأصغر بعد في النافذة (كان 0.60)
+MIN_WINDOW = (260, 180)
+_NAME = '_alhisabat_watermark'
+_src = {}
+_marks = weakref.WeakSet()
+_state = {'mode': 'light', 'level': 'faint', 'logged': False}
+
+
+def _log(msg):
+    try:
+        base = os.path.join(os.environ.get('APPDATA') or os.path.expanduser('~'), 'AlhisabatPro')
+        os.makedirs(base, exist_ok=True)
+        with open(os.path.join(base, 'watermark.log'), 'a', encoding='utf-8') as fh:
+            fh.write(msg + '\n')
+    except Exception:      # noqa: BLE001
+        pass
+
+
+def _source():
+    if 'img' not in _src:
+        p = branding.logo_path(dark=False)
+        img = QImage(str(p)) if p else QImage()
+        if img.isNull():
+            _log(f'logo not found/unreadable: {p}')
+        _src['img'] = img
+    return _src['img']
+
+
+def _opacity(mode, level):
+    return T.watermark_opacity(mode) * LEVEL_FACTOR.get(level, 1.0)
+
+
+def _make(mode, level, side):
+    """الشعار بلون واحد هادئ (muted من لوحة الثيم) بنفس شكل قناع الشعار، وبشفافية الثيم × الشدة."""
+    src = _source()
+    if src.isNull():
+        return QPixmap()
+    scaled = src.scaled(side, side, Qt.KeepAspectRatio, Qt.SmoothTransformation).convertToFormat(QImage.Format_ARGB32_Premultiplied)
+    tint = QImage(scaled.size(), QImage.Format_ARGB32_Premultiplied)
+    tint.fill(QColor(T.palette(mode)['muted']))
+    p = QPainter(tint)
+    p.setCompositionMode(QPainter.CompositionMode_DestinationIn)
+    p.drawImage(0, 0, scaled)
+    p.end()
+    scaled = _soft_edges(tint)
+    out = QImage(scaled.size(), QImage.Format_ARGB32_Premultiplied)
+    out.fill(Qt.transparent)
+    p = QPainter(out)
+    p.setOpacity(min(_opacity(mode, level), 1.0))
+    p.drawImage(0, 0, scaled)
+    p.end()
+    return QPixmap.fromImage(out)
+
+
+def _soft_edges(img):
+    """تدرج رأسي ناعم: الأعلى بكامل الوضوح ثم يخفّ تدريجيًا نحو الأسفل (لا قصّ لأي جزء من الشعار)."""
+    w, h = img.width(), img.height()
+    mask = QImage(img.size(), QImage.Format_ARGB32_Premultiplied)
+    mask.fill(Qt.transparent)
+    g = QLinearGradient(0, 0, 0, h)
+    g.setColorAt(0.0, QColor(0, 0, 0, 255))
+    g.setColorAt(0.35, QColor(0, 0, 0, 255))
+    g.setColorAt(1.0, QColor(0, 0, 0, int(255 * FADE_BOTTOM)))
+    mp = QPainter(mask)
+    mp.fillRect(0, 0, w, h, QBrush(g))
+    mp.end()
+    out = QImage(img)
+    pp = QPainter(out)
+    pp.setCompositionMode(QPainter.CompositionMode_DestinationIn)
+    pp.drawImage(0, 0, mask)
+    pp.end()
+    return out
+
+
+class _Mark(QLabel):
+    def __init__(self, win):
+        super().__init__(win)
+        self.setObjectName(_NAME)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setAlignment(Qt.AlignCenter)
+        self.setStyleSheet('background: transparent; border: none;')
+        self._key = None
+        _marks.add(self)
+        self.sync()
+
+    def sync(self, force=False):
+        win = self.parentWidget()
+        if win is None:
+            return
+        r = win.rect()
+        if self.geometry() != r:
+            self.setGeometry(r)
+        mode, level = _state['mode'], _state['level']
+        if level == 'off':
+            self.setVisible(False)
+            return
+        if not self.isVisible():
+            self.setVisible(True)
+        side = int(min(r.width(), r.height()) * LOGO_FRACTION)
+        key = (mode, level, side // 8)
+        if (force or key != self._key) and side >= 60:
+            self._key = key
+            self.setPixmap(_make(mode, level, side))
+
+
+class _WindowFilter(QObject):
+    def __init__(self, win, mark):
+        super().__init__(win)
+        self._m = mark
+
+    def eventFilter(self, obj, event):
+        try:
+            t = event.type()
+            if t == QEvent.Resize:
+                self._m.sync()
+            elif t in (QEvent.Show, QEvent.WindowActivate):
+                self._m.sync()
+                self._m.raise_()
+        except Exception as exc:      # noqa: BLE001
+            _log(f'window filter error: {exc!r}')
+        return False
+
+
+def attach(win):
+    """يضيف العلامة لنافذة (آمن للتكرار). يُستدعى تلقائيًا لكل نافذة، ويمكن استدعاؤه صراحةً."""
+    if not WATERMARK_ENABLED:
+        return
+    try:
+        if not isinstance(win, (QMainWindow, QDialog)) or isinstance(win, QMessageBox) or win.property(_NAME):
+            return
+        if win.width() < MIN_WINDOW[0] or win.height() < MIN_WINDOW[1]:
+            return
+        win.setProperty(_NAME, True)
+        mark = _Mark(win)
+        win.installEventFilter(_WindowFilter(win, mark))
+        mark.raise_()
+        mark.show()
+        if not _state['logged']:
+            _state['logged'] = True
+            _log(f'attached to {type(win).__name__} size={win.width()}x{win.height()} mode={_state["mode"]}')
+    except Exception as exc:      # noqa: BLE001
+        _log(f'attach error: {exc!r}')
+
+
+def set_mode(mode):
+    """يضبط الثيم (معرّفه) ويحدّث العلامات الموجودة."""
+    _state['mode'] = mode if mode in T.PALETTES else 'light'
+    for m in list(_marks):
+        try:
+            m.sync(force=True)
+        except Exception as exc:      # noqa: BLE001
+            _log(f'set_mode error: {exc!r}')
+
+
+class _Filter(QObject):
+    def eventFilter(self, obj, event):
+        try:
+            if event.type() == QEvent.Show and obj.isWidgetType() and obj.isWindow():
+                attach(obj)
+        except Exception as exc:      # noqa: BLE001
+            _log(f'app filter error: {exc!r}')
+        return False
+
+
+_filter = None
+
+
+def set_level(level):
+    """شدة العلامة: 'off' | 'faint' | 'normal' (تُطبَّق فورًا بلا إعادة تشغيل)."""
+    _state['level'] = level if level in LEVEL_FACTOR else 'faint'
+    for m in list(_marks):
+        try:
+            m.sync(force=True)
+        except Exception as exc:      # noqa: BLE001
+            _log(f'set_level error: {exc!r}')
+
+
+def install(app, mode='light', level='faint'):
+    global _filter
+    if not WATERMARK_ENABLED or _filter is not None:
+        return
+    _state['mode'] = mode if mode in T.PALETTES else 'light'
+    _state['level'] = level if level in LEVEL_FACTOR else 'faint'
+    _filter = _Filter(app)
+    app.installEventFilter(_filter)

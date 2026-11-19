@@ -1,0 +1,434 @@
+"""قالب «كشف الربيع» الكلاسيكي للتقارير وكشوف الحساب (A4/A5)، مطابق لعيّنة الربيع المعتمدة.
+
+الورقة: ترويسة بإطار (اسم الشركة بالعربية يمينًا وبالإنجليزية يسارًا، عنوان التقرير والفترة وسطًا، وبيانات الاتصال يسارًا)،
+ثم إطار الجدول (رقم الطرف واسمه + العملة، ترويسة الأعمدة الزرقاء مع مجموعة «المبلغ»، الصفوف، الرصيد الافتتاحي بالأحمر،
+إجمالي العمليات، إجمالي الرصيد مع المبلغ كتابةً)، فعبارة الإقرار والتوقيعات، وتذييل بثلاث خانات (تاريخ التقرير/الصفحة/طبع بواسطة).
+
+HTML بمجموعة العناصر التي يدعمها محرك النص الغني في Qt (جداول وألوان خلفية وحدود) فهو نفسه للشاشة والطباعة.
+بلا PySide6. الأرقام كلها من المواصفة (المحرك)؛ هنا عرض فقط.
+"""
+import re
+from datetime import datetime
+from decimal import Decimal
+from html import escape
+
+from alhisabat import branding
+from alhisabat.reporting import words as report_words
+from alhisabat.ui.core import format as fmt
+from alhisabat.ui.design import tokens as T
+
+from .document_model import column_tint
+
+_P = T.PALETTES['light']      # الورقة بيضاء دائمًا (تحاكي المطبوع) فألوانها من الفاتحة حتى في السمة الداكنة
+BLUE = _P['paper_head']       # خلفية ترويسة الجدول
+RED = _P['paper_red']         # الرصيد الافتتاحي والإجماليات
+LINE = _P['paper_grid']       # شبكة الجدول
+FRAME = _P['paper_frame']
+FONT = "Arial, Tahoma, 'Segoe UI', 'Noto Sans Arabic'"
+
+DEFAULT_NOTICE = 'يعتبر هذا الكشف صحيحاً وموافقاً عليه من قبلكم مالم يصلنا اي اعتراض خطي خلال مدة 15 يوم'
+SIGNATURES = ['المحاسب', 'المراجع', 'المدير المالي', 'المدير العام']
+
+# عمود «المبلغ» المجمّع مدين/دائن كما في العيّنة، وعرض الأعمدة بالنسبة المئوية (من العيّنة)
+STATEMENT_COLUMNS = [
+    {'key': 'date', 'label': 'التاريخ', 'w': 8.5, 'align': 'center'},
+    {'key': 'doc_type', 'label': 'نوع المستند', 'w': 11, 'align': 'center'},
+    {'key': 'doc_no', 'label': 'رقم المستند', 'w': 7, 'align': 'center'},
+    {'key': 'desc', 'label': 'البيان', 'w': 21, 'align': 'right'},
+    {'key': 'ref', 'label': 'رقم المرجع', 'w': 9.5, 'align': 'right'},
+    {'key': 'currency', 'label': 'العملة', 'w': 6.5, 'align': 'center'},
+    {'key': 'debit', 'label': 'مدين', 'w': 12, 'align': 'right', 'numeric': True, 'group': 'المبلغ'},
+    {'key': 'credit', 'label': 'دائن', 'w': 12, 'align': 'right', 'numeric': True, 'group': 'المبلغ'},
+    {'key': 'balance', 'label': 'الرصيد', 'w': 12.5, 'align': 'right', 'numeric': True},
+]
+
+# كشف «كل العملات»: نفس الترتيب (المبالغ بعملة كل حركة الأصلية، والرصيد الجاري لكل عملة على حدة)
+STATEMENT_COLUMNS_MC = STATEMENT_COLUMNS
+
+_CURRENCIES = {
+    'USD': ('$', 'دولار امريكي'), 'SAR': ('ر.س', 'ريال سعودي'), 'YER': ('ر.ي', 'ريال يمني'), 'AED': ('د.إ', 'درهم إماراتي'),
+    'EUR': ('€', 'يورو'), 'GBP': ('£', 'جنيه إسترليني'), 'EGP': ('ج.م', 'جنيه مصري'), 'KWD': ('د.ك', 'دينار كويتي'),
+    'QAR': ('ر.ق', 'ريال قطري'), 'OMR': ('ر.ع', 'ريال عماني'), 'BHD': ('د.ب', 'دينار بحريني'), 'JOD': ('د.أ', 'دينار أردني'),
+    'IQD': ('د.ع', 'دينار عراقي'),
+}
+_PARTY_LABEL = {'customer': 'رقم العميل', 'supplier': 'رقم المورد', 'employee': 'رقم الموظف'}
+_EMPH = ('إجمالي', 'الإجمالي', 'الإجماليات', 'مجمل', 'صافي', 'الرصيد الختامي', 'المتبقي')
+
+LRE, PDF = '‪', '‬'
+
+# محرك النص الغني في Qt (QTextDocument) يرصّ خلايا الجدول من اليسار لليمين حتى مع dir="rtl" (ظهر ذلك في معاينة كشف الحساب).
+# فنكتب كل صف من كشف الحساب بترتيب منطقي «أول عمود = أقصى اليمين» (التاريخ ثم نوع المستند ... ثم الرصيد) ونعكسه هنا ليظهر عربيًا صحيحًا.
+# إن ظهر الترتيب معكوسًا على جهازك (نسخة Qt تعكس الجداول تلقائيًا) اجعلها False.
+MIRROR = True
+
+
+def _tr(cells, mirror=True):
+    return '<tr>' + ''.join(reversed(cells) if (MIRROR and mirror) else cells) + '</tr>'
+
+
+def _e(v):
+    return escape('' if v is None else str(v))
+
+
+def _ltr(s):
+    """نص لاتيني/أرقام يُعرض من اليسار لليمين داخل فقرة عربية."""
+    return f'{LRE}{_e(s)}{PDF}'
+
+
+def dmy(s):
+    """2026-08-05 → 05/08/2026 (كما في العيّنة)."""
+    m = re.match(r'^(\d{4})-(\d{2})-(\d{2})', str(s or ''))
+    return f'{m.group(3)}/{m.group(2)}/{m.group(1)}' if m else str(s or '')
+
+
+def currency_label(code):
+    code = (code or '').strip().upper()
+    return _CURRENCIES.get(code, (code, code)) if code else ('', '')
+
+
+def printed_stamp(iso):
+    """«11:24:14 AM 05/08/2026» من ISO؛ يُرجع '' إن تعذّر."""
+    try:
+        d = datetime.fromisoformat(str(iso))
+    except (TypeError, ValueError):
+        return ''
+    h12 = d.hour % 12 or 12
+    return f"{LRE}{'AM' if d.hour < 12 else 'PM'} {h12:02d}:{d.minute:02d}:{d.second:02d} {d.day:02d}/{d.month:02d}/{d.year}{PDF}"
+
+
+def money(v, blank_zero=False, places=2):
+    if v is None:
+        return ''
+    if isinstance(v, Decimal):
+        if blank_zero and v == 0:
+            return ''
+        return _e(fmt.fmt_money(v, places=places))
+    return _e(v)
+
+
+def is_statement(doc):
+    return doc.sums is not None and {c.get('key') for c in doc.columns} >= {'date', 'desc', 'debit', 'credit'}
+
+
+def _period_line(doc):
+    p = (doc.period or '').strip()
+    if not p:
+        return ''
+    parts = [x.strip() for x in p.split('—')]
+    if len(parts) == 2 and all(parts):
+        return f'من تاريخ : {_ltr(dmy(parts[0]))}&nbsp;&nbsp;&nbsp;&nbsp;إلى تاريخ : {_ltr(dmy(parts[1]))}'
+    return f'كما في تاريخ : {_ltr(dmy(p))}'
+
+
+# ---------------------------------------------------------------- الترويسة
+def _contact_block(opts):
+    lines = []
+    for label, val in (('Tele No.', opts.phone), ('Fax No.', opts.fax), ('P.O.Box', opts.pobox)):
+        lines.append(f'<b>{label}</b>' + (f' {_ltr(val)}' if val else ''))
+    return '<br>'.join(f'<span style="font-size:9pt;">{x}</span>' for x in lines)
+
+
+def _is_doc(doc):
+    """فاتورة/سند/قيد/جرد/رواتب (لا تقرير ولا كشف): تُظهر الشعار ونص الترويسة وسطر العلامة وتحترم «الترويسة فقط»."""
+    return doc.kind not in ('report', 'statement')
+
+
+def _image_only(doc, opts, header_image_html):
+    return bool(header_image_html) and _is_doc(doc) and bool(getattr(opts, 'header_image_only', False))
+
+
+def header(doc, opts, header_image_html=''):
+    from . import document_html as DH
+    ar = ' - '.join(x for x in (doc.company, doc.branch if opts.show_branch else '') if x)
+    en = _e(opts.company_name_en)
+    if header_image_html:
+        top = f'<tr><td colspan="2">{header_image_html}</td></tr>'
+    else:
+        top = (f'<tr><td width="55%" align="right"><b style="font-size:11pt;">{_e(ar)}</b></td>'
+               f'<td width="45%" align="left"><b style="font-size:11pt;">{en}</b></td></tr>')
+    only = _image_only(doc, opts, header_image_html)
+    logo = DH._logo_img(opts, 48) if (_is_doc(doc) and not header_image_html) else ''
+    note = (f'<tr><td colspan="2" align="center"><span style="font-size:9pt;">{DH._multiline(opts.header_note)}</span></td></tr>'
+            if (_is_doc(doc) and opts.header_note and not header_image_html) else '')
+    period = '' if getattr(doc, 'voucher', None) is not None else _period_line(doc)   # السند يعرض تاريخه في جسمه
+    stamp = doc.stamp if (getattr(opts, 'show_stamp', True) and doc.kind not in ('report', 'statement')) else ''
+    big = getattr(doc, 'voucher', None) is not None        # السند: عنوان كبير بارز
+    title = (f'<span style="font-size:{"24pt" if big else "10.5pt"};"><b>{_e(doc.title)}</b></span>'
+             + (f'<br><span style="font-size:{"12pt" if big else "9pt"}; color:{RED};"><b>( {_e(stamp)} )</b></span>' if stamp else '')
+             + (f'<br><br><span style="font-size:10pt;"><b>{period}</b></span>' if period else ''))
+    mid = ('<tr><td colspan="2"><table width="100%" border="0" cellspacing="0" cellpadding="2"><tr>'
+           f'<td width="28%" valign="middle">{logo}</td>'
+           f'<td width="44%" align="center" valign="middle">{title}</td>'
+           f'<td width="28%" align="left" valign="bottom">{_contact_block(opts)}</td>'
+           '</tr></table></td></tr>')
+    return (f'<table width="100%" border="0" cellspacing="0" cellpadding="0"><tr><td style="border: 2px solid {FRAME};">'
+            f'<table width="100%" border="0" cellspacing="0" cellpadding="4">{top}{'' if only else note + mid}</table></td></tr></table>')
+
+
+# ---------------------------------------------------------------- الجدول
+def is_multi_currency(doc):
+    """كشف «كل العملات»: عمود عملة وأرصدة/إجماليات لكل عملة (sums['multi'])."""
+    return is_statement(doc) and bool((doc.sums or {}).get('multi'))
+
+
+def _columns(doc):
+    if is_multi_currency(doc):
+        return STATEMENT_COLUMNS_MC
+    return STATEMENT_COLUMNS if is_statement(doc) else _generic_columns(doc)
+
+
+def _generic_columns(doc):
+    cols = []
+    weights = [1.0 if c.get('numeric') else 2.5 for c in doc.columns]       # عمود الوصف/الصنف أعرض من الأرقام
+    total = sum(weights) or 1.0
+    for c, wt in zip(doc.columns, weights):
+        cols.append({'key': c['key'], 'label': c.get('label', c.get('title', '')), 'w': round(100.0 * wt / total, 2),
+                     'align': 'right', 'numeric': bool(c.get('numeric')), 'group': c.get('group')})
+    return cols
+
+
+def _th(text, extra='', size='10pt'):
+    return (f'<th {extra} bgcolor="{BLUE}" align="center" style="background-color:{BLUE}; border: 1px solid {LINE}; padding:5px; '
+            f'font-size:{size};"><b>{_e(text)}</b></th>')
+
+
+def _head_rows(cols, mirror=False):
+    groups = any(c.get('group') for c in cols)
+    if not groups:
+        return _tr([_th(c['label'], f'width="{c["w"]}%"') for c in cols], mirror)
+    r1, r2, i = [], [], 0
+    while i < len(cols):
+        c = cols[i]
+        if not c.get('group'):
+            r1.append(_th(c['label'], f'rowspan="2" width="{c["w"]}%"'))
+            i += 1
+            continue
+        j = i
+        while j < len(cols) and cols[j].get('group') == c['group']:
+            j += 1
+        r1.append(_th(c['group'], f'colspan="{j - i}"'))
+        r2.extend(_th(x['label'], f'width="{x["w"]}%"', '9.5pt') for x in cols[i:j])
+        i = j
+    return _tr(r1, mirror) + _tr(r2, mirror)
+
+
+def _info_row(doc, cols, opts, img_only=False):
+    """صف المعلومات أعلى الجدول: رقم الطرف واسمه (يمينًا) والعملة (يسارًا)."""
+    items = [(k, v) for k, v in doc.info if k != 'العملة']
+    if _is_doc(doc) and not img_only:                      # مستند (فاتورة/سند/قيد): رقمه وتاريخه أولًا
+        head = [(k, v) for k, v in (('رقم المستند', doc.number), ('التاريخ', dmy(doc.date))) if v]
+        items = head + items
+    right = ''
+    for k, v in items:
+        v = str(v or '')
+        if is_statement(doc) and k == 'الاسم':
+            kind = (doc.sums or {}).get('party')
+            code, _sp, name = v.partition(' ')
+            if kind in _PARTY_LABEL:
+                right += (f'<td align="right">{_PARTY_LABEL[kind]}</td>'
+                          f'<td align="center"><b style="color:{RED}; font-size:11pt;">{_e(code)}</b></td>'
+                          f'<td align="right"><b>{_e(name)}</b></td>')
+                continue
+            right += f'<td align="right">الحساب</td><td align="right"><b>{_e(v)}</b></td>'
+            continue
+        right += f'<td align="right">{_e(k)}</td><td align="right"><b>{_e(v)}</b></td>'
+    sym, name = currency_label(doc.currency)
+    left = ''
+    if sym or name:
+        left = (f'<td align="left"><b>العملة :</b></td><td align="center"><b style="color:{RED};">{_ltr(sym)}</b></td>'
+                f'<td align="right"><b>{_e(name)}</b></td>')
+    inner = (f'<table width="100%" border="0" cellspacing="0" cellpadding="3"><tr>'
+             f'<td width="60%"><table border="0" cellspacing="0" cellpadding="3"><tr>{right}</tr></table></td>'
+             f'<td width="40%" align="left"><table border="0" cellspacing="0" cellpadding="3"><tr>{left}</tr></table></td>'
+             f'</tr></table>')
+    return f'<tr><td colspan="{len(cols)}" style="border: 1px solid {LINE};">{inner}</td></tr>'
+
+
+def _td(content, align='right', extra='', style='', bg=None):
+    if bg:
+        extra = f'{extra} bgcolor="{bg}"'
+        style = f'background-color:{bg}; {style}'
+    return (f'<td {extra} align="{align}" style="border: 1px solid {LINE}; padding:3px 5px; {style}">'
+            f'<b style="font-size:8.5pt;">{content}</b></td>')
+
+
+def _cell(row, c, statement):
+    v = row.get(c['key'])
+    if c['key'] == 'date':
+        return dmy(v)
+    if c.get('numeric'):
+        places = 3 if c['key'] == 'qty' else 2
+        return money(v, blank_zero=statement, places=places)
+    if isinstance(v, Decimal):
+        return money(v)
+    return _e(v)
+
+
+def _balance_label(doc, net):
+    kind = (doc.sums or {}).get('party')
+    if kind:
+        side = 'عليكم' if net > 0 else ('لكم' if net < 0 else '')
+    else:
+        side = 'مدين' if net > 0 else ('دائن' if net < 0 else '')
+    return ('إجمالي الرصيد ' + side).strip()
+
+
+def _bal_cell(net, doc, red=''):
+    """خلية عمود «الرصيد» في صفوف الافتتاحي والإجمالي: الرصيد بطبيعة الحساب (مدين موجب لحساب مدين، ودائن موجب لحساب دائن)."""
+    sign = (doc.sums or {}).get('sign') or 1
+    v = net * sign
+    return _td(money(v) if v != 0 else '', 'right', '', red)
+
+
+def _multi_tail(doc, cols, opts):
+    """ذيل كشف كل العملات: لكل عملة سطر «إجمالي العمليات» وسطر «إجمالي الرصيد» مع المبلغ كتابةً بتلك العملة."""
+    s = doc.sums or {}
+    red = f'color:{RED};'
+    left = max(len(cols) - 6, 1)                      # بين «العدد» (3 أعمدة) وأعمدة مدين/دائن/الرصيد
+    out = ''
+    for i, c in enumerate(s.get('by_currency') or []):
+        code = c['currency']
+        sym, _n = currency_label(code)
+        deb, cred = c.get('debit') or Decimal(0), c.get('credit') or Decimal(0)
+        net = (c.get('opening') or Decimal(0)) + deb - cred
+        cnt = f'العدد : {_ltr(c.get("count", 0))}' if i == 0 else ''
+        out += _tr([_td(cnt, "right", "colspan=3", red),
+                    _td(_ltr(sym or code) + "&nbsp;&nbsp;إجمالي العمليات", "center", f"colspan={left}", red),
+                    _td(money(deb), "right", "", red), _td(money(cred), "right", "", red), _td("", "right", "", red)])
+        words = ''
+        if opts.show_amount_words and net != 0:
+            words = _e(fmt.amount_in_words(abs(net), code, prefix='', suffix=''))
+        label = _balance_label(doc, net) + f' ({code})'
+        out += _tr([_td(_e(label), "right", "colspan=3", "font-size:10pt;"),
+                    _td(words, "right", f"colspan={left}"),
+                    _td(money(net) if net > 0 else (money(Decimal(0)) if net == 0 else ""), "right", "", red),
+                    _td(money(abs(net)) if net < 0 else "", "right", "", red), _bal_cell(net, doc, red)])
+    if s.get('truncated'):
+        out += (f'<tr><td colspan="{len(cols)}" align="center" style="border: 1px solid {LINE}; padding:3px;">'
+                f'<b style="color:{RED}; font-size:8pt;">تنبيه: الكشف يتجاوز الحد الأقصى للحركات المعروضة؛ الإجماليات أعلاه تشمل كل الفترة.</b></td></tr>')
+    return out
+
+
+def _statement_tail(doc, cols, opts):
+    if is_multi_currency(doc):
+        return _multi_tail(doc, cols, opts)
+    s = doc.sums or {}
+    deb, cred = s.get('debit') or Decimal(0), s.get('credit') or Decimal(0)
+    opening = doc.opening or Decimal(0)
+    net = opening + deb - cred
+    sym, _name = currency_label(doc.currency)
+    red = f'color:{RED};'
+    count_txt = 'العدد : ' + _ltr(s.get('count', 0))
+    mid = max(len(cols) - 6, 1)
+    out = _tr([_td(count_txt, "right", "colspan=3", red),
+               _td(((_ltr(sym) + "&nbsp;&nbsp;") if sym else "") + "إجمالي العمليات", "center", f"colspan={mid}", red),
+               _td(money(deb), "right", "", red), _td(money(cred), "right", "", red), _td("", "right", "", red)])
+    words = ''
+    if opts.show_amount_words and net != 0:
+        words = _e(fmt.amount_in_words(abs(net), doc.currency or 'SAR', prefix='', suffix=''))
+    debit_cell = money(net) if net > 0 else ''
+    credit_cell = money(abs(net)) if net < 0 else ''
+    if net == 0:
+        debit_cell = money(Decimal(0))
+    out += _tr([_td(_e(_balance_label(doc, net)), "right", "colspan=3", "font-size:10pt;"),
+                _td(words, "right", f"colspan={mid}"),
+                _td(debit_cell, "right", "", red), _td(credit_cell, "right", "", red), _bal_cell(net, doc, red)])
+    if s.get('truncated'):
+        out += (f'<tr><td colspan="{len(cols)}" align="center" style="border: 1px solid {LINE}; padding:3px;">'
+                f'<b style="color:{RED}; font-size:8pt;">تنبيه: الكشف يتجاوز الحد الأقصى للحركات المعروضة؛ الإجماليات أعلاه تشمل كل الفترة.</b></td></tr>')
+    return out
+
+
+def _generic_tail(doc, cols, opts=None):
+    out = ''
+    for t in doc.totals:
+        out += (f'<tr>{_td(_e(t.get("label")), "right", f"colspan={max(len(cols) - 1, 1)}", f"color:{RED};")}'
+                f'{_td(money(t.get("value")), "right", "", f"color:{RED};")}</tr>')
+    if doc.amount_words and (opts is None or opts.show_amount_words):      # المبلغ كتابةً بنوع العملة (سطر لكل إجمالي)
+        lines = [_e(x) for x in report_words.split_lines(doc.amount_words)]
+        body = ('المبلغ كتابةً : ' + lines[0]) if len(lines) == 1 else ('المبلغ كتابةً :<br>' + '<br>'.join(lines))
+        out += f'<tr>{_td(body, "right", f"colspan={max(len(cols), 1)}", "font-size:10pt;")}</tr>'
+    return out
+
+
+def table(doc, opts, img_only=False):
+    st = is_statement(doc)
+    cols = _columns(doc)
+    body = ''
+    multi = is_multi_currency(doc)
+    mc_open = [c for c in ((doc.sums or {}).get('by_currency') or []) if c.get('opening')] if multi else []
+    if multi:
+        for c in mc_open:
+            o = c['opening']
+            body += _tr([_td("", "center", "colspan=3"),
+                         _td(_e("الرصيد الإفتتاحي (" + c["currency"] + ")"), "center", f"colspan={max(len(cols) - 6, 1)}", f"color:{RED};"),
+                         _td(money(o) if o > 0 else "", "right", "", f"color:{RED};"),
+                         _td(money(abs(o)) if o < 0 else "", "right", "", f"color:{RED};"), _bal_cell(o, doc, f"color:{RED};")])
+    elif st and doc.opening:
+        o = doc.opening
+        body += _tr([_td("", "center", "colspan=3"), _td("الرصيد الإفتتاحي", "center", f"colspan={max(len(cols) - 6, 1)}", f"color:{RED};"),
+                     _td(money(o) if o > 0 else "", "right", "", f"color:{RED};"),
+                     _td(money(abs(o)) if o < 0 else "", "right", "", f"color:{RED};"), _bal_cell(o, doc, f"color:{RED};")])
+    for r in doc.rows:
+        first = str(r.get(cols[0]['key']) or '') if cols else ''
+        emph = (not st) and any(first.strip().startswith(x) for x in _EMPH)
+        style = f'color:{RED};' if emph else ''
+        body += _tr([_td(_cell(r, c, st), c.get('align', 'right'), '', style, column_tint(c['key'], i))
+                     for i, c in enumerate(cols)], st)
+    if not doc.rows and not ((st and doc.opening) or mc_open):
+        body += (f'<tr><td colspan="{len(cols)}" align="center" style="border: 1px solid {LINE}; padding:8px;">'
+                 f'<b>{"لا توجد بيانات" if not _is_doc(doc) else "لا توجد بنود"}</b></td></tr>')
+    tail = _statement_tail(doc, cols, opts) if st else _generic_tail(doc, cols, opts)
+    return (f'<table width="100%" border="1" cellspacing="0" cellpadding="0" style="border: 1px solid {LINE}; border-collapse: collapse;">'
+            f'<thead>{_info_row(doc, cols, opts, img_only)}{_head_rows(cols, st)}</thead><tbody>{body}{tail}</tbody></table>')
+
+
+# ---------------------------------------------------------------- الإقرار والتوقيعات والتذييل
+def notice_and_signatures(doc, opts, note_pt=7, sig_pt=9, bold=False):
+    note = doc.footer_note or opts.footer_note or (DEFAULT_NOTICE if is_statement(doc) else '')
+    out = ''
+    if note:
+        note_html = f'<b>{_e(note)}</b>' if bold else _e(note)
+        out += f'<p align="right" style="margin:6px 4px 0 4px; font-size:{note_pt}pt;">{note_html}</p>'
+    if opts.show_signatures:
+        labels = doc.signatures or SIGNATURES
+        w = int(100 / len(labels))
+        cells = ''.join(
+            f'<td width="{w}%" align="center" valign="bottom"><span style="font-size:{sig_pt}pt;">{("<b>" + _e(s) + "</b>") if bold else _e(s)}</span><br><br>'
+            f'<table width="70%" border="0" cellspacing="0" cellpadding="0"><tr><td style="border-top: 1px solid {FRAME};" '
+            f'height="1"></td></tr></table></td>' for s in labels)
+        out += f'<table width="100%" border="0" cellspacing="0" cellpadding="3"><tr>{cells}</tr></table>'
+    return out
+
+
+def filler(fill_px):
+    """مساحة فارغة داخل الإطار تدفع التذييل إلى أسفل الصفحة (تُحسب في print_service من ارتفاع المحتوى)."""
+    if not fill_px or fill_px < 8:
+        return ''
+    return f'<table width="100%" border="0" cellspacing="0" cellpadding="0"><tr><td height="{int(fill_px)}"></td></tr></table>'
+
+
+def footer(doc, page=None, pages=None, opts=None, pt=8, brand_pt=7):
+    when = printed_stamp(doc.printed_at)
+    label = 'تاريخ التقرير' if doc.kind in ('report', 'statement') else 'تاريخ الطباعة'
+    pg = f'{page} / {pages}' if page and pages else ''
+    by = f'طبع بواسطة : {_e(doc.printed_by)}' if doc.printed_by else 'طبع بواسطة :'
+    brand = (f'<p align="center" style="margin:2px 0 0 0; font-size:{brand_pt}pt; color:#666;">{_e(branding.BRAND_LINE)}</p>'
+             if (opts is not None and _is_doc(doc) and opts.show_brand_footer) else '')
+    return (f'<table width="100%" border="0" cellspacing="0" cellpadding="2"><tr><td colspan="3" height="3" '
+            f'style="border-top: 2px solid {FRAME};"></td></tr><tr>'
+            f'<td width="34%" align="right"><b style="font-size:{pt}pt;">{(label + " : " + when) if when else ""}</b></td>'
+            f'<td width="32%" align="center"><b style="font-size:{pt}pt;">{pg}</b></td>'
+            f'<td width="34%" align="left"><b style="font-size:{pt}pt;">{by}</b></td></tr></table>{brand}')
+
+
+def render_classic(doc, paper, opts, header_image_html='', fill_px=0, pages=None):
+    size = opts.font_pt or (10 if paper == 'A4' else 9)
+    img_only = _image_only(doc, opts, header_image_html)
+    inner = (table(doc, opts, img_only) + notice_and_signatures(doc, opts) + filler(fill_px))
+    frame = (f'<table width="100%" border="0" cellspacing="0" cellpadding="0"><tr><td style="border: 1px solid {FRAME};">'
+             f'{inner}</td></tr></table>')
+    gap = '<p style="margin:0; font-size:4pt;">&nbsp;</p>'
+    return (f'<html dir="rtl"><head><meta charset="utf-8"></head>'
+            f'<body dir="rtl" style="font-family:{FONT}; font-size:{size}pt; color:{FRAME}; background-color:{_P["paper"]};">'
+            f'{header(doc, opts, header_image_html)}{gap}{frame}{gap}{footer(doc, pages, pages, opts)}</body></html>')

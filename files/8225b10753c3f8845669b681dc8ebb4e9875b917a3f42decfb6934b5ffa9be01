@@ -1,0 +1,138 @@
+"""أعمار الديون (Aging): تطبيق الدفعات على أقدم الأرصدة المستحقة (FIFO) ثم تصنيف المتبقي حسب أيام التأخر عن الاستحقاق
+(تاريخ القيد + مدة السداد للطرف). المجموع = رصيد الطرف تماما. الدفعات الزائدة تظهر كـ«دفعات مقدمة/رصيد عكسي».
+حدود: التطبيق FIFO وليس مطابقة مستند-بمستند (تأتي مع الفواتير/السندات في Gate 10–12)، وبالعملة الأساسية."""
+from datetime import date, timedelta
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.accounting import balance_engine as be
+from alhisabat.business import parties as pt
+from alhisabat.security import permissions
+
+
+def _label(edges, i):
+    if i == 0:
+        return "غير مستحق"
+    if i == len(edges) + 1:
+        return f"أكثر من {edges[-1]}"
+    lo = 1 if i == 1 else edges[i - 2] + 1
+    return f"{lo}-{edges[i - 1]}"
+
+
+def aging(conn, user_id, company_id, kind, as_of, *, edges=(30, 60, 90), party_id=None, include_zero=False):
+    permissions.require(conn, user_id, company_id, "party.view", check_branch=False)
+    permissions.require(conn, user_id, company_id, "report.view", check_branch=False)
+    if kind not in pt.KINDS:
+        raise AccountingError("نوع غير معروف")
+    ps = conn.execute("SELECT * FROM parties WHERE company_id=? AND kind=?" + (" AND id=?" if party_id else "") + " ORDER BY code",
+                      (company_id, kind, *([party_id] if party_id else []))).fetchall()
+    if party_id and not ps:
+        raise AccountingError("العميل/المورد غير موجود في هذه الشركة")
+    ys = be.year_start(conn, company_id, as_of)
+    args = {"c": company_id, "t": as_of, "ys": ys, "fl": be.perm_floor(conn, company_id, ys)}
+    eff, counted, _ = be.frag("a")
+    keys = []
+    for i, p in enumerate(ps):
+        args[f"a{i}"] = p["account_id"]; keys.append(f":a{i}")
+    lines = {}
+    if ps:
+        for r in conn.execute(
+                f"SELECT l.account_id, e.entry_date, l.debit_base d, l.credit_base c FROM journal_lines l "
+                f"JOIN journal_entries e ON e.id=l.entry_id JOIN accounts a ON a.id=l.account_id "
+                f"WHERE e.company_id=:c AND e.status IN {be.POSTED} AND e.entry_date<=:t AND {counted} "
+                f"AND l.account_id IN ({','.join(keys)}) ORDER BY l.account_id,e.entry_date,e.posted_no,e.id,l.line_no", args):
+            lines.setdefault(r["account_id"], []).append(r)
+    asof = date.fromisoformat(as_of)
+    labels = [_label(edges, i) for i in range(len(edges) + 2)]
+    rows, tot = [], [0] * (len(edges) + 2)
+    tot_adv = 0
+    for p in ps:
+        sign = pt._sign(p["kind"])
+        open_items, advance = [], 0
+        for r in lines.get(p["account_id"], []):
+            amt = sign * (r["d"] - r["c"])
+            if amt > 0:
+                use = min(advance, amt); advance -= use; amt -= use
+                if amt:
+                    open_items.append([date.fromisoformat(r["entry_date"]), amt])
+            elif amt < 0:
+                pay = -amt
+                while pay and open_items:
+                    take = min(pay, open_items[0][1]); open_items[0][1] -= take; pay -= take
+                    if open_items[0][1] == 0:
+                        open_items.pop(0)
+                advance += pay
+        buckets = [0] * (len(edges) + 2)
+        for d0, amt in open_items:
+            over = (asof - (d0 + timedelta(days=p["payment_terms_days"]))).days
+            idx = 0 if over <= 0 else next((i + 1 for i, e in enumerate(edges) if over <= e), len(edges) + 1)
+            buckets[idx] += amt
+        total = sum(buckets) - advance
+        if include_zero or total or advance or any(buckets):
+            rows.append({"party_id": p["id"], "code": p["code"], "name": p["name"], "terms_days": p["payment_terms_days"],
+                         "buckets": buckets, "advance": advance, "total": total})
+            for i, b in enumerate(buckets):
+                tot[i] += b
+            tot_adv += advance
+    return {"as_of": as_of, "labels": labels, "rows": rows,
+            "totals": {"buckets": tot, "advance": tot_adv, "total": sum(tot) - tot_adv}}
+
+
+def _party_net_orig(conn, company_id, party, currency, as_of):
+    ys = be.year_start(conn, company_id, as_of)
+    eff, counted, _x = be.frag("a")
+    r = conn.execute(
+        f"SELECT COALESCE(SUM(l.debit_orig-l.credit_orig),0) FROM journal_lines l JOIN journal_entries e ON e.id=l.entry_id JOIN accounts a ON a.id=l.account_id "
+        f"WHERE l.account_id=:acc AND e.company_id=:c AND e.status IN {be.POSTED} AND e.entry_date<=:t AND l.currency=:cur AND {counted}",
+        {"acc": party["account_id"], "c": company_id, "t": as_of, "ys": ys, "fl": be.perm_floor(conn, company_id, ys), "cur": currency}).fetchone()[0]
+    return pt._sign(party["kind"]) * r
+
+
+def aging_documents(conn, user_id, company_id, kind, as_of, *, edges=(30, 60, 90)):
+    """أعمار الديون مستندا بمستند: الفواتير الآجلة المرحّلة بمتبقيها (بعد تخصيصات السندات والمرتجعات المرحّلة حتى as_of)، مصنفة بأيام التأخر
+    عن تاريخ الاستحقاق، لكل (طرف، عملة الفاتورة). «على الحساب» = رصيد الطرف بتلك العملة − مجموع المتبقي (دفعات مقدمة/أرصدة افتتاحية بلا مستند
+    /قيود تسوية). حدود: إلغاء فاتورة بعد as_of لا يُراعى تاريخيا."""
+    from alhisabat.business import cash
+    permissions.require(conn, user_id, company_id, "party.view", check_branch=False)
+    permissions.require(conn, user_id, company_id, "report.view", check_branch=False)
+    if kind not in pt.KINDS:
+        raise AccountingError("نوع غير معروف")
+    tbl, dtype, pcol = ("sales_invoices", "sales_invoice", "customer_id") if kind == "customer" else ("purchase_invoices", "purchase_invoice", "supplier_id")
+    asof = date.fromisoformat(as_of)
+    labels = [_label(edges, i) for i in range(len(edges) + 2)]
+    parties = {p["id"]: p for p in conn.execute("SELECT * FROM parties WHERE company_id=? AND kind=?", (company_id, kind))}
+    rows = {}
+    for h in conn.execute(f"SELECT * FROM {tbl} WHERE company_id=? AND doc_type='invoice' AND status='posted' AND invoice_date<=? AND due_total>0 "
+                          f"AND {pcol} IS NOT NULL", (company_id, as_of)).fetchall():
+        out = cash.outstanding(conn, dtype, h["id"], as_of)
+        if out <= 0:
+            continue
+        over = (asof - date.fromisoformat(h["due_date"] or h["invoice_date"])).days
+        idx = 0 if over <= 0 else next((i + 1 for i, e in enumerate(edges) if over <= e), len(edges) + 1)
+        r = rows.setdefault((h[pcol], h["currency"]), {"buckets": [0] * (len(edges) + 2), "outstanding": 0})
+        r["buckets"][idx] += out; r["outstanding"] += out
+    ys = be.year_start(conn, company_id, as_of)
+    eff, counted, _x = be.frag("a")
+    ids = [p["account_id"] for p in parties.values()]
+    if ids:
+        args = {"c": company_id, "t": as_of, "ys": ys, "fl": be.perm_floor(conn, company_id, ys)}
+        keys = []
+        for i, a in enumerate(ids):
+            args[f"a{i}"] = a; keys.append(f":a{i}")
+        by_acc = {p["account_id"]: p["id"] for p in parties.values()}
+        for r in conn.execute(f"SELECT l.account_id,l.currency,SUM(l.debit_orig-l.credit_orig) n FROM journal_lines l JOIN journal_entries e ON e.id=l.entry_id "
+                              f"JOIN accounts a ON a.id=l.account_id WHERE e.company_id=:c AND e.status IN {be.POSTED} AND e.entry_date<=:t AND {counted} "
+                              f"AND l.account_id IN ({','.join(keys)}) GROUP BY l.account_id,l.currency HAVING n<>0", args):
+            rows.setdefault((by_acc[r["account_id"]], r["currency"]), {"buckets": [0] * (len(edges) + 2), "outstanding": 0})
+    out_rows, tot = [], {}
+    for (pid, cur), r in sorted(rows.items(), key=lambda kv: (parties[kv[0][0]]["code"], kv[0][1])):
+        p = parties[pid]
+        bal = _party_net_orig(conn, company_id, p, cur, as_of)
+        onacc = bal - r["outstanding"]
+        if not (r["outstanding"] or onacc):
+            continue
+        out_rows.append({"party_id": pid, "code": p["code"], "name": p["name"], "currency": cur, "buckets": r["buckets"],
+                         "outstanding": r["outstanding"], "on_account": onacc, "balance": bal})
+        t = tot.setdefault(cur, {"buckets": [0] * (len(edges) + 2), "outstanding": 0, "on_account": 0, "balance": 0})
+        for i, b in enumerate(r["buckets"]):
+            t["buckets"][i] += b
+        t["outstanding"] += r["outstanding"]; t["on_account"] += onacc; t["balance"] += bal
+    return {"as_of": as_of, "labels": labels, "rows": out_rows, "totals_by_currency": tot}

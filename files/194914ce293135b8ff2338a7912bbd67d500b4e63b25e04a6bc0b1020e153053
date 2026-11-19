@@ -1,0 +1,84 @@
+"""لوحة إعدادات النسخ الاحتياطي التلقائي (أعلى صفحة النسخ الاحتياطي): تفعيل، المجلد، عدد النسخ المحفوظة، آخر نسخة، «نسخ الآن». يتطلب PySide6."""
+from PySide6.QtCore import QUrl, Qt
+from PySide6.QtGui import QDesktopServices
+from PySide6.QtWidgets import QCheckBox, QGroupBox, QHBoxLayout, QLabel, QPushButton, QSpinBox, QVBoxLayout
+
+from alhisabat.ui.core import backup_logic as BL
+
+
+class BackupSettingsPanel(QGroupBox):
+    def __init__(self, auto_backup, prefs, parent=None):
+        super().__init__('النسخ الاحتياطي التلقائي', parent)
+        self.ab, self.prefs = auto_backup, prefs
+        self.setLayoutDirection(Qt.RightToLeft)
+        v = QVBoxLayout(self)
+        v.setSpacing(6)
+        r1 = QHBoxLayout()
+        self.chk = QCheckBox('تفعيل النسخ التلقائي (عند فتح البرنامج مرة يوميًا، وعند إغلاقه)')
+        self.chk.toggled.connect(self._on_auto)
+        r1.addWidget(self.chk); r1.addStretch(1)
+        v.addLayout(r1)
+        r2 = QHBoxLayout()
+        r2.addWidget(QLabel('المجلد:'))
+        self.folder = QLabel(''); self.folder.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.folder.setLayoutDirection(Qt.LeftToRight)
+        r2.addWidget(self.folder, 1)
+        self.btn_dir = QPushButton('تحديد المجلد…'); self.btn_dir.setAutoDefault(False); self.btn_dir.clicked.connect(self._pick)
+        self.btn_open = QPushButton('فتح المجلد'); self.btn_open.setAutoDefault(False); self.btn_open.clicked.connect(self._open)
+        r2.addWidget(self.btn_dir); r2.addWidget(self.btn_open)
+        v.addLayout(r2)
+        r3 = QHBoxLayout()
+        r3.addWidget(QLabel('الاحتفاظ بآخر'))
+        self.keep = QSpinBox(); self.keep.setRange(BL.MIN_KEEP, BL.MAX_KEEP); self.keep.setSuffix(' نسخة تلقائية')
+        self.keep.setToolTip('الأقدم تُحذف تلقائيًا. النسخ اليدوية وأي ملفات أخرى في المجلد لا تُمَسّ.')
+        self.keep.editingFinished.connect(self._on_keep)
+        r3.addWidget(self.keep)
+        self.last = QLabel(''); self.last.setObjectName('ctxKey')
+        r3.addSpacing(16); r3.addWidget(self.last, 1)
+        self.btn_now = QPushButton('نسخ الآن'); self.btn_now.setProperty('primary', True); self.btn_now.setAutoDefault(False)
+        self.btn_now.clicked.connect(self._now)
+        r3.addWidget(self.btn_now)
+        v.addLayout(r3)
+        self.hint = QLabel(''); self.hint.setObjectName('invWarn'); self.hint.setWordWrap(True)
+        v.addWidget(self.hint)
+        self.reload()
+
+    def reload(self):
+        cfg = BL.load(self.prefs)
+        ok = BL.is_configured(cfg)
+        for w, val in ((self.chk, cfg['auto'] and ok), (self.keep, cfg['keep'])):
+            w.blockSignals(True)
+            (w.setChecked if w is self.chk else w.setValue)(val)
+            w.blockSignals(False)
+        self.chk.setEnabled(ok)
+        self.keep.setEnabled(ok)
+        self.btn_now.setEnabled(ok)
+        self.btn_open.setEnabled(ok)
+        self.folder.setText(cfg['dir'] if ok else '— لم يُحدَّد بعد —')
+        self.btn_dir.setText('تغيير المجلد…' if ok else 'تحديد المجلد…')
+        self.last.setText(BL.describe_last(cfg))
+        self.hint.setVisible(not ok)
+        self.hint.setText('حدّد مجلدًا لتبدأ النسخ التلقائية. يُفضَّل قرص آخر أو فلاشة أو مجلد مزامنة سحابية.')
+
+    def _on_auto(self, flag):
+        BL.set_auto(self.prefs, flag)
+        self.reload()
+
+    def _on_keep(self):
+        BL.set_keep(self.prefs, self.keep.value())
+        self.reload()
+
+    def _pick(self):
+        if self.ab.choose_folder(self):
+            self.reload()
+
+    def _open(self):
+        d = BL.load(self.prefs)['dir']
+        if d:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(d))
+
+    def _now(self):
+        self.btn_now.setEnabled(False)
+        started = self.ab.run(BL.MANUAL, on_done=lambda _r: self.reload(), on_error=lambda _e: self.reload())
+        if not started:
+            self.reload()

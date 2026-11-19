@@ -1,0 +1,37 @@
+"""ملاحظة أرصدة الحسابات (مدين / دائن / الرصيد) للنوافذ: القيد البسيط والمركب. لا SQL هنا؛ تعتمد على ملخص الحساب في الجلسة."""
+
+
+def balance_line(session, name, account_id, as_of, currency=None):
+    """«الاسم: مدين X | دائن Y | الرصيد Z (مدين/دائن) العملة» حتى تاريخ as_of بعملة currency (أو كل عملات الحساب إن لم توجد حركة بها).
+    تُرجع '' عند تعذّر الحساب (صلاحية/حساب غير موجود) فلا تعطّل النافذة."""
+    try:
+        summ = session.account_summary(int(account_id), as_of, as_of)
+    except Exception:  # noqa: BLE001
+        return ''
+    from alhisabat.ui.components.datagrid import format_minor
+    rows = summ.get('by_currency') or []
+    mine = [r for r in rows if r.get('currency') == currency] or rows
+    if not mine:
+        return f'{name}: لا حركة (مدين 0.00 | دائن 0.00)'
+    parts = []
+    for r in mine:
+        d, c = int(r.get('debit_orig') or 0), int(r.get('credit_orig') or 0)
+        net = d - c
+        side = 'مدين' if net > 0 else ('دائن' if net < 0 else 'متزن')
+        parts.append(f"مدين {format_minor(d)} | دائن {format_minor(c)} | الرصيد {format_minor(abs(net))} {side} {r.get('currency') or ''}".strip())
+    return f'{name}: ' + '  ‖  '.join(parts)
+
+
+def balances_text(session, accounts, as_of, currency=None, limit=6):
+    """accounts: [(account_id, name)] — يُكرَّر الحساب مرة واحدة. سطر لكل حساب."""
+    seen, out = set(), []
+    for aid, name in accounts:
+        if not aid or aid in seen:
+            continue
+        seen.add(aid)
+        ln = balance_line(session, name, aid, as_of, currency)
+        if ln:
+            out.append(ln)
+        if len(out) >= limit:
+            break
+    return '\n'.join(out)

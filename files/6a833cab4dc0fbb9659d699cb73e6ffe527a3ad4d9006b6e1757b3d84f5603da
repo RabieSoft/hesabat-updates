@@ -1,0 +1,36 @@
+-- 0044_party_agreements.sql: اتفاقية فتح حساب تعامل تجاري لكل عميل (توليد من القالب، لقطة نص، نسخة موقّعة)
+ALTER TABLE parties ADD COLUMN id_type TEXT NOT NULL DEFAULT '';
+ALTER TABLE parties ADD COLUMN id_number TEXT NOT NULL DEFAULT '';
+ALTER TABLE parties ADD COLUMN id_issuer TEXT NOT NULL DEFAULT '';
+ALTER TABLE parties ADD COLUMN id_issue_date TEXT NOT NULL DEFAULT '';
+
+CREATE TABLE agreement_templates(
+  id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id),
+  kind TEXT NOT NULL DEFAULT 'commercial_account',
+  body_html TEXT NOT NULL CHECK(length(trim(body_html))>0),
+  updated_by INTEGER REFERENCES users(id), updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(company_id,kind));
+
+CREATE TABLE party_agreements(
+  id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id),
+  party_id INTEGER NOT NULL REFERENCES parties(id),
+  version INTEGER NOT NULL CHECK(version>0),
+  status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','printed','signed','void')),
+  body_html TEXT NOT NULL,
+  data_json TEXT NOT NULL DEFAULT '{}',
+  created_by INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  printed_at TEXT, signed_at TEXT, signed_by INTEGER REFERENCES users(id),
+  signed_file_name TEXT, signed_file_mime TEXT, signed_file BLOB,
+  UNIQUE(party_id,version));
+CREATE INDEX ix_party_agreements_party ON party_agreements(party_id,status);
+
+CREATE TRIGGER party_agreement_no_delete BEFORE DELETE ON party_agreements BEGIN
+  SELECT RAISE(ABORT,'لا يمكن حذف اتفاقية: تُلغى فقط (حالة ملغاة) للحفاظ على سجل التوقيعات');
+END;
+CREATE TRIGGER party_agreement_body_frozen BEFORE UPDATE OF body_html,party_id,version,company_id ON party_agreements BEGIN
+  SELECT RAISE(ABORT,'نص الاتفاقية لقطة ثابتة ولا يُعدَّل: ولِّد نسخة جديدة');
+END;
+
+INSERT INTO permissions(code,name_ar,is_sensitive) VALUES
+ ('party.agreement_template','تعديل قالب اتفاقية فتح الحساب',1);
+INSERT INTO role_permissions SELECT r.id,'party.agreement_template' FROM roles r WHERE r.id IN (1,2);

@@ -1,0 +1,86 @@
+CREATE TABLE purchase_invoices(
+  id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), branch_id INTEGER REFERENCES branches(id),
+  warehouse_id INTEGER REFERENCES warehouses(id),
+  doc_type TEXT NOT NULL DEFAULT 'invoice' CHECK(doc_type IN ('invoice','return')),
+  invoice_no TEXT, supplier_ref TEXT NOT NULL DEFAULT '', invoice_date TEXT NOT NULL, due_date TEXT,
+  supplier_id INTEGER REFERENCES parties(id), currency TEXT NOT NULL REFERENCES currencies(code), exchange_rate TEXT NOT NULL DEFAULT '1',
+  status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','posted','cancelled')),
+  discount_type TEXT NOT NULL DEFAULT 'none' CHECK(discount_type IN ('none','percent','amount')),
+  discount_value INTEGER NOT NULL DEFAULT 0 CHECK(discount_value>=0),
+  cost_allocation TEXT NOT NULL DEFAULT 'value' CHECK(cost_allocation IN ('value','qty')),
+  gross_ex_total INTEGER NOT NULL DEFAULT 0, discount_ex_total INTEGER NOT NULL DEFAULT 0, net_ex_total INTEGER NOT NULL DEFAULT 0,
+  tax_total INTEGER NOT NULL DEFAULT 0, costs_total INTEGER NOT NULL DEFAULT 0, grand_total INTEGER NOT NULL DEFAULT 0,
+  paid_total INTEGER NOT NULL DEFAULT 0, due_total INTEGER NOT NULL DEFAULT 0,
+  original_invoice_id INTEGER REFERENCES purchase_invoices(id), notes TEXT NOT NULL DEFAULT '',
+  journal_entry_id INTEGER REFERENCES journal_entries(id),
+  created_by INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  posted_by INTEGER REFERENCES users(id), posted_at TEXT,
+  cancelled_by INTEGER REFERENCES users(id), cancelled_at TEXT, cancel_reason TEXT, cancel_entry_id INTEGER REFERENCES journal_entries(id),
+  UNIQUE(company_id,doc_type,invoice_no),
+  CHECK((doc_type='invoice' AND original_invoice_id IS NULL) OR (doc_type='return' AND original_invoice_id IS NOT NULL)),
+  CHECK(paid_total>=0 AND due_total>=0 AND grand_total>=0 AND paid_total+due_total=grand_total),
+  CHECK(grand_total=net_ex_total+tax_total+costs_total));
+-- رقم فاتورة المورد لا يتكرر لنفس المورد (غير الملغاة)
+CREATE UNIQUE INDEX ux_pi_supplier_ref ON purchase_invoices(company_id,supplier_id,supplier_ref)
+  WHERE supplier_ref<>'' AND doc_type='invoice' AND status<>'cancelled';
+CREATE INDEX ix_pi_date ON purchase_invoices(company_id,invoice_date);
+CREATE INDEX ix_pi_supplier ON purchase_invoices(supplier_id);
+CREATE INDEX ix_pi_orig ON purchase_invoices(original_invoice_id);
+
+CREATE TABLE purchase_invoice_lines(
+  id INTEGER PRIMARY KEY, invoice_id INTEGER NOT NULL REFERENCES purchase_invoices(id), line_no INTEGER NOT NULL,
+  item_id INTEGER REFERENCES items(id), expense_account_id INTEGER REFERENCES accounts(id), description TEXT NOT NULL DEFAULT '',
+  qty_milli INTEGER NOT NULL CHECK(qty_milli>0), unit_id INTEGER REFERENCES units(id), factor_milli INTEGER NOT NULL DEFAULT 1000,
+  unit_price_minor INTEGER NOT NULL CHECK(unit_price_minor>=0),
+  line_discount_type TEXT NOT NULL DEFAULT 'none' CHECK(line_discount_type IN ('none','percent','amount')),
+  line_discount_value INTEGER NOT NULL DEFAULT 0 CHECK(line_discount_value>=0),
+  tax_rate_id INTEGER REFERENCES tax_rates(id), tax_bps INTEGER NOT NULL DEFAULT 0, tax_inclusive INTEGER NOT NULL DEFAULT 0 CHECK(tax_inclusive IN (0,1)),
+  amount_minor INTEGER NOT NULL DEFAULT 0, line_discount_minor INTEGER NOT NULL DEFAULT 0, invoice_discount_share INTEGER NOT NULL DEFAULT 0,
+  gross_ex INTEGER NOT NULL DEFAULT 0, discount_ex INTEGER NOT NULL DEFAULT 0, net_ex INTEGER NOT NULL DEFAULT 0,
+  tax_minor INTEGER NOT NULL DEFAULT 0, total_minor INTEGER NOT NULL DEFAULT 0, cost_share_minor INTEGER NOT NULL DEFAULT 0,
+  cost_base_minor INTEGER NOT NULL DEFAULT 0, movement_id INTEGER REFERENCES stock_movements(id),
+  orig_line_id INTEGER REFERENCES purchase_invoice_lines(id),
+  UNIQUE(invoice_id,line_no), CHECK(item_id IS NOT NULL OR expense_account_id IS NOT NULL),
+  CHECK(gross_ex-discount_ex=net_ex AND net_ex+tax_minor=total_minor));
+CREATE INDEX ix_pil_invoice ON purchase_invoice_lines(invoice_id);
+CREATE INDEX ix_pil_orig ON purchase_invoice_lines(orig_line_id);
+CREATE TABLE purchase_direct_costs(
+  id INTEGER PRIMARY KEY, invoice_id INTEGER NOT NULL REFERENCES purchase_invoices(id),
+  account_id INTEGER NOT NULL REFERENCES accounts(id), description TEXT NOT NULL DEFAULT '',
+  amount_minor INTEGER NOT NULL CHECK(amount_minor>0), capitalize INTEGER NOT NULL DEFAULT 1 CHECK(capitalize IN (0,1)));
+CREATE TABLE purchase_payments(
+  id INTEGER PRIMARY KEY, invoice_id INTEGER NOT NULL REFERENCES purchase_invoices(id),
+  account_id INTEGER NOT NULL REFERENCES accounts(id), amount_minor INTEGER NOT NULL CHECK(amount_minor>0), note TEXT NOT NULL DEFAULT '');
+
+CREATE TRIGGER pil_lock_ins BEFORE INSERT ON purchase_invoice_lines
+WHEN (SELECT status FROM purchase_invoices WHERE id=NEW.invoice_id)<>'draft' BEGIN SELECT RAISE(ABORT,'المستند مرحّل: لا يمكن تعديل بنوده'); END;
+CREATE TRIGGER pil_lock_upd BEFORE UPDATE ON purchase_invoice_lines
+WHEN (SELECT status FROM purchase_invoices WHERE id=OLD.invoice_id)<>'draft' BEGIN SELECT RAISE(ABORT,'المستند مرحّل: لا يمكن تعديل بنوده'); END;
+CREATE TRIGGER pil_lock_del BEFORE DELETE ON purchase_invoice_lines
+WHEN (SELECT status FROM purchase_invoices WHERE id=OLD.invoice_id)<>'draft' BEGIN SELECT RAISE(ABORT,'المستند مرحّل: لا يمكن تعديل بنوده'); END;
+CREATE TRIGGER pdc_lock_ins BEFORE INSERT ON purchase_direct_costs
+WHEN (SELECT status FROM purchase_invoices WHERE id=NEW.invoice_id)<>'draft' BEGIN SELECT RAISE(ABORT,'المستند مرحّل: لا يمكن تعديل تكاليفه'); END;
+CREATE TRIGGER pdc_lock_del BEFORE DELETE ON purchase_direct_costs
+WHEN (SELECT status FROM purchase_invoices WHERE id=OLD.invoice_id)<>'draft' BEGIN SELECT RAISE(ABORT,'المستند مرحّل: لا يمكن تعديل تكاليفه'); END;
+CREATE TRIGGER ppay_lock_ins BEFORE INSERT ON purchase_payments
+WHEN (SELECT status FROM purchase_invoices WHERE id=NEW.invoice_id)<>'draft' BEGIN SELECT RAISE(ABORT,'المستند مرحّل: لا يمكن تعديل دفعاته'); END;
+CREATE TRIGGER ppay_lock_del BEFORE DELETE ON purchase_payments
+WHEN (SELECT status FROM purchase_invoices WHERE id=OLD.invoice_id)<>'draft' BEGIN SELECT RAISE(ABORT,'المستند مرحّل: لا يمكن تعديل دفعاته'); END;
+CREATE TRIGGER pi_no_delete BEFORE DELETE ON purchase_invoices WHEN OLD.status<>'draft' BEGIN SELECT RAISE(ABORT,'لا يحذف مستند مرحّل: يُلغى بقيد عكسي'); END;
+CREATE TRIGGER pi_upd_rules BEFORE UPDATE ON purchase_invoices WHEN OLD.status<>'draft' BEGIN
+  SELECT RAISE(ABORT,'لا يمكن تعديل مستند مرحّل أو ملغى: التصحيح بالإلغاء أو بمرتجع')
+   WHERE NOT (OLD.status='posted' AND NEW.status='cancelled' AND NEW.company_id=OLD.company_id AND NEW.doc_type=OLD.doc_type
+     AND NEW.invoice_no IS OLD.invoice_no AND NEW.invoice_date=OLD.invoice_date AND NEW.supplier_id IS OLD.supplier_id
+     AND NEW.currency=OLD.currency AND NEW.exchange_rate=OLD.exchange_rate AND NEW.net_ex_total=OLD.net_ex_total
+     AND NEW.tax_total=OLD.tax_total AND NEW.costs_total=OLD.costs_total AND NEW.grand_total=OLD.grand_total
+     AND NEW.paid_total=OLD.paid_total AND NEW.due_total=OLD.due_total AND NEW.supplier_ref=OLD.supplier_ref
+     AND NEW.journal_entry_id IS OLD.journal_entry_id AND NEW.original_invoice_id IS OLD.original_invoice_id
+     AND NEW.cancel_reason IS NOT NULL AND length(trim(NEW.cancel_reason))>0);
+END;
+
+INSERT INTO permissions(code,name_ar,is_sensitive) VALUES
+ ('purchases.view','عرض المشتريات',0),('purchases.create','إنشاء فواتير ومرتجعات مشتريات (مسودة)',0),
+ ('purchases.post','ترحيل فواتير ومرتجعات المشتريات',0),('purchases.cancel','إلغاء مستندات المشتريات',1);
+INSERT INTO role_permissions SELECT r.id,'purchases.view' FROM roles r WHERE r.id IN (1,2,3,4);
+INSERT INTO role_permissions SELECT r.id,p.code FROM roles r, permissions p WHERE r.id IN (1,2,3) AND p.code IN ('purchases.create','purchases.post');
+INSERT INTO role_permissions SELECT r.id,'purchases.cancel' FROM roles r WHERE r.id IN (1,2);

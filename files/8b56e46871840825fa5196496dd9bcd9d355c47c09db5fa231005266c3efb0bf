@@ -1,0 +1,155 @@
+"""قراءة الحركات المقيّدة وغير المرسلة لأطراف لديهم أرقام هاتف (دليل الرسائل).
+
+المصدر الوحيد: القيود المرحّلة على حسابات الأطراف (journal_lines ← parties.account_id)،
+فتشمل تلقائيًا فواتير البيع والشراء وسندات القبض والدفع والقيود اليومية اليدوية.
+خالٍ من Qt. الأرقام صحيحة (وحدة صغرى) وDecimal للعرض، بلا float.
+"""
+import sqlite3
+from decimal import Decimal
+from typing import Any, Dict, List, Optional
+
+from alhisabat.messaging.templates import render_template
+
+# ref_type المستعمل في أزرار الإرسال القديمة ↔ source_type للقيد، لعدم تكرار التنبيه
+_LEGACY_REFS = {"sales_invoice": "sales_invoice", "cash_receipt": "cash_voucher"}
+
+_SQL = """
+SELECT je.id AS entry_id, je.entry_no, je.entry_date, je.description, je.source_type, je.source_id,
+       p.id AS party_id, p.name AS party_name, p.phone, p.kind AS party_kind, p.wa_consent,
+       jl.currency, COALESCE(c.minor_digits, 2) AS digits, COALESCE(c.name_ar, jl.currency) AS currency_name,
+       SUM(jl.debit_orig) AS d, SUM(jl.credit_orig) AS cr
+FROM journal_entries je
+JOIN journal_lines jl ON jl.entry_id = je.id
+JOIN parties p ON p.account_id = jl.account_id
+LEFT JOIN currencies c ON c.code = jl.currency
+WHERE je.company_id = ? AND je.status = 'posted'
+  AND je.entry_type NOT IN ('opening','closing','reversal')
+  AND COALESCE(je.source_type,'') NOT IN ('party_opening','party_reconcile')
+  AND je.entry_date >= ?
+  AND (je.branch_id IS ? OR je.branch_id IS NULL)
+  AND p.is_active = 1 AND TRIM(p.phone) <> '' AND p.kind IN ('customer','supplier')
+  AND NOT EXISTS (SELECT 1 FROM wa_movement_ignored g WHERE g.entry_id = je.id AND g.party_id = p.id)
+  AND NOT EXISTS (
+        SELECT 1 FROM wa_outbox o
+        WHERE o.party_id = p.id AND o.status NOT IN ('cancelled','failed','blocked')
+          AND ((o.ref_type = 'movement' AND o.ref_id = je.id)
+            OR (o.ref_type = 'sales_invoice' AND je.source_type = 'sales_invoice' AND o.ref_id = je.source_id)
+            OR (o.ref_type = 'cash_receipt' AND je.source_type = 'cash_voucher' AND o.ref_id = je.source_id)))
+GROUP BY je.id, p.id, jl.currency
+HAVING SUM(jl.debit_orig) <> SUM(jl.credit_orig)
+ORDER BY je.entry_date DESC, je.id DESC
+LIMIT ?
+"""
+
+
+def _fmt(minor: int, digits: int) -> str:
+    d = Decimal(int(minor)).scaleb(-int(digits))
+    s = f"{abs(d):,.{int(digits)}f}"
+    return f"-{s}" if d < 0 else s
+
+
+def _fmt_date(iso: str) -> str:
+    """2026-10-23 → 23/10/2026 (كما في نموذج الرسالة)."""
+    p = str(iso or "")[:10].split("-")
+    return f"{p[2]}/{p[1]}/{p[0]}" if len(p) == 3 else str(iso or "")
+
+
+def _words(minor: int, digits: int, currency: str) -> str:
+    """المبلغ كتابةً بلا «فقط/لا غير». '' إن تعذّر (للعرض فقط)."""
+    try:
+        from alhisabat.ui.core import format as _f
+        return _f.amount_in_words(Decimal(int(minor)).scaleb(-int(digits)), currency, prefix="", suffix="")
+    except Exception:  # noqa: BLE001 — التفقيط لا يُفشل الرسالة
+        return ""
+
+
+def company_of_branch(conn: sqlite3.Connection, branch_id: Optional[int]) -> int:
+    if branch_id is not None:
+        r = conn.execute("SELECT company_id FROM branches WHERE id=?", (branch_id,)).fetchone()
+        if r:
+            return int(r[0])
+    r = conn.execute("SELECT id FROM companies ORDER BY id LIMIT 1").fetchone()
+    return int(r[0]) if r else 1
+
+
+def party_balance_minor(conn, party_id: int, currency: str, upto_date: str, upto_entry: int) -> int:
+    """رصيد الطرف بعملته بعد الحركة: العميل = مدين − دائن، المورد = دائن − مدين."""
+    r = conn.execute(
+        "SELECT p.kind, COALESCE(SUM(jl.debit_orig),0), COALESCE(SUM(jl.credit_orig),0) "
+        "FROM parties p JOIN journal_lines jl ON jl.account_id = p.account_id AND jl.currency = ? "
+        "JOIN journal_entries je ON je.id = jl.entry_id AND je.status = 'posted' "
+        "AND (je.entry_date < ? OR (je.entry_date = ? AND je.id <= ?)) "
+        "WHERE p.id = ?", (currency, upto_date, upto_date, upto_entry, party_id)).fetchone()
+    if not r or r[0] is None:
+        return 0
+    return int(r[1] - r[2]) if r[0] == "customer" else int(r[2] - r[1])
+
+
+def _doc_info(conn, source_type, source_id) -> Dict[str, str]:
+    """نوع المستند ورقمه من مصدر القيد."""
+    if source_type == "sales_invoice" and source_id:
+        r = conn.execute("SELECT invoice_no, doc_type FROM sales_invoices WHERE id=?", (source_id,)).fetchone()
+        if r:
+            return {"label": "مرتجع مبيعات" if r[1] == "return" else "فاتورة بيع", "no": str(r[0] or source_id), "tpl": "sale_invoice" if r[1] != "return" else "movement"}
+    if source_type == "purchase_invoice" and source_id:
+        r = conn.execute("SELECT invoice_no, doc_type FROM purchase_invoices WHERE id=?", (source_id,)).fetchone()
+        if r:
+            return {"label": "مرتجع مشتريات" if r[1] == "return" else "فاتورة شراء", "no": str(r[0] or source_id), "tpl": "movement"}
+    if source_type == "cash_voucher" and source_id:
+        r = conn.execute("SELECT voucher_no, voucher_type FROM cash_vouchers WHERE id=?", (source_id,)).fetchone()
+        if r:
+            is_rec = r[1] == "receipt"
+            return {"label": "سند قبض" if is_rec else "سند دفع", "no": str(r[0] or source_id), "tpl": "payment_receipt" if is_rec else "movement"}
+    return {"label": "قيد يومية", "no": "", "tpl": "movement"}
+
+
+def scan_new_movements(conn: sqlite3.Connection, branch_id: Optional[int], since_date: str,
+                       templates: Dict[str, str], limit: int = 500, company_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    """الحركات المرحّلة غير المرسلة وغير المتجاهلة، مع نص رسالة جاهز لكل حركة."""
+    cid = company_id if company_id is not None else company_of_branch(conn, branch_id)
+    rows = conn.execute(_SQL, (cid, since_date, branch_id, int(limit))).fetchall()
+    out = []
+    for r in rows:
+        r = dict(r) if not isinstance(r, dict) else r
+        net = int(r["d"]) - int(r["cr"])
+        digits = int(r["digits"])
+        info = _doc_info(conn, r["source_type"], r["source_id"])
+        if info["no"] == "":
+            info["no"] = str(r["entry_no"])
+        # الجانب من وجهة نظر الطرف: عميل (مدين = عليه)، مورد (دائن = له)
+        if r["party_kind"] == "customer":
+            side = "مدين عليكم" if net > 0 else "دائن لكم"
+        else:
+            side = "دائن لكم" if net < 0 else "مدين عليكم"
+        bal = party_balance_minor(conn, r["party_id"], r["currency"], r["entry_date"], r["entry_id"])
+        # الرصيد من وجهة نظر الطرف: ما يطلبه المنشأة منه = «عليكم»، وما تدين به له = «لكم» (الصفر = عليكم)
+        owed_by_party = bal if r["party_kind"] == "customer" else -bal
+        bal_side = "لكم" if owed_by_party < 0 else "عليكم"
+        co = conn.execute("SELECT name FROM companies WHERE id=?", (cid,)).fetchone()
+        ctx = {"الشركة": co[0] if co else "", "الاسم": r["party_name"], "نوع_الحركة": info["label"],
+               "نوع_القيد": info["label"], "رقم_المستند": info["no"],
+               "رقم_الفاتورة": info["no"], "رقم_السند": info["no"], "التاريخ": _fmt_date(r["entry_date"]),
+               "المبلغ": _fmt(abs(net), digits), "العملة": r["currency"], "اسم_العملة": r["currency_name"],
+               "الجانب": side, "لكم_عليكم": "لكم" if net < 0 else "عليكم",
+               "المبلغ_كتابة": _words(abs(net), digits, r["currency"]),
+               "البيان": " ".join(str(r["description"] or "").split()),
+               "الرصيد": _fmt(abs(bal), digits), "جانب_الرصيد": bal_side}
+        tpl = templates.get(info["tpl"]) or templates.get("movement") or ""
+        out.append({
+            "entry_id": r["entry_id"], "entry_no": r["entry_no"], "entry_date": r["entry_date"],
+            "doc_label": info["label"], "doc_no": info["no"], "party_id": r["party_id"],
+            "party_name": r["party_name"], "phone": r["phone"], "wa_consent": bool(r["wa_consent"]),
+            "amount": ctx["المبلغ"], "currency": r["currency"], "side": side,
+            "balance": ctx["الرصيد"], "body": render_template(tpl, ctx),
+            "key": f"{r['entry_id']}:{r['party_id']}:{r['currency']}",
+        })
+    return out
+
+
+def ignore_movements(conn, items: List[Dict[str, Any]], user_id: Optional[int]) -> int:
+    n = 0
+    for it in items:
+        cur = conn.execute("INSERT OR IGNORE INTO wa_movement_ignored(entry_id, party_id, ignored_by) VALUES (?,?,?)",
+                           (it["entry_id"], it["party_id"], user_id))
+        n += cur.rowcount
+    return n

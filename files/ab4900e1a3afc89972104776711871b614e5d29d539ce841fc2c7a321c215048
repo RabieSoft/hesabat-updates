@@ -1,0 +1,123 @@
+"""مكوّنات الإجماليات الملوّنة الموحّدة لشاشات الإدخال (قيود/فواتير/سندات). الألوان من tokens عبر QSS فقط.
+
+- TotalChip: خانة صغيرة (عنوان + قيمة) بلون حسب النوع: debit | credit | gold | diff (+ state: ok | bad | zero).
+- TotalsStrip: شريط المدين/الدائن/الفرق مع شارة الحالة (قيد مركب).
+- HeroTotal: خانة كبرى للإجمالي الرئيسي بتدرّج (قيد بسيط/سند): dir = '' | in | out؛ ونص تفصيلي أسفلها.
+كل القيم تُعرض LTR وبخط عريض.
+"""
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout
+
+
+def _repolish(w):
+    w.style().unpolish(w)
+    w.style().polish(w)
+    for c in w.findChildren(QLabel):
+        c.style().unpolish(c)
+        c.style().polish(c)
+
+
+class TotalChip(QFrame):
+    def __init__(self, key_text, tk, parent=None):
+        super().__init__(parent)
+        self.setObjectName('totChip')
+        self.setProperty('tk', tk)
+        self.setProperty('state', '')
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 5, 12, 5)
+        lay.setSpacing(1)
+        self.setMinimumHeight(54)
+        self.key = QLabel(key_text)
+        self.key.setObjectName('totChipKey')
+        self.key.setAlignment(Qt.AlignCenter)
+        self.val = QLabel('0.00')
+        self.val.setObjectName('totChipVal')
+        self.val.setLayoutDirection(Qt.LeftToRight)
+        self.val.setAlignment(Qt.AlignCenter)
+        lay.addWidget(self.key)
+        lay.addWidget(self.val)
+        self.setMinimumWidth(130)
+
+    def set_value(self, text, state=None):
+        self.val.setText(text)
+        if state is not None and state != self.property('state'):
+            self.setProperty('state', state)
+            _repolish(self)
+
+
+class TotalsStrip(QFrame):
+    """مدين | دائن | الفرق + شارة التوازن. update(d, c, status_text, status_tone)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName('totStrip')
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+        self.debit = TotalChip('إجمالي المدين', 'debit')
+        self.credit = TotalChip('إجمالي الدائن', 'credit')
+        self.diff = TotalChip('الفرق', 'diff')
+        self.status = QLabel('')
+        self.status.setProperty('badge', True)
+        self.status.setAlignment(Qt.AlignCenter)
+        self.status.setMinimumWidth(130)
+        self.status.setMinimumHeight(54)
+        for w in (self.debit, self.credit, self.diff):
+            lay.addWidget(w)
+        lay.addWidget(self.status, 1)
+
+    def update_totals(self, d, c, status_text, tone):
+        diff = d - c
+        self.debit.set_value(f'{d:,.2f}')
+        self.credit.set_value(f'{c:,.2f}')
+        st = 'zero' if (d == 0 and c == 0) else ('ok' if diff == 0 else 'bad')
+        self.diff.set_value(f'{diff:,.2f}', st)
+        short = status_text.split('(')[0].strip()                  # «⚠ غير متوازن»؛ الشرح الكامل في التلميح
+        self.status.setText(short)
+        self.status.setToolTip(status_text)
+        if self.status.property('tone') != tone:
+            self.status.setProperty('tone', tone)
+            _repolish(self.status)
+
+
+class HeroTotal(QFrame):
+    """الإجمالي الرئيسي: عنوان صغير + مبلغ كبير بتدرّج لوني + سطر تفصيل. dir: '' (محايد) | in | out."""
+
+    def __init__(self, key_text='الإجمالي', parent=None):
+        super().__init__(parent)
+        self.setObjectName('totHero')
+        self.setProperty('dir', '')
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(22, 8, 22, 8)
+        lay.setSpacing(2)
+        self.key = QLabel(key_text)
+        self.key.setObjectName('totHeroKey')
+        self.key.setAlignment(Qt.AlignCenter)
+        self.val = QLabel('0.00')
+        self.val.setObjectName('totHeroVal')
+        self.val.setLayoutDirection(Qt.LeftToRight)
+        self.val.setAlignment(Qt.AlignCenter)
+        self.detail = QLabel('')
+        self.detail.setObjectName('totHeroDetail')
+        self.detail.setAlignment(Qt.AlignCenter)
+        self.detail.setWordWrap(True)
+        self.detail.setVisible(False)
+        for w in (self.key, self.val, self.detail):
+            lay.addWidget(w)
+        self.setMinimumWidth(460)
+        self.setMinimumHeight(86)
+
+    def set_amount(self, text):
+        self.val.setText(text or '0.00')
+
+    def setText(self, text):                       # توافق مع QLabel: سطر التفصيل أسفل المبلغ
+        self.detail.setText(text or '')
+        self.detail.setVisible(bool(text))
+
+    def text(self):
+        return self.detail.text()
+
+    def set_dir(self, d):
+        if (d or '') != self.property('dir'):
+            self.setProperty('dir', d or '')
+            _repolish(self)

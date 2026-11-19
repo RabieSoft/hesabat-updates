@@ -1,0 +1,154 @@
+"""خدمات النقدية والبنوك والمطابقة: بلا PySide6، Decimal فقط.
+"""
+from datetime import date
+from decimal import Decimal
+from alhisabat.business import cash, bank_recon
+
+class CashService:
+    def __init__(self, session):
+        self.s = session
+    def currency_options(self):
+        """العملات المفعّلة للشركة (الأساسية أولًا): [{code, name_ar, is_base, is_default}] لتصفية الصناديق والسندات."""
+        from alhisabat.ui.core import readmodel
+        return [c for c in readmodel.currencies_list(self.s.conn, self.s.company_id) if c.get('is_enabled') or c.get('is_base')]
+    def list_accounts(self):
+        self.s.require('cash.view')
+        from alhisabat.ui.core import readmodel
+        out=[]
+        for r in readmodel.cash_accounts(self.s.conn, self.s.company_id, self.s.branch_id):
+            d=dict(r)
+            try:
+                # رصيد كل حساب بعملته الأصلية كما أُدخلت (لا معادل العملة الأساسية)؛ balances = {عملة: رصيد} لأي عملات أخرى على الحساب
+                bals={}
+                for x in cash.cash_balance(self.s.conn, self.s.user_id, self.s.company_id, r['id']):
+                    bals[x['currency']]=bals.get(x['currency'],0)+int(x['net_orig'] or 0)
+                d['balances']=bals
+                own=d.get('currency')
+                d['balance_minor']=bals.get(own, sum(bals.values()) if len(bals)==1 else 0)
+            except Exception:
+                d['balances']={}; d['balance_minor']=None
+            out.append(d)
+        return out
+    def create(self, v):
+        self.s.require('cash.manage')
+        return cash.create_cash_account(self.s.conn, self.s.user_id, self.s.company_id, v['kind'], (v['name'] or '').strip(),
+            currency=v.get('currency') or None, bank_name=v.get('bank_name','') or '', account_no=v.get('account_no','') or '',
+            parent_id=int(v['parent_id']) if v.get('parent_id') else None, branch_id=self.s.branch_id)
+    def parent_missing(self, kind):
+        from alhisabat.ui.core import readmodel
+        return not readmodel.has_mapping(self.s.conn, self.s.company_id, 'cash' if kind=='cashbox' else 'bank')
+    def set_active(self, cash_id, active):
+        return cash.set_cash_active(self.s.conn, self.s.user_id, int(cash_id), bool(active))
+    def statement(self, cash_id, date_from, date_to):
+        return cash.cash_statement(self.s.conn, self.s.user_id, self.s.company_id, int(cash_id), date_from, date_to, limit=500)
+    def vouchers(self, limit=300):
+        self.s.require('cash.view')
+        from alhisabat.ui.core import readmodel
+        rows=cash.list_vouchers(self.s.conn, self.s.user_id, self.s.company_id, limit=limit, branch_id=self.s.branch_id)
+        names=readmodel.cash_account_names(self.s.conn, self.s.company_id)
+        pnames=readmodel.party_names(self.s.conn, self.s.company_id)
+        # الطرف المقابل: الطرف إن وُجد، وإلا أسماء الحسابات المقابلة في بنود السند (استعلام واحد لكل الصفوف)
+        acc_by_v={}
+        try:
+            ids=[int(r['id']) for r in rows]
+            if ids:
+                q=','.join('?'*len(ids))
+                for l in self.s.conn.execute(f"SELECT l.voucher_id v, a.name n FROM cash_voucher_lines l JOIN accounts a ON a.id=l.account_id WHERE l.voucher_id IN ({q}) ORDER BY l.voucher_id,l.line_no", ids):
+                    acc_by_v.setdefault(l['v'],[]).append(l['n'])
+        except Exception: acc_by_v={}
+        for r in rows:
+            r['cash_name']=names.get(r['cash_account_id'],'')
+            r['party_name']=pnames.get(r['party_id'],'') if r.get('party_id') else ''
+            r['type_ar']='سند قبض' if r['voucher_type']=='receipt' else 'سند صرف'
+            cp=r['party_name'] or '، '.join(dict.fromkeys(acc_by_v.get(r['id'],[])))
+            r['counter_name']=cp
+            # سند القبض: «من» الطرف المقابل — سند الصرف: «إلى» الطرف المقابل
+            r['counter_label']=(('من: ' if r['voucher_type']=='receipt' else 'إلى: ')+cp) if cp else ''
+        return rows
+    def create_voucher(self, kind, v):
+        self.s.require('cash.voucher')
+        amt=Decimal(str(v['amount'])); party=int(v['party_id']) if v.get('party_id') else None; acct=int(v['account_id']) if v.get('account_id') else None
+        from alhisabat.accounting.errors import AccountingError
+        if party and acct: raise AccountingError('اختر طرفاً أو حساباً مقابلاً، وليس الاثنين معاً.')
+        if not party and not acct: raise AccountingError('حدد الطرف أو الحساب المقابل للسند.')
+        if acct:                                   # حساب عميل/مورد/موظف مختار كحساب مقابل → يتحول تلقائياً إلى سند طرف
+            k,i=cash.resolve_counter(self.s.conn, self.s.company_id, acct)
+            if k=='party': party,acct=i,None
+        lines=[{'account_id':acct,'amount':amt,'description':v.get('description','')}] if acct else None
+        d=v.get('date') or str(date.today())
+        kw=dict(lines=lines, description=v.get('description',''), branch_id=self.s.branch_id)
+        if party:
+            pk=self.s.conn.execute('SELECT kind FROM parties WHERE id=?',(party,)).fetchone()
+            pk=pk[0] if pk else None
+            key={'customer':'customer_id','supplier':'supplier_id','employee':'employee_id'}.get(pk)
+            if not key: raise AccountingError('الطرف غير موجود')
+            if kind=='receipt' and key=='employee_id': raise AccountingError('القبض من موظف غير مدعوم هنا؛ استخدم قيداً يومياً')
+            kw[key]=party
+        fn=cash.create_receipt if kind=='receipt' else cash.create_payment
+        return fn(self.s.conn, self.s.user_id, self.s.company_id, d, int(v['cash_id']), amt, **kw)
+    def voucher_detail(self, vid):
+        """السند مع بنوده وتخصيصاته (لتعبئة نافذة التعديل)."""
+        self.s.require('cash.view')
+        return cash.get_voucher(self.s.conn, self.s.user_id, int(vid))
+    def update_voucher(self, vid, kind, v, reason=None):
+        """تعديل سند: المسودة في مكانها، والمرحَّل بإلغائه وإنشاء سند جديد مرحَّل (يتطلب السبب)."""
+        self.s.require('cash.voucher')
+        return cash.update_voucher(self.s.conn, self.s.user_id, int(vid), kind, v.get('date') or str(date.today()), int(v['cash_id']), Decimal(str(v['amount'])),
+                                   party_id=v.get('party_id'), account_id=v.get('account_id'), description=v.get('description',''), reason=reason)
+    def post(self, vid): return cash.post_voucher(self.s.conn, self.s.user_id, int(vid))
+    def delete_draft(self, vid): return cash.delete_voucher_draft(self.s.conn, self.s.user_id, int(vid))
+    def cancel(self, vid, d, reason): return cash.cancel_voucher(self.s.conn, self.s.user_id, int(vid), d, reason)
+    def set_allow_negative(self, cash_id, allow):
+        return cash.set_allow_negative(self.s.conn, self.s.user_id, int(cash_id), bool(allow))
+
+    def transfer(self, v):
+        self.s.require('cash.voucher')
+        return cash.transfer(self.s.conn, self.s.user_id, self.s.company_id, v.get('date') or str(date.today()), int(v['from_id']), int(v['to_id']), Decimal(str(v['amount'])), description=v.get('description',''))
+    # بنكية
+    def unmatched(self):
+        self.s.require('cash.reconcile')
+        from alhisabat.ui.core import readmodel
+        rows=[]
+        for r in readmodel.bank_accounts(self.s.conn, self.s.company_id):
+            for x in bank_recon.unmatched_statement(self.s.conn, self.s.user_id, r['id']):
+                x=dict(x); x['bank']=r['name']; x['cash_id']=r['id']; rows.append(x)
+        return rows
+    def auto_match(self):
+        self.s.require('cash.reconcile')
+        from alhisabat.ui.core import readmodel
+        n=0
+        for cid in readmodel.bank_account_ids(self.s.conn, self.s.company_id):
+            res=bank_recon.auto_match(self.s.conn, self.s.user_id, cid); n+=len(res) if hasattr(res,'__len__') else 0
+        return n
+    def import_statement(self, cash_id, rows): return bank_recon.import_statement(self.s.conn, self.s.user_id, int(cash_id), rows)
+    def unmatched_gl(self, cash_id, as_of=None): return bank_recon.unmatched_gl(self.s.conn, self.s.user_id, int(cash_id), as_of or str(date.today()))
+    def match(self, sid, lid): return bank_recon.match(self.s.conn, self.s.user_id, int(sid), int(lid))
+    def unmatch(self, sid, reason): return bank_recon.unmatch(self.s.conn, self.s.user_id, int(sid), reason)
+    def ignore(self, sid, reason): return bank_recon.ignore_line(self.s.conn, self.s.user_id, int(sid), reason)
+    def book(self, sid, account_id, desc=''): return bank_recon.book_statement_line(self.s.conn, self.s.user_id, int(sid), int(account_id), desc)
+    def voucher_print(self, vid):
+        from alhisabat.reporting import printing as PR
+        return PR.voucher_print(self.s.conn, self.s.user_id, int(vid))
+
+    def transfers(self, limit=200):
+        self.s.require('cash.view')
+        from alhisabat.ui.core import readmodel
+        return readmodel.cash_transfers(self.s.conn, self.s.company_id, limit=limit)
+
+    def cancel_transfer(self, tid, cancel_date, reason):
+        self.s.require('cash.cancel')
+        self.s.require('journal.reverse')
+        return cash.cancel_transfer(self.s.conn, self.s.user_id, int(tid), cancel_date, reason)
+
+    def cash_count(self, cash_id, count_date, counted_amount, note=''):
+        self.s.require('cash.manage')
+        return cash.cash_count(self.s.conn, self.s.user_id, int(cash_id), count_date, Decimal(str(counted_amount)), note=note)
+
+    def cash_counts(self, limit=200):
+        self.s.require('cash.view')
+        from alhisabat.ui.core import readmodel
+        return readmodel.cash_counts(self.s.conn, self.s.company_id, limit=limit)
+
+    def reconciliation_report(self, cash_id, as_of, statement_balance):
+        self.s.require('cash.reconcile')
+        return bank_recon.reconciliation_report(self.s.conn, self.s.user_id, int(cash_id), as_of, Decimal(str(statement_balance)))

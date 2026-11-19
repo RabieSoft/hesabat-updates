@@ -1,0 +1,66 @@
+"""مُساعد لصفحة نهاية الفترة: بناء تبويب الأرصدة الافتتاحية.
+
+مُستخرج لإبقاء ملفات الصفحات ضمن حد الحجم. لا منطق محاسبي، لا float، لا ألوان ثابتة.
+"""
+from PySide6.QtWidgets import (
+    QComboBox, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
+)
+
+from alhisabat.ui.components.datagrid import DataGrid
+from alhisabat.ui.components.grid_logic import Column
+from alhisabat.ui.app_dialogs.period_end import ManualOpeningDialog
+
+
+def build_opening_tab(page):
+    """بناء تبويب الأرصدة الافتتاحية (معاينة، توليد، مقارنة، إدخال يدوي)."""
+    w = QWidget()
+    lay = QVBoxLayout(w)
+    lay.setContentsMargins(8, 12, 8, 8)
+    lay.setSpacing(6)
+
+    # شريط اختيار السنوات
+    bar = QHBoxLayout()
+    bar.addWidget(QLabel("من سنة (المصدر السابقة):"))
+    page.cb_from = QComboBox()
+    bar.addWidget(page.cb_from, 1)
+    bar.addWidget(QLabel("إلى سنة (الجديدة التالية):"))
+    page.cb_to = QComboBox()
+    bar.addWidget(page.cb_to, 1)
+    bar.addStretch(1)
+    lay.addLayout(bar)
+
+    # أزرار الإجراءات
+    row = QHBoxLayout()
+    page.btn_open_prev = QPushButton("معاينة الأرصدة")
+    page.btn_open_gen = QPushButton("توليد قيد الافتتاح")
+    page.btn_open_cmp = QPushButton("مقارنة بالإقفال السابق")
+    page.btn_manual_open = QPushButton("إدخال يدوي (للسنة الأولى فقط)")
+
+    page.btn_open_prev.clicked.connect(page._opening_preview)
+    page.btn_open_gen.clicked.connect(page._opening_generate)
+    page.btn_open_cmp.clicked.connect(page._opening_compare)
+    page.btn_manual_open.clicked.connect(page._manual_opening)
+
+    for b in (page.btn_open_prev, page.btn_open_gen, page.btn_open_cmp, page.btn_manual_open):
+        row.addWidget(b)
+    row.addStretch(1)
+    lay.addLayout(row)
+
+    # جدول الأرصدة
+    page.grid_open = DataGrid([
+        Column('code', 'الكود', width=90),
+        Column('name', 'الحساب', width=180),
+        Column('currency', 'العملة', width=70),
+        Column('previous_base', 'ختام السابقة', 'money', 110, minor=True),
+        Column('opening_base', 'قيد الافتتاح', 'money', 110, minor=True),
+        Column('diff_base', 'الفرق', 'money', 110, minor=True),
+    ], grid_id='period_end_opening')
+    lay.addWidget(page.grid_open, 1)
+
+    # شريط الحالة التوضيحي
+    page.lbl_open = QLabel("التوليد الآلي يتطلب: إقفال السنة السابقة، وعدم وجود قيد افتتاح فعال للسنة الجديدة، وتصفير الحسابات المؤقتة.")
+    page.lbl_open.setWordWrap(True)
+    page.lbl_open.setObjectName('hint')
+    lay.addWidget(page.lbl_open)
+
+    return w

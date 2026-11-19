@@ -1,0 +1,874 @@
+"""قارئ المستندات للاستيراد: PDF (طبقة نص أو ممسوح ضوئيًا) وصور → صفوف جاهزة لمحرك الاستيراد.
+
+الطبقة هنا استخراج نصي فقط: لا قاعدة بيانات ولا منطق محاسبي ولا PySide6. المخرجات قواميس بنفس مفاتيح CSV
+(name/phone/... للعملاء والموردين، name/code/unit/... للأصناف) فتمر على preview_* ثم commit_* كما هي:
+المحرك هو الذي يتحقق ويكشف المكرر ولا يُستورد إلا الصحيح. هذه الوحدة لا تقرر الصحة، بل تقترح فقط.
+
+المراحل: فتح الملف → أسطر وخلايا (جدول PDF أو كلمات بإحداثياتها أو OCR) → توحيد النص العربي → اكتشاف رأس الأعمدة
+→ تعيين الأعمدة (أو استنتاج بالنمط عند غياب الرأس) → تجاهل الضجيج (إجماليات، عناوين، أرقام صفحات) → صفوف + درجة ثقة.
+
+الاعتماديات اختيارية ومحمَّلة كسولًا: pdfplumber (نص PDF)، pypdfium2 + pytesseract + Tesseract (OCR)، opencv/PIL (تحسين الصورة).
+غيابها يعطي رسالة عربية واضحة بدل انهيار.
+"""
+import os
+import re
+import shutil
+import unicodedata
+
+from alhisabat.accounting.errors import AccountingError
+
+PDF_EXT = (".pdf",)
+IMAGE_EXT = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
+DOC_EXTENSIONS = PDF_EXT + IMAGE_EXT
+MAX_PAGES = 60
+LOW_CONFIDENCE = 60          # درجة OCR (0-100) أدنى منها يُعلَّم السطر «يحتاج مراجعة»
+
+# ---------------------------------------------------------------- توحيد النص
+_AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹٫٬،", "01234567890123456789.,,")
+_BIDI = dict.fromkeys(list(range(0x200B, 0x2010)) + list(range(0x202A, 0x202F)) + list(range(0x2066, 0x206A)) + [0xFEFF])
+_DIACRITICS = re.compile("[\u064B-\u065F\u0670\u06D6-\u06ED\u0640]")
+_AR_LETTER = re.compile("[\u0621-\u064A\u066E-\u06D3\u06FA-\u06FF]")
+_LATIN = re.compile("[A-Za-z]")
+
+
+def _clean(s):
+    """NFKC (يفك أشكال العرض العربية FExx) + إزالة علامات الاتجاه + أرقام لاتينية + مسافات موحدة."""
+    s = unicodedata.normalize("NFKC", str(s or "")).translate(_BIDI).translate(_AR_DIGITS)
+    return re.sub(r"[ \t\u00A0]+", " ", s).strip()
+
+
+def _key(s):
+    """مفتاح مقارنة لعناوين الأعمدة: بلا تشكيل/تطويل، ألفات وياء وتاء مربوطة موحدة، بلا ترقيم."""
+    s = _DIACRITICS.sub("", _clean(s)).lower()
+    s = s.translate(str.maketrans("أإآٱىة", "اااايه"))
+    return re.sub(r"[^\w\s]|_", " ", s).strip()
+
+
+def _arabic_count(s):
+    return len(_AR_LETTER.findall(s))
+
+
+def _is_arabic_word(w):
+    letters = [c for c in w if c.isalpha()]
+    return bool(letters) and all(_AR_LETTER.match(c) for c in letters) and not any(c.isdigit() for c in w)
+
+
+def _looks_reversed(words):
+    """هل كلمات طبقة نص PDF العربية بحروف معكوسة (ترتيب بصري)؟ استدلال: ال التعريف في أول الكلمة، وتاء مربوطة/ألف مقصورة
+    لا تبدأ كلمة. يقارن شكل الكلمة كما هي بشكلها معكوسة، والتعادل يعني «معكوسة» لأن استخراج الإحداثيات يعطي الترتيب البصري عادة."""
+    fwd = rev = 0
+    for w in words:
+        if not _is_arabic_word(w) or len(w) < 2:
+            continue
+        for cand, sign in ((w, 1), (w[::-1], -1)):
+            sc = 0
+            if cand.startswith("ال"):
+                sc += 2
+            if cand[0] in "ةىءئ":          # لا تبدأ بها كلمة
+                sc -= 3
+            if cand[-1] in "ةى" or cand.endswith(("ات", "ين", "ون", "ان")):
+                sc += 1
+            if cand[-1] in "وؤ" and len(cand) > 3:
+                sc -= 0
+            if sign == 1:
+                fwd += sc
+            else:
+                rev += sc
+    return rev >= fwd
+
+
+def _fix_visual(text, reverse_chars, reorder_tokens=True):
+    """نص بصري (يسار→يمين) ← منطقي: عكس حروف الكلمة العربية فقط (الأرقام واللاتيني كما هي)، وعكس ترتيب الكلمات
+    إن كان النص سطرًا كاملًا (نص خلايا الجداول). كلمات الإحداثيات تُرتَّب أصلًا من اليمين فلا تُعكس."""
+    if not reverse_chars:
+        return text
+    toks = text.split(" ")
+    if reorder_tokens:
+        toks = toks[::-1]
+    return " ".join(t[::-1] if _is_arabic_word(t) else t for t in toks)
+
+
+# ---------------------------------------------------------------- كلمات → أسطر → خلايا
+class _Box:
+    __slots__ = ("text", "x0", "x1", "top", "bottom", "conf")
+
+    def __init__(self, text, x0, x1, top, bottom, conf=100):
+        self.text, self.x0, self.x1, self.top, self.bottom, self.conf = text, x0, x1, top, bottom, conf
+
+
+def _median(v, default):
+    v = sorted(v)
+    return v[len(v) // 2] if v else default
+
+
+def _group_boxes(boxes, rtl, gap_factor=1.3):
+    """يجمّع الكلمات في أسطر بالإحداثي الرأسي ثم في خلايا بفجوة أفقية كبيرة. الخلية الأولى في السطر هي الأقرب لجهة القراءة."""
+    boxes = [b for b in boxes if b.text.strip()]
+    if not boxes:
+        return []
+    med_h = _median([b.bottom - b.top for b in boxes], 10)
+    boxes.sort(key=lambda b: (b.top + b.bottom) / 2)
+    lines, cur, cur_y = [], [], None
+    for b in boxes:
+        cy = (b.top + b.bottom) / 2
+        if cur_y is None or abs(cy - cur_y) <= med_h * 0.6:
+            cur.append(b)
+            cur_y = cy if cur_y is None else (cur_y * (len(cur) - 1) + cy) / len(cur)
+        else:
+            lines.append(cur)
+            cur, cur_y = [b], cy
+    if cur:
+        lines.append(cur)
+    out = []
+    for ln in lines:
+        ln.sort(key=lambda b: b.x0, reverse=rtl)
+        cells, cell = [], [ln[0]]
+        for prev, b in zip(ln, ln[1:]):
+            gap = (prev.x0 - b.x1) if rtl else (b.x0 - prev.x1)
+            if gap > med_h * gap_factor:
+                cells.append(cell)
+                cell = [b]
+            else:
+                cell.append(b)
+        cells.append(cell)
+        conf = [b.conf for b in ln if b.conf is not None and b.conf >= 0]
+        out.append({"cells": [" ".join(b.text for b in c) for c in cells], "groups": cells,
+                    "conf": (sum(conf) / len(conf)) if conf else 100})
+    return out
+
+
+# ---------------------------------------------------------------- PDF
+def _declare_bundled_deps():
+    """لا تُستدعى أبدًا: تكشف لـ PyInstaller المكتبات التي تُحمَّل ديناميكيًا عبر _need فيضمّها داخل exe."""
+    import pdfplumber  # noqa: F401
+    import pypdfium2  # noqa: F401
+    import pytesseract  # noqa: F401
+    import pdfminer  # noqa: F401
+    import cv2  # noqa: F401
+    import numpy  # noqa: F401
+
+
+def _need(mod, label):
+    try:
+        return __import__(mod)
+    except ImportError:
+        import sys
+        if getattr(sys, "frozen", False):
+            raise AccountingError(f"نسخة البرنامج هذه بُنيت بلا مكتبة {label}. أعد بناء البرنامج بـ build.py (يضمّها تلقائيًا) أو استخدم CSV.")
+        raise AccountingError(f"قراءة هذا الملف تحتاج مكتبة {label} وهي غير مثبَّتة. ثبّتها (pip install {label}) أو استخدم CSV.")
+
+
+def _pdf_pages_text(path):
+    """طبقة النص: لكل صفحة {lines|tables}. يرجع قائمة صفحات (قد تكون فارغة للممسوح ضوئيًا)."""
+    pdfplumber = _need("pdfplumber", "pdfplumber")
+    pages = []
+    with pdfplumber.open(path) as pdf:
+        if len(pdf.pages) > MAX_PAGES:
+            raise AccountingError(f"الملف أكثر من {MAX_PAGES} صفحة. قسّمه ثم استورد كل جزء على حدة.")
+        for pg in pdf.pages:
+            tables = []
+            try:
+                for t in pg.extract_tables() or []:
+                    rows = [[(c or "").replace("\n", " ") for c in r] for r in t if r and any((c or "").strip() for c in r)]
+                    if len(rows) >= 2:
+                        tables.append(rows)
+            except Exception:  # noqa: BLE001 — جدول مشوَّه لا يوقف قراءة الكلمات
+                tables = []
+            words = [_Box(w["text"], w["x0"], w["x1"], w["top"], w["bottom"], None)
+                     for w in (pg.extract_words(x_tolerance=2, y_tolerance=3, keep_blank_chars=False) or [])]
+            pages.append({"tables": tables, "words": words})
+    return pages
+
+
+def _pdf_pages_ocr(path, lang):
+    pdfium = _need("pypdfium2", "pypdfium2")
+    out = []
+    pdf = pdfium.PdfDocument(path)
+    try:
+        if len(pdf) > MAX_PAGES:
+            raise AccountingError(f"الملف أكثر من {MAX_PAGES} صفحة. قسّمه ثم استورد كل جزء على حدة.")
+        for i in range(len(pdf)):
+            img = pdf[i].render(scale=300 / 72).to_pil()
+            out.append(_ocr_image(img, lang))
+    finally:
+        pdf.close()
+    return out
+
+
+# ---------------------------------------------------------------- OCR
+_TESS_PATHS = (r"C:\Program Files\Tesseract-OCR\tesseract.exe", r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe")
+
+
+def _tesseract(lang):
+    """يضبط مسار Tesseract (PATH ثم مجلد tesseract بجوار البرنامج ثم المسارات المعتادة) ويختار اللغات المتاحة فعلًا."""
+    pt = _need("pytesseract", "pytesseract")
+    cmd = shutil.which("tesseract")
+    if not cmd:
+        base = os.path.dirname(os.path.abspath(__import__("alhisabat").__file__))
+        for p in (os.path.join(base, "..", "tesseract", "tesseract.exe"),) + _TESS_PATHS:
+            if os.path.exists(p):
+                cmd = p
+                break
+    if not cmd:
+        raise AccountingError("قراءة الصور وملفات PDF الممسوحة ضوئيًا تحتاج برنامج Tesseract OCR (مع لغة العربية ara). "
+                              "ثبّته من مشروع UB-Mannheim ثم أعد المحاولة، أو استخدم ملف PDF نصيًا أو CSV.")
+    pt.pytesseract.tesseract_cmd = cmd
+    try:
+        have = set(pt.get_languages(config=""))
+    except Exception:  # noqa: BLE001
+        have = set()
+    wanted = [x for x in lang.split("+") if x in have]
+    warn = None
+    if "ara" not in have:
+        warn = "لغة العربية (ara) غير مثبَّتة في Tesseract: دقة قراءة الأسماء العربية ستكون ضعيفة جدًا. ثبّت ملف ara.traineddata."
+    return pt, ("+".join(wanted) or "eng"), warn
+
+
+def _preprocess(img):
+    """تحسين الصورة للتعرف: اتجاه EXIF، تدرج رمادي، تكبير الصغيرة، إزالة الضوضاء، عتبة تكيفية."""
+    from PIL import ImageOps
+    img = ImageOps.exif_transpose(img).convert("L")
+    if img.width < 1800:
+        k = 1800 / img.width
+        img = img.resize((int(img.width * k), int(img.height * k)))
+    try:
+        import cv2
+        import numpy as np
+        a = cv2.fastNlMeansDenoising(np.array(img), None, 12, 7, 21)
+        a = cv2.adaptiveThreshold(a, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 41, 15)
+        from PIL import Image
+        return Image.fromarray(a)
+    except Exception:  # noqa: BLE001 — بدون OpenCV نكتفي بتباين PIL
+        return ImageOps.autocontrast(img)
+
+
+def _ocr_image(img, lang):
+    pt, use_lang, warn = _tesseract(lang)
+    data = pt.image_to_data(_preprocess(img), lang=use_lang, config="--psm 6", output_type=pt.Output.DICT)
+    boxes = []
+    for i, t in enumerate(data["text"]):
+        t = (t or "").strip()
+        try:
+            conf = float(data["conf"][i])
+        except (TypeError, ValueError):
+            conf = -1
+        if t and conf >= 0:
+            boxes.append(_Box(t, data["left"][i], data["left"][i] + data["width"][i], data["top"][i],
+                              data["top"][i] + data["height"][i], conf))
+    return {"tables": [], "words": boxes, "ocr": True, "warn": warn}
+
+
+# ---------------------------------------------------------------- استخراج الأسطر
+def _extract_lines(path, lang="ara+eng"):
+    """يرجع (أسطر، وصف المصدر، تحذيرات). السطر = {cells, conf, page}. ترتيب الخلايا: الأولى هي الأقرب لجهة القراءة."""
+    ext = os.path.splitext(path)[1].lower()
+    if not os.path.isfile(path):
+        raise AccountingError("الملف غير موجود")
+    warnings = []
+    if ext in IMAGE_EXT:
+        from PIL import Image
+        pages, source = [_ocr_image(Image.open(path), lang)], "صورة (OCR)"
+    elif ext in PDF_EXT:
+        pages = _pdf_pages_text(path)
+        total_chars = sum(len(b.text) for p in pages for b in p["words"])
+        if total_chars < 15 * max(1, len(pages)):          # لا طبقة نص كافية: ممسوح ضوئيًا
+            pages, source = _pdf_pages_ocr(path, lang), "PDF ممسوح ضوئيًا (OCR)"
+        else:
+            source = "PDF نصي"
+    else:
+        raise AccountingError("نوع الملف غير مدعوم. المدعوم: CSV وPDF والصور (PNG/JPG/TIFF/BMP/WEBP).")
+    for p in pages:
+        if p.get("warn") and p["warn"] not in warnings:
+            warnings.append(p["warn"])
+
+    all_words = [b.text for p in pages for b in p["words"]]
+    from_text_layer = source == "PDF نصي"
+    ar = sum(_arabic_count(w) for w in all_words)
+    lat = sum(len(_LATIN.findall(w)) for w in all_words)
+    rtl = ar > lat
+    reverse = bool(from_text_layer and rtl and _looks_reversed(all_words))
+
+    # ترتيب الكلمات: OCR وPDF بصري (معكوس الحروف) موضوعان فعلًا من اليمين لليسار؛ نص PDF منطقي موضوع يسار→يمين يبقى كذلك
+    sort_rtl = rtl and (reverse or not from_text_layer)
+    lines = []
+    for pno, p in enumerate(pages, 1):
+        if p["tables"]:
+            for t in p["tables"]:
+                for r in t:
+                    cells = [_clean(_fix_visual(_clean(c), reverse, reorder_tokens=True)) for c in r]
+                    cells = cells[::-1] if (rtl and from_text_layer) else cells
+                    lines.append({"cells": cells, "conf": 100, "page": pno, "table": True})
+            continue
+        for b in p["words"]:
+            b.text = _clean(b.text)
+            if reverse and _is_arabic_word(b.text):
+                b.text = b.text[::-1]
+        for ln in _group_boxes(p["words"], sort_rtl):
+            ln["page"], ln["table"] = pno, False
+            lines.append(ln)
+    if not lines:
+        raise AccountingError("لم يُعثر على أي نص في الملف. تأكد من وضوح المستند أو استخدم صورة أعلى جودة.")
+    return _regrid_by_header(lines, sort_rtl), source, warnings
+
+
+def _regrid_by_header(lines, rtl):
+    """إن وُجد صف عناوين بثلاث خلايا فأكثر: يعيد توزيع كلمات كل سطر على أعمدة العناوين بأقرب مركز أفقي، فلا تلتصق
+    الأعمدة المتقاربة (اسم طويل بجوار الكود). الأسطر القادمة من جداول PDF تبقى كما هي."""
+    hi, _m = _find_header(lines)
+    if hi is None or "groups" not in lines[hi] or len(lines[hi]["groups"]) < 3:
+        return lines
+    groups = lines[hi]["groups"]
+    order = sorted(range(len(groups)), key=lambda i: min(x.x0 for x in groups[i]))      # أعمدة من اليسار لليمين
+    left = [min(x.x0 for x in groups[i]) for i in order]
+    right = [max(x.x1 for x in groups[i]) for i in order]
+    bounds = [(right[k] + left[k + 1]) / 2 for k in range(len(order) - 1)]              # منتصف الفجوة بين عمودين
+    for k, ln in enumerate(lines):
+        if k <= hi or "groups" not in ln:
+            continue
+        cols = [[] for _ in groups]
+        for g in ln["groups"]:
+            for bx in g:
+                cx = (bx.x0 + bx.x1) / 2
+                pos = sum(1 for bd in bounds if cx > bd)
+                cols[order[pos]].append(bx)
+        ln["cells"] = [" ".join(bx.text for bx in sorted(c, key=lambda t: t.x0, reverse=rtl)) for c in cols]
+    return lines
+
+
+# ---------------------------------------------------------------- رؤوس الأعمدة والأنماط
+_SYN = {
+    "name": ["الاسم", "اسم", "اسم العميل", "اسم المورد", "العميل", "المورد", "اسم الصنف", "الصنف", "اسم المادة", "المادة",
+             "الصنف المادة", "البيان", "اسم الحساب", "name", "item", "item name", "description", "product", "customer", "supplier"],
+    "code": ["الكود", "كود", "كود الصنف", "رقم الصنف", "رمز", "الرمز", "رمز الصنف", "code", "sku", "item code"],
+    "unit": ["الوحده", "وحده", "unit", "uom"],
+    "phone": ["الهاتف", "هاتف", "التليفون", "تليفون", "الموبايل", "موبايل", "الجوال", "جوال", "رقم الهاتف", "رقم الموبايل",
+              "tel", "phone", "mobile"],
+    "email": ["البريد", "البريد الالكتروني", "الايميل", "ايميل", "email", "e mail"],
+    "tax_no": ["الرقم الضريبي", "رقم ضريبي", "ضريبي", "الرقم الضريبى", "tax", "tax no", "vat"],
+    "notes": ["ملاحظات", "ملاحظه", "العنوان", "عنوان", "notes", "address"],
+    "barcode": ["الباركود", "باركود", "barcode"],
+    "category": ["التصنيف", "الفئه", "المجموعه", "الفئة", "category", "group"],
+    "credit_limit": ["الحد الائتماني", "الحد الائتمانى", "سقف الائتمان", "credit limit"],
+    "payment_terms_days": ["مده السداد", "ايام السداد", "مدة السداد"],
+    "item_type": ["نوع الصنف", "النوع", "type"],
+    "min_qty": ["الحد الادنى", "حد الطلب", "حد التنبيه", "حد التنبيه للمخزون", "min", "min qty"],
+    "qty": ["الكميه", "كميه", "الكمية", "المخزون", "الرصيد المخزني", "الكميه المتوفره", "الكميه الموجوده", "qty", "quantity", "stock"],
+    "qty_unit": ["الموجود في المخزن", "الموجود"],
+    "purchase_price": ["سعر الشراء", "سعر التكلفه", "التكلفه", "تكلفه", "سعر الشراء للوحده", "cost", "purchase price", "buy price"],
+    "sale_price": ["سعر البيع", "سعر المبيع", "سعر البيع للوحده", "sale price", "sell price", "selling price"],
+    "unit_price": ["سعر الوحده الاساسيه", "سعر الوحده", "سعر الوحدة الاساسية"],
+    "price": ["السعر", "سعر", "price", "unit price", "سعر الافرادي"],
+    "total_value": ["سعر المخزون المتوفر", "قيمه المخزون", "قيمه المخزون المتوفر", "الاجمالي", "اجمالي", "اجمالي القيمه", "القيمه", "total", "amount", "المبلغ"],
+    "_ignore": ["م", "مسلسل", "تسلسل", "#", "no", "الرصيد",
+                "رصيد", "balance", "الخصم", "الضريبه", "رقم", "serial", "sl"],
+}
+_SYN_KEYS = {}
+for _f, _words in _SYN.items():
+    for _w in _words:
+        _SYN_KEYS.setdefault(_key(_w), _f)
+
+KNOWN_UNITS = ["قطعه", "قطعة", "حبه", "حبة", "علبه", "علبة", "كرتونه", "كرتونة", "كرتون", "كيلو", "كجم", "جرام", "جم", "طن",
+               "لتر", "متر", "سم", "عبوه", "عبوة", "دزينه", "دزينة", "كيس", "شوال", "رول", "طقم", "زوج", "باكو", "باكيت", "عدد",
+               "pcs", "pc", "piece", "kg", "g", "l", "m", "box", "carton", "set", "unit"]
+_UNIT_KEYS = {_key(u): u for u in KNOWN_UNITS}
+
+_NOISE = re.compile(
+    r"(^|\s)(الاجمالي|اجمالي|المجموع|مجموع|الإجمالي|total|sub ?total|صفحه|صفحة|page|تاريخ|فاتوره|فاتورة|كشف|قائمه|قائمة|تقرير|"
+    r"طبع بواسطه|طبع في|هاتف الشركه|سجل تجاري|بطاقه ضريبيه|الرقم الضريبي للشركه|توقيع|المستلم|المحاسب|ختم|list|report|statement|invoice|date|customers|suppliers|items)(\s|$)", re.I)
+_PHONE = re.compile(r"^\+?\d[\d\s\-()]{7,16}\d$")
+_EMAIL = re.compile(r"^[\w.+-]+@[\w-]+(\.[\w-]+)+$")
+_NUMBER = re.compile(r"^[\d.,]+$")
+_CODE = re.compile(r"^(?=.*\d)[A-Za-z0-9][A-Za-z0-9\-_/.]{0,24}$")
+
+
+def _header_field(text):
+    """حقل العمود من نص عنوانه: تطابق تام ثم قواعد احتواء تتحمل العناوين المقصوصة/المتداخلة في ملفات PDF."""
+    k = _key(text)
+    k = k.replace("اا", "ا")
+    if not k:
+        return None
+    f = _SYN_KEYS.get(k)
+    if f:
+        return f
+    if len(k) > 40:
+        return None
+    if "سعر" in k and "المخزون" in k:
+        return "total_value"
+    if "سعر" in k and "الوحده" in k:
+        return "unit_price"
+    if "سعر" in k and "شراء" in k:
+        return "purchase_price"
+    if "سعر" in k and "بيع" in k:
+        return "sale_price"
+    if "الموجود" in k:
+        return "qty_unit"
+    if "حد" in k.split() and "التنبيه" in k:
+        return "min_qty"
+    if k in ("الرقم", "رقم الصنف", "رقم المادة", "رقم") and k != "رقم":
+        return "code"
+    if "اسم" in k and ("الصنف" in k or "الماده" in k):
+        return "name"
+    if "كود" in k:
+        return "code"
+    return None
+
+
+def _find_header(lines):
+    """أول سطر (من أول 15) فيه عمودان معروفان أو أكثر، منها name. يرجع (فهرس السطر، {عمود: حقل})."""
+    for i, ln in enumerate(lines[:15]):
+        m = {}
+        for j, c in enumerate(ln["cells"]):
+            f = _header_field(c)
+            if f:
+                m[j] = f
+        real = [f for f in m.values() if f != "_ignore"]
+        if "name" in real and len(m) >= 2 or len(set(real)) >= 2:
+            return i, m
+    return None, {}
+
+
+def _is_header_like(cells):
+    hits = sum(1 for c in cells if _header_field(c))
+    return hits >= 2 or (len(cells) == 1 and hits == 1)
+
+
+def _letters(s):
+    return sum(ch.isalpha() for ch in s)
+
+
+def _clean_name(s):
+    s = re.sub(r"^[\s\d.\-:)(]+(?=\D)", "", s)          # رقم تسلسلي في أول الاسم (1- / 12.)
+    return re.sub(r"\s{2,}", " ", s).strip(" -:|،,")
+
+
+_PHONE_IN_TEXT = re.compile(r"(?<![\w.])(\+?\d[\d\-]{7,14}\d)(?![\w.])")
+
+
+def _pull_phone(row, target):
+    """هاتف ملتصق باسم العميل/المورد (خلية واحدة) يُفصل إلى حقله."""
+    if target == "item" or not row.get("name") or row.get("phone"):
+        return row
+    m = _PHONE_IN_TEXT.search(row["name"])
+    if m:
+        row["phone"] = m.group(1)
+        row["name"] = _clean_name(row["name"].replace(m.group(1), " "))
+    return row
+
+
+def _row_from_header(cells, mapping, target):
+    row, ignored_ok = {}, True
+    for j, f in mapping.items():
+        if j >= len(cells) or f == "_ignore":
+            continue
+        v = cells[j].strip()
+        if not v:
+            continue
+        if f == "notes" and row.get("notes"):
+            v = f"{row['notes']} | {v}"
+        row[f] = v
+    name = row.get("name", "")
+    if name:
+        row["name"] = _clean_name(name)
+    return row
+
+
+def _row_heuristic(cells, target):
+    """بلا رأس: يستنتج الحقول من شكل كل خلية (هاتف/بريد/وحدة/كود/اسم)."""
+    row, names = {}, []
+    for c in cells:
+        c = c.strip()
+        if not c:
+            continue
+        k = _key(c)
+        compact = c.replace(" ", "")
+        if _EMAIL.match(compact):
+            row["email"] = compact
+        elif _PHONE.match(c) and target != "item":
+            row["phone"] = compact
+        elif k in _UNIT_KEYS and target == "item":
+            row["unit"] = _UNIT_KEYS[k]
+        elif _NUMBER.match(compact):
+            continue                                   # رقم تسلسل/كمية/سعر: غير مطلوب في الاستيراد
+        elif target == "item" and _CODE.match(compact) and "code" not in row and _letters(c) <= 3:
+            row["code"] = compact
+        elif _letters(c) >= 2:
+            names.append(c)
+    if names:
+        row["name"] = _clean_name(max(names, key=_letters))
+        extra = [n for n in names if n != max(names, key=_letters)]
+        if extra and target != "item":
+            row["notes"] = " | ".join(extra)
+    return row
+
+
+def _confidence(row, line, mapped, target):
+    score = 100 if mapped else 75
+    if line["conf"] < LOW_CONFIDENCE:
+        score = min(score, int(line["conf"]))
+    name = row.get("name", "")
+    if not name or _letters(name) < 2:
+        score = min(score, 30)
+    elif len(name) < 3:
+        score = min(score, 50)
+    if re.search(r"[|\\/_~^<>{}=]", name):
+        score = min(score, 55)
+    return score
+
+
+def _lines_to_rows(lines, target, default_unit=""):
+    """target: 'customer' | 'supplier' | 'item'. يرجع (صفوف، تفاصيل لكل صف). كل تفصيلة: {page, raw, confidence, review}."""
+    if target not in ("customer", "supplier", "item"):
+        raise AccountingError("قراءة المستندات مدعومة للعملاء والموردين والأصناف فقط")
+    hdr_i, mapping = _find_header(lines)
+    body = lines[hdr_i + 1:] if hdr_i is not None else lines
+    hdr_len = len(lines[hdr_i]["cells"]) if hdr_i is not None else 0
+    rows, details = [], []
+    for ln in body:
+        cells = [c for c in ln["cells"] if c.strip()]
+        raw = " | ".join(cells)
+        if not cells or not any(_letters(c) for c in cells):
+            continue
+        if _NOISE.search(raw) or _is_header_like(cells):
+            continue
+        use_map = bool(mapping) and abs(len(ln["cells"]) - hdr_len) <= 1
+        row = _row_from_header(ln["cells"], mapping, target) if use_map else {}
+        if not row.get("name"):
+            row = _row_heuristic(cells, target)
+            use_map = False
+        if not row.get("name"):
+            continue
+        row = _pull_phone(row, target)
+        if target == "item":
+            row.setdefault("unit", default_unit)
+            row.setdefault("item_type", "stock")
+            if not row.get("unit"):
+                row["unit"] = ""
+        conf = _confidence(row, ln, use_map, target)
+        rows.append(row)
+        details.append({"page": ln.get("page", 1), "raw": raw, "confidence": conf, "review": conf < LOW_CONFIDENCE or not use_map})
+    return rows, details
+
+
+# ---------------------------------------------------------------- قارئ الجداول (PDF نصي)
+# النص العربي في ملفات PDF يُخزَّن غالبًا بترتيب بصري (معكوس) أو بأشكال عرض FExx، فاستخراج الكلمات الخام يعطي أسماء مقلوبة.
+# هنا: الهندسة (حدود الخلايا) من pdfplumber، ونص كل خلية من pdfium الذي يطبّق خوارزمية الاتجاه (bidi) فيعطي النص المنطقي
+# الصحيح. ثم يُصلَح عيبان معروفان في pdfium: (1) لام-ألف المركَّبة (ﻻ) تخرج «ال» بدل «لا»، (2) رموز لاتينية+أرقام مثل MT12-0004
+# تخرج مقلوبة (12-0004MT). الإصلاح يستند إلى كلمات pdfplumber لنفس الخلية، لا إلى تخمين.
+_AR_RANGE = re.compile("[\u0600-\u06FF\uFB50-\uFDFF\uFE70-\uFEFF]")
+_LIGA = re.compile("[\uFEF5-\uFEFC]")
+_LAM_ALEF = (("ال", "لا"), ("أل", "لأ"), ("إل", "لإ"), ("آل", "لآ"))
+_TOTAL_ROW = re.compile(r"^(الاجمالي|الإجمالي|اجمالي|المجموع|مجموع|الكلي|total|grand total)\b", re.I)
+_CURRENCY = re.compile(r"(ر\.?\s?س|ريال\s*(سعودي|يمني)?|SAR|YER|USD|\$|ر\.?\s?ي)", re.I)
+
+
+def _unlig(tok, lig):
+    """يعيد «ال» المقلوبة إلى «لا» فقط إن طابقت النتيجة كلمة مركَّبة مؤكدة من pdfplumber."""
+    if tok in lig:
+        return tok
+    frontier, seen = [tok], {tok}
+    for _ in range(3):
+        nxt = []
+        for t in frontier:
+            for bad, good in _LAM_ALEF:
+                start = 0
+                while True:
+                    i = t.find(bad, start)
+                    if i < 0:
+                        break
+                    c = t[:i] + good + t[i + 2:]
+                    if c in lig:
+                        return c
+                    if c not in seen:
+                        seen.add(c)
+                        nxt.append(c)
+                    start = i + 1
+        frontier = nxt
+    return tok
+
+
+_LAT_RUN = re.compile(r"[A-Za-z0-9][A-Za-z0-9\-_/.]*|-[A-Za-z0-9][A-Za-z0-9\-_/.]*")
+
+
+def _repair_tokens(text, plumber_tokens):
+    lat, lig = {}, set()
+    for w in plumber_tokens:
+        w = w.strip()
+        if not w:
+            continue
+        for run in _LAT_RUN.findall(w):                # ترتيب الرموز اللاتينية في pdfplumber بصري = ترتيب القراءة الصحيح
+            lat.setdefault("".join(sorted(run)), set()).add(run)
+        if _AR_RANGE.search(w) and _LIGA.search(w):
+            fixed = _clean(w[::-1])                    # العكس أولًا ثم NFKC: لا يفكّ «ﻻ» إلى حرفين قبل العكس
+            if _is_arabic_word(fixed):
+                lig.add(fixed)
+
+    def fix_run(m):
+        run = m.group(0)
+        if re.search(r"[A-Za-z]", run) and re.search(r"[\d\-]", run):
+            cand = lat.get("".join(sorted(run)))
+            if cand and len(cand) == 1:
+                return next(iter(cand))
+        return run
+    out = []
+    for tok in text.split(" "):
+        if not tok:
+            continue
+        tok = _LAT_RUN.sub(fix_run, tok)
+        if lig and _AR_RANGE.search(tok):
+            tok = _unlig(tok, lig)
+        out.append(tok)
+    return " ".join(out)
+
+
+def _grid_tables_of_page(pg):
+    """جداول الصفحة: بالخطوط أولًا (الأدق)، ثم باستنتاج الأعمدة من مواضع الكلمات إن لم توجد خطوط."""
+    good = [t for t in pg.find_tables() if t.rows and max(len(r.cells) for r in t.rows) >= 3 and len(t.rows) >= 2]
+    if good:
+        return good
+    try:
+        alt = pg.find_tables({"vertical_strategy": "text", "horizontal_strategy": "text", "snap_tolerance": 3,
+                              "join_tolerance": 3, "min_words_vertical": 3, "min_words_horizontal": 1})
+    except Exception:  # noqa: BLE001
+        return []
+    return [t for t in alt if len(t.rows) >= 3 and max(len(r.cells) for r in t.rows) >= 3]
+
+
+def _page_chars(tp):
+    """حروف الصفحة بترتيب pdfium المنطقي: [(حرف، وسط س، وسط ص، حجم الخط)]. المسافات المولَّدة (بلا مربع حقيقي) س/ص=None."""
+    from pypdfium2 import raw as pc
+    out = []
+    for i in range(tp.count_chars()):
+        u = pc.FPDFText_GetUnicode(tp.raw, i)
+        if u in (0xFFFE, 0xFFFF) or (u == 0 and not pc.FPDFText_IsGenerated(tp.raw, i)):
+            continue
+        ch = chr(u) if 0 < u < 0xD800 or u > 0xDFFF else ""
+        if pc.FPDFText_IsGenerated(tp.raw, i):
+            out.append((ch or " ", None, None, 0.0))
+            continue
+        ang = abs(pc.FPDFText_GetCharAngle(tp.raw, i)) % 6.283185307
+        if 0.1 < ang < 6.18:                    # حرف مائل (علامة مائية قطرية): ليس من الجدول
+            continue
+        l, b, r, t = tp.get_charbox(i)
+        out.append((ch, (l + r) / 2, (b + t) / 2, pc.FPDFText_GetFontSize(tp.raw, i)))
+    return out
+
+
+def _chars_in(chars, l, t, r, b, H):
+    """حروف المستطيل بترتيبها المنطقي؛ المسافة المولَّدة تُحسب إن أحاط بها حرفان داخل المستطيل،
+    وتُدرج مسافة عند الانتقال لسطر جديد داخل الخلية (التفاف النص)."""
+    m = [None if cx is None else (l + 0.5 <= cx <= r - 0.5 and t <= H - cy <= b) for _c, cx, cy, _s in chars]
+    res, n = [], len(chars)
+    last_sz, last_cy = 0.0, None
+    for k in range(n):
+        if m[k]:
+            ch, _cx, cy, sz = chars[k]
+            if last_cy is not None and abs(cy - last_cy) > max(6.0, 0.8 * sz) and res and res[-1][0].strip() and ch.strip():
+                res.append((" ", sz))
+            if ch.strip():
+                last_cy = cy
+            last_sz = sz
+            res.append((ch, sz))
+        elif m[k] is None:
+            prev_in = k > 0 and next((m[j] for j in range(k - 1, -1, -1) if m[j] is not None), False)
+            next_in = next((m[j] for j in range(k + 1, n) if m[j] is not None), False)
+            if prev_in and next_in:
+                res.append((chars[k][0], last_sz))
+    return res
+
+
+def _pdf_grid(path):
+    """[{page, rows:[[نص الخلية…]]}] لكل جدول في ملف PDF نصي. فارغ إن لم تُوجد جداول أو لا طبقة نص.
+    حروف أصغر خطًا من نص عمودها (ترويسة/تذييل الطباعة المتراكبان على أول صف في كل صفحة) تُستبعد من الخلية."""
+    pdfplumber = _need("pdfplumber", "pdfplumber")
+    pdfium = _need("pypdfium2", "pypdfium2")
+    tables = []
+    doc = pdfium.PdfDocument(path)
+    try:
+        with pdfplumber.open(path) as pdf:
+            if len(pdf.pages) > MAX_PAGES:
+                raise AccountingError(f"الملف أكثر من {MAX_PAGES} صفحة. قسّمه ثم استورد كل جزء على حدة.")
+            for pno, pg in enumerate(pdf.pages, 1):
+                found = _grid_tables_of_page(pg)
+                if not found:
+                    continue
+                H = pg.height
+                tp = doc[pno - 1].get_textpage()
+                chars = _page_chars(tp)
+                words = pg.extract_words(x_tolerance=1.5, y_tolerance=3) or []
+                for tb in found:
+                    grid = []                                   # لكل خلية: حروفها (الترتيب المنطقي) أو None
+                    for row in tb.rows:
+                        line = []
+                        for c in row.cells:
+                            if not c:
+                                line.append(None)
+                                continue
+                            l, t, r, b = c
+                            line.append((c, _chars_in(chars, l, t, r, b, H)))
+                        grid.append(line)
+                    ncol = max(len(g) for g in grid)
+                    mode = {}
+                    for j in range(ncol):
+                        cnt = {}
+                        for g in grid:
+                            if j < len(g) and g[j]:
+                                for ch, sz in g[j][1]:
+                                    if ch.strip():
+                                        cnt[round(sz, 1)] = cnt.get(round(sz, 1), 0) + 1
+                        if cnt:
+                            mode[j] = max(cnt.items(), key=lambda kv: kv[1])[0]
+                    rows = []
+                    for g in grid:
+                        cells = []
+                        for j, cell in enumerate(g):
+                            if not cell:
+                                cells.append("")
+                                continue
+                            c, cc = cell
+                            keep = [ch for ch, sz in cc if not ch.strip() or sz >= mode.get(j, 0) * 0.9]
+                            txt = _clean("".join(keep).replace("\r", " ").replace("\n", " "))
+                            l, t, r, b = c
+                            inside = [w["text"] for w in words
+                                      if l <= (w["x0"] + w["x1"]) / 2 <= r and t <= (w["top"] + w["bottom"]) / 2 <= b]
+                            cells.append(_repair_tokens(txt, inside))
+                        if any(cells):
+                            rows.append(cells)
+                    if rows:
+                        tables.append({"page": pno, "rows": rows})
+    finally:
+        doc.close()
+    return tables
+
+
+def _num(s):
+    """نص رقمي (عملة، فواصل آلاف، علامة سالب بعد الرقم مثل ١-) ← Decimal أو None."""
+    from decimal import Decimal, InvalidOperation
+    t = _CURRENCY.sub("", _clean(s)).replace(",", "").replace(" ", "")
+    neg = t.startswith("-") or t.endswith("-") or (t.startswith("(") and t.endswith(")"))
+    t = t.strip("-()")
+    if not re.fullmatch(r"\d+(\.\d+)?", t):
+        return None
+    try:
+        d = Decimal(t)
+    except InvalidOperation:
+        return None
+    return -d if neg else d
+
+
+def _fmt(d):
+    s = format(d, "f")
+    return s.rstrip("0").rstrip(".") if "." in s else s
+
+
+def _tidy_unit(u):
+    u = re.sub(r"\s*\*\s*", " * ", u)
+    u = re.sub(r"(\d)([^\d\s.,])", r"\1 \2", u)
+    return re.sub(r"\s{2,}", " ", u).strip()
+
+
+_NUM_FIELDS = ("qty", "purchase_price", "sale_price", "unit_price", "price", "total_value", "min_qty")
+
+
+def _grid_rows(tables, target, default_unit=""):
+    """جداول ← (صفوف، تفاصيل، وُجد رأس). يطبّق تعيين الأعمدة من صف العناوين لكل جدول، ويرث التعيين للجداول بلا رأس بنفس عدد الأعمدة."""
+    rows, details = [], []
+    mapping, hdr_len, found = None, 0, False
+    for tb in tables:
+        trs = tb["rows"]
+        hi, m = _find_header([{"cells": r, "conf": 100} for r in trs[:8]])
+        if hi is not None and "name" in m.values():
+            mapping, hdr_len, start, found = m, len(trs[hi]), hi + 1, True
+        elif mapping and len(trs[0]) == hdr_len:
+            start = 0
+        else:
+            continue
+        for cells in trs[start:]:
+            if len(cells) != hdr_len or _is_header_like([c for c in cells if c.strip()]):
+                continue
+            row = {}
+            for j, f in mapping.items():
+                v = cells[j].strip() if j < len(cells) else ""
+                if not v or f == "_ignore":
+                    continue
+                if f == "qty_unit":
+                    mm = re.match(r"^\s*(-?[\d.,]+-?)\s*(.*)$", v)
+                    if mm:
+                        row.setdefault("qty", mm.group(1))
+                        if mm.group(2).strip():
+                            row.setdefault("unit", mm.group(2).strip())
+                    else:
+                        row.setdefault("unit", v)
+                elif f == "notes" and row.get("notes"):
+                    row["notes"] = f"{row['notes']} | {v}"
+                else:
+                    row.setdefault(f, v)
+            name = _clean_name(row.get("name", ""))
+            if not name or _letters(name) < 2 or _TOTAL_ROW.match(_key(name)):
+                continue
+            name = re.sub(r"([\u0621-\u064A])([A-Za-z])", r"\1 \2", name)      # ملتصق عربي+لاتيني: سيارةC20 → سيارة C20
+            name = re.sub(r"([A-Za-z])([\u0621-\u064A])", r"\1 \2", name)
+            row["name"] = name
+            review_why = []
+            for f in _NUM_FIELDS:
+                if f in row:
+                    d = _num(row[f])
+                    if d is None:
+                        row.pop(f)
+                        review_why.append(f"قيمة غير رقمية في {f}")
+                    else:
+                        row[f] = _fmt(d)
+            if "code" in row:
+                row["code"] = row["code"].replace(" ", "")
+            if target == "item":
+                if row.get("unit"):
+                    row["unit"] = _tidy_unit(row["unit"])
+                else:
+                    row["unit"] = default_unit or ""
+                    if not default_unit:
+                        review_why.append("وحدة غير مذكورة")
+                row.setdefault("item_type", "stock")
+                try:
+                    from decimal import Decimal
+                    q, p, t = (Decimal(row[k]) if k in row else None for k in ("qty", "price", "total_value"))
+                    if q is not None and q < 0:
+                        review_why.append("كمية سالبة")
+                    if q is not None and p is not None and t is not None and abs(q * p - t) > Decimal("0.05"):
+                        review_why.append("الكمية × السعر لا تساوي الإجمالي")
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                row = _pull_phone(row, target)
+            raw = " | ".join(c.strip() for c in cells if c.strip())
+            rows.append(row)
+            details.append({"page": tb["page"], "raw": raw, "confidence": 100 if not review_why else 70,
+                            "review": bool(review_why), "notes": review_why})
+    return rows, details, found
+
+
+def read_document(path, target, default_unit="", lang="ara+eng"):
+    """نقطة الدخول: ملف PDF/صورة → {'rows', 'details', 'source', 'warnings', 'header_found'}.
+    PDF نصي بجدول: القارئ الشبكي (نص منطقي صحيح + كل الأعمدة). غير ذلك: المسار القديم (أسطر/OCR)."""
+    if target not in ("customer", "supplier", "item"):
+        raise AccountingError("قراءة المستندات مدعومة للعملاء والموردين والأصناف فقط")
+    if os.path.splitext(path)[1].lower() in PDF_EXT and os.path.isfile(path):
+        try:
+            tables = _pdf_grid(path)
+        except AccountingError:
+            raise
+        except Exception:  # noqa: BLE001 — أي عطب في القارئ الشبكي يرجع للمسار القديم بدل الفشل
+            tables = []
+        if tables:
+            rows, details, found = _grid_rows(tables, target, default_unit)
+            if rows and found:
+                warns = []
+                if any(d["review"] for d in details):
+                    warns.append("بعض الأسطر معلَّمة «يحتاج مراجعة» (وحدة ناقصة أو كمية سالبة أو عدم تطابق إجمالي).")
+                return {"rows": rows, "details": details, "source": "PDF نصي (جدول)", "warnings": warns, "header_found": True}
+    lines, source, warnings = _extract_lines(path, lang)
+    hdr_i, _m = _find_header(lines)
+    rows, details = _lines_to_rows(lines, target, default_unit)
+    if not rows:
+        raise AccountingError("لم أتمكن من التعرف على أسطر صالحة للاستيراد في هذا المستند. جرّب صورة أوضح أو PDF نصيًا أو CSV.")
+    if hdr_i is None:
+        warnings.append("لم يُعثر على صف عناوين أعمدة: التعرف تم بالاستنتاج، راجع الأسطر المعلَّمة بعناية.")
+    return {"rows": rows, "details": details, "source": source, "warnings": warnings, "header_found": hdr_i is not None}

@@ -1,0 +1,128 @@
+"""منطق النسخ الاحتياطي التلقائي: خالص — بلا PySide6 ولا SQL ولا float.
+
+الإعدادات محلية للجهاز (تفضيلات النظام عبر Prefs.get_raw/set_raw) لأن مجلد النسخ يخص هذا الحاسوب وقرصه.
+هذا الملف يقرّر: هل الإعداد مكتمل، متى تستحق نسخة (عند الفتح/عند الإغلاق)، وهل يُسأل المستخدم عن المجلد أول مرة، وفحص صلاحية المجلد.
+"""
+import os
+import threading
+import uuid
+from datetime import datetime, timedelta
+
+K_DIR, K_AUTO, K_KEEP, K_LAST, K_ASK = 'backup_dir', 'backup_auto', 'backup_keep', 'backup_last_auto', 'backup_ask'
+DEFAULT_KEEP, MIN_KEEP, MAX_KEEP = 30, 3, 365
+CLOSE_MIN_GAP = timedelta(minutes=30)        # عند الإغلاق: لا نسخة جديدة إن كانت الأخيرة أحدث من هذا
+STARTUP, CLOSE, MANUAL = 'startup', 'close', 'manual'
+ASK_LATER, ASK_NEVER = '', 'never'
+
+
+def _truthy(v):
+    return str(v).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def load(prefs):
+    """{dir, auto, keep, last (datetime|None), ask}. auto الافتراضية: تعمل متى حُدّد المجلد."""
+    d = prefs.get_raw(K_DIR, '').strip()
+    raw_auto = prefs.get_raw(K_AUTO, '')
+    auto = bool(d) if raw_auto == '' else _truthy(raw_auto)
+    try:
+        keep = int(prefs.get_raw(K_KEEP, str(DEFAULT_KEEP)))
+    except ValueError:
+        keep = DEFAULT_KEEP
+    last = None
+    raw_last = prefs.get_raw(K_LAST, '')
+    if raw_last:
+        try:
+            last = datetime.fromisoformat(raw_last)
+        except ValueError:
+            last = None
+    return {'dir': d, 'auto': auto, 'keep': clamp_keep(keep), 'last': last, 'ask': prefs.get_raw(K_ASK, ASK_LATER)}
+
+
+def clamp_keep(n):
+    return max(MIN_KEEP, min(int(n), MAX_KEEP))
+
+
+def save_dir(prefs, path):
+    prefs.set_raw(K_DIR, str(path).strip())
+    prefs.set_raw(K_AUTO, '1')
+    prefs.set_raw(K_ASK, ASK_LATER)
+
+
+def set_auto(prefs, flag):
+    prefs.set_raw(K_AUTO, '1' if flag else '0')
+
+
+def set_keep(prefs, n):
+    prefs.set_raw(K_KEEP, str(clamp_keep(n)))
+
+
+def mark_done(prefs, now):
+    prefs.set_raw(K_LAST, now.isoformat(timespec='seconds'))
+
+
+def never_ask(prefs):
+    prefs.set_raw(K_ASK, ASK_NEVER)
+
+
+def is_configured(cfg):
+    return bool(cfg['dir'])
+
+
+def needs_first_prompt(cfg, can_manage):
+    """يُسأل عن المجلد أول مرة فقط: صلاحية النسخ موجودة، لا مجلد محدد، ولم يختر «لا تسأل مجددًا»."""
+    return bool(can_manage) and not is_configured(cfg) and cfg['ask'] != ASK_NEVER
+
+
+def is_due(cfg, trigger, now):
+    """هل تُؤخذ نسخة تلقائية الآن؟ فتح البرنامج: مرة في اليوم؛ الإغلاق: إن مضى 30 دقيقة على آخر نسخة؛ اليدوي: دائمًا."""
+    if trigger == MANUAL:
+        return is_configured(cfg)
+    if not (cfg['auto'] and is_configured(cfg)):
+        return False
+    last = cfg['last']
+    if last is None:
+        return True
+    if trigger == STARTUP:
+        return last.date() != now.date()
+    if trigger == CLOSE:
+        return now - last >= CLOSE_MIN_GAP
+    return False
+
+
+def check_dir(path):
+    """(صالح، سبب) لمجلد النسخ: موجود أو قابل للإنشاء، وقابل للكتابة فعليًا (ملف اختبار يُحذف)."""
+    p = str(path or '').strip()
+    if not p:
+        return False, 'لم تختر مجلدًا'
+    try:
+        os.makedirs(p, exist_ok=True)
+        probe = os.path.join(p, f'.write_test_{uuid.uuid4().hex[:8]}')
+        with open(probe, 'w', encoding='utf-8') as f:
+            f.write('ok')
+        os.remove(probe)
+    except OSError:
+        return False, 'لا يمكن الكتابة في هذا المجلد: اختر مجلدًا آخر أو تأكد من صلاحياتك/اتصال القرص'
+    return True, ''
+
+
+def check_dir_timeout(path, seconds=8):
+    """check_dir بمهلة: مسار شبكي/قرص غير متصل قد يعلّق نظام الملفات دقائق؛ نفحص في خيط ونُبلغ بعدم الاستجابة بدل تجميد الواجهة."""
+    box = {}
+
+    def _w():
+        box['r'] = check_dir(path)
+    t = threading.Thread(target=_w, daemon=True)
+    t.start()
+    t.join(seconds)
+    if t.is_alive():
+        return False, 'المجلد لا يستجيب (مشاركة شبكية أو قرص غير متاح). اختر مجلدًا محليًا أو تأكد من الاتصال'
+    return box.get('r', (False, 'تعذّر فحص المجلد'))
+
+
+def describe_last(cfg):
+    last = cfg['last']
+    return 'لم تؤخذ نسخة تلقائية بعد' if last is None else f"آخر نسخة تلقائية: {last:%Y-%m-%d %H:%M}"
+
+
+def success_text(trigger, name):
+    return f'تم حفظ نسخة احتياطية مضغوطة: {name}'

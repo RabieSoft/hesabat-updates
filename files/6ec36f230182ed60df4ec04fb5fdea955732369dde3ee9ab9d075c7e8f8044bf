@@ -1,0 +1,656 @@
+"""دليل الرسائل: إدارة طابور رسائل واتساب، القوالب، الإعدادات، والاتصال.
+
+يتبع معايير تصميم النظام (DataGrid، BasePage، ألوان الرموز)، وخالٍ من SQL المباشر.
+"""
+from datetime import date, timedelta
+from pathlib import Path
+
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtWidgets import (
+    QCheckBox, QComboBox, QFileDialog, QGroupBox, QHBoxLayout,
+    QLabel, QLineEdit, QMessageBox, QPushButton, QSpinBox,
+    QTabWidget, QTextEdit, QVBoxLayout, QWidget
+)
+
+from alhisabat.messaging import browser_prefs
+from alhisabat.messaging.service import MessagingService
+from alhisabat.messaging.templates import extract_placeholders, render_template
+from alhisabat.ui.components.datagrid import DataGrid
+from alhisabat.ui.components.grid_logic import Column
+from alhisabat.ui.core.base_page import BasePage
+from alhisabat.ui.design import tokens as T
+
+
+class MessagingPage(BasePage):
+    key = "messages"
+    title = "دليل الرسائل"
+    icon = "mail"
+    required_permission = "message.send"
+
+    def build(self):
+        user_id = self.session.user_id if hasattr(self.session, "user_id") else None
+        branch_id = self.session.branch_id if hasattr(self.session, "branch_id") else None
+        self.svc = MessagingService(self.session.db_path, branch_id=branch_id, user_id=user_id)
+        self._sel_outbox = None
+
+        main_lay = QVBoxLayout(self)
+        main_lay.setContentsMargins(8, 8, 8, 8)
+        main_lay.setSpacing(6)
+
+        self.tabs = QTabWidget()
+        main_lay.addWidget(self.tabs)
+
+        self._build_queue_tab()
+        self._build_movements_tab()
+        self._build_send_tab()
+        self._build_templates_tab()
+        self._build_settings_tab()
+        self._build_logs_tab()
+
+        self._poll = QTimer(self)
+        self._poll.setInterval(4000)
+        self._poll.timeout.connect(self._on_poll)
+        self._poll.start()
+
+        self._mov_timer = QTimer(self)
+        self._mov_timer.setInterval(30000)
+        self._mov_timer.timeout.connect(self._auto_scan_movements)
+        self._mov_timer.start()
+
+        self._reload_all()
+        self._scan_movements(silent=True)
+        self._ensure_worker()
+
+    # --------------------------------------------------------- تبويب 1: الطابور
+    def _build_queue_tab(self):
+        tab = QWidget(); lay = QVBoxLayout(tab)
+        tb = QHBoxLayout()
+        tb.addWidget(QLabel("تصفية بالحالة:"))
+        self.cb_filter = QComboBox()
+        self.cb_filter.addItem("الكل", "all")
+        self.cb_filter.addItem("بانتظار الإرسال", "queued")
+        self.cb_filter.addItem("قيد الإرسال", "sending")
+        self.cb_filter.addItem("تم الإرسال", "sent")
+        self.cb_filter.addItem("سُلّمت للمستخدم", "handed")
+        self.cb_filter.addItem("فشلت", "failed")
+        self.cb_filter.addItem("ملغاة", "cancelled")
+        self.cb_filter.addItem("محظورة", "blocked")
+        self.cb_filter.currentIndexChanged.connect(self._load_queue)
+        tb.addWidget(self.cb_filter)
+
+        btn_refresh = QPushButton("تحديث")
+        btn_refresh.clicked.connect(self._load_queue)
+        tb.addWidget(btn_refresh)
+        tb.addStretch(1)
+
+        self.btn_retry = QPushButton("إعادة محاولة")
+        self.btn_retry.setEnabled(False)
+        self.btn_retry.clicked.connect(self._on_retry)
+        tb.addWidget(self.btn_retry)
+
+        self.btn_cancel = QPushButton("إلغاء الرسالة")
+        self.btn_cancel.setEnabled(False)
+        self.btn_cancel.clicked.connect(self._on_cancel)
+        tb.addWidget(self.btn_cancel)
+        lay.addLayout(tb)
+
+        cols = [
+            Column("id", "#", width=50),
+            Column("phone", "رقم الهاتف", width=120),
+            Column("party_name", "الطرف", width=140),
+            Column("ref_type", "المرجع", width=90),
+            Column("status", "الحالة", "status", 90),
+            Column("error_code", "سبب الخطأ", width=110),
+            Column("attempts", "المحاولات", width=70),
+            Column("created_at", "تاريخ الإدراج", width=130),
+            Column("sent_at", "تاريخ الإرسال", width=130),
+        ]
+        self.grid_queue = DataGrid(cols, grid_id="wa_queue_grid")
+        self.grid_queue.selectionChangedRows.connect(self._on_queue_select)
+        lay.addWidget(self.grid_queue, 1)
+        self.tabs.addTab(tab, "طابور الإرسال")
+
+    # --------------------------------------------------------- تبويب: حركات جديدة
+    def _build_movements_tab(self):
+        tab = QWidget(); lay = QVBoxLayout(tab)
+        self._movs = []
+        tb = QHBoxLayout()
+        self.btn_scan = QPushButton("قراءة الحركات الجديدة")
+        self.btn_scan.setStyleSheet("font-weight:bold;")
+        self.btn_scan.clicked.connect(lambda: self._scan_movements())
+        tb.addWidget(self.btn_scan)
+        tb.addWidget(QLabel("آخر"))
+        self.sp_mov_days = QSpinBox(); self.sp_mov_days.setRange(1, 365); self.sp_mov_days.setValue(7)
+        tb.addWidget(self.sp_mov_days)
+        tb.addWidget(QLabel("يومًا"))
+        self.chk_mov_auto = QCheckBox("قراءة تلقائية كل 30 ثانية")
+        self.chk_mov_auto.setChecked(True)
+        tb.addWidget(self.chk_mov_auto)
+        tb.addStretch(1)
+        btn_all = QPushButton("تحديد الكل")
+        btn_all.clicked.connect(lambda: self.grid_mov.table.selectAll())
+        tb.addWidget(btn_all)
+        btn_none = QPushButton("إلغاء التحديد")
+        btn_none.clicked.connect(lambda: self.grid_mov.table.clearSelection())
+        tb.addWidget(btn_none)
+        self.btn_mov_ignore = QPushButton("تجاهل المحدد")
+        self.btn_mov_ignore.clicked.connect(self._ignore_movements)
+        tb.addWidget(self.btn_mov_ignore)
+        self.btn_mov_send = QPushButton("إدراج المحدد في الطابور")
+        self.btn_mov_send.setStyleSheet("font-weight:bold;")
+        self.btn_mov_send.setEnabled(False)
+        self.btn_mov_send.clicked.connect(self._send_movements)
+        tb.addWidget(self.btn_mov_send)
+        lay.addLayout(tb)
+
+        self.lbl_mov_info = QLabel("اضغط «قراءة الحركات الجديدة» لعرض الحركات المقيّدة غير المرسلة.")
+        lay.addWidget(self.lbl_mov_info)
+
+        cols = [
+            Column("entry_date", "التاريخ", kind="date", width=95),
+            Column("doc_label", "نوع الحركة", width=100),
+            Column("doc_no", "رقم المستند", width=90),
+            Column("party_name", "الطرف", width=150),
+            Column("phone", "رقم الهاتف", width=115),
+            Column("amount", "المبلغ", width=100),
+            Column("currency", "العملة", width=60),
+            Column("side", "الجانب", width=90),
+            Column("balance", "الرصيد", width=100),
+            Column("body", "نص الرسالة", width=300),
+        ]
+        self.grid_mov = DataGrid(cols, grid_id="wa_movements_grid")
+        self.grid_mov.selectionChangedRows.connect(self._on_mov_select)
+        lay.addWidget(self.grid_mov, 1)
+        self._tab_mov = tab
+        self.tabs.addTab(tab, "حركات جديدة")
+
+    def _mov_since(self):
+        return (date.today() - timedelta(days=self.sp_mov_days.value())).isoformat()
+
+    def _scan_movements(self, silent=False):
+        try:
+            rows = self.svc.scan_movements(self._mov_since())
+        except Exception as e:
+            if not silent:
+                QMessageBox.critical(self, self.title, f"تعذرت قراءة الحركات: {e}")
+            return
+        old = {m["key"] for m in self._movs}
+        keys = {m["key"] for m in rows}
+        new_n = len(keys - old)
+        self._movs = rows
+        self.grid_mov.set_rows(rows)
+        self.lbl_mov_info.setText(f"{len(rows)} حركة غير مرسلة منذ {self._mov_since()}" + (f" — منها {new_n} جديدة" if old and new_n else ""))
+        idx = self.tabs.indexOf(self._tab_mov)
+        if idx >= 0:
+            self.tabs.setTabText(idx, f"حركات جديدة ({len(rows)})" if rows else "حركات جديدة")
+        if not silent and not rows:
+            QMessageBox.information(self, self.title, "لا توجد حركات جديدة غير مرسلة.")
+
+    def _auto_scan_movements(self):
+        if self.isVisible() and self.chk_mov_auto.isChecked():
+            self._scan_movements(silent=True)
+
+    def _on_mov_select(self, rows):
+        self.btn_mov_send.setEnabled(bool(rows))
+        self.btn_mov_send.setText(f"إدراج المحدد في الطابور ({len(rows)})" if rows else "إدراج المحدد في الطابور")
+
+    def _send_movements(self):
+        sel = self.grid_mov.selected_rows()
+        if not sel:
+            return
+        if QMessageBox.question(self, self.title, f"إدراج {len(sel)} رسالة في طابور الإرسال؟") != QMessageBox.Yes:
+            return
+        ok, errors = self.svc.enqueue_movements(sel)
+        self._ensure_worker()
+        msg = f"تم إدراج {ok} رسالة في الطابور."
+        if errors:
+            msg += f"\n\nتعذر إدراج {len(errors)}:\n" + "\n".join(errors[:8])
+        QMessageBox.information(self, self.title, msg)
+        self._scan_movements(silent=True)
+        self._load_queue()
+
+    def _ignore_movements(self):
+        sel = self.grid_mov.selected_rows()
+        if not sel:
+            return
+        if QMessageBox.question(self, self.title, f"تجاهل {len(sel)} حركة (لن تظهر مجددًا)؟") != QMessageBox.Yes:
+            return
+        self.svc.ignore_movements(sel)
+        self._scan_movements(silent=True)
+
+    # --------------------------------------------------------- تبويب 2: إرسال
+    def _build_send_tab(self):
+        tab = QWidget(); lay = QVBoxLayout(tab)
+        grp = QGroupBox("إنشاء وإدراج رسالة جديدة في الطابور"); glay = QVBoxLayout(grp)
+
+        r1 = QHBoxLayout()
+        r1.addWidget(QLabel("اختيار الطرف:"))
+        self.cb_party = QComboBox()
+        self.cb_party.currentIndexChanged.connect(self._on_party_changed)
+        r1.addWidget(self.cb_party, 1)
+        r1.addWidget(QLabel("أو رقم مباشر:"))
+        self.txt_manual_phone = QLineEdit()
+        self.txt_manual_phone.setPlaceholderText("مثال: 771234567")
+        r1.addWidget(self.txt_manual_phone, 1)
+        glay.addLayout(r1)
+
+        r2 = QHBoxLayout()
+        r2.addWidget(QLabel("القالب:"))
+        self.cb_send_template = QComboBox()
+        self.cb_send_template.currentIndexChanged.connect(self._on_send_template_changed)
+        r2.addWidget(self.cb_send_template, 1)
+        r2.addWidget(QLabel("مرفق (PDF):"))
+        self.txt_attachment = QLineEdit()
+        self.txt_attachment.setPlaceholderText("مسار ملف اختياري...")
+        r2.addWidget(self.txt_attachment, 1)
+        btn_browse = QPushButton("استعراض...")
+        btn_browse.clicked.connect(self._browse_attachment)
+        r2.addWidget(btn_browse)
+        glay.addLayout(r2)
+
+        glay.addWidget(QLabel("نص الرسالة (معاينة حية):"))
+        self.txt_message_body = QTextEdit()
+        self.txt_message_body.setMinimumHeight(110)
+        glay.addWidget(self.txt_message_body)
+
+        r3 = QHBoxLayout()
+        self.chk_bypass = QCheckBox("تجاوز منع التكرار لـ 24 ساعة")
+        r3.addWidget(self.chk_bypass)
+        r3.addStretch(1)
+        btn_enqueue = QPushButton("إدراج في الطابور")
+        btn_enqueue.setStyleSheet("font-weight:bold;")
+        btn_enqueue.clicked.connect(self._on_enqueue)
+        r3.addWidget(btn_enqueue)
+        glay.addLayout(r3)
+
+        lay.addWidget(grp)
+        lay.addStretch(1)
+        self.tabs.addTab(tab, "إرسال جديد")
+
+    # --------------------------------------------------------- تبويب 3: القوالب
+    def _build_templates_tab(self):
+        tab = QWidget(); lay = QVBoxLayout(tab)
+        grp = QGroupBox("إدارة قوالب الرسائل"); glay = QVBoxLayout(grp)
+
+        r1 = QHBoxLayout()
+        r1.addWidget(QLabel("اختر القالب:"))
+        self.cb_tpl_list = QComboBox()
+        self.cb_tpl_list.currentIndexChanged.connect(self._on_tpl_selected)
+        r1.addWidget(self.cb_tpl_list, 1)
+        glay.addLayout(r1)
+
+        r2 = QHBoxLayout()
+        r2.addWidget(QLabel("عنوان القالب:"))
+        self.txt_tpl_title = QLineEdit()
+        r2.addWidget(self.txt_tpl_title, 1)
+        glay.addLayout(r2)
+
+        glay.addWidget(QLabel("نص القالب:"))
+        self.txt_tpl_body = QTextEdit()
+        self.txt_tpl_body.setMinimumHeight(110)
+        glay.addWidget(self.txt_tpl_body)
+
+        lbl_tokens = QLabel("الحقول المتاحة: {الاسم} {المبلغ} {العملة} {رقم_الفاتورة} {رقم_السند} {الرصيد} {من_تاريخ} {إلى_تاريخ} {نوع_الحركة} {رقم_المستند} {التاريخ} {الجانب} {الشركة} {نوع_القيد} {لكم_عليكم} {اسم_العملة} {المبلغ_كتابة} {البيان} {جانب_الرصيد}")
+        lbl_tokens.setWordWrap(True)
+        glay.addWidget(lbl_tokens)
+
+        r3 = QHBoxLayout()
+        r3.addStretch(1)
+        btn_save_tpl = QPushButton("حفظ تعديل القالب")
+        btn_save_tpl.clicked.connect(self._save_template)
+        r3.addWidget(btn_save_tpl)
+        glay.addLayout(r3)
+
+        lay.addWidget(grp)
+        lay.addStretch(1)
+        self.tabs.addTab(tab, "القوالب")
+
+    # --------------------------------------------------------- تبويب 4: الإعدادات والاتصال
+    def _build_settings_tab(self):
+        tab = QWidget(); lay = QVBoxLayout(tab)
+
+        # 1) الاتصال والخدمة
+        g1 = QGroupBox("1) خدمة الإرسال وحالة الاتصال"); l1 = QVBoxLayout(g1)
+        self.lbl_worker_status = QLabel("جاري فحص حالة الخدمة...")
+        self.lbl_worker_status.setStyleSheet("font-weight:bold;")
+        l1.addWidget(self.lbl_worker_status)
+
+        row_btns = QHBoxLayout()
+        self.btn_toggle_worker = QPushButton("تشغيل خدمة الطابور")
+        self.btn_toggle_worker.clicked.connect(self._toggle_worker)
+        row_btns.addWidget(self.btn_toggle_worker)
+
+        btn_check_conn = QPushButton("ربط واتساب / فحص الجلسة")
+        btn_check_conn.clicked.connect(self._check_connection)
+        row_btns.addWidget(btn_check_conn)
+        row_btns.addStretch(1)
+        l1.addLayout(row_btns)
+
+        self.lbl_conn_detail = QLabel()
+        self.lbl_conn_detail.setWordWrap(True)
+        l1.addWidget(self.lbl_conn_detail)
+
+        r_br = QHBoxLayout()
+        r_br.addWidget(QLabel("المتصفح:"))
+        self.cb_browser = QComboBox()
+        self.cb_browser.addItem("Google Chrome (الافتراضي)", "chrome")
+        self.cb_browser.addItem("Microsoft Edge", "msedge")
+        self.cb_browser.addItem("تلقائي (Chrome ثم Edge)", "auto")
+        r_br.addWidget(self.cb_browser, 1)
+        l1.addLayout(r_br)
+
+        r_sc = QHBoxLayout()
+        r_sc.addWidget(QLabel("اختصار واتساب (اختياري):"))
+        self.txt_shortcut = QLineEdit()
+        self.txt_shortcut.setPlaceholderText("اختر اختصار نافذة واتساب الذي أنشأته على سطح المكتب (.lnk)")
+        r_sc.addWidget(self.txt_shortcut, 1)
+        btn_sc = QPushButton("استعراض...")
+        btn_sc.clicked.connect(self._browse_shortcut)
+        r_sc.addWidget(btn_sc)
+        btn_br_save = QPushButton("حفظ المتصفح")
+        btn_br_save.clicked.connect(self._save_browser_prefs)
+        r_sc.addWidget(btn_br_save)
+        l1.addLayout(r_sc)
+        lay.addWidget(g1)
+
+        # 2) إعدادات الأمان
+        g2 = QGroupBox("2) سياسات الأمان ومنع الحظر"); l2 = QVBoxLayout(g2)
+        r_mode = QHBoxLayout()
+        r_mode.addWidget(QLabel("وضع النقل:"))
+        self.cb_mode = QComboBox()
+        self.cb_mode.addItem("أتمتة WhatsApp Web عبر Chrome (الافتراضي)", "web")
+        self.cb_mode.addItem("يدوي مساعد عبر تطبيق واتساب (صفر مخاطر)", "deeplink")
+        r_mode.addWidget(self.cb_mode, 1)
+
+        r_mode.addWidget(QLabel("رمز الدولة الافتراضي:"))
+        self.txt_cc = QLineEdit("+967")
+        r_mode.addWidget(self.txt_cc)
+        l2.addLayout(r_mode)
+
+        r_delays = QHBoxLayout()
+        r_delays.addWidget(QLabel("أدنى فاصل عشوائي (ثوانٍ):"))
+        self.sp_min_delay = QSpinBox(); self.sp_min_delay.setRange(5, 120); self.sp_min_delay.setValue(12)
+        r_delays.addWidget(self.sp_min_delay)
+        r_delays.addWidget(QLabel("أقصى فاصل (ثوانٍ):"))
+        self.sp_max_delay = QSpinBox(); self.sp_max_delay.setRange(5, 300); self.sp_max_delay.setValue(35)
+        r_delays.addWidget(self.sp_max_delay)
+        l2.addLayout(r_delays)
+
+        r_caps = QHBoxLayout()
+        r_caps.addWidget(QLabel("السقف اليومي:"))
+        self.sp_daily_cap = QSpinBox(); self.sp_daily_cap.setRange(10, 400); self.sp_daily_cap.setValue(150)
+        r_caps.addWidget(self.sp_daily_cap)
+        r_caps.addWidget(QLabel("السقف الساعي:"))
+        self.sp_hourly_cap = QSpinBox(); self.sp_hourly_cap.setRange(5, 100); self.sp_hourly_cap.setValue(40)
+        r_caps.addWidget(self.sp_hourly_cap)
+        l2.addLayout(r_caps)
+
+        r_win = QHBoxLayout()
+        r_win.addWidget(QLabel("بداية نافذة العمل:"))
+        self.txt_win_start = QLineEdit("08:00")
+        r_win.addWidget(self.txt_win_start)
+        r_win.addWidget(QLabel("نهاية نافذة العمل:"))
+        self.txt_win_end = QLineEdit("21:00")
+        r_win.addWidget(self.txt_win_end)
+        l2.addLayout(r_win)
+
+        r_save = QHBoxLayout(); r_save.addStretch(1)
+        btn_save_cfg = QPushButton("حفظ إعدادات الأمان")
+        btn_save_cfg.clicked.connect(self._save_settings)
+        r_save.addWidget(btn_save_cfg)
+        l2.addLayout(r_save)
+
+        lay.addWidget(g2)
+        lay.addStretch(1)
+        self.tabs.addTab(tab, "الإعدادات والاتصال")
+
+    # --------------------------------------------------------- تبويب 5: السجل
+    def _build_logs_tab(self):
+        tab = QWidget(); lay = QVBoxLayout(tab)
+        tb = QHBoxLayout()
+        btn_refresh_logs = QPushButton("تحديث السجل")
+        btn_refresh_logs.clicked.connect(self._load_logs)
+        tb.addWidget(btn_refresh_logs)
+        tb.addStretch(1)
+        lay.addLayout(tb)
+
+        cols = [
+            Column("id", "#", width=50),
+            Column("outbox_id", "رقم الرسالة", width=80),
+            Column("phone", "رقم الهاتف", width=120),
+            Column("event", "الحدث", width=90),
+            Column("detail", "التفاصيل", width=220),
+            Column("at", "الوقت", width=140),
+        ]
+        self.grid_logs = DataGrid(cols, grid_id="wa_logs_grid")
+        lay.addWidget(self.grid_logs, 1)
+        self.tabs.addTab(tab, "السجل")
+
+    # --------------------------------------------------------- منطق العمل والتحميل
+    def _ensure_worker(self):
+        """تشغيل الخدمة تلقائيًا عند وجود رسائل في الانتظار (ما لم يوقفها المستخدم عمدًا)."""
+        try:
+            self.svc.ensure_worker()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_poll(self):
+        self._ensure_worker()
+        if not self.isVisible():
+            return
+        self._update_worker_ui()
+        if self.tabs.currentIndex() == 0:
+            self._load_queue()
+
+    def _reload_all(self):
+        self._load_queue()
+        self._load_parties()
+        self._load_templates()
+        self._load_settings()
+        self._load_logs()
+        self._update_worker_ui()
+
+    def _update_worker_ui(self):
+        up = self.svc.is_worker_running()
+        paused = up and self.svc.is_worker_paused()
+        self.lbl_worker_status.setText(self.svc.worker_status_text())
+        self.btn_toggle_worker.setText("استئناف الخدمة" if paused else ("إيقاف الخدمة" if up else "تشغيل الخدمة"))
+
+    def _toggle_worker(self):
+        if self.svc.is_worker_running() and self.svc.is_worker_paused():
+            self.svc.resume_worker()
+        elif self.svc.is_worker_running():
+            self.svc.stop_worker()
+        else:
+            self.svc.start_worker()
+        self._update_worker_ui()
+
+    def _check_connection(self):
+        # الفحص قد يفتح نافذة Chrome وينتظر تحميل واتساب؛ يجري في الخلفية كي لا تتجمد الواجهة
+        if getattr(self, "_checking", False):
+            return
+        self._checking = True
+        self.lbl_conn_detail.setText("جاري فتح نافذة واتساب وفحص الجلسة...")
+
+        def _bg(_session, _ctx):
+            return self.svc.check_connection()
+
+        def _done(st):
+            self._checking = False
+            self.lbl_conn_detail.setText(f"حالة الاتصال: {st.message}")
+            QMessageBox.information(self, self.title, f"حالة الجلسة: {st.message}")
+
+        def _err(exc):
+            self._checking = False
+            self.lbl_conn_detail.setText(f"تعذر الفحص: {exc}")
+            QMessageBox.warning(self, self.title, f"تعذر فحص الجلسة:\n{exc}")
+
+        self.run_task(_bg, on_done=_done, on_error=_err)
+
+    def _browse_shortcut(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "اختيار اختصار واتساب", str(Path.home() / "Desktop"), "اختصار أو برنامج (*.lnk *.exe)"
+        )
+        if path:
+            self.txt_shortcut.setText(path)
+
+    def _load_browser_prefs(self):
+        pr = browser_prefs.load_prefs()
+        i = self.cb_browser.findData(pr.get("browser", "chrome"))
+        self.cb_browser.setCurrentIndex(i if i >= 0 else 0)
+        self.txt_shortcut.setText(str(pr.get("shortcut", "") or ""))
+
+    def _save_browser_prefs(self):
+        browser_prefs.save_prefs({
+            "browser": self.cb_browser.currentData(),
+            "shortcut": self.txt_shortcut.text().strip().strip('"'),
+        })
+        QMessageBox.information(
+            self, self.title,
+            "تم حفظ إعداد المتصفح. إن كانت نافذة واتساب مفتوحة فاضغط «ربط واتساب / فحص الجلسة» لإعادة الاتصال بها.",
+        )
+
+    def _load_queue(self):
+        st = self.cb_filter.currentData()
+        rows = self.svc.list_queue(status=st)
+        self.grid_queue.set_rows(rows)
+
+    def _on_queue_select(self, rows):
+        self._sel_outbox = rows[0] if len(rows) == 1 else None
+        can_cancel = bool(self._sel_outbox and self._sel_outbox.get("status") == "queued")
+        can_retry = bool(self._sel_outbox and self._sel_outbox.get("status") in ("failed", "cancelled"))
+        self.btn_cancel.setEnabled(can_cancel)
+        self.btn_retry.setEnabled(can_retry)
+
+    def _on_cancel(self):
+        if not self._sel_outbox:
+            return
+        self.svc.cancel_message(self._sel_outbox["id"])
+        self._load_queue()
+
+    def _on_retry(self):
+        if not self._sel_outbox:
+            return
+        self.svc.retry_message(self._sel_outbox["id"])
+        self._load_queue()
+
+    def _load_parties(self):
+        self.cb_party.clear()
+        self.cb_party.addItem("— اختر طرفًا —", None)
+        parties = self.svc.list_parties_with_phones()
+        for p in parties:
+            tag = "" if p["wa_consent"] else " [بلا موافقة]"
+            self.cb_party.addItem(f"{p['name']} ({p['phone']}){tag}", p)
+
+    def _on_party_changed(self):
+        p = self.cb_party.currentData()
+        if p:
+            self.txt_manual_phone.setText(p["phone"])
+            self._update_send_preview()
+
+    def _load_templates(self):
+        self.cb_send_template.clear()
+        self.cb_tpl_list.clear()
+        tpls = self.svc.list_templates()
+        for t in tpls:
+            self.cb_send_template.addItem(t["title"], t)
+            self.cb_tpl_list.addItem(t["title"], t)
+        self._on_tpl_selected()
+        self._update_send_preview()
+
+    def _on_send_template_changed(self):
+        self._update_send_preview()
+
+    def _update_send_preview(self):
+        tpl = self.cb_send_template.currentData()
+        if not tpl:
+            return
+        p = self.cb_party.currentData() or {}
+        ctx = {"name": p.get("name", "العميل"), "phone": p.get("phone", "")}
+        rendered = render_template(tpl.get("body", ""), ctx)
+        self.txt_message_body.setText(rendered)
+
+    def _browse_attachment(self):
+        fn, _ = QFileDialog.getOpenFileName(self, "اختر ملف المرفق (PDF)", "", "PDF Files (*.pdf);;All Files (*.*)")
+        if fn:
+            self.txt_attachment.setText(fn)
+
+    def _on_enqueue(self):
+        p = self.cb_party.currentData()
+        phone = self.txt_manual_phone.text().strip() or (p.get("phone") if p else "")
+        body = self.txt_message_body.toPlainText().strip()
+        att = self.txt_attachment.text().strip()
+        bypass = self.chk_bypass.isChecked()
+        party_id = p.get("id") if p else None
+
+        if not phone or not body:
+            QMessageBox.warning(self, self.title, "يرجى تحديد رقم الهاتف ونص الرسالة")
+            return
+
+        try:
+            kind = "document" if att else "text"
+            mid = self.svc.enqueue(
+                phone=phone,
+                body=body,
+                party_id=party_id,
+                kind=kind,
+                attachment_path=att,
+                bypass_idempotency=bypass,
+            )
+            self._ensure_worker()
+            QMessageBox.information(self, self.title, f"تم إدراج الرسالة في الطابور بنجاح (رقم: {mid})")
+            self.tabs.setCurrentIndex(0)
+            self._load_queue()
+        except Exception as e:
+            QMessageBox.critical(self, self.title, f"تعذر الإدراج في الطابور: {e}")
+
+    def _on_tpl_selected(self):
+        t = self.cb_tpl_list.currentData()
+        if t:
+            self.txt_tpl_title.setText(t.get("title", ""))
+            self.txt_tpl_body.setText(t.get("body", ""))
+
+    def _save_template(self):
+        t = self.cb_tpl_list.currentData()
+        if not t:
+            return
+        title = self.txt_tpl_title.text().strip()
+        body = self.txt_tpl_body.toPlainText().strip()
+        if not title or not body:
+            QMessageBox.warning(self, self.title, "العنوان والنص مطلوبان")
+            return
+        self.svc.save_template(t["code"], title, body)
+        QMessageBox.information(self, self.title, "تم حفظ القالب بنجاح")
+        self._load_templates()
+
+    def _load_settings(self):
+        self._load_browser_prefs()
+        cfg = self.svc.get_settings()
+        idx = self.cb_mode.findData(cfg.get("mode", "web"))
+        if idx >= 0:
+            self.cb_mode.setCurrentIndex(idx)
+        self.txt_cc.setText(cfg.get("country_code", "+967"))
+        self.sp_min_delay.setValue(cfg.get("min_delay", 12))
+        self.sp_max_delay.setValue(cfg.get("max_delay", 35))
+        self.sp_daily_cap.setValue(cfg.get("daily_cap", 150))
+        self.sp_hourly_cap.setValue(cfg.get("hourly_cap", 40))
+        self.txt_win_start.setText(cfg.get("window_start", "08:00"))
+        self.txt_win_end.setText(cfg.get("window_end", "21:00"))
+
+    def _save_settings(self):
+        cfg = {
+            "mode": self.cb_mode.currentData(),
+            "country_code": self.txt_cc.text().strip(),
+            "min_delay": self.sp_min_delay.value(),
+            "max_delay": self.sp_max_delay.value(),
+            "daily_cap": self.sp_daily_cap.value(),
+            "hourly_cap": self.sp_hourly_cap.value(),
+            "window_start": self.txt_win_start.text().strip(),
+            "window_end": self.txt_win_end.text().strip(),
+        }
+        self.svc.save_settings(cfg)
+        QMessageBox.information(self, self.title, "تم حفظ الإعدادات بنجاح")
+
+    def _load_logs(self):
+        rows = self.svc.list_logs()
+        self.grid_logs.set_rows(rows)

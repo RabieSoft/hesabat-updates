@@ -1,0 +1,81 @@
+"""تشغيل العمليات الثقيلة في خيوط خلفية مع تقدّم وإلغاء (القسم 7 بند 4).
+
+قاعدة: كل مهمة تعمل بنسخة جلسة مستقلة (`CoreSession.clone()`) لأن اتصال SQLite لا يُشارَك بين الخيوط؛ وتُغلق عند الانتهاء.
+الدالة المُمرَّرة توقيعها: fn(session, ctx) ← النتيجة. تُرجَع النتيجة/الخطأ في خيط الواجهة عبر إشارات Qt.
+يتطلب PySide6.
+"""
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
+
+
+class _Signals(QObject):
+    done = Signal(object)
+    failed = Signal(object)
+    progress = Signal(int, str)
+
+
+class TaskContext:
+    """يُمرَّر للمهمة: progress(pct, msg) لتقرير التقدم، وcancelled لفحص طلب الإلغاء."""
+
+    def __init__(self, signals):
+        self._signals = signals
+        self._cancel = False
+
+    def progress(self, pct, msg=''):
+        self._signals.progress.emit(int(pct), str(msg))
+
+    def cancel(self):
+        self._cancel = True
+
+    @property
+    def cancelled(self):
+        return self._cancel
+
+
+class _Runner(QRunnable):
+    def __init__(self, fn, session, ctx, signals):
+        super().__init__()
+        self._fn, self._session, self._ctx, self._signals = fn, session, ctx, signals
+
+    def run(self):
+        sess = None
+        try:
+            sess = self._session.clone()        # الاتصال يُنشأ داخل خيط العامل (SQLite لا يسمح بمشاركته بين الخيوط)
+            result = self._fn(sess, self._ctx)
+        except Exception as exc:  # noqa: BLE001 — تُمرَّر للواجهة لتترجمها errors.translate
+            self._signals.failed.emit(exc)
+        else:
+            self._signals.done.emit(result)
+        finally:
+            try:
+                if sess is not None:
+                    sess.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+class TaskRunner(QObject):
+    def __init__(self, session, parent=None):
+        super().__init__(parent)
+        self._session = session
+        self._live = {}
+
+    def run(self, fn, on_done=None, on_error=None, on_progress=None):
+        """يبدأ مهمة ويُرجع TaskContext (للإلغاء). ردود النداء تُنفَّذ في خيط الواجهة."""
+        signals = _Signals()
+        ctx = TaskContext(signals)
+        key = id(signals)
+        self._live[key] = signals        # إبقاء المرجع حيًا حتى تنتهي المهمة
+
+        def finish():
+            self._live.pop(key, None)
+
+        if on_done:
+            signals.done.connect(on_done)
+        if on_error:
+            signals.failed.connect(on_error)
+        if on_progress:
+            signals.progress.connect(on_progress)
+        signals.done.connect(lambda _r: finish())
+        signals.failed.connect(lambda _e: finish())
+        QThreadPool.globalInstance().start(_Runner(fn, self._session, ctx, signals))
+        return ctx

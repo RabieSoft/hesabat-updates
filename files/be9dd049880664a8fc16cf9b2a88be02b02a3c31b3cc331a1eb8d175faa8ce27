@@ -1,0 +1,19 @@
+-- 0040_party_groups.sql: مجموعات الأطراف ورفع سعة الترقيم للمستوى الخامس
+CREATE TABLE party_groups(
+  id INTEGER PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id),
+  kind TEXT NOT NULL CHECK(kind IN ('customer','supplier')),
+  account_id INTEGER NOT NULL UNIQUE REFERENCES accounts(id),
+  default_credit_limit INTEGER NOT NULL DEFAULT 0 CHECK(default_credit_limit>=0),
+  default_payment_terms_days INTEGER NOT NULL DEFAULT 0 CHECK(default_payment_terms_days BETWEEN 0 AND 3650),
+  created_by INTEGER NOT NULL REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+
+CREATE TRIGGER party_group_immutable BEFORE UPDATE OF account_id,kind,company_id ON party_groups BEGIN
+  SELECT RAISE(ABORT,'لا يمكن تغيير حساب المجموعة أو نوعها');
+END;
+
+UPDATE numbering_settings
+SET segment_lengths = '1,1,2,3,4'
+WHERE segment_lengths = '1,1,2,3,2'
+  AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.company_id = numbering_settings.company_id AND a.level >= 5);

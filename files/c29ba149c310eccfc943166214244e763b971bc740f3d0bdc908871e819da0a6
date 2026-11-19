@@ -1,0 +1,86 @@
+"""منطق نافذة الفاتورة المنبثقة (المبيعات والمشتريات): خالص — بلا PySide6 ولا SQL ولا float.
+
+النافذة تستضيف محرر الفاتورة في نافذة منبثقة متوسطة الحجم. هذا الملف يقرّر: ما الوضع (جديدة/تعديل مسودة/تعديل مرحّلة)، أي دالة خدمة تُستدعى
+وبأي وسائط، وهل يلزم سبب، وما الرسائل، ومتى نسأل قبل استبدال إدخال غير محفوظ، وكيف يُقسَّم ارتفاع الصفحة بين الإدخال والقائمة.
+المحرك هو الحَكَم النهائي: أي رفض يظهر مترجمًا والمحرر يبقى بقيمه.
+"""
+NEW, DRAFT, POSTED = 'new', 'draft', 'posted'
+MODES = (NEW, DRAFT, POSTED)
+
+_DOC = {'sales': 'فاتورة مبيعات', 'purchase': 'فاتورة مشتريات'}
+
+
+def doc_name(kind):
+    return _DOC.get(kind, 'فاتورة')
+
+
+def mode_of(invoice, posted=False):
+    """None → جديدة؛ مسودة → تعديل مسودة؛ posted=True → تعديل مرحّلة."""
+    if not invoice:
+        return NEW
+    return POSTED if posted else DRAFT
+
+
+def header_text(kind, mode, invoice_no=None):
+    """(عنوان، وصف فرعي) لشريط اللوحة."""
+    name = doc_name(kind)
+    if mode == NEW:
+        return f'{name} جديدة', 'تُحفظ كمسودة ثم تُرحَّل — Ctrl+S للحفظ، والنافذة تبقى مفتوحة لفاتورة جديدة'
+    no = f' {invoice_no}' if invoice_no else ''
+    if mode == DRAFT:
+        return f'تعديل مسودة{no}', 'بعد الحفظ تبقى النافذة مفتوحة لفاتورة جديدة'
+    return f'تعديل {name} مرحّلة{no}', 'يُطلب سبب التعديل ويُسجَّل في التدقيق'
+
+
+def needs_reason(mode):
+    return mode == POSTED
+
+
+def call_args(mode, kind, invoice_id, values, reason=None):
+    """(اسم دالة InvoiceService، وسائطها) لوضع الحفظ."""
+    if mode == NEW:
+        return 'create', (kind, values)
+    if mode == DRAFT:
+        return 'update', (kind, int(invoice_id), values)
+    if mode == POSTED:
+        return 'edit_posted', (int(invoice_id), values, reason or '')
+    raise ValueError(f'وضع غير معروف: {mode}')
+
+
+def saved_message(mode):
+    return {NEW: 'تم الحفظ — فاتورة جديدة جاهزة',
+            DRAFT: 'تم تحديث المسودة', POSTED: 'تم تعديل الفاتورة المرحّلة'}[mode]
+
+
+def confirm_replace(dirty, current_mode, target_mode):
+    """هل نسأل قبل استبدال المحرر الحالي؟ فقط إن كان فيه إدخال غير محفوظ وكان الهدف مختلفًا (فتح سجل للتعديل أو مسح)."""
+    return bool(dirty)
+
+
+def replace_text(current_mode):
+    if current_mode == NEW:
+        return 'في النافذة فاتورة جديدة لم تُحفظ. تُحفظ نسخة تلقائية يمكن استعادتها عند فتح فاتورة جديدة. هل تريد المتابعة؟'
+    return 'في النافذة تعديلات لم تُحفظ على هذه الفاتورة. هل تريد التخلي عنها؟'
+
+
+def close_text(current_mode):
+    """سؤال إغلاق النافذة وفيها إدخال غير محفوظ."""
+    if current_mode == NEW:
+        return 'في النافذة فاتورة جديدة لم تُحفظ. تُحفظ نسخة تلقائية يمكن استعادتها عند فتح فاتورة جديدة. هل تريد الإغلاق؟'
+    return 'في النافذة تعديلات لم تُحفظ على هذه الفاتورة. هل تريد الإغلاق والتخلي عنها؟'
+
+
+def popup_size(avail_w, avail_h, max_w=1240, max_h=800, min_w=900, min_h=600, ratio_w=0.82, ratio_h=0.86):
+    """(عرض، ارتفاع) النافذة المنبثقة: متوسطة (≈82%×86% من المساحة المتاحة) بسقف ثابت، ولا تتجاوز الشاشة أبدًا."""
+    w = max(min_w, min(max_w, int(avail_w * ratio_w)))
+    h = max(min_h, min(max_h, int(avail_h * ratio_h)))
+    return min(w, max(int(avail_w) - 20, 1)), min(h, max(int(avail_h) - 40, 1))
+
+
+def entry_allowed(access_state, read_only=False):
+    """(مسموح، سبب) من حالة صلاحية ActionState (enabled, reason) وقراءة فقط."""
+    if read_only:
+        return False, 'الفترة أو السنة للقراءة فقط'
+    if access_state is not None and not getattr(access_state, 'enabled', True):
+        return False, getattr(access_state, 'reason', '') or 'ليست لديك صلاحية'
+    return True, ''

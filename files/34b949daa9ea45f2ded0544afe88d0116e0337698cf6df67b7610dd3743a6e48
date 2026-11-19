@@ -1,0 +1,72 @@
+"""تطبيع وفحص أرقام الهواتف لصيغة E.164 لرسائل واتساب.
+
+خالص بلا Qt. يدعم الأرقام العربية-الهندية والمسافات ومفتاح الدولة الافتراضي (اليمن +967).
+"""
+import re
+
+_EASTERN_TO_WESTERN = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
+
+
+def clean_digits(raw: str) -> str:
+    """تحويل الأرقام العربية-الهندية وإزالة المسافات والفواصل."""
+    if not raw:
+        return ""
+    text = str(raw).translate(_EASTERN_TO_WESTERN).strip()
+    # إبقاء + فقط في البداية إن وُجد
+    has_plus = text.startswith("+")
+    digits = re.sub(r"[^\d]", "", text)
+    return ("+" + digits) if has_plus else digits
+
+
+def normalize_phone(raw: str, default_country_code: str = "+967") -> str:
+    """تحويل الرقم إلى صيغة E.164 (+<country><number>).
+
+    يرفع ValueError إذا كان الرقم غير صالح.
+    """
+    cleaned = clean_digits(raw)
+    if not cleaned:
+        raise ValueError("رقم الهاتف فارغ")
+
+    cc = clean_digits(default_country_code)
+    if not cc.startswith("+"):
+        cc = "+" + cc
+    cc_digits = cc.lstrip("+")
+
+    if cleaned.startswith("00"):
+        cleaned = "+" + cleaned[2:]
+
+    if cleaned.startswith("+"):
+        digits_only = cleaned.lstrip("+")
+    else:
+        # رقم محلي يبدأ بـ 0 (مثل 0771234567 أو 01234567)
+        if cleaned.startswith("0"):
+            local_number = cleaned.lstrip("0")
+            cleaned = cc + local_number
+            digits_only = cleaned.lstrip("+")
+        elif cleaned.startswith(cc_digits):
+            cleaned = "+" + cleaned
+            digits_only = cleaned.lstrip("+")
+        else:
+            cleaned = cc + cleaned
+            digits_only = cleaned.lstrip("+")
+
+    # معيار E.164: من 7 إلى 15 رقمًا
+    if not (7 <= len(digits_only) <= 15) or not digits_only.isdigit():
+        raise ValueError(f"رقم هاتف غير صالح لمعيار E.164: {raw}")
+
+    return cleaned
+
+
+def is_valid_phone(raw: str, default_country_code: str = "+967") -> bool:
+    """فحص صلاحية الرقم دون رفع استثناء."""
+    try:
+        normalize_phone(raw, default_country_code)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def to_wa_number(e164_phone: str) -> str:
+    """إرجاع الرقم لرابط واتساب (E.164 بلا علامة +)."""
+    norm = normalize_phone(e164_phone)
+    return norm.lstrip("+")

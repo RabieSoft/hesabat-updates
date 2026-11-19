@@ -1,0 +1,289 @@
+"""رموز التصميم (Design Tokens) للطابع الكلاسيكي المكتبي الاحترافي (القسم 4 من prompt.md).
+
+لا لون ولا قياس ثابتًا خارج هذا الملف. كل أزواج (نص، خلفية) مفحوصة بنسبة تباين ≥ 4.5:1 في tests/test_ui_foundation.py.
+بلا PySide6.
+"""
+
+# ------------------------------------------------------------------ التباين (WCAG)
+def _lin(c):
+    c = c / 255
+    return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def luminance(hex_color):
+    h = hex_color.lstrip('#')
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    return 0.2126 * _lin(r) + 0.7152 * _lin(g) + 0.0722 * _lin(b)
+
+
+def contrast(fg, bg):
+    a, b = luminance(fg), luminance(bg)
+    hi, lo = max(a, b), min(a, b)
+    return (hi + 0.05) / (lo + 0.05)
+
+FONT_STACK = '"Segoe UI","Tahoma","Noto Sans Arabic","Cairo","Arial"'
+MONO_STACK = '"Consolas","Cascadia Mono","Courier New",monospace'
+
+# ------------------------------------------------------------------ الأبعاد
+RADIUS = 8                     # زوايا ناعمة حديثة (1.7)
+BORDER = 1
+FONT_PT = {'compact': 9, 'comfortable': 10}
+ROW_HEIGHT = {'compact': 26, 'comfortable': 32}
+SPACING = {'xs': 2, 'sm': 4, 'md': 8, 'lg': 12, 'xl': 16}
+RIBBON_HEIGHT = 42                # شريط الإجراءات: صف أفقي واحد (كان 100 بكسل بأزرار كبيرة)
+TOPBAR_HEIGHT = 44
+ICON_SIZE = 20
+ICON_SIZE_SMALL = 16
+ACTION_ICON = 16                  # أيقونة أزرار شريط الإجراءات
+
+# ---- مقاييس التوحيد (مصدر واحد لكل الأزرار والحقول والنوافذ؛ المنطق في metrics.py) ----
+CONTROL_H = 28                    # ارتفاع موحّد: الأزرار والحقول والقوائم
+BUTTON_MIN_W = 84                 # أصغر عرض لأزرار تذييل النوافذ (حفظ/إلغاء/إغلاق)
+
+# ------------------------------------------------------------------ اللوحات
+PALETTES = {
+    # هوية حديثة: تركواز عميق + كحلي ليلي (من ألوان الشعار) على رمادي-أزرق بارد نظيف؛ الورقة المطبوعة بيضاء دائمًا
+    'light': {
+        'workspace': '#edf1f6', 'bg': '#f5f7fa', 'surface': '#ffffff', 'surface2': '#f0f3f8', 'toolbar': '#f9fafc', 'border': '#dce3ec',
+        'border_strong': '#9fadc0', 'grid': '#e5eaf1', 'text': '#152033', 'muted': '#475569', 'disabled_text': '#677489', 'disabled_bg': '#eceff4',
+        'accent': '#0f766e', 'accent_hover': '#0b5d57', 'accent_text': '#ffffff', 'accent_soft': '#d8f1ed', 'accent_soft_text': '#0a4a45',
+        'menu_bg': '#ffffff', 'menu_text': '#152033', 'menu_hover': '#e0f2ef', 'nav_bg': '#0f1c2e', 'nav_text': '#e6edf5', 'nav_muted': '#a3b3c7',
+        'nav_hover': '#1b2d47', 'nav_active': '#2dd4bf', 'nav_active_text': '#05231f', 'selection': '#cdece7', 'selection_text': '#08302c',
+        'row_alt': '#f7f9fc', 'success': '#15803d', 'success_soft': '#dcfce7', 'warning': '#a15c07', 'warning_soft': '#fef3c7', 'danger': '#b91c1c',
+        'danger_soft': '#fee2e2', 'info': '#1d4ed8', 'info_soft': '#dbeafe', 'neutral': '#475569', 'neutral_soft': '#e2e8f0', 'chart_rev': '#14b8a6',
+        'chart_exp': '#334155', 'chart_net': '#f59e0b', 'paper_head': '#dbe7f3', 'paper_head_soft': '#e9f0f8', 'paper_col_alt': '#f6f9fc',
+        'paper_col_debit': '#eaf4ec', 'paper_col_credit': '#fbeceb', 'paper_col_balance': '#e3eefa', 'paper': '#ffffff', 'paper_text': '#111111',
+        'paper_line': '#888888', 'paper_shadow': '#a59c82', 'stamp': '#b3261e', 'paper_red': '#8b0000', 'paper_grid': '#6b6b6b',
+        'paper_frame': '#000000',
+    },
+    'dark': {
+        'workspace': '#0a111d', 'bg': '#0e1726', 'surface': '#141f33', 'surface2': '#1a2940', 'toolbar': '#111b2d', 'border': '#243650',
+        'border_strong': '#3c5272', 'grid': '#1e2d45', 'text': '#e8eef6', 'muted': '#a2b2c6', 'disabled_text': '#7a8ba1', 'disabled_bg': '#18233a',
+        'accent': '#2dd4bf', 'accent_hover': '#5eead4', 'accent_text': '#04201c', 'accent_soft': '#12403d', 'accent_soft_text': '#a4f1e6',
+        'menu_bg': '#111b2d', 'menu_text': '#e8eef6', 'menu_hover': '#1c3a42', 'nav_bg': '#08101c', 'nav_text': '#d3dce8', 'nav_muted': '#90a3ba',
+        'nav_hover': '#14233a', 'nav_active': '#2dd4bf', 'nav_active_text': '#04201c', 'selection': '#18414a', 'selection_text': '#dcfbf6',
+        'row_alt': '#111b2d', 'success': '#4ade80', 'success_soft': '#12351f', 'warning': '#fbbf24', 'warning_soft': '#3a2c0c', 'danger': '#f87171',
+        'danger_soft': '#3d1a1a', 'info': '#7cb2ff', 'info_soft': '#14274a', 'neutral': '#b4c0cc', 'neutral_soft': '#1f2b3a', 'chart_rev': '#2dd4bf',
+        'chart_exp': '#7c93b3', 'chart_net': '#fbbf24', 'paper': '#ffffff', 'paper_text': '#111111', 'paper_line': '#888888',
+        'paper_shadow': '#050403', 'stamp': '#b3261e', 'paper_head': '#ecd27a', 'paper_head_soft': '#f3e8b8', 'paper_red': '#8b0000',
+        'paper_grid': '#6b6b6b', 'paper_frame': '#000000', 'paper_col_alt': '#fbf7e8', 'paper_col_debit': '#eaf4ec', 'paper_col_credit': '#fbeceb',
+        'paper_col_balance': '#fdf1c9',
+    },
+}
+
+
+# ------------------------------------------------------------------ ألوان الإجماليات (v2.1.13)
+# لغة لونية واحدة للإجماليات في كل شاشات الإدخال (قيود/فواتير/سندات) وصفوف إجماليات الجداول:
+#   مدين = أزرق، دائن = برتقالي، صافي/ملخص = ذهبي، الإجمالي الرئيسي = تدرّج كحلي→تركواز بنص أبيض،
+#   «داخل/قبض/سُدِّد» = أخضر، «خارج/صرف/متبقٍ» = أحمر، فاتورة الشراء = تدرّج عنبري.
+# ثابتة بين الثيمات (تتبع فاتح/داكن فقط) كألوان الحالات؛ كل زوج (نص، خلفية) في CONTRAST_PAIRS مفحوص بالاختبار.
+_TOTALS = {
+    'light': {
+        'tot_debit': '#1d4ed8', 'tot_debit_soft': '#dbeafe', 'tot_debit_text': '#1e3a8a',
+        'tot_credit': '#c2410c', 'tot_credit_soft': '#ffedd5', 'tot_credit_text': '#7c2d12',
+        'tot_gold': '#b45309', 'tot_gold_soft': '#fef3c7', 'tot_gold_text': '#78350f',
+        'tot_grand_a': '#0b2a4a', 'tot_grand_b': '#0f766e', 'tot_grand_text': '#ffffff', 'tot_grand_key': '#d5f7f1',
+        'tot_in_a': '#14532d', 'tot_in_b': '#15803d', 'tot_out_a': '#7f1d1d', 'tot_out_b': '#b91c1c',
+        'tot_buy_a': '#78350f', 'tot_buy_b': '#b45309',
+    },
+    'dark': {
+        'tot_debit': '#7cb2ff', 'tot_debit_soft': '#14274a', 'tot_debit_text': '#cfe2ff',
+        'tot_credit': '#fb923c', 'tot_credit_soft': '#3b1d0a', 'tot_credit_text': '#fed7aa',
+        'tot_gold': '#fbbf24', 'tot_gold_soft': '#3a2c0c', 'tot_gold_text': '#fde68a',
+        'tot_grand_a': '#0b2a4a', 'tot_grand_b': '#0f766e', 'tot_grand_text': '#ffffff', 'tot_grand_key': '#d5f7f1',
+        'tot_in_a': '#14532d', 'tot_in_b': '#15803d', 'tot_out_a': '#7f1d1d', 'tot_out_b': '#b91c1c',
+        'tot_buy_a': '#78350f', 'tot_buy_b': '#b45309',
+    },
+}
+for _m, _d in _TOTALS.items():
+    PALETTES[_m].update(_d)
+
+
+# ------------------------------------------------------------------ الثيمات (سمات الألوان)
+# كل ثيم = لوحة أساسها 'light' أو 'dark' مع تعديل ألوان الواجهة فقط؛ ألوان الحالات (نجاح/تحذير/خطر…) والورقة المطبوعة ثابتة.
+# المعرّف المحفوظ في التفضيلات (mode) هو معرّف الثيم. النوع الداكن/الفاتح يُعرف بـ is_dark().
+def _theme(base, **over):
+    p = dict(PALETTES[base])
+    p.update(over)
+    return p
+
+
+_THEME_DEFS = [
+    # (id, الاسم، الأساس، شفافية الشعار المائي، تعديلات اللوحة)
+    ('ocean', 'أزرق سماوي هادئ', 'light', 0.055, dict(
+        workspace='#eaf1f8', bg='#f2f6fb', surface2='#eaf0f8', toolbar='#f6f9fd', border='#d6e1ee', border_strong='#8fa3bd', grid='#e1e9f3',
+        text='#14243a', muted='#4a5b73', disabled_text='#66758c', disabled_bg='#e8edf4', accent='#2b6cb0', accent_hover='#22568e',
+        accent_soft='#dbe8f6', accent_soft_text='#1b4373', menu_text='#14243a', menu_hover='#e1ecf8', nav_bg='#1f3a5c', nav_text='#e8f0f9',
+        nav_muted='#aebfd6', nav_hover='#2c4c75', nav_active='#8ab8e8', nav_active_text='#0d233f', selection='#cfe0f3', selection_text='#12304f',
+        row_alt='#f6f9fc', chart_rev='#4a90d9', chart_exp='#3c4f6b', chart_net='#e0a030')),
+    ('mint', 'أخضر نعناعي', 'light', 0.055, dict(
+        workspace='#eaf3ef', bg='#f2f8f5', surface2='#e8f1ed', toolbar='#f6faf8', border='#d3e3dc', border_strong='#8aa89a', grid='#e0ece6',
+        text='#14291f', muted='#476055', disabled_text='#667a70', disabled_bg='#e7eeea', accent='#2f7d62', accent_hover='#256450',
+        accent_soft='#d9ece4', accent_soft_text='#1a4d3b', menu_text='#14291f', menu_hover='#deeee7', nav_bg='#24493b', nav_text='#e8f3ee',
+        nav_muted='#a9c4b8', nav_hover='#31604f', nav_active='#9fd8c0', nav_active_text='#0f2d22', selection='#cde7dc', selection_text='#123628',
+        row_alt='#f6faf8', chart_rev='#4caf8a', chart_exp='#3b5248', chart_net='#d9a030')),
+    ('sand', 'رملي دافئ (مريح للعين)', 'light', 0.05, dict(
+        workspace='#f1ece2', bg='#f7f3ea', surface='#fffdf8', surface2='#f1ebdf', toolbar='#faf6ee', border='#e2d9c6', border_strong='#a89a7c', grid='#ebe4d4',
+        text='#2b2418', muted='#62574a', disabled_text='#7d7264', disabled_bg='#eee8db', accent='#8a5a1f', accent_hover='#6f4716',
+        accent_soft='#f0e2c8', accent_soft_text='#5a3a10', menu_bg='#fffdf8', menu_text='#2b2418', menu_hover='#f1e6d0', nav_bg='#ece3d1',
+        nav_text='#2b2418', nav_muted='#62574a', nav_hover='#ddd1b9', nav_active='#8a5a1f', nav_active_text='#ffffff', selection='#ead9b8',
+        selection_text='#3d2808', row_alt='#faf6ee', chart_rev='#b8863b', chart_exp='#5c5144', chart_net='#3f8f78')),
+    ('lavender', 'بنفسجي هادئ', 'light', 0.055, dict(
+        workspace='#efecf6', bg='#f6f4fa', surface2='#ece8f4', toolbar='#faf9fc', border='#ddd7ea', border_strong='#9d93b9', grid='#e7e3f0',
+        text='#1f1a33', muted='#54496b', disabled_text='#71688a', disabled_bg='#ebe8f2', accent='#6a54a8', accent_hover='#55428c',
+        accent_soft='#e3ddf3', accent_soft_text='#3d2f70', menu_text='#1f1a33', menu_hover='#e8e2f5', nav_bg='#3d3563', nav_text='#eeeaf8',
+        nav_muted='#b9b0d6', nav_hover='#4d437a', nav_active='#c8bdf0', nav_active_text='#241b4d', selection='#dcd5f0', selection_text='#2b2158',
+        row_alt='#f8f7fb', chart_rev='#8d77d1', chart_exp='#4a4263', chart_net='#e0a030')),
+    ('rose', 'وردي ترابي ناعم', 'light', 0.055, dict(
+        workspace='#f5ecee', bg='#faf4f5', surface2='#f4e9ec', toolbar='#fcf8f9', border='#e9d8dc', border_strong='#b8949d', grid='#f0e3e6',
+        text='#2d1a20', muted='#644852', disabled_text='#806470', disabled_bg='#f1e7ea', accent='#a24a5e', accent_hover='#85394a',
+        accent_soft='#f5dde2', accent_soft_text='#6b2434', menu_text='#2d1a20', menu_hover='#f6e2e6', nav_bg='#5a2d3a', nav_text='#f8eef0',
+        nav_muted='#d6b4bc', nav_hover='#6e3b4a', nav_active='#f0b8c4', nav_active_text='#3a1620', selection='#f0d3d9', selection_text='#4a1a28',
+        row_alt='#fbf6f7', chart_rev='#c9647c', chart_exp='#5c4a50', chart_net='#d9a030')),
+    ('slate', 'رمادي محايد (بلا ألوان)', 'light', 0.045, dict(
+        workspace='#ebedf0', bg='#f3f4f6', surface2='#eceef1', toolbar='#f8f9fa', border='#d9dce1', border_strong='#8a919d', grid='#e3e5e9',
+        text='#1c2128', muted='#4b5563', disabled_text='#6b7280', disabled_bg='#eaecef', accent='#4b5563', accent_hover='#374151',
+        accent_soft='#e1e4e9', accent_soft_text='#273039', menu_text='#1c2128', menu_hover='#e5e7eb', nav_bg='#e4e7eb', nav_text='#1f2937',
+        nav_muted='#4b5563', nav_hover='#d3d7de', nav_active='#4b5563', nav_active_text='#ffffff', selection='#d8dce3', selection_text='#1f2937',
+        row_alt='#f6f7f9', chart_rev='#6b7a8f', chart_exp='#374151', chart_net='#b7791f')),
+    ('graphite', 'فحمي محايد (داكن)', 'dark', 0.045, dict(
+        workspace='#121212', bg='#1a1b1d', surface='#222427', surface2='#2a2d31', toolbar='#1e2023', border='#34373c', border_strong='#50555d', grid='#2d3034',
+        text='#e6e8eb', muted='#a7adb5', disabled_text='#7d838b', disabled_bg='#25272a', accent='#8fb4d9', accent_hover='#a9c7e5',
+        accent_text='#0e1a27', accent_soft='#2b3947', accent_soft_text='#cfe2f3', menu_bg='#1e2023', menu_text='#e6e8eb', menu_hover='#2f3338',
+        nav_bg='#141517', nav_text='#d9dce0', nav_muted='#9aa0a8', nav_hover='#25282c', nav_active='#8fb4d9', nav_active_text='#0e1a27',
+        selection='#33465a', selection_text='#eaf3fb', row_alt='#1e2023', chart_rev='#7fb0d8', chart_exp='#8b929c', chart_net='#d9b45a')),
+    ('forest_night', 'أخضر ليلي (داكن)', 'dark', 0.045, dict(
+        workspace='#0c1511', bg='#111c17', surface='#17251f', surface2='#1e3029', toolbar='#14211b', border='#29403a', border_strong='#416056', grid='#223630',
+        text='#e4efe9', muted='#9fb8ac', disabled_text='#7a9387', disabled_bg='#18261f', accent='#7fc8a9', accent_hover='#9bd9bf',
+        accent_text='#06241a', accent_soft='#1d4136', accent_soft_text='#bfeed9', menu_bg='#14211b', menu_text='#e4efe9', menu_hover='#24433a',
+        nav_bg='#0a110e', nav_text='#d0e0d8', nav_muted='#8fa89c', nav_hover='#17251f', nav_active='#7fc8a9', nav_active_text='#06241a',
+        selection='#1f4a3e', selection_text='#e0f7ee', row_alt='#14211b', chart_rev='#6fcfa6', chart_exp='#86a396', chart_net='#e0b84f')),
+]
+
+# الثيمان الأصليان يبقيان بمعرّفيهما (light/dark) ليبقى كل ما سبق متوافقًا
+THEMES = {
+    'light': {'label': 'الأصلي — تركواز', 'dark': False, 'wm': 0.06},
+    'dark': {'label': 'ليلي كحلي (داكن)', 'dark': True, 'wm': 0.05},
+}
+for _id, _label, _base, _wm, _over in _THEME_DEFS:
+    PALETTES[_id] = _theme(_base, **_over)
+    THEMES[_id] = {'label': _label, 'dark': _base == 'dark', 'wm': _wm}
+THEME_IDS = tuple(THEMES)
+# ترتيب العرض: الفاتحة ثم الداكنة
+THEME_ORDER = tuple([t for t in THEME_IDS if not THEMES[t]['dark']] + [t for t in THEME_IDS if THEMES[t]['dark']])
+
+
+def is_dark(mode):
+    return bool(THEMES.get(mode, THEMES['light'])['dark'])
+
+
+def theme_label(mode):
+    return THEMES.get(mode, THEMES['light'])['label']
+
+
+def watermark_opacity(mode):
+    return THEMES.get(mode, THEMES['light'])['wm']
+
+
+# الثيم الفعّال حاليًا (للمكونات التي لا تصلها الحالة المشتركة مباشرة)
+_ACTIVE = {'mode': 'light'}
+
+
+def set_active(mode):
+    _ACTIVE['mode'] = mode if mode in PALETTES else 'light'
+
+
+def active_palette():
+    return PALETTES[_ACTIVE['mode']]
+
+
+# ألوان هوية المنتج (مأخوذة من الشعار): الأزرق الداكن للدرع، الأخضر للسهم، الذهبي للتمييز
+BRAND = {'navy': '#0f2a52', 'green': '#1b8a4a', 'gold': '#c9a227'}
+
+TONES = ('success', 'warning', 'danger', 'info', 'neutral')
+
+# ------------------------------------------------------------------ دلالات الحالات الثابتة (القسم 4.1 بند 6)
+# الحالة ← (النص العربي، النغمة). مسودة=رمادي، مراجعة=أزرق، معتمد=برتقالي، مرحّل=أخضر، معكوس/ملغى=أحمر.
+STATUS = {
+    'draft': ('مسودة', 'neutral'),
+    'reviewed': ('قيد المراجعة', 'info'),
+    'approved': ('معتمد', 'warning'),
+    'posted': ('مرحّل', 'success'),
+    'reversed': ('معكوس', 'danger'),
+    'cancelled': ('ملغى', 'danger'),
+    'open': ('مفتوحة', 'success'),
+    'closed': ('مقفلة', 'danger'),
+    'active': ('نشط', 'success'),
+    'inactive': ('معطّل', 'neutral'),
+    'disposed': ('مستبعد', 'danger'),
+    'matched': ('مطابَق', 'success'),
+    'unmatched': ('غير مطابَق', 'warning'),
+    'ignored': ('مستبعَد', 'neutral'),
+    'previewed': ('معاينة', 'info'),
+    'committed': ('منفَّذ', 'success'),
+    'expired': ('منتهي الصلاحية', 'danger'),
+    'near': ('قريب الانتهاء', 'warning'),
+    'ok': ('سليم', 'success'),
+    'none': ('بلا تاريخ', 'neutral'),
+    'queued': ('في الانتظار', 'info'),
+    'sending': ('جاري الإرسال', 'warning'),
+    'sent': ('أُرسلت', 'success'),
+    'handed': ('سُلّمت للمستخدم', 'success'),
+    'failed': ('فشلت', 'danger'),
+    'blocked': ('محظورة', 'danger'),
+    'accepted': ('مقبول', 'success'),
+    'rejected': ('مرفوض', 'danger'),
+    'printed': ('مطبوع', 'info'),
+    'signed': ('موقّع', 'success'),
+    'void': ('باطل', 'danger'),
+    'reopened': ('أُعيد فتحها', 'warning'),
+    'superseded': ('مستبدلة', 'neutral'),
+    # معاينة الاستيراد
+    'valid': ('صالح', 'success'),
+    'invalid': ('غير صالح', 'danger'),
+    'duplicate_in_file': ('مكرر في الملف', 'warning'),
+    'duplicate_existing': ('موجود مسبقًا', 'warning'),
+    'unchanged': ('بلا تغيير', 'neutral'),
+    'not_found': ('لا جهة مطابقة', 'neutral'),
+    'review': ('يحتاج مراجعة', 'warning'),
+}
+
+
+def status_label(code):
+    return STATUS.get(code, (str(code or ''), 'neutral'))[0]
+
+
+def status_tone(code):
+    return STATUS.get(code, ('', 'neutral'))[1]
+
+
+def workflow_badge(status, workflow_state=None):
+    """الحالة المعروضة للقيد: المرحّل/المعكوس يغلبان، وإلا حالة سير العمل للمسودات."""
+    if status == 'draft' and workflow_state in ('reviewed', 'approved'):
+        return workflow_state
+    return status
+
+
+def palette(mode='light'):
+    return PALETTES.get(mode, PALETTES['light'])
+
+
+# أزواج (نص، خلفية) يجب أن تحقق AA
+CONTRAST_PAIRS = [
+    ('text', 'bg'), ('text', 'surface'), ('text', 'surface2'), ('text', 'toolbar'), ('text', 'workspace'),
+    ('muted', 'surface'), ('muted', 'bg'), ('muted', 'toolbar'),
+    ('accent_text', 'accent'), ('accent_soft_text', 'accent_soft'),
+    ('menu_text', 'menu_bg'), ('menu_text', 'menu_hover'),
+    ('nav_text', 'nav_bg'), ('nav_muted', 'nav_bg'), ('nav_text', 'nav_hover'), ('nav_active_text', 'nav_active'),
+    ('selection_text', 'selection'), ('text', 'row_alt'),
+    ('success', 'success_soft'), ('warning', 'warning_soft'), ('danger', 'danger_soft'),
+    ('info', 'info_soft'), ('neutral', 'neutral_soft'),
+    ('disabled_text', 'disabled_bg'),
+    ('paper_text', 'paper'), ('stamp', 'paper'),
+    ('tot_debit_text', 'tot_debit_soft'), ('tot_credit_text', 'tot_credit_soft'), ('tot_gold_text', 'tot_gold_soft'),
+    ('tot_grand_text', 'tot_grand_a'), ('tot_grand_text', 'tot_grand_b'), ('tot_grand_key', 'tot_grand_a'), ('tot_grand_key', 'tot_grand_b'),
+    ('tot_grand_text', 'tot_in_a'), ('tot_grand_text', 'tot_in_b'), ('tot_grand_text', 'tot_out_a'), ('tot_grand_text', 'tot_out_b'),
+    ('tot_grand_text', 'tot_buy_a'), ('tot_grand_text', 'tot_buy_b'),
+]
+# أزواج المحتوى الأساسي فقط بحد 4.5؛ النص المعطّل يكفيه 3 (مستثنى من AA بحسب WCAG)
+RELAXED_PAIRS = {('disabled_text', 'disabled_bg'): 3.0}

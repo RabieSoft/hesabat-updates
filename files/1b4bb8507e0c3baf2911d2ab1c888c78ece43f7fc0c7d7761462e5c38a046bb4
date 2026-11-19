@@ -1,0 +1,141 @@
+"""خدمات النقدية والبنوك والسندات والتحويلات والتسوية البنكية."""
+from datetime import date
+from decimal import Decimal
+
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.business import bank_recon, branch_scope, cash
+
+
+class CashMixin:
+    def cash_accounts(self):
+        self.require('cash.view')
+        out = []
+        f, fa = branch_scope.txn_clause(self.conn, self.company_id, self.branch_id)
+        g, ga = self._access_clause('user_cash_access', 'cash_account_id')
+        for r in self.conn.execute("SELECT id,code,name,kind,currency,bank_name,is_active FROM cash_accounts WHERE company_id=?" + f + g + " ORDER BY name",
+                                   (self.company_id, *fa, *ga)):
+            d = dict(r)
+            try:
+                d['balance_minor'] = sum(x['net_base'] or 0 for x in cash.cash_balance(self.conn, self.user_id, self.company_id, r['id']))
+            except Exception:
+                d['balance_minor'] = None
+            out.append(d)
+        return out
+
+    def create_cash(self, v):
+        self.require('cash.manage')
+        return cash.create_cash_account(
+            self.conn, self.user_id, self.company_id, v['kind'], (v['name'] or '').strip(),
+            currency=v.get('currency') or None, bank_name=v.get('bank_name', '') or '',
+            account_no=v.get('account_no', '') or '',
+            parent_id=int(v['parent_id']) if v.get('parent_id') else None, branch_id=self.branch_id)
+
+    def cash_parent_missing(self, kind):
+        r = self.conn.execute("SELECT 1 FROM account_mappings WHERE company_id=? AND map_key=?",
+                              (self.company_id, 'cash' if kind == 'cashbox' else 'bank')).fetchone()
+        return r is None
+
+    def lookup_cash_parents(self):
+        self.require('account.view')
+        return self.lookup_accounts(groups=True, types=('asset',))
+
+    def set_cash_active(self, cash_id, active):
+        return cash.set_cash_active(self.conn, self.user_id, int(cash_id), bool(active))
+
+    def cash_statement_rows(self, cash_id, date_from, date_to):
+        st = cash.cash_statement(self.conn, self.user_id, self.company_id, int(cash_id), date_from, date_to, limit=500)
+        return st
+
+    def cash_vouchers(self, limit=300):
+        self.require('cash.view')
+        rows = cash.list_vouchers(self.conn, self.user_id, self.company_id, limit=limit, branch_id=self.branch_id)
+        names = {r['id']: r['name'] for r in self.conn.execute("SELECT id,name FROM cash_accounts WHERE company_id=?", (self.company_id,))}
+        pnames = {r['id']: r['name'] for r in self.conn.execute("SELECT id,name FROM parties WHERE company_id=?", (self.company_id,))}
+        for r in rows:
+            r['cash_name'] = names.get(r['cash_account_id'], '')
+            r['party_name'] = pnames.get(r['party_id'], '') if r.get('party_id') else ''
+            r['type_ar'] = 'سند قبض' if r['voucher_type'] == 'receipt' else 'سند صرف'
+        return rows
+
+    def post_voucher(self, vid):
+        return cash.post_voucher(self.conn, self.user_id, int(vid))
+
+    def delete_voucher(self, vid):
+        return cash.delete_voucher_draft(self.conn, self.user_id, int(vid))
+
+    def cancel_voucher(self, vid, cancel_date, reason):
+        return cash.cancel_voucher(self.conn, self.user_id, int(vid), cancel_date, reason)
+
+    def create_voucher(self, kind, v):
+        self.require('cash.voucher')
+        d = v.get('date') or str(date.today())
+        amount = Decimal(str(v['amount']))
+        party = int(v['party_id']) if v.get('party_id') else None
+        account = int(v['account_id']) if v.get('account_id') else None
+        if party and account:
+            raise AccountingError('اختر طرفاً (عميل/مورد) أو حساباً مقابلاً، وليس الاثنين معاً.')
+        if not party and not account:
+            raise AccountingError('حدد الطرف (عميل/مورد) أو الحساب المقابل للسند.')
+        if account:
+            k, i = cash.resolve_counter(self.conn, self.company_id, account)
+            if k == 'party':
+                party, account = i, None
+        lines = [{'account_id': account, 'amount': amount, 'description': v.get('description', '')}] if account else None
+        kw = dict(lines=lines, description=v.get('description', ''), branch_id=self.branch_id)
+        if party:
+            pk = self.conn.execute('SELECT kind FROM parties WHERE id=?', (party,)).fetchone()
+            key = {'customer': 'customer_id', 'supplier': 'supplier_id', 'employee': 'employee_id'}.get(pk[0] if pk else None)
+            if not key:
+                raise AccountingError('الطرف غير موجود')
+            if kind == 'receipt' and key == 'employee_id':
+                raise AccountingError('القبض من موظف غير مدعوم هنا؛ استخدم قيداً يومياً')
+            kw[key] = party
+        fn = cash.create_receipt if kind == 'receipt' else cash.create_payment
+        return fn(self.conn, self.user_id, self.company_id, d, int(v['cash_id']), amount, **kw)
+
+    def update_voucher(self, vid, kind, v, reason=None):
+        self.require('cash.voucher')
+        return cash.update_voucher(self.conn, self.user_id, int(vid), kind, v.get('date') or str(date.today()), int(v['cash_id']), Decimal(str(v['amount'])),
+                                   party_id=v.get('party_id'), account_id=v.get('account_id'), description=v.get('description', ''), reason=reason)
+
+    def transfer(self, v):
+        self.require('cash.voucher')
+        return cash.transfer(self.conn, self.user_id, self.company_id, v.get('date') or str(date.today()),
+                             int(v['from_id']), int(v['to_id']), Decimal(str(v['amount'])), description=v.get('description', ''))
+
+    def unmatched_bank(self):
+        self.require('cash.reconcile')
+        rows = []
+        for r in self.conn.execute("SELECT id,name FROM cash_accounts WHERE company_id=? AND kind='bank' AND is_active=1", (self.company_id,)):
+            for x in bank_recon.unmatched_statement(self.conn, self.user_id, r['id']):
+                x = dict(x)
+                x['bank'] = r['name']
+                x['cash_id'] = r['id']
+                rows.append(x)
+        return rows
+
+    def auto_match_bank(self):
+        self.require('cash.reconcile')
+        n = 0
+        for r in self.conn.execute("SELECT id FROM cash_accounts WHERE company_id=? AND kind='bank' AND is_active=1", (self.company_id,)):
+            res = bank_recon.auto_match(self.conn, self.user_id, r['id'])
+            n += len(res) if hasattr(res, '__len__') else 0
+        return n
+
+    def import_bank_statement(self, cash_id, rows):
+        return bank_recon.import_statement(self.conn, self.user_id, int(cash_id), rows)
+
+    def bank_unmatched_gl(self, cash_id, as_of=None):
+        return bank_recon.unmatched_gl(self.conn, self.user_id, int(cash_id), as_of or str(date.today()))
+
+    def bank_match(self, statement_id, journal_line_id):
+        return bank_recon.match(self.conn, self.user_id, int(statement_id), int(journal_line_id))
+
+    def bank_unmatch(self, statement_id, reason):
+        return bank_recon.unmatch(self.conn, self.user_id, int(statement_id), reason)
+
+    def bank_ignore(self, statement_id, reason):
+        return bank_recon.ignore_line(self.conn, self.user_id, int(statement_id), reason)
+
+    def bank_book(self, statement_id, account_id, description=''):
+        return bank_recon.book_statement_line(self.conn, self.user_id, int(statement_id), int(account_id), description)

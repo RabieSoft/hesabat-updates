@@ -1,0 +1,182 @@
+"""إعدادات الطباعة الخاصة بكل مستخدم (الورق، الاتجاه، الهوامش، الترويسة، التذييل، النسخ، الطابعة).
+
+خالصة بلا PySide6. تُخزَّن في تفضيلات الجهاز (Prefs) بمفتاح مستقل لكل اسم مستخدم، فيطبع كل مستخدم بإعداداته
+على نفس الجهاز. الخيارات «النشطة» (active) هي ما يقرأه قالب المستند وخدمة الطباعة؛ تُضبط عند الدخول وعند تعديلها.
+"""
+import json
+import re
+from dataclasses import asdict, dataclass, fields
+
+PAPERS = ('A4', 'A5', 'RECEIPT80')
+ORIENTATIONS = ('portrait', 'landscape')
+HEADER_MODES = ('default', 'image')              # default = شعار + اسم الشركة + نص؛ image = صورة ترويسة كاملة العرض
+FONT_SIZES = (0, 8, 9, 10, 11, 12, 14)          # 0 = تلقائي حسب الورق
+MARGIN_MIN, MARGIN_MAX = 3, 30                   # مم؛ 0 = هامش الورق الافتراضي
+COPIES_MAX = 5
+HEADER_NOTE_MAX, FOOTER_NOTE_MAX = 200, 120
+REPORT_STYLES = ('rabee', 'modern')              # rabee = قالب «كشف الربيع» الكلاسيكي للتقارير والكشوف؛ modern = القالب الحديث
+CONTACT_MAX = 80
+
+
+@dataclass(frozen=True)
+class PrintOptions:
+    paper: str = 'A4'
+    orientation: str = 'portrait'
+    margin_mm: int = 0
+    font_pt: int = 0
+    copies: int = 1
+    printer_name: str = ''
+    show_logo: bool = True
+    logo_path: str = ''
+    header_note: str = ''
+    header_mode: str = 'default'
+    header_image_path: str = ''
+    header_image_only: bool = False
+    show_branch: bool = True
+    show_stamp: bool = True
+    show_amount_words: bool = True
+    show_signatures: bool = True
+    show_printed_at: bool = True
+    show_brand_footer: bool = True
+    footer_note: str = ''
+    report_style: str = 'rabee'
+    company_name_en: str = ''
+    phone: str = ''
+    fax: str = ''
+    pobox: str = ''
+
+
+DEFAULTS = PrintOptions()
+_NAMES = tuple(f.name for f in fields(PrintOptions))
+
+
+def _bool(v, default):
+    if isinstance(v, bool):
+        return v
+    if v in (1, '1', 'true', 'True'):
+        return True
+    if v in (0, '0', 'false', 'False'):
+        return False
+    return default
+
+
+def _int(v, default):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def from_dict(data, strict=False):
+    """dict ← PrintOptions. الوضع غير الصارم (للتحميل) يستبدل أي قيمة تالفة بالافتراضية؛ الصارم (للحفظ) يرفع ValueError."""
+    data = data or {}
+    out = {}
+    for name in _NAMES:
+        default = getattr(DEFAULTS, name)
+        v = data.get(name, default)
+        if isinstance(default, bool):
+            out[name] = _bool(v, default)
+        elif isinstance(default, int):
+            out[name] = _int(v, default)
+        else:
+            out[name] = '' if v is None else str(v)
+    problems = []
+    if out['paper'] not in PAPERS:
+        problems.append(f"ورق غير معروف: {out['paper']}")
+        out['paper'] = DEFAULTS.paper
+    if out['header_mode'] not in HEADER_MODES:
+        problems.append(f"نمط ترويسة غير معروف: {out['header_mode']}")
+        out['header_mode'] = DEFAULTS.header_mode
+    out['header_image_path'] = out['header_image_path'].strip()
+    if out['header_mode'] == 'image' and not out['header_image_path']:
+        problems.append('اختر صورة الترويسة أو أعد النمط إلى الافتراضي')
+    if out['orientation'] not in ORIENTATIONS:
+        problems.append(f"اتجاه غير معروف: {out['orientation']}")
+        out['orientation'] = DEFAULTS.orientation
+    if out['margin_mm'] != 0 and not MARGIN_MIN <= out['margin_mm'] <= MARGIN_MAX:
+        problems.append(f'الهامش بين {MARGIN_MIN} و{MARGIN_MAX} مم (أو تلقائي)')
+        out['margin_mm'] = DEFAULTS.margin_mm
+    if out['font_pt'] not in FONT_SIZES:
+        problems.append('حجم الخط غير مدعوم')
+        out['font_pt'] = DEFAULTS.font_pt
+    if not 1 <= out['copies'] <= COPIES_MAX:
+        problems.append(f'عدد النسخ بين 1 و{COPIES_MAX}')
+        out['copies'] = DEFAULTS.copies
+    if out['report_style'] not in REPORT_STYLES:
+        problems.append(f"نمط تقارير غير معروف: {out['report_style']}")
+        out['report_style'] = DEFAULTS.report_style
+    for k, label in (('company_name_en', 'الاسم الإنجليزي'), ('phone', 'الهاتف'), ('fax', 'الفاكس'), ('pobox', 'ص.ب')):
+        out[k] = out[k].strip()
+        if len(out[k]) > CONTACT_MAX:
+            problems.append(f'{label} أطول من {CONTACT_MAX} حرفًا')
+            out[k] = out[k][:CONTACT_MAX]
+    out['header_note'] = out['header_note'].strip()
+    out['footer_note'] = out['footer_note'].strip()
+    if len(out['header_note']) > HEADER_NOTE_MAX:
+        problems.append(f'نص الترويسة أطول من {HEADER_NOTE_MAX} حرفًا')
+        out['header_note'] = out['header_note'][:HEADER_NOTE_MAX]
+    if len(out['footer_note']) > FOOTER_NOTE_MAX:
+        problems.append(f'نص التذييل أطول من {FOOTER_NOTE_MAX} حرفًا')
+        out['footer_note'] = out['footer_note'][:FOOTER_NOTE_MAX]
+    if strict and problems:
+        raise ValueError('؛ '.join(problems))
+    return PrintOptions(**out)
+
+
+def to_dict(opts):
+    return asdict(opts)
+
+
+# ---------------------------------------------------------------- التخزين لكل مستخدم
+def storage_key(username):
+    safe = re.sub(r'[\\/\s]+', '_', str(username or '').strip()) or 'default'
+    return f'print_settings_{safe}'
+
+
+def load(prefs, username):
+    """إعدادات المستخدم المحفوظة، أو الافتراضية إن لم توجد أو كانت تالفة."""
+    raw = prefs.get_raw(storage_key(username), '')
+    if not raw:
+        return PrintOptions()
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return PrintOptions()
+    return from_dict(data if isinstance(data, dict) else {})
+
+
+def save(prefs, username, opts):
+    opts = from_dict(to_dict(opts), strict=True)
+    prefs.set_raw(storage_key(username), json.dumps(to_dict(opts), ensure_ascii=False))
+    return opts
+
+
+def reset(prefs, username):
+    prefs.set_raw(storage_key(username), '')
+
+
+# ---------------------------------------------------------------- الخيارات النشطة
+_ACTIVE = PrintOptions()
+
+
+def active():
+    return _ACTIVE
+
+
+_USER = ''
+
+
+def set_user(name):
+    """اسم المستخدم الحالي لتذييل «طبع بواسطة» في التقارير (يُضبط عند الدخول)."""
+    global _USER
+    _USER = str(name or '')
+
+
+def user():
+    return _USER
+
+
+def apply(opts):
+    global _ACTIVE
+    _ACTIVE = opts
+    return opts

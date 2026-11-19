@@ -1,0 +1,51 @@
+"""عمود «اللون» وشريط أرصدة الألوان في فواتير البيع والشراء.
+العمود مخفي افتراضيًا ويظهر فقط حين يكون في الفاتورة صنف ملوّن؛ ولا يظهر شيء لعملاء بلا أصناف ملوّنة.
+الشريط أسفل البنود يعرض رصيد كل لون من ألوان كل صنف أم في الفاتورة (بمستودع الفاتورة)، مع تمييز الألوان المستخدمة في الفاتورة."""
+import html
+from decimal import Decimal
+
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QIcon
+from PySide6.QtWidgets import QLabel
+
+from alhisabat.ui.design.color_swatch import color_html, swatch_icon
+
+
+def _qty(m):
+    return f"{Decimal(m or 0) / 1000:,.3f}".rstrip('0').rstrip('.') or '0'
+
+
+def attach(dlg, layout):
+    """يُنشئ شريط الأرصدة داخل تخطيط بنود الفاتورة (مخفي حتى يوجد صنف ملوّن)."""
+    dlg.color_lbl = QLabel('')
+    dlg.color_lbl.setObjectName('invHint'); dlg.color_lbl.setWordWrap(True); dlg.color_lbl.setVisible(False)
+    layout.addWidget(dlg.color_lbl)
+
+
+def wire(dlg):
+    """يربط التحديث التلقائي بتغيّر البنود والمستودع ثم يحدّث مرة (للمسودات المحمّلة)."""
+    dlg.lines.linesChanged.connect(lambda: refresh(dlg))
+    dlg.wh.selected.connect(lambda _i: refresh(dlg))
+    refresh(dlg)
+
+
+def refresh(dlg):
+    if getattr(dlg, '_color_busy', False):
+        return
+    dlg._color_busy = True
+    try:
+        rows = dlg.lines.rows()
+        used = {r.get('item_id') for r in rows if r.get('item_id')}
+        info = dlg.page.svc.item_colors(used) if used else {}
+        parents = {v['parent_id'] for v in info.values()}
+        bal = dlg.page.svc.color_balances(parents, dlg.wh.current_id()) if parents else {}
+        scope = 'بالمستودع المحدد' if dlg.wh.current_id() else 'في كل المستودعات'
+        lines = []
+        for pid, b in bal.items():
+            parts = [f"{'◂ ' if c['item_id'] in used else ''}{color_html(c['color'], c.get('hex'))}: {_qty(c['qty_milli'])}" for c in b['colors']]
+            lines.append(f"أرصدة «{html.escape(b['parent_name'])}» حسب اللون {scope}:  " + '   |   '.join(parts)
+                         + f"   (الإجمالي {_qty(sum(c['qty_milli'] for c in b['colors']))})")
+        dlg.color_lbl.setTextFormat(Qt.RichText)                         # مربعات ملوّنة بجانب أسماء الألوان
+        dlg.color_lbl.setText('<br>'.join(lines)); dlg.color_lbl.setVisible(bool(lines))
+    finally:
+        dlg._color_busy = False

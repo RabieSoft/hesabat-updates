@@ -1,0 +1,111 @@
+"""مراجعة قوالب القيود الجاهزة: (أ) القوالب المدمجة: اتجاه المدين/الدائن لكل قالب مقابل الجدول المحاسبي المرجعي،
+(ب) قوالب المستخدم: وجود الحسابات وصلاحيتها للحركة والتوازن وعدم التكرار. قراءة فقط: لا يُعدَّل أي قالب تلقائيًا."""
+import json
+from decimal import Decimal
+
+from alhisabat.security import permissions
+
+# key -> (حقول المدين, حقول الدائن) كما يقتضيه الأثر المحاسبي الصحيح للعملية
+EXPECTED = {
+    'cust_pay_and_buy': ({'cash', 'customer'}, {'customer', 'sales'}),
+    'cust_receipt': ({'cash'}, {'customer'}),
+    'cust_receipt_discount': ({'cash', 'disc_exp'}, {'customer'}),
+    'cust_credit_sale': ({'customer'}, {'sales'}),
+    'cust_partial': ({'cash', 'customer'}, {'sales'}),
+    'cust_cash_sale': ({'cash'}, {'sales'}),
+    'cust_sales_return': ({'sales_ret'}, {'customer'}),
+    'cust_cash_return': ({'sales_ret'}, {'cash'}),
+    'cust_discount': ({'disc_exp'}, {'customer'}),
+    'cust_refund': ({'customer'}, {'cash'}),
+    'cust_transfer': ({'customer2'}, {'customer'}),
+    'cust_opening_debit': ({'customer'}, {'opening'}),
+    'cust_opening_credit': ({'opening'}, {'customer'}),
+    'sup_pay_and_buy': ({'supplier', 'purchases'}, {'cash', 'supplier'}),
+    'sup_payment': ({'supplier'}, {'cash'}),
+    'sup_payment_discount': ({'supplier'}, {'cash', 'disc_inc'}),
+    'sup_credit_purchase': ({'purchases'}, {'supplier'}),
+    'sup_cash_purchase': ({'purchases'}, {'cash'}),
+    'sup_purchase_return': ({'supplier'}, {'purchases'}),
+    'sup_discount': ({'supplier'}, {'disc_inc'}),
+    'sup_gave_cash': ({'cash'}, {'supplier'}),
+    'setoff': ({'supplier'}, {'customer'}),
+    'sup_opening_credit': ({'opening'}, {'supplier'}),
+    'sup_opening_debit': ({'supplier'}, {'opening'}),
+    'expense': ({'expense'}, {'cash'}),
+    'expense_accrued': ({'expense'}, {'supplier'}),
+    'other_income': ({'cash'}, {'income'}),
+    'cash_transfer': ({'cash_to'}, {'cash'}),
+    'owner_capital': ({'cash'}, {'equity'}),
+    'owner_withdrawal': ({'equity'}, {'cash'}),
+    'emp_advance': ({'employee'}, {'cash'}),
+    'emp_advance_repay': ({'cash'}, {'employee'}),
+    'emp_salary_accrual': ({'expense'}, {'employee'}),
+    'wh_to_pos': ({'pos'}, {'wh'}),
+    'pos_to_wh': ({'wh'}, {'pos'}),
+}
+_KEYS = ('customer', 'supplier', 'cash', 'sales', 'purchases', 'expense', 'employee', 'opening', 'pos', 'wh', 'customer2', 'sales_ret',
+         'disc_exp', 'disc_inc', 'income', 'equity', 'cash_to')
+
+
+def audit_builtin():
+    """يبني كل قالب بحسابات مميّزة ويقارن اتجاهاته بـ EXPECTED. يعيد قائمة مشاكل (فارغة = سليم) وقوالب مكررة الأثر."""
+    from alhisabat.ui.core import journal_recipes as R
+    vals = {k: i + 1 for i, k in enumerate(_KEYS)}
+    inv = {v: k for k, v in vals.items()}
+    vals.update({'amt': Decimal(500), 'amt_in': Decimal(300), 'amt_out': Decimal(200), 'amt_disc': Decimal(50),
+                 'amt_total': Decimal(1000), 'amt_paid': Decimal(400)})
+    problems, sigs = [], {}
+    for r in R.RECIPES:
+        if r.key not in EXPECTED:
+            problems.append((r.key, 'قالب غير مدرج في الجدول المرجعي: راجعه محاسبيًا وأضفه'))
+            continue
+        rows = R.build(r.key, vals)
+        deb = {inv[x['account_id']] for x in rows if x['debit']}
+        cre = {inv[x['account_id']] for x in rows if x['credit']}
+        if (deb, cre) != EXPECTED[r.key]:
+            problems.append((r.key, f'اتجاه خاطئ: مدين={sorted(deb)} دائن={sorted(cre)} والمتوقع {sorted(EXPECTED[r.key][0])}/{sorted(EXPECTED[r.key][1])}'))
+        sig = (frozenset(deb), frozenset(cre), tuple(f.kind for f in r.fields))
+        if sig in sigs:
+            problems.append((r.key, f'يكرر أثر القالب {sigs[sig]}'))
+        sigs[sig] = r.key
+    for k in EXPECTED:
+        if k not in {r.key for r in R.RECIPES}:
+            problems.append((k, 'قالب مرجعي غير موجود'))
+    return problems
+
+
+def _signature(lines):
+    return tuple(sorted((int(l['account_id']), str(Decimal(str(l.get('debit') or 0))), str(Decimal(str(l.get('credit') or 0)))) for l in lines))
+
+
+def audit_user_templates(conn, user_id, company_id):
+    """قوالب المستخدم: حسابات موجودة وغير تجميعية ونشطة، سطر بجهة واحدة، توازن (إن حُددت مبالغ)، وعدم تكرار الأثر."""
+    permissions.require(conn, user_id, company_id, 'journal.view', check_branch=False)
+    accs = {r['id']: r for r in conn.execute("SELECT * FROM accounts WHERE company_id=?", (company_id,))}
+    out, seen = [], {}
+    for t in conn.execute("SELECT * FROM journal_templates WHERE company_id=? ORDER BY id", (company_id,)):
+        issues = []
+        lines = json.loads(t['lines_json'] or '[]')
+        if len(lines) < 2:
+            issues.append('أقل من سطرين')
+        d = c = Decimal(0)
+        for l in lines:
+            a = accs.get(int(l['account_id']))
+            dv, cv = Decimal(str(l.get('debit') or 0)), Decimal(str(l.get('credit') or 0))
+            d, c = d + dv, c + cv
+            if not a:
+                issues.append(f"حساب غير موجود ({l['account_id']})")
+            elif a['is_group']:
+                issues.append(f"حساب تجميعي لا يقبل حركة ({a['code']})")
+            elif not a['is_active']:
+                issues.append(f"حساب موقوف ({a['code']})")
+            if dv > 0 and cv > 0:
+                issues.append('سطر مدين ودائن معًا')
+        if (d or c) and d != c:
+            issues.append(f'غير متوازن: مدين={d} دائن={c}')
+        sig = _signature(lines)
+        if sig in seen:
+            issues.append(f"يكرر أثر القالب «{seen[sig]}»")
+        seen[sig] = t['name']
+        out.append({'id': t['id'], 'name': t['name'], 'issues': issues, 'ok': not issues})
+    return out

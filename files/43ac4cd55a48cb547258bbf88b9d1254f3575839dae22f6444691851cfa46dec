@@ -1,0 +1,251 @@
+"""دليل تصنيفات الأصناف (شجرة + أصناف التصنيف) ودليل الوحدات. تستخدم InventoryService فقط."""
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QMessageBox, QSplitter, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget
+
+from alhisabat.ui.components.basic import ask_reason
+from alhisabat.ui.components.datagrid import DataGrid
+from alhisabat.ui.components.grid_logic import Column
+from alhisabat.ui.core.actions import Action, ActionGroup
+from alhisabat.ui.core.base_page import BasePage
+from alhisabat.ui.core.inventory_service import InventoryService
+from alhisabat.ui.core.permissions import ActionState
+
+_ALL, _NONE = 0, -1      # عقدتان خاصتان في أعلى الشجرة
+
+
+class CategoriesPage(BasePage):
+    key = 'item_categories'; title = 'دليل التصنيفات'; icon = 'tree'; required_permission = 'inventory.view'
+
+    def build(self):
+        self.svc = InventoryService(self.session)
+        self._cats, self._items, self._sel_id, self._grid_sel = [], [], _ALL, []
+        lay = QVBoxLayout(self); lay.setContentsMargins(6, 6, 6, 6)
+        split = QSplitter(Qt.Horizontal)
+        self.tree = QTreeWidget(); self.tree.setLayoutDirection(Qt.RightToLeft)
+        self.tree.setHeaderLabels(['التصنيف', 'الكود', 'الأصناف', 'طريقة التقييم']); self.tree.setColumnWidth(0, 230)
+        self.tree.currentItemChanged.connect(lambda cur, _p: self._on_tree(cur))
+        split.addWidget(self.tree)
+        right = QWidget(); rl = QVBoxLayout(right); rl.setContentsMargins(0, 0, 0, 0)
+        self.head = QLabel(''); rl.addWidget(self.head)
+        self.grid = DataGrid([
+            Column('code', 'الكود', width=90),
+            Column('name', 'اسم الصنف', width=220),
+            Column('category', 'التصنيف', width=160),
+            Column('unit', 'الوحدة', width=80),
+            Column('stock_milli', 'الرصيد', 'qty', 100, milli=True),
+            Column('is_active', 'نشط', 'status', 70)
+        ], grid_id='category_items')
+        self.grid.selectionChangedRows.connect(self._on_grid)
+        rl.addWidget(self.grid, 1)
+        split.addWidget(right); split.setStretchFactor(0, 1); split.setStretchFactor(1, 2)
+        lay.addWidget(split, 1)
+
+    # ------------------------------------------------------------------ بيانات
+    def refresh(self):
+        if not getattr(self, '_built', False): return
+        try:
+            self._cats = self.svc.category_tree(True)
+            self._items = self.svc.items(limit=5000)
+        except Exception as exc:  # noqa: BLE001
+            self.show_error(exc); self._cats, self._items = [], []
+        self._build_tree()
+        self._filter()
+        self.actions_changed.emit()
+
+    def _build_tree(self):
+        keep = self._sel_id
+        self.tree.blockSignals(True); self.tree.clear()
+        nodes = {}
+        def mk(parent, text, code, cnt, cid, method=''):
+            it = QTreeWidgetItem(parent if parent is not None else self.tree, [text, code, str(cnt), method])
+            it.setData(0, Qt.UserRole, cid)
+            return it
+        mk(None, 'كل الأصناف', '', len(self._items), _ALL)
+        mk(None, 'بدون تصنيف', '', sum(1 for r in self._items if not r.get('category_id')), _NONE)
+        for c in self._cats:            # القائمة مرتبة كشجرة: الأب قبل أبنائه
+            label = c['name'] + ('' if c['is_active'] else '  (معطّل)')
+            from alhisabat.ui.core import strings_ar as S
+            m = S.COST_METHOD_LABELS.get(c.get('cost_method_effective'), '') + ('' if c.get('cost_method') else ' (موروثة)')
+            nodes[c['id']] = mk(nodes.get(c['parent_id']), label, c['code'], c['total_items'], c['id'], m)
+        self.tree.expandAll()
+        self.tree.blockSignals(False)
+        target = nodes.get(keep) if keep not in (_ALL, _NONE) else None
+        if target is None:
+            target = self.tree.topLevelItem(0 if keep != _NONE else 1)
+            self._sel_id = _ALL if keep != _NONE else _NONE
+        self.tree.setCurrentItem(target)
+
+    def _on_tree(self, cur):
+        self._sel_id = cur.data(0, Qt.UserRole) if cur is not None else _ALL
+        self._filter()
+        self.actions_changed.emit()
+
+    def _subtree(self, cid):
+        kids = {}
+        for c in self._cats: kids.setdefault(c['parent_id'], []).append(c['id'])
+        out, stack = set(), [cid]
+        while stack:
+            cur = stack.pop(); out.add(cur); stack += kids.get(cur, [])
+        return out
+
+    def _filter(self):
+        sid = self._sel_id
+        if sid == _ALL: rows = self._items; self.head.setText('كل الأصناف')
+        elif sid == _NONE: rows = [r for r in self._items if not r.get('category_id')]; self.head.setText('أصناف بدون تصنيف')
+        else:
+            ids = self._subtree(sid); rows = [r for r in self._items if r.get('category_id') in ids]
+            cat = self._cat(sid); self.head.setText(f"{cat['path']}  —  يشمل التصنيفات الفرعية" if cat else '')
+        self.grid.set_rows(rows)
+
+    def _on_grid(self, rows):
+        self._grid_sel = rows; self.actions_changed.emit()
+
+    def _cat(self, cid):
+        return next((c for c in self._cats if c['id'] == cid), None)
+
+    def _real(self):
+        return self._cat(self._sel_id) if self._sel_id not in (_ALL, _NONE) else None
+
+    # ------------------------------------------------------------------ إجراءات
+    def _state(self, k):
+        manage = self.access.state('inventory.manage')
+        if not manage.enabled: return manage
+        if k == 'add_root': return ActionState(True)
+        if k == 'move_items':
+            return ActionState(bool(self._grid_sel), 'حدد صنفًا أو أكثر من الجدول')
+        c = self._real()
+        if c is None: return ActionState(False, 'حدد تصنيفًا من الشجرة')
+        if k == 'toggle' and not c['is_active']: return ActionState(True)
+        if k == 'add_child' and not c['is_active']: return ActionState(False, 'التصنيف معطّل')
+        return ActionState(True)
+
+    def ribbon_groups(self):
+        def a(k, lab, icon, **kw):
+            return Action(k, lab, icon, state_fn=lambda kk=k: self._state(kk), handler=lambda kk=k: self.do(kk), **kw)
+        return [
+            ActionGroup('تصنيف', [
+                a('add_root', '+ تصنيف رئيسي', 'new', primary=True),
+                a('add_child', '+ تصنيف فرعي', 'plus'),
+                a('edit', 'تعديل', 'edit'),
+                a('move', 'نقل التصنيف', 'transfer'),
+                a('toggle', 'تفعيل/تعطيل', 'refresh'),
+                a('delete', 'حذف', 'delete', danger=True)
+            ]),
+            ActionGroup('الأصناف', [
+                a('assign', 'ربط أصناف بالتصنيف', 'link'),
+                a('move_items', 'نقل الأصناف المحددة', 'transfer')
+            ]),
+            ActionGroup('عرض', [Action('refresh', 'تحديث', 'refresh', handler=self.refresh)])
+        ]
+
+    def _done(self, ok):
+        if ok: self.refresh(); self.window_.data_changed(self.key)
+
+    def do(self, k):
+        st = self._state(k)
+        if not st.enabled: return QMessageBox.information(self, self.title, st.reason)
+        from alhisabat.ui.app_dialogs.catalog import CategoryDialog, CategoryPickDialog, ItemsPickDialog
+        c = self._real()
+        if k in ('add_root', 'add_child'):
+            parent = c if k == 'add_child' else None
+            d = CategoryDialog(self, parent_id=parent['id'] if parent else None, parent_path=parent['path'] if parent else '')
+            if self.exec_form(d): self._done(self.guarded(self.svc.create_category, d.values(), reload=False)[0])
+        elif k == 'edit':
+            d = CategoryDialog(self, existing=c)
+            if self.exec_form(d): self._done(self.guarded(self.svc.edit_category, c['id'], d.values(), reload=False)[0])
+        elif k == 'move':
+            banned = self._subtree(c['id'])
+            d = CategoryPickDialog(self, 'نقل التصنيف إلى', self._cats, exclude_ids=banned, allow_none=True, none_text='— تصنيف رئيسي (بدون أب) —')
+            if self.exec_form(d): self._done(self.guarded(self.svc.move_category, c['id'], d.value(), reload=False)[0])
+        elif k == 'toggle':
+            verb = 'تعطيل' if c['is_active'] else 'تفعيل'
+            if ask_reason(self, verb, [f"هل تريد {verb} التصنيف «{c['path']}»؟"], need_reason=False, confirm_text=verb, danger=bool(c['is_active'])) is None: return
+            self._done(self.guarded(self.svc.set_category_active, c['id'], not bool(c['is_active']), reload=False)[0])
+        elif k == 'delete':
+            if ask_reason(self, 'حذف تصنيف', [f"سيُحذف التصنيف «{c['path']}» نهائيًا. لا يُسمح بالحذف إن كان له أصناف أو تصنيفات فرعية."],
+                          need_reason=False, confirm_text='حذف', danger=True) is None: return
+            self._sel_id = _ALL
+            self._done(self.guarded(self.svc.delete_category, c['id'], reload=False)[0])
+        elif k == 'assign':
+            others = [r for r in self._items if r.get('category_id') != c['id']]
+            if not others: return QMessageBox.information(self, self.title, 'كل الأصناف مرتبطة بهذا التصنيف أصلًا.')
+            d = ItemsPickDialog(self, f"ربط أصناف بالتصنيف «{c['path']}»", others)
+            if self.exec_form(d): self._done(self.guarded(self.svc.assign_items_category, d.ids(), c['id'], reload=False)[0])
+        elif k == 'move_items':
+            d = CategoryPickDialog(self, 'نقل الأصناف المحددة إلى', self._cats, allow_none=True, none_text='— بدون تصنيف —')
+            if self.exec_form(d):
+                ids = [r['id'] for r in self._grid_sel]
+                self._done(self.guarded(self.svc.assign_items_category, ids, d.value(), reload=False)[0])
+
+
+class UnitsPage(BasePage):
+    key = 'units'; title = 'دليل الوحدات'; icon = 'coins'; required_permission = 'inventory.view'
+
+    def build(self):
+        self.svc = InventoryService(self.session); self._sel = None
+        lay = QVBoxLayout(self); lay.setContentsMargins(6, 6, 6, 6)
+        note = QLabel('هنا تُعرَّف الوحدات (قطعة، كرتون، كيلو…). تُختار الوحدة الأساسية عند إنشاء الصنف، '
+                      'وتُضاف وحدات التحويل من «الأصناف والأرصدة ← وحدات التحويل».')
+        note.setWordWrap(True); lay.addWidget(note)
+        self.grid = DataGrid([
+            Column('code', 'الكود', width=80),
+            Column('name', 'اسم الوحدة', width=180),
+            Column('notes', 'ملاحظات', width=220),
+            Column('as_base', 'أصناف أساسية', 'int', 100),
+            Column('usage', 'مرات الاستخدام', 'int', 110),
+            Column('is_active', 'نشطة', 'status', 80)
+        ], grid_id='units_catalog')
+        self.grid.selectionChangedRows.connect(lambda rows: (setattr(self, '_sel', rows[0] if len(rows) == 1 else None), self.actions_changed.emit()))
+        self.grid.rowActivated.connect(lambda _r: self.do('edit'))
+        lay.addWidget(self.grid, 1)
+
+    def refresh(self):
+        if not getattr(self, '_built', False): return
+        keep = self._sel['id'] if self._sel else None
+        try: rows = self.svc.units_catalog()
+        except Exception as exc:  # noqa: BLE001
+            self.show_error(exc); rows = []
+        self.grid.set_rows(rows)
+        if keep is not None: self.grid.select_where(lambda r: r['id'] == keep)
+        self.actions_changed.emit()
+
+    def _state(self, k):
+        manage = self.access.state('inventory.manage')
+        if not manage.enabled: return manage
+        if k == 'add': return ActionState(True)
+        if not self._sel: return ActionState(False, 'حدد وحدة أولًا')
+        if k == 'delete' and self._sel.get('usage'): return ActionState(False, 'الوحدة مستخدمة؛ عطّلها بدل حذفها')
+        return ActionState(True)
+
+    def ribbon_groups(self):
+        def a(k, lab, icon, **kw):
+            return Action(k, lab, icon, state_fn=lambda kk=k: self._state(kk), handler=lambda kk=k: self.do(kk), **kw)
+        return [
+            ActionGroup('وحدة', [a('add', '+ وحدة', 'new', primary=True), a('edit', 'تعديل', 'edit'),
+                                 a('toggle', 'تفعيل/تعطيل', 'refresh'), a('delete', 'حذف', 'delete', danger=True)]),
+            ActionGroup('عرض', [Action('refresh', 'تحديث', 'refresh', handler=self.refresh)])
+        ]
+
+    def _done(self, ok):
+        if ok: self.refresh(); self.window_.data_changed(self.key)
+
+    def do(self, k):
+        st = self._state(k)
+        if not st.enabled: return QMessageBox.information(self, self.title, st.reason)
+        from alhisabat.ui.app_dialogs.catalog import UnitDialog
+        u = self._sel
+        if k == 'add':
+            d = UnitDialog(self)
+            if self.exec_form(d):
+                v = d.values()
+                self._done(self.guarded(self.svc.create_unit, v['name'], v['code'] or None, v['notes'], reload=False)[0])
+        elif k == 'edit':
+            d = UnitDialog(self, u)
+            if self.exec_form(d): self._done(self.guarded(self.svc.edit_unit, u['id'], d.values(), reload=False)[0])
+        elif k == 'toggle':
+            verb = 'تعطيل' if u.get('is_active') else 'تفعيل'
+            if ask_reason(self, verb, [f"هل تريد {verb} الوحدة «{u['name']}»؟"], need_reason=False, confirm_text=verb, danger=bool(u.get('is_active'))) is None: return
+            self._done(self.guarded(self.svc.set_unit_active, u['id'], not bool(u.get('is_active')), reload=False)[0])
+        elif k == 'delete':
+            if ask_reason(self, 'حذف وحدة', [f"سيتم حذف الوحدة «{u['name']}» نهائيًا."], need_reason=False, confirm_text='حذف', danger=True) is None: return
+            self._done(self.guarded(self.svc.delete_unit, u['id'], reload=False)[0])

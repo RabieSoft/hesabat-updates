@@ -1,0 +1,41 @@
+"""خدمات شجرة الحسابات وربط الحسابات.
+"""
+from alhisabat.business import chart_of_accounts as coa
+
+class AccountsService:
+    def __init__(self, session):
+        self.s=session
+    def tree(self):
+        self.s.require('account.view')
+        return coa.get_tree(self.s.conn, self.s.company_id, include_inactive=True, branch_id=self.s.branch_id)
+    def create(self, v):
+        return coa.add_account(self.s.conn, self.s.user_id, self.s.company_id, v['name'], v['type'], parent_id=int(v['parent']) if v.get('parent') else None, code=v.get('code') or None, is_group=bool(v.get('is_group')), description=v.get('description',''))
+    def edit(self, account_id, v): return coa.edit_account(self.s.conn, self.s.user_id, int(account_id), name=v.get('name'), description=v.get('description'))
+    def set_active(self, account_id, active, reason=''): return coa.set_active(self.s.conn, self.s.user_id, int(account_id), bool(active), reason)
+    def load_default(self): return coa.load_default_template(self.s.conn, self.s.user_id, self.s.company_id)
+    def complete_mappings(self): return coa.complete_default_mappings(self.s.conn, self.s.user_id, self.s.company_id)
+    def mappings(self):
+        self.s.require('account.view')
+        from alhisabat.ui.core import readmodel
+        from alhisabat.ui.core.logic import MAP_KEYS_AR
+        linked = readmodel.account_mappings(self.s.conn, self.s.company_id)
+        out=[]
+        for key in list(MAP_KEYS_AR)+sorted(k for k in linked if k not in MAP_KEYS_AR):
+            r=linked.get(key)
+            out.append({'key':key,'account_id':r['account_id'] if r else None,'account': f"{r['code']} — {r['name']}" if r else '—'})
+        return out
+    def set_mapping(self, key, account_id):
+        self.s.require('account.system_edit')
+        return coa.set_mapping(self.s.conn, self.s.user_id, self.s.company_id, key, int(account_id))
+
+    def delete_account(self, account_id):
+        self.s.require('account.delete')
+        return coa.delete_account(self.s.conn, self.s.user_id, int(account_id))
+
+    def move_account(self, account_id, new_parent_id, preview=False):
+        return coa.move_account(self.s.conn, self.s.user_id, int(account_id),
+                                int(new_parent_id) if new_parent_id else None, preview=preview)
+
+    def merge_accounts(self, source_id, target_id, reason):
+        return coa.merge_accounts(self.s.conn, self.s.user_id, int(source_id), int(target_id), reason)
+

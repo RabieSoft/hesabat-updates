@@ -1,0 +1,116 @@
+"""RelatedPanel وAuditTrailView وTaskProgress وReportViewer: لوحات مساندة. يتطلب PySide6."""
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (
+    QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QProgressBar, QPushButton, QVBoxLayout, QWidget
+)
+
+from alhisabat.ui.core import strings_ar as S
+
+from .datagrid import DataGrid
+from .grid_logic import Column
+from .document_sheet import DocumentSheet
+
+
+class RelatedPanel(QFrame):
+    """لوحة جانبية بالعناصر المرتبطة بأي سجل (قيد ← مستند، مستند ← دفعات، حساب ← حركات...).
+    set_items([(مجموعة، نص، page_key، معاملات)]) ثم openRequested(page_key, params) عند النقر."""
+    openRequested = Signal(str, object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName('panel')
+        self.setLayoutDirection(Qt.RightToLeft)
+        lay = QVBoxLayout(self)
+        t = QLabel('مرتبط بهذا السجل')
+        t.setObjectName('panelTitle')
+        lay.addWidget(t)
+        self.lst = QListWidget()
+        self.lst.itemActivated.connect(self._open)
+        self.lst.itemClicked.connect(self._open)
+        lay.addWidget(self.lst, 1)
+        self._empty = QLabel(S.GENERIC['empty'])
+        self._empty.setObjectName('ctxKey')
+        lay.addWidget(self._empty)
+
+    def set_items(self, items):
+        self.lst.clear()
+        for group, text, page, params in items:
+            it = QListWidgetItem(f'{group}: {text}')
+            it.setData(Qt.UserRole, (page, params))
+            self.lst.addItem(it)
+        self._empty.setVisible(not items)
+
+    def _open(self, item):
+        page, params = item.data(Qt.UserRole)
+        self.openRequested.emit(page, params)
+
+
+class AuditTrailView(QWidget):
+    """تاريخ سجل واحد من audit_query (المستخدم/الوقت/الإجراء/السبب). rows: dicts بمفاتيح at,user,action,reason."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.grid = DataGrid([
+            Column('at', 'الوقت', width=150), Column('user', 'المستخدم', width=120),
+            Column('action', 'الإجراء', width=140), Column('reason', 'السبب')], grid_id='audit_trail', quick_search=False)
+        lay.addWidget(self.grid)
+
+    def set_rows(self, rows):
+        self.grid.set_rows(rows)
+
+
+class TaskProgress(QFrame):
+    """شريط تقدّم وإلغاء للعمليات الثقيلة. start(ctx) يربطه بـTaskContext من core/tasks."""
+    cancelled = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName('panel')
+        lay = QHBoxLayout(self)
+        self.lbl = QLabel('')
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 100)
+        self.btn = QPushButton('إلغاء')
+        self.btn.clicked.connect(self._cancel)
+        lay.addWidget(self.lbl)
+        lay.addWidget(self.bar, 1)
+        lay.addWidget(self.btn)
+        self._ctx = None
+        self.setVisible(False)
+
+    def start(self, ctx=None, text=S.GENERIC['loading']):
+        self._ctx = ctx
+        self.lbl.setText(text)
+        self.bar.setValue(0)
+        self.setVisible(True)
+
+    def update_progress(self, pct, msg=''):
+        self.bar.setValue(pct)
+        if msg:
+            self.lbl.setText(msg)
+
+    def finish(self):
+        self.setVisible(False)
+        self._ctx = None
+
+    def _cancel(self):
+        if self._ctx:
+            self._ctx.cancel()
+        self.cancelled.emit()
+        self.finish()
+
+
+class ReportViewer(QWidget):
+    """معاينة تقرير على ورقة (DocumentSheet) → طباعة/PDF/HTML. XLSX وCSV من printing.render_xlsx/render_csv عبر الجلسة."""
+
+    def __init__(self, paper='A4', parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.sheet = DocumentSheet(paper)
+        lay.addWidget(self.sheet)
+
+    def show_spec(self, doc_spec):
+        self.sheet.set_document(doc_spec)

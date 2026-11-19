@@ -1,0 +1,49 @@
+-- تعديل القيد المرحّل وحذفه: بندان في الإعدادات (مغلقان افتراضيًا) + صلاحيتان لمدير النظام فقط.
+--  1) التعديل = عكس القيد القديم + قيد جديد مرحّل بالقيم الصحيحة في معاملة واحدة، ويُسجَّل السبب في journal_edit_log والتدقيق.
+--  2) الحذف = حذف فعلي للقيد المرحّل اليدوي (وعكسه إن وُجد) من فترة مفتوحة فقط، بعد حفظ نسخة كاملة منه في journal_deletion_log
+--     (سجل لا يُعدَّل ولا يُحذف). القيود المولّدة من مستندات (فواتير/سندات/رواتب...) لا تُحذف من هنا بل من شاشة مستندها.
+ALTER TABLE journal_settings ADD COLUMN allow_edit_posted_entries INTEGER NOT NULL DEFAULT 0 CHECK(allow_edit_posted_entries IN (0,1));
+ALTER TABLE journal_settings ADD COLUMN allow_delete_posted_entries INTEGER NOT NULL DEFAULT 0 CHECK(allow_delete_posted_entries IN (0,1));
+
+INSERT INTO permissions(code,name_ar,is_sensitive) VALUES
+ ('journal.edit_posted','تعديل قيد مرحّل (بالعكس وإعادة الترحيل) وتفعيله من الإعدادات',1),
+ ('journal.delete_posted','حذف قيد مرحّل يدوي من فترة مفتوحة وتفعيله من الإعدادات',1);
+INSERT INTO role_permissions SELECT 1,'journal.edit_posted';
+INSERT INTO role_permissions SELECT 1,'journal.delete_posted';
+
+-- بلا مفاتيح أجنبية إلى journal_entries عمدًا: السجل يبقى بعد حذف القيد
+CREATE TABLE journal_edit_log(
+  id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id),
+  old_entry_id INTEGER NOT NULL, old_posted_no INTEGER, reversal_entry_id INTEGER NOT NULL, new_entry_id INTEGER NOT NULL,
+  before_json TEXT NOT NULL, after_json TEXT NOT NULL,
+  reason TEXT NOT NULL CHECK(length(trim(reason))>0), edited_by INTEGER NOT NULL REFERENCES users(id),
+  edited_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX ix_jel_old ON journal_edit_log(old_entry_id);
+CREATE TRIGGER jel_no_update BEFORE UPDATE ON journal_edit_log BEGIN SELECT RAISE(ABORT,'سجل تعديل القيود لا يُعدَّل'); END;
+CREATE TRIGGER jel_no_delete BEFORE DELETE ON journal_edit_log BEGIN SELECT RAISE(ABORT,'سجل تعديل القيود لا يُحذف'); END;
+
+CREATE TABLE journal_deletion_log(
+  id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id),
+  entry_id INTEGER NOT NULL, entry_no INTEGER, posted_no INTEGER, entry_date TEXT NOT NULL,
+  snapshot_json TEXT NOT NULL,
+  reason TEXT NOT NULL CHECK(length(trim(reason))>0), deleted_by INTEGER NOT NULL REFERENCES users(id),
+  deleted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX ix_jdl_company ON journal_deletion_log(company_id, deleted_at);
+CREATE TRIGGER jdl_no_update BEFORE UPDATE ON journal_deletion_log BEGIN SELECT RAISE(ABORT,'سجل حذف القيود لا يُعدَّل'); END;
+CREATE TRIGGER jdl_no_delete BEFORE DELETE ON journal_deletion_log BEGIN SELECT RAISE(ABORT,'سجل حذف القيود لا يُحذف'); END;
+
+-- حارس الحذف: لا يُفعَّل إلا من journal_engine.delete_posted داخل معاملة الحذف نفسها
+CREATE TABLE journal_edit_guard(id INTEGER PRIMARY KEY CHECK(id=1), active INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0,1)));
+INSERT INTO journal_edit_guard VALUES(1,0);
+
+DROP TRIGGER jl_no_delete;
+CREATE TRIGGER jl_no_delete BEFORE DELETE ON journal_lines WHEN (SELECT active FROM journal_edit_guard)=0 BEGIN
+  SELECT RAISE(ABORT,'لا يمكن حذف سطر من قيد مرحّل')
+   WHERE (SELECT status FROM journal_entries WHERE id=OLD.entry_id)<>'draft';
+  SELECT RAISE(ABORT,'القيد تحت المراجعة أو معتمد: أعده إلى المسودة قبل التعديل')
+   WHERE (SELECT workflow_state FROM journal_entries WHERE id=OLD.entry_id)<>'draft';
+END;
+DROP TRIGGER je_no_delete;
+CREATE TRIGGER je_no_delete BEFORE DELETE ON journal_entries WHEN OLD.status<>'draft' AND (SELECT active FROM journal_edit_guard)=0 BEGIN
+  SELECT RAISE(ABORT,'لا يمكن حذف قيد مرحّل: استخدم العكس');
+END;

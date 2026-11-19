@@ -1,0 +1,228 @@
+"""قالب الفاتورة (A4/A5) بلغة «شكل 1» الكلاسيكي: ترويسة علوية (اسم الشركة يمينًا، الشعار وسطًا، الاسم الإنجليزي والاتصال يسارًا، أو صورة ترويسة)
+يليها صف أربعة مربعات (التاريخ، عنوان المستند، العملة، الرقم)، سطر الطرف والمستودع بلا شبكة، جدول أصناف بأعمدة
+(رقم الصنف، البيان، الوحدة، الكمية، سعر الوحدة، الإجمالي) بلا صفوف فارغة ولا خصم/ضريبة، صف الإجمالي في نهاية الجدول، المبلغ كتابةً،
+ثم **كشف رصيد الطرف** («الرصيد السابق + هذه الفاتورة = الرصيد الحالي» بصيغة عليكم/لكم وبالتفقيط)، فالتوقيعات والتذييل.
+
+HTML بعناصر يدعمها محرك النص الغني في Qt (جداول وألوان خلفية وحدود)، فهو نفسه للشاشة والطباعة. بلا PySide6.
+كل الأرقام تأتي من printing.invoice_print (المحرك)؛ هنا عرض فقط. يُستخدم حين تحمل المواصفة `invoice` (وإلا يبقى القالب القديم).
+"""
+import re
+from dataclasses import replace
+from decimal import Decimal
+
+from alhisabat.reporting import words as report_words
+from alhisabat.ui.core import format as fmt
+
+from . import document_classic as K
+from .document_classic import BLUE, FRAME, LINE, RED, _e, money
+
+
+
+# محرك النص الغني في Qt (QTextDocument) يرصّ خلايا الجدول من اليسار لليمين حتى مع dir="rtl" (جُرِّب على Qt 6.12).
+# فنكتب كل صف بترتيب منطقي «من اليمين» (الأول = أقصى اليمين) ونعكسه هنا ليظهر بالترتيب العربي الصحيح.
+# إن ظهر الترتيب معكوسًا على جهازك (نسخة Qt تعكس الجداول تلقائيًا) اجعلها False.
+MIRROR = True
+
+FOOT_PT = 10          # خط تذييل الفاتورة (المبلغ كتابةً، الملاحظات، كشف الرصيد، التوقيعات، سطر الطباعة): عريض بحجم «نوع الدفع» فأكبر
+
+
+def _row(cells):
+    """يضم خلايا صف مكتوبة بترتيب «أول عنصر = أقصى اليمين» بالترتيب الذي يفرضه محرك Qt."""
+    return ''.join(reversed(cells) if MIRROR else cells)
+
+
+def _qty(v):
+    if v is None:
+        return ''
+    s = fmt.fmt_money(Decimal(str(v)), 3).rstrip('0').rstrip('.')
+    return _e(s or '0')
+
+
+def _cell(content, align='center', extra='', style='', bg=None, bold=False, size=None):
+    if bg:
+        extra = f'{extra} bgcolor="{bg}"'
+        style = f'background-color:{bg}; {style}'
+    body = f'<b>{content}</b>' if bold else content
+    fs = f'font-size:{size};' if size else ''
+    return f'<td {extra} align="{align}" style="border: 1px solid {LINE}; padding:3px 5px; {fs}{style}">{body}</td>'
+
+
+def _cells_row(cells, extra=''):
+    return f'<tr {extra}>{_row(cells)}</tr>'
+
+
+def _box(content, w, bg=None, color=None, size='10pt'):
+    st = f'color:{color};' if color else ''
+    bgs = f' bgcolor="{bg}"' if bg else ''
+    return (f'<td width="{w}%" align="center"{bgs} style="border: 1px solid {FRAME}; padding:5px; font-size:{size}; {st}'
+            f'{"background-color:" + bg + ";" if bg else ""}"><b>{content}</b></td>')
+
+
+def _title_row(doc, inv):
+    """صف المربعات الأربعة: التاريخ، عنوان المستند، العملة، الرقم (من اليمين)."""
+    _sym, cur_name = K.currency_label(inv.get('currency') or doc.currency)
+    sp = '<td width="1%"></td>'
+    cells = [_box(K._ltr(K.dmy(doc.date)), 25), sp, _box(_e(doc.title) + (f'<br><span style="font-size:8pt; color:{RED};">( {_e(doc.stamp)} )</span>' if doc.stamp else ''), 33, BLUE, size='12pt'),
+             sp, _box('العملة: ' + _e(cur_name or inv.get('currency') or ''), 21), sp, _box(f'الرقم: {_e(doc.number)}', 19, color=RED)]
+    return f'<table width="100%" border="0" cellspacing="0" cellpadding="0"><tr>{_row(cells)}</tr></table>'
+
+
+def _party_block(doc, inv):
+    """سطر الطرف: يمينًا نوع الدفع ثم رقم الحساب، وسطًا اسم العميل/المورد بخط كبير (بحجم عنوان المستند) ولون مميّز،
+    يسارًا الهاتف ثم المخزن. تحته سطر صغير لبقية البيانات (الاستحقاق، العنوان، الرقم الضريبي، مرجع المورد، الفاتورة الأصلية، المُعِدّ)."""
+    p = inv['party']
+    right = f'<b>نوع الدفع:</b> {_e(inv["payment"])}' + (f'<br><b>رقم الحساب:</b> {K._ltr(p["code"])}' if p.get('code') else '')
+    mid = f'<b style="font-size:12pt; color:{RED};">{_e(p["name"])}</b>'
+    left = (f'<b>الهاتف:</b> {K._ltr(p["phone"])}' if p.get('phone') else '') \
+        + (('<br>' if p.get('phone') else '') + f'<b>المخزن:</b> {_e(inv["warehouse"])}' if inv.get('warehouse') else '')
+    top = ('<table width="100%" border="0" cellspacing="0" cellpadding="3"><tr>'
+           + _row([f'<td width="28%" align="right" valign="middle" style="font-size:9.5pt;">{right}</td>',
+                   f'<td width="44%" align="center" valign="middle">{mid}</td>',
+                   f'<td width="28%" align="left" valign="middle" style="font-size:9.5pt;">{left}</td>'])
+           + '</tr></table>')
+    bits = [('تاريخ الاستحقاق', K._ltr(K.dmy(inv['due_date'])) if inv.get('due_date') and inv['payment'] != 'نقدي' else ''),
+            ('العنوان', _e(p.get('address'))), ('الرقم الضريبي', K._ltr(p['tax_no']) if p.get('tax_no') else ''),
+            ('مرجع المورد', _e(inv.get('supplier_ref'))), ('الفاتورة الأصلية', _e(inv.get('original_no'))), ('المُعِدّ', _e(inv.get('prepared_by')))]
+    line = ' &nbsp;|&nbsp; '.join(f'<b>{k}:</b> {v}' for k, v in bits if v)
+    return top + (f'<p align="right" style="margin:0 4px 2px 4px; font-size:8.5pt;">{line}</p>' if line else '')
+
+
+_COLS = [  # (مفتاح، عنوان، عرض%، محاذاة) — بلا م ولا خصم ولا ضريبة
+    ('code', 'رقم الصنف', 14, 'center'), ('name', 'البيان', 38, 'right'), ('unit', 'الوحدة', 10, 'center'),
+    ('qty', 'الكمية', 10, 'center'), ('price', 'سعر الوحدة', 14, 'center'), ('total', 'الإجمالي', 14, 'center'),
+]
+_COLS_A5 = [
+    ('name', 'البيان', 46, 'right'), ('unit', 'الوحدة', 12, 'center'), ('qty', 'الكمية', 12, 'center'),
+    ('price', 'سعر الوحدة', 15, 'center'), ('total', 'الإجمالي', 15, 'center'),
+]
+_ROW_LINE = f'border: 1px solid {LINE};'           # شبكة كاملة: خط أفقي بين الصفوف وخط طولي بين كل عمود وعمود
+
+
+def _items_table(doc, paper, inv):
+    cols = _COLS_A5 if paper == 'A5' else _COLS
+    th = _row([f'<th width="{w}%" bgcolor="{BLUE}" align="center" style="background-color:{BLUE}; border: 1px solid {LINE}; padding:5px; '
+               f'font-size:9.5pt;"><b>{_e(lab)}</b></th>' for _k, lab, w, _a in cols])
+    body = ''
+    for r in doc.rows:
+        tds = []
+        for k, _lab, _w, al in cols:
+            v = r.get(k)
+            if k == 'qty':
+                txt = _qty(v)
+            elif k in ('price', 'total'):
+                txt = money(v)
+            elif k == 'name':
+                txt = _e(v if v not in (None, '') else r.get('item'))
+                if r.get('note'):
+                    txt += f'<br><span style="font-size:8pt;">{_e(r["note"])}</span>'
+            else:
+                txt = _e(v)
+            tds.append(f'<td align="{al}" style="{_ROW_LINE} padding:4px 5px; font-size:9.5pt;"><b>{txt}</b></td>')
+        body += f'<tr>{_row(tds)}</tr>'
+    a = inv['amounts']
+    foot = [('إجمالي الفاتورة', a['grand'], True)]
+    if a['paid'] and a['due']:                                  # دفعة جزئية فقط: يلزم إظهار المدفوع والمتبقي
+        foot += [('المدفوع', a['paid'], False), ('المتبقي', a['due'], True)]
+    n = len(cols)
+    for lab, v, strong in foot:
+        c_lab = (f'<td colspan="{n - 1}" align="right" bgcolor="{BLUE}" style="background-color:{BLUE}; border: 1px solid {LINE}; padding:4px 8px;">'
+                 f'<b>{_e(lab)}</b></td>')
+        c_val = (f'<td align="center" bgcolor="{BLUE}" style="background-color:{BLUE}; border: 1px solid {LINE}; padding:4px 5px; '
+                 f'{"color:" + RED + ";" if strong else ""}"><b>{money(v)}</b></td>')
+        body += f'<tr>{_row([c_lab, c_val])}</tr>'
+    return (f'<table width="100%" border="0" cellspacing="0" cellpadding="0" style="border-collapse: collapse;">'
+            f'<thead><tr>{th}</tr></thead><tbody>{body}</tbody></table>')
+
+
+def _words_notes(doc, inv, opts):
+    out = ''
+    if doc.amount_words and opts.show_amount_words:
+        out += (f'<p align="right" style="margin:5px 4px 0 4px; font-size:{FOOT_PT}pt;"><b>المبلغ كتابةً:</b> '
+                f'<b>{" ".join(_e(x) for x in report_words.split_lines(doc.amount_words))}</b></p>')
+    note = inv.get('notes') or doc.notes
+    if note:
+        out += f'<p align="right" style="margin:3px 4px 0 4px; font-size:{FOOT_PT}pt;"><b>ملاحظات: {_e(note)}</b></p>'
+    return out
+
+
+def _side_cell(owed_side):
+    return _cell(_e(owed_side) if owed_side else '—', 'center', 'width="18%"', f'color:{RED};' if owed_side else '', None, bold=True, size=f'{FOOT_PT}pt')
+
+
+def balance_block(doc, inv):
+    """كشف رصيد الطرف: السابق + هذه الفاتورة = الحالي، بأسلوب «عليكم / لكم»، وجملة ختامية بالتفقيط."""
+    b = inv.get('balance')
+    if not b:
+        return ''
+    label = inv['party']['label']
+    cur = b['currency'] or ''
+    prev, mv, now = b['previous'], b['movement'], b['current']
+    mv_side = 'عليكم' if mv > 0 else ('لكم' if mv < 0 else '')
+    mv_title = 'هذه الفاتورة' if inv['doc_type'] == 'invoice' else 'هذا المرتجع'
+    if inv['payment'] != 'نقدي' or mv != 0:
+        mv_title += ' (المتبقي على الحساب)'
+
+    def row(title, amount, side, strong=False):
+        bg = BLUE if strong else None
+        return ('<tr>' + _row([_cell(_e(title), "right", "width=\"46%\"", "", bg, bold=True, size=f"{FOOT_PT}pt"),
+                               _cell(money(abs(amount)), "center", "", f"color:{RED};" if strong else "", bg, bold=True, size=f"{FOOT_PT + 1}pt"),
+                               _side_cell(side)]) + '</tr>')
+
+    rows = (row('الرصيد السابق', prev, b['previous_side']) + row(mv_title, mv, mv_side)
+            + row('الرصيد الحالي' + (' (تقديري)' if b['estimated'] else ''), now, b['current_side'], True))
+    if now == 0:
+        sentence = 'الحساب مسدّد: لا يوجد رصيد.'
+    else:
+        sentence = f'الرصيد الحالي: <span style="color:{RED};">{_e(b["current_side"])}</span> مبلغ وقدره ' + _e(b['current_words'])
+    note = ''
+    if b['estimated']:
+        note += f'<br><b style="font-size:{FOOT_PT - 1}pt;">تنبيه: الفاتورة غير مرحّلة؛ الرصيد الحالي تقديري وقد يتغير عند الترحيل.</b>'
+    if b.get('base_currency') and cur != b['base_currency']:               # فاتورة بعملة غير الأساسية: المعادل بالأساسي
+        bs = b['base']
+        note += (f'<br><b style="font-size:{FOOT_PT - 1}pt;">الأرصدة بعملة الفاتورة ({_e(cur)}) بسعر صرف {_e(fmt.fmt_money(b["rate"], 4).rstrip("0").rstrip("."))}. '
+                 f'المعادل بالعملة الأساسية ({_e(b["base_currency"])}): السابق {money(abs(bs["previous"]))}، الحالي {money(abs(bs["current"]))}.</b>')
+    title = (f'<table width="100%" border="1" cellspacing="0" cellpadding="0" style="border: 1px solid {LINE}; border-collapse: collapse;">'
+             f'<tr><td colspan="3" align="center" bgcolor="{BLUE}" style="background-color:{BLUE}; border: 1px solid {LINE}; padding:4px;">'
+             f'<b style="font-size:{FOOT_PT + 0.5}pt;">كشف رصيد {_e(label)} — {_e(inv["party"]["name"])}</b></td></tr>{rows}'
+             f'<tr><td colspan="3" align="right" style="border: 1px solid {LINE}; padding:4px;"><b style="font-size:{FOOT_PT + 0.5}pt;">{sentence}</b>{note}</td></tr>'
+             '</table>')
+    return title
+
+
+def _header(doc, opts, header_image_html=''):
+    """ترويسة علوية بلا إطار وبخط سفلي: اسم الشركة (وسطر التعريف) يمينًا، الشعار وسطًا، الاسم الإنجليزي والاتصال يسارًا؛ أو صورة الترويسة."""
+    from . import document_html as DH
+    rule = f'<table width="100%" border="0" cellspacing="0" cellpadding="0"><tr><td height="3" style="border-top: 2px solid {FRAME};"></td></tr></table>'
+    if header_image_html:
+        return f'{header_image_html}{rule}'
+    ar = ' - '.join(x for x in (doc.company, doc.branch if opts.show_branch else '') if x)
+    note = f'<br><span style="font-size:9pt;">{DH._multiline(opts.header_note)}</span>' if opts.header_note else ''
+    right = f'<b style="font-size:16pt;">{_e(ar)}</b>{note}'
+    mid = DH._logo_img(opts, 60)
+    left = (f'<b style="font-size:11pt;">{_e(opts.company_name_en)}</b><br>' if opts.company_name_en else '') + K._contact_block(opts)
+    cells = [f'<td width="40%" align="right" valign="middle">{right}</td>', f'<td width="20%" align="center" valign="middle">{mid}</td>',
+             f'<td width="40%" align="left" valign="middle">{left}</td>']
+    return f'<table width="100%" border="0" cellspacing="0" cellpadding="4"><tr>{_row(cells)}</tr></table>{rule}'
+
+
+def render_invoice(doc, paper, opts, header_image_html='', fill_px=0, pages=None):
+    size = opts.font_pt or (10 if paper == 'A4' else 9)
+    inv = doc.invoice
+    img_only = K._image_only(doc, opts, header_image_html)
+    gap = '<p style="margin:0; font-size:4pt;">&nbsp;</p>'
+    inner = gap
+    if not img_only:
+        inner += _title_row(doc, inv) + gap + _party_block(doc, inv) + gap
+    inner += _items_table(doc, paper, inv) + _words_notes(doc, inv, opts)
+    bal = balance_block(doc, inv)
+    if bal:
+        inner += gap + bal
+    inner += K.notice_and_signatures(doc, opts, FOOT_PT - 0.5, FOOT_PT, True) + K.filler(fill_px)
+    frame = (f'<table width="100%" border="0" cellspacing="0" cellpadding="0"><tr><td style="border: 1px solid {FRAME}; padding:4px;">'
+             f'{inner}</td></tr></table>')
+    html = (f'<html dir="rtl"><head><meta charset="utf-8"></head>'
+            f'<body dir="rtl" style="font-family:{K.FONT}; font-size:{size}pt; color:{FRAME}; background-color:{K._P["paper"]};">'
+            f'{_header(doc, opts, header_image_html)}{gap}{frame}{gap}{K.footer(doc, pages, pages, opts, FOOT_PT, FOOT_PT - 1)}</body></html>')
+    if paper == 'A5':                                        # خطوط A5 أصغر بنسبة ثابتة (القياسات المطلقة داخل القالب)
+        html = re.sub(r'font-size:([\d.]+)pt', lambda m: f'font-size:{(Decimal(m.group(1)) * Decimal("0.88")).quantize(Decimal("0.1"))}pt', html)
+    return html

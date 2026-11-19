@@ -1,0 +1,83 @@
+"""معاينة الألوان: مربع ملوّن صغير بجانب اسم اللون في كل مكان يظهر فيه (جداول، قوائم اختيار، فواتير، جرد).
+
+الدوال الخالصة (normalize_hex، color_html) بلا PySide6 وقابلة للاختبار؛ ورسم الأيقونة يستورد Qt عند الاستدعاء فقط.
+"""
+import html
+import re
+
+_HEX6 = re.compile(r"^#?([0-9A-Fa-f]{6})$")
+_HEX3 = re.compile(r"^#?([0-9A-Fa-f]{3})$")
+
+# ألوان جاهزة شائعة للأقمشة والملابس: (الاسم، HEX، العائلة)
+PRESETS = [
+    ("أبيض", "#FFFFFF", "أبيض"), ("أسود", "#000000", "أسود"), ("رمادي", "#808080", "رمادي"), ("بيج", "#D9C7A3", "بيج"),
+    ("بني", "#7B4B2A", "بني"), ("أحمر", "#D32F2F", "أحمر"), ("وردي", "#F06292", "وردي"), ("برتقالي", "#F57C00", "برتقالي"),
+    ("أصفر", "#FDD835", "أصفر"), ("أخضر", "#388E3C", "أخضر"), ("أزرق", "#1976D2", "أزرق"), ("بنفسجي", "#7B1FA2", "بنفسجي"),
+]
+
+_cache = {}
+
+
+def normalize_hex(value):
+    """'' للفارغ، '#RRGGBB' (كبيرة) للصالح (يقبل 3 أو 6 خانات بدون #)، None لغير الصالح."""
+    s = (value or "").strip()
+    if not s:
+        return ""
+    m = _HEX6.match(s)
+    if m:
+        return "#" + m.group(1).upper()
+    m = _HEX3.match(s)
+    if m:
+        return "#" + "".join(ch * 2 for ch in m.group(1)).upper()
+    return None
+
+
+def color_html(name, hex_value):
+    """نص HTML لـ QLabel: مربع ملوّن ثم الاسم (الاسم يُهرَّب)."""
+    h = normalize_hex(hex_value)
+    box = f'<span style="color:{h};">&#9632;</span> ' if h else ""
+    return box + html.escape(str(name or ""))
+
+
+def swatch_icon(hex_value, size=14):
+    """QIcon مربع بحدود رمادية بلون HEX؛ بلا لون: مربع منقّط بخط مائل (يعني «لا لون محدد»)."""
+    from PySide6.QtCore import QRectF, Qt
+    from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
+    h = normalize_hex(hex_value) or ""
+    key = (h, size)
+    if key in _cache:
+        return _cache[key]
+    pm = QPixmap(size, size); pm.fill(Qt.transparent)
+    p = QPainter(pm); p.setRenderHint(QPainter.Antialiasing)
+    r = QRectF(1, 1, size - 2, size - 2)
+    if h:
+        p.setBrush(QColor(h)); p.setPen(QPen(QColor("#7a8699"), 1))
+        p.drawRoundedRect(r, 3, 3)
+    else:
+        pen = QPen(QColor("#9aa5b5"), 1, Qt.DashLine); p.setBrush(Qt.NoBrush); p.setPen(pen)
+        p.drawRoundedRect(r, 3, 3); p.drawLine(int(size * .25), int(size * .75), int(size * .75), int(size * .25))
+    p.end()
+    _cache[key] = QIcon(pm)
+    return _cache[key]
+
+
+def set_swatch(item, hex_value):
+    """يضع المعاينة على عنصر جدول/قائمة (QTableWidgetItem/QListWidgetItem)."""
+    item.setIcon(swatch_icon(hex_value))
+
+
+def swatches_icon(hexes, size=14, max_n=6):
+    """QIcon يضم حتى max_n مربعات ألوان متجاورة (معاينة ألوان الصنف في الجدول)."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
+    hs = [normalize_hex(h) for h in (hexes or [])][:max_n]
+    hs = [h for h in hs if h]
+    if not hs:
+        return QIcon()
+    gap = size + 3
+    pm = QPixmap(gap * len(hs), size); pm.fill(Qt.transparent)
+    p = QPainter(pm); p.setRenderHint(QPainter.Antialiasing)
+    for i, h in enumerate(hs):
+        p.setBrush(QColor(h)); p.setPen(QPen(QColor("#7a8699"), 1)); p.drawRoundedRect(i * gap + 1, 1, size - 2, size - 2, 3, 3)
+    p.end()
+    return QIcon(pm)

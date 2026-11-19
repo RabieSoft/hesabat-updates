@@ -1,0 +1,36 @@
+CREATE TABLE parties(
+  id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id),
+  kind TEXT NOT NULL CHECK(kind IN ('customer','supplier')),
+  seq INTEGER NOT NULL CHECK(seq>0), code TEXT NOT NULL, name TEXT NOT NULL CHECK(length(trim(name))>0),
+  phone TEXT NOT NULL DEFAULT '', email TEXT NOT NULL DEFAULT '', address TEXT NOT NULL DEFAULT '',
+  tax_no TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '',
+  account_id INTEGER NOT NULL UNIQUE REFERENCES accounts(id),
+  default_currency TEXT NOT NULL DEFAULT 'SAR' REFERENCES currencies(code),
+  credit_limit INTEGER NOT NULL DEFAULT 0 CHECK(credit_limit>=0),
+  payment_terms_days INTEGER NOT NULL DEFAULT 0 CHECK(payment_terms_days BETWEEN 0 AND 3650),
+  is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
+  created_by INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(company_id,kind,seq), UNIQUE(company_id,kind,code));
+CREATE UNIQUE INDEX ux_parties_name ON parties(company_id,kind,name COLLATE NOCASE);
+CREATE INDEX ix_parties_phone ON parties(company_id,phone);
+
+CREATE TRIGGER party_immutable BEFORE UPDATE OF account_id,kind,company_id,code,seq ON parties BEGIN
+  SELECT RAISE(ABORT,'لا يمكن تغيير حساب الطرف أو نوعه أو رقمه: الرصيد نتيجة للعمليات');
+END;
+CREATE TRIGGER party_ins_rules BEFORE INSERT ON parties BEGIN
+  SELECT RAISE(ABORT,'حساب الطرف غير صالح (نوع الحساب لا يطابق نوع الطرف أو الحساب تجميعي أو من شركة أخرى)')
+   WHERE NOT EXISTS(SELECT 1 FROM accounts a WHERE a.id=NEW.account_id AND a.company_id=NEW.company_id AND a.is_group=0
+      AND a.account_type=CASE NEW.kind WHEN 'customer' THEN 'asset' ELSE 'liability' END);
+END;
+CREATE TRIGGER party_no_delete BEFORE DELETE ON parties BEGIN
+  SELECT RAISE(ABORT,'لا يمكن حذف طرف له حركات: استخدم التعطيل')
+   WHERE EXISTS(SELECT 1 FROM journal_lines WHERE account_id=OLD.account_id);
+END;
+
+INSERT INTO permissions(code,name_ar,is_sensitive) VALUES
+ ('party.view','عرض العملاء والموردين',0),('party.create','إضافة عميل/مورد',0),('party.edit','تعديل بيانات عميل/مورد',0),
+ ('party.deactivate','تعطيل/تفعيل عميل/مورد',1),('party.delete','حذف عميل/مورد بلا حركات',1);
+INSERT INTO role_permissions SELECT r.id,'party.view' FROM roles r WHERE r.id IN (1,2,3,4);
+INSERT INTO role_permissions SELECT r.id,p.code FROM roles r, permissions p WHERE r.id IN (1,2,3) AND p.code IN ('party.create','party.edit');
+INSERT INTO role_permissions SELECT r.id,'party.deactivate' FROM roles r WHERE r.id IN (1,2);
+INSERT INTO role_permissions SELECT 1,'party.delete';

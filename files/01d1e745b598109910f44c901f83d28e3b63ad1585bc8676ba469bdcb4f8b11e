@@ -1,0 +1,5 @@
+-- كود تفعيل واحد للتثبيت (مُوقَّع ومرتبط ببصمة الجهاز؛ التحقق في alhisabat/licensing)
+CREATE TABLE app_license(
+  id INTEGER PRIMARY KEY CHECK(id=1),
+  code TEXT NOT NULL,
+  activated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);

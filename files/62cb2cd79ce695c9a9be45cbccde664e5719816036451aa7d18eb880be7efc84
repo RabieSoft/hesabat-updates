@@ -1,0 +1,388 @@
+"""معلومات الصنف: ملف شامل للصنف في شاشة واحدة (التعريف، التكلفة والأسعار والهامش، الرصيد، التنبيهات، الحركات، المشتريات والمبيعات،
+الكميات بالمخازن والفروع، الوحدات، الباركودات، إجماليات السنة الحالية والماضية) مع التنقل بين الأصناف والبحث بالاسم/الكود/الباركود
+وعرض الأسعار بأي عملة مفعّلة. القراءة عبر InventoryService فقط؛ التعديل بمفاتيح صلاحية inventory.manage عبر المحرك."""
+from decimal import Decimal
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QComboBox, QCompleter, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QTabWidget, QVBoxLayout, QWidget
+)
+
+from alhisabat.ui.components import document_model as DM
+from alhisabat.ui.components.datagrid import DataGrid
+from alhisabat.ui.components.grid_logic import Column
+from alhisabat.ui.core import format as fmt, strings_ar as S
+from alhisabat.ui.core.actions import Action, ActionGroup
+from alhisabat.ui.core.base_page import BasePage
+from alhisabat.ui.core.inventory_service import InventoryService
+from alhisabat.ui.core.permissions import ActionState
+from alhisabat.ui.design import tokens as T
+
+MOVE_LABELS = {'opening': 'رصيد افتتاحي', 'purchase': 'شراء', 'purchase_return': 'مرتجع شراء', 'sale': 'بيع', 'sale_return': 'مرتجع بيع',
+               'adjustment_in': 'تسوية زيادة', 'adjustment_out': 'تسوية نقص', 'transfer_in': 'تحويل وارد', 'transfer_out': 'تحويل صادر',
+               'reversal': 'عكس حركة'}
+def _style(pal):
+    return (f"QLabel#infoLabel {{ background: {pal['nav_bg']}; color: {pal['nav_text']}; border-radius: 5px; padding: 4px 8px; font-weight: bold; }}"
+            f"QLabel#infoValue {{ background: palette(base); border: 1px solid {pal['border_strong']}; border-radius: 5px; padding: 4px 10px; }}"
+            f"QFrame#infoPanel {{ border: 1px solid {pal['border']}; border-radius: 8px; background: {pal['surface2']}; }}"
+            f"QLabel#photoBox {{ border: 1px dashed {pal['border_strong']}; border-radius: 6px; color: {pal['muted']}; background: palette(base); }}"
+            f"QPushButton#miniEdit {{ padding: 2px 6px; border-radius: 5px; background: {pal['accent_soft']}; color: {pal['accent_soft_text']}; }}"
+            f"QPushButton#miniEdit:hover {{ background: {pal['accent']}; color: {pal['accent_text']}; }}")
+
+
+def _d(minor, rate):
+    """مبلغ بوحدة صغرى بالعملة الأساسية ← Decimal بعملة العرض."""
+    return (Decimal(int(minor or 0)) / 100 / rate) if rate else Decimal(0)
+
+
+class ItemInfoPage(BasePage):
+    key = 'item_info'; title = 'معلومات الصنف'; icon = 'info'; required_permission = 'inventory.view'
+
+    # ------------------------------------------------------------------ البناء
+    def build(self):
+        self.svc = InventoryService(self.session)
+        self._items, self._info, self._id = [], None, None
+        self._rate, self._cur, self._base = Decimal(1), '', ''
+        self._loading = False
+        self.setStyleSheet(_style(T.palette(self.state.get('mode'))))
+        outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFrameShape(QFrame.NoFrame); outer.addWidget(scroll)
+        content = QWidget(); scroll.setWidget(content)            # تمرير عند صغر الشاشة بدل انضغاط الحقول
+        root = QVBoxLayout(content); root.setContentsMargins(8, 8, 8, 8); root.setSpacing(8)
+
+        # شريط الاختيار
+        bar = QHBoxLayout()
+        self.pick = QComboBox(); self.pick.setEditable(True); self.pick.setInsertPolicy(QComboBox.NoInsert); self.pick.setMinimumWidth(320)
+        self.pick.lineEdit().setPlaceholderText('ابحث بالاسم أو الكود…')
+        comp = QCompleter(self.pick.model(), self.pick); comp.setFilterMode(Qt.MatchContains); comp.setCaseSensitivity(Qt.CaseInsensitive)
+        self.pick.setCompleter(comp)
+        self.pick.activated.connect(self._on_pick)
+        self.barcode = QLineEdit(); self.barcode.setPlaceholderText('امسح الباركود ثم Enter'); self.barcode.setClearButtonEnabled(True)
+        self.barcode.setLayoutDirection(Qt.LeftToRight); self.barcode.setMaximumWidth(210); self.barcode.returnPressed.connect(self._on_barcode)
+        self.btn_prev = QPushButton('▶ السابق'); self.btn_next = QPushButton('التالي ◀')
+        self.btn_prev.clicked.connect(lambda: self._step(-1)); self.btn_next.clicked.connect(lambda: self._step(1))
+        self.cur = QComboBox(); self.cur.setToolTip('عرض الأسعار والتكاليف بعملة أخرى (بآخر سعر صرف مسجّل)')
+        self.cur.activated.connect(lambda _i: self._load(self._id))
+        for w in (QLabel('الصنف:'), self.pick): bar.addWidget(w, 1 if w is self.pick else 0)
+        bar.addWidget(self.btn_prev); bar.addWidget(self.btn_next); bar.addWidget(self.barcode)
+        bar.addWidget(QLabel('العملة:')); bar.addWidget(self.cur)
+        root.addLayout(bar)
+
+        # الترويسة
+        head = QHBoxLayout()
+        self.h_name = QLabel('—'); self.h_name.setObjectName('panelTitle'); self.h_name.setStyleSheet('font-size: 17px; font-weight: bold;')
+        self.h_sub = QLabel(''); self.h_sub.setObjectName('ctxKey'); self.h_state = QLabel('')
+        col = QVBoxLayout(); col.setSpacing(0); col.addWidget(self.h_name); col.addWidget(self.h_sub)
+        head.addLayout(col, 1); head.addWidget(self.h_state)
+        root.addLayout(head)
+
+        # اللوحة: عمودان للبيانات (يمينًا) + عمود الوحدة الكبرى والصورة (يسارًا) على نسق نماذج الأنظمة المحاسبية
+        self.f = {}
+        panel = QFrame(); panel.setObjectName('infoPanel'); pl = QHBoxLayout(panel); pl.setContentsMargins(10, 10, 10, 10); pl.setSpacing(14)
+        pl.addLayout(self._column((('name', 'اسم الصنف', 'edit'), ('name_en', 'الاسم الأجنبي', 'extras'), ('code', 'رقم الصنف', None),
+                                   ('unit', 'الوحدة', None), ('avg_cost', 'متوسط سعر التكلفة', None), ('qty', 'كمية المخزون', None),
+                                   ('last_purchase', 'آخر سعر شراء', None), ('margin', 'هامش الربح', None), ('brand', 'الماركة', 'extras'),
+                                   ('supplier', 'اسم المورد', None), ('notes', 'وصف الصنف', 'extras'))), 3)
+        pl.addLayout(self._column((('category', 'مجموعة الصنف', 'edit'), ('sale_price', 'سعر البيع', 'extras'), ('last_sale', 'آخر سعر بيع', None),
+                                   ('min_qty', 'نقطة إعادة الطلب', 'edit'), ('reorder', 'حالة الرصيد', None), ('expiry', 'نقطة الانتهاء', 'edit'),
+                                   ('cost_method', 'طريقة التقييم', None), ('barcode', 'الباركود', 'edit'),
+                                   ('y_prev_in', 'وارد السنة الماضية', None), ('y_prev_out', 'منصرف السنة الماضية', None),
+                                   ('y_cur_in', 'وارد السنة الحالية', None), ('y_cur_out', 'منصرف السنة الحالية', None))), 3)
+        side = QVBoxLayout(); side.setSpacing(6)
+        self.photo = QLabel('صورة الصنف'); self.photo.setObjectName('photoBox'); self.photo.setAlignment(Qt.AlignCenter); self.photo.setFixedSize(250, 110)
+        side.addWidget(self.photo)
+        bu = QGroupBox('بيانات الوحدة الكبرى'); bl = QVBoxLayout(bu); bl.setSpacing(4)
+        for k, lab in (('bu_name', 'اسم الوحدة الكبرى'), ('bu_factor', 'المحتوى'), ('bu_buy', 'سعر الشراء'), ('bu_cost', 'متوسط سعر التكلفة'),
+                       ('bu_sale', 'سعر البيع'), ('bu_qty', 'كمية المخزون')):
+            l = QLabel(lab); l.setObjectName('infoLabel'); l.setAlignment(Qt.AlignCenter); l.setFixedHeight(28); v = self._value()
+            bl.addWidget(l); bl.addWidget(v); self.f[k] = v
+        side.addWidget(bu); side.addStretch(1)
+        sw = QWidget(); sw.setLayout(side); sw.setFixedWidth(270); pl.addWidget(sw)
+        panel.setSizePolicy(panel.sizePolicy().horizontalPolicy(), QSizePolicy.Fixed)
+        root.addWidget(panel)
+
+        # التبويبات
+        self.tabs = QTabWidget(); self.tabs.setLayoutDirection(Qt.RightToLeft)
+        self.g_moves = DataGrid([Column('movement_date', 'التاريخ', 'date', 95), Column('type', 'النوع', width=110), Column('dir', 'الاتجاه', width=70),
+                                 Column('warehouse', 'المستودع', width=130), Column('qty_milli', 'الكمية', 'qty', 90, milli=True),
+                                 Column('value', 'القيمة', 'money', 100), Column('note', 'ملاحظة', width=220)], grid_id='iteminfo_moves')
+        self.g_buy = DataGrid(self._inv_cols('المورد'), grid_id='iteminfo_buy')
+        self.g_sell = DataGrid(self._inv_cols('العميل'), grid_id='iteminfo_sell')
+        self.g_wh = DataGrid([Column('warehouse_code', 'الكود', width=80), Column('warehouse', 'المستودع', width=170), Column('branch', 'الفرع', width=130),
+                              Column('qty_milli', 'الكمية', 'qty', 100, True, milli=True), Column('avg', 'متوسط التكلفة', 'money', 110),
+                              Column('value', 'القيمة', 'money', 110, True)], grid_id='iteminfo_wh')
+        self.g_br = DataGrid([Column('branch', 'الفرع', width=200), Column('qty_milli', 'الكمية', 'qty', 100, True, milli=True),
+                              Column('avg', 'متوسط التكلفة', 'money', 110), Column('value', 'القيمة', 'money', 110, True)], grid_id='iteminfo_br')
+        self.g_units = DataGrid([Column('name', 'الوحدة', width=160), Column('code', 'الرمز', width=80), Column('factor', 'تحتوي على (وحدات أساس)', 'qty', 150, milli=True),
+                                 Column('kind', 'النوع', width=100)], grid_id='iteminfo_units')
+        self.g_bar = DataGrid([Column('barcode', 'الباركود', width=200), Column('unit', 'الوحدة', width=120), Column('note', 'ملاحظة', width=240)],
+                              grid_id='iteminfo_bar')
+        self.g_bar.selectionChangedRows.connect(lambda rows: (setattr(self, '_bar_sel', rows[0] if len(rows) == 1 else None), self.actions_changed.emit()))
+        self._bar_sel = None
+        self.g_prices = DataGrid([Column('date', 'التاريخ', 'date', 95), Column('kind', 'النوع', width=80), Column('party', 'الطرف', width=170),
+                                  Column('unit', 'الوحدة', width=80), Column('price', 'السعر', 'money', 100), Column('currency', 'عملة الفاتورة', width=90),
+                                  Column('invoice_no', 'رقم الفاتورة', width=110)], grid_id='iteminfo_prices')
+        for g, t in ((self.g_moves, 'حركة الوارد والمنصرف'), (self.g_buy, 'حركة شراء الصنف'), (self.g_sell, 'حركة بيع الصنف'),
+                     (self.g_prices, 'تاريخ الأسعار'), (self.g_wh, 'الكمية في كافة المخازن'), (self.g_br, 'الكمية في كافة الفروع'),
+                     (self.g_units, 'وحدات الصنف'), (self.g_bar, 'باركودات الصنف')):
+            self.tabs.addTab(g, t)
+        self.tabs.setMinimumHeight(320)
+        root.addWidget(self.tabs, 1)
+
+    @staticmethod
+    def _inv_cols(party):
+        return [Column('date', 'التاريخ', 'date', 95), Column('invoice_no', 'رقم الفاتورة', width=110), Column('doc', 'النوع', width=80),
+                Column('party', party, width=170), Column('qty_milli', 'الكمية', 'qty', 80, milli=True), Column('unit', 'الوحدة', width=80),
+                Column('price', 'سعر الوحدة', 'money', 100), Column('currency', 'العملة', width=70), Column('total', 'الإجمالي', 'money', 110)]
+
+    def _value(self):
+        v = QLabel('—'); v.setObjectName('infoValue'); v.setFixedHeight(30); v.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        return v
+
+    def _column(self, rows):
+        """عمود صفوف: كل صف (عنوان + قيمة + زر تعديل) في سطر مستقل بارتفاع ثابت فلا يختل التحاذي ولا ينضغط."""
+        col = QVBoxLayout(); col.setSpacing(6)
+        for k, lab, edit in rows:
+            row = QHBoxLayout(); row.setSpacing(6)
+            l = QLabel(lab); l.setObjectName('infoLabel'); l.setFixedSize(140, 30); l.setAlignment(Qt.AlignCenter)
+            v = self._value(); self.f[k] = v
+            row.addWidget(l); row.addWidget(v, 1)
+            b = QPushButton('تعديل'); b.setObjectName('miniEdit'); b.setFixedSize(54, 30); b.setAutoDefault(False); b.setCursor(Qt.PointingHandCursor)
+            if edit: b.clicked.connect(lambda _c=False, kk=edit: self.do(kk))
+            else: b.setVisible(False); b.setEnabled(False)
+            sp = b.sizePolicy(); sp.setRetainSizeWhenHidden(True); b.setSizePolicy(sp)       # يحفظ المحاذاة لعمود القيم
+            row.addWidget(b); col.addLayout(row)
+        col.addStretch(1)
+        return col
+
+    # ------------------------------------------------------------------ التحميل
+    def refresh(self):
+        if not getattr(self, '_built', False): return
+        want, prm = self._id, getattr(self, 'params', None)
+        if isinstance(prm, dict): want = prm.get('item_id') or prm.get('id') or want
+        elif isinstance(prm, int): want = prm
+        self.params = None
+        try: self._items = self.svc.items(limit=5000)
+        except Exception as exc:
+            self.show_error(exc); self._items = []
+        self._loading = True
+        try:
+            self.pick.clear()
+            for r in self._items:
+                self.pick.addItem(f"{r.get('code', '')} — {r.get('name', '')}" + ('' if r.get('is_active') else ' (معطّل)'), r['id'])
+            keep = self.cur.currentData()
+            self.cur.clear()
+            try: curs = self.svc.enabled_currencies()
+            except Exception: curs = []
+            for c in curs: self.cur.addItem(f"{c['code']} — {c.get('name_ar') or ''}".strip(' —'), '' if c.get('is_base') else c['code'])
+            self.cur.setCurrentIndex(max(self.cur.findData(keep), 0))
+        finally:
+            self._loading = False
+        if want is None and self._items: want = self._items[0]['id']
+        self._load(want)
+
+    def _load(self, item_id):
+        if self._loading or not getattr(self, '_built', False): return
+        if item_id is None or not any(r['id'] == item_id for r in self._items):
+            self._id, self._info = None, None; self._render(None); return
+        try:
+            self._cur, self._rate = self.svc.currency_view(self.cur.currentData() or None)
+        except Exception as exc:
+            self._cur, self._rate = '', Decimal(1)
+            self.cur.setCurrentIndex(0); self.notify(f'تعذّر عرض العملة المختارة: {exc}')
+        try:
+            self._info = self.svc.item_info(item_id); self._id = item_id
+            self._moves = self.svc.item_movements(item_id)
+            self._buys = self.svc.item_invoice_history(item_id, 'purchases')
+            self._sells = self.svc.item_invoice_history(item_id, 'sales')
+        except Exception as exc:
+            self.show_error(exc); self._info = None
+        self._render(self._info)
+
+    def _money(self, minor, places=2):
+        return fmt.fmt_money(_d(minor, self._rate), places=places)
+
+    def _render(self, i):
+        for v in self.f.values(): v.setText('—')
+        if not i:
+            self.h_name.setText('اختر صنفًا' if self._items else 'لا توجد أصناف بعد'); self.h_sub.setText(''); self.h_state.setText('')
+            for g in (self.g_moves, self.g_buy, self.g_sell, self.g_prices, self.g_wh, self.g_br, self.g_units, self.g_bar): g.set_rows([])
+            self.actions_changed.emit(); return
+        cur = self._cur or self._base
+        if not self._base:
+            try: self._base = self.svc.currency_view(None)[0]
+            except Exception: self._base = ''
+            cur = self._cur or self._base
+        sfx = f' {cur}' if cur else ''
+        self.pick.blockSignals(True); self.pick.setCurrentIndex(max(self.pick.findData(i['id']), 0)); self.pick.blockSignals(False)
+        self.h_name.setText(i['name'])
+        self.h_sub.setText(f"{i['code']}  ·  {i['category'] or 'بلا مجموعة'}  ·  {'خدمة' if i['kind'] == 'service' else 'مخزون'}")
+        self.h_state.setText('● نشط' if i['is_active'] else '● معطّل')
+        pal = T.palette(self.state.get('mode'))
+        self.h_state.setStyleSheet('font-weight: bold; color: %s;' % pal['success' if i['is_active'] else 'danger'])
+        service = i['kind'] == 'service'
+        qty_t = fmt.fmt_qty(i['qty_milli']) + f" {i['unit']}"
+        low = (not service) and i['min_qty_milli'] > 0 and i['qty_milli'] <= i['min_qty_milli']
+        mg = i['margin_pct']
+        f = self.f
+        f['name'].setText(i['name']); f['name_en'].setText(i['name_en'] or '—'); f['code'].setText(i['code']); f['category'].setText(i['category'] or '—')
+        f['brand'].setText(i['brand'] or '—'); f['unit'].setText(i['unit']); f['barcode'].setText(i['barcode'] or '—'); f['notes'].setText(i['notes'] or '—')
+        f['avg_cost'].setText('—' if service else self._money(i['avg_cost']) + sfx)
+        lp, ls = i['last_purchase'], i['last_sale']
+        f['last_purchase'].setText(self._money(lp['price_base']) + sfx if lp else '—'); f['last_purchase'].setToolTip(self._price_text(lp, sfx) if lp else '')
+        f['supplier'].setText(i['supplier'] or '—')
+        f['sale_price'].setText(self._money(i['sale_price']) + sfx + ('' if i['sale_price_minor'] else '  (آخر سعر بيع)') if i['sale_price'] else '—')
+        f['last_sale'].setText(self._money(ls['price_base']) + sfx if ls else '—'); f['last_sale'].setToolTip(self._price_text(ls, sfx) if ls else '')
+        f['margin'].setText('—' if mg is None else f"{mg:.2f}%"); f['margin'].setToolTip(f"ربح الوحدة: {self._money(i['sale_price'] - i['avg_cost'])}{sfx}")
+        f['cost_method'].setText(S.COST_METHOD_LABELS.get(i['cost_method'] or 'avg', S.COST_METHOD_LABELS['avg']))
+        f['qty'].setText('—' if service else qty_t); f['qty'].setStyleSheet('color: %s; font-weight: bold;' % pal['danger'] if low else '')
+        f['min_qty'].setText(fmt.fmt_qty(i['min_qty_milli']) + f" {i['unit']}" if i['min_qty_milli'] else 'غير محددة')
+        f['reorder'].setText('خدمة — بلا رصيد' if service else ('⚠ عند/تحت نقطة إعادة الطلب' if low else ('نفد' if i['qty_milli'] <= 0 else 'كافٍ')))
+        f['expiry'].setText(('أقرب انتهاء: ' + fmt.fmt_date(i['next_expiry']) if i['next_expiry'] else 'يتتبّع الصلاحية — لا دفعات') if i['track_expiry']
+                            else 'لا يتتبّع الصلاحية')
+        yc, yp = i['years'][i['year']], i['years'][i['year'] - 1]
+        for pre, y in (('y_cur', yc), ('y_prev', yp)):
+            f[pre + '_in'].setText(fmt.fmt_qty(y['in_qty']) + f" {i['unit']}"); f[pre + '_in'].setToolTip(f"القيمة: {self._money(y['in_value'])}{sfx}")
+            f[pre + '_out'].setText(fmt.fmt_qty(y['out_qty']) + f" {i['unit']}"); f[pre + '_out'].setToolTip(f"القيمة: {self._money(y['out_value'])}{sfx}")
+        big = max((u for u in i['units'] if not u['is_base']), key=lambda u: u['factor_milli'], default=None)
+        fm = big['factor_milli'] if big else 1000
+        bn = big['name'] if big else i['unit']
+        whole, rem = divmod(i['qty_milli'], fm)
+        f['bu_name'].setText(bn); f['bu_factor'].setText(f"{fmt.fmt_qty(fm)} {i['unit']}")
+        f['bu_buy'].setText(self._money(lp['price_base'] * fm / 1000) + sfx if lp else '—')
+        f['bu_cost'].setText('—' if service else self._money(i['avg_cost'] * fm / 1000) + sfx)
+        f['bu_sale'].setText(self._money(i['sale_price'] * fm / 1000) + sfx if i['sale_price'] else '—')
+        f['bu_qty'].setText('—' if service else (f"{whole:,} {bn}" + (f" و {fmt.fmt_qty(rem)} {i['unit']}" if rem and big else '')))
+        self.tabs.setTabText(2, 'حركة بيع الصنف'); self._fill_grids(i)
+        self.actions_changed.emit()
+
+    def _price_text(self, p, sfx):
+        t = f"{self._money(p['price_base'])}{sfx}  ·  {fmt.fmt_date(p['date'])}"
+        if p.get('party'): t += f"  ·  {p['party']}"
+        return t
+
+    def _fill_grids(self, i):
+        r = self._rate
+        self.g_moves.set_rows([{**m, 'type': MOVE_LABELS.get(m['movement_type'], m['movement_type']), 'dir': 'وارد' if m['direction'] == 'in' else 'صادر',
+                                'value': _d(m['value_base'], r)} for m in self._moves])
+
+        def inv_rows(rows):
+            return [{'date': h['date'], 'invoice_no': h['invoice_no'] or ('مسودة' if h['status'] == 'draft' else ''),
+                     'doc': 'مرتجع' if h['doc_type'] == 'return' else 'فاتورة', 'party': h['party'] or '—', 'qty_milli': h['qty_milli'],
+                     'unit': h['unit'] or i['unit'], 'price': _d(h['base_price'] * h['factor_milli'] / 1000, r), 'currency': self._cur or self._base,
+                     'total': _d(int(Decimal(h['total'] or 0) * Decimal(str(h['rate'] or 1))), r)} for h in rows]
+        self.g_buy.set_rows(inv_rows(self._buys)); self.g_sell.set_rows(inv_rows(self._sells))
+        pr = [{'date': h['date'], 'kind': 'شراء', 'party': h['party'] or '—', 'unit': h['unit'] or i['unit'], 'price': _d(h['price'], 1),
+               'currency': h['currency'], 'invoice_no': h['invoice_no'] or ''} for h in self._buys if h['doc_type'] == 'invoice']
+        pr += [{'date': h['date'], 'kind': 'بيع', 'party': h['party'] or '—', 'unit': h['unit'] or i['unit'], 'price': _d(h['price'], 1),
+                'currency': h['currency'], 'invoice_no': h['invoice_no'] or ''} for h in self._sells if h['doc_type'] == 'invoice']
+        self.g_prices.set_rows(sorted(pr, key=lambda x: x['date'], reverse=True))
+        self.g_wh.set_rows([{**w, 'avg': _d(w['avg_cost'], r), 'value': _d(w['value_base'], r)} for w in i['warehouses']])
+        self.g_br.set_rows([{**b, 'avg': _d(b['avg_cost'], r), 'value': _d(b['value_base'], r)} for b in i['branches']])
+        self.g_units.set_rows([{**u, 'factor': u['factor_milli'], 'kind': 'أساسية' if u['is_base'] else 'تحويل'} for u in i['units']])
+        self.g_bar.set_rows(i['barcodes'])
+
+    # ------------------------------------------------------------------ التنقل
+    def _on_pick(self, idx):
+        self._load(self.pick.itemData(idx))
+
+    def _step(self, d):
+        ids = [r['id'] for r in self._items]
+        if not ids: return
+        n = (ids.index(self._id) + d) % len(ids) if self._id in ids else 0
+        self._load(ids[n])
+
+    def _on_barcode(self):
+        code = self.barcode.text().strip()
+        if not code: return
+        try: iid = self.svc.item_find_barcode(code)
+        except Exception as exc: return self.show_error(exc)
+        self.barcode.selectAll()
+        if iid is None: return QMessageBox.information(self, self.title, f'لا يوجد صنف بالباركود «{code}».')
+        if not any(r['id'] == iid for r in self._items): return QMessageBox.information(self, self.title, 'الصنف ليس ضمن الفرع الحالي.')
+        self._load(iid)
+
+    # ------------------------------------------------------------------ الإجراءات
+    def _row(self):
+        return next((r for r in self._items if r['id'] == self._id), None)
+
+    def _state(self, k):
+        if not self._info: return ActionState(False, 'اختر صنفًا أولًا')
+        if k in ('edit', 'extras', 'units', 'add_bar', 'toggle'): return self.access.state('inventory.manage')
+        if k == 'rm_bar':
+            if not self._bar_sel or self._bar_sel.get('primary'): return ActionState(False, 'حدّد باركودًا إضافيًا (الأساسي يُعدَّل من «تعديل الصنف»)')
+            return self.access.state('inventory.manage')
+        return ActionState(True)
+
+    def ribbon_groups(self):
+        def a(k, lab, icon, **kw):
+            return Action(k, lab, icon, state_fn=lambda kk=k: self._state(kk), handler=lambda kk=k: self.do(kk), **kw)
+        return [
+            ActionGroup('الصنف', [a('edit', 'تعديل الصنف', 'edit', primary=True), a('extras', 'بيانات إضافية وسعر البيع', 'edit'),
+                                  a('units', 'وحدات التحويل', 'link'), a('toggle', 'تفعيل/تعطيل', 'refresh')]),
+            ActionGroup('الباركودات', [a('add_bar', '+ باركود', 'new'), a('rm_bar', 'حذف الباركود', 'delete', danger=True)]),
+            ActionGroup('تقارير', [a('card', 'كارت الصنف (حركات)', 'history'), a('print', 'طباعة بطاقة الصنف', 'print')]),
+            ActionGroup('عرض', [Action('refresh', 'تحديث', 'refresh', handler=self.refresh)]),
+        ]
+
+    def _after(self):
+        self.window_.data_changed(self.key); self.refresh()
+
+    def do(self, k):
+        st = self._state(k)
+        if not st.enabled: return QMessageBox.information(self, self.title, st.reason)
+        row, i = self._row(), self._info
+        if k == 'edit':
+            from alhisabat.ui.app_dialogs.inventory import ItemDialog
+            d = ItemDialog(self, row)
+            if self.exec_form(d):
+                ok, _ = self.guarded(self.svc.edit_item, i['id'], d.values(), reload=False)
+                if ok: self._after()
+        elif k == 'extras':
+            from alhisabat.ui.app_dialogs.item_info import ItemExtrasDialog
+            d = ItemExtrasDialog(self, i, self._base)
+            if self.exec_form(d):
+                ok, _ = self.guarded(self.svc.item_update_extras, i['id'], reload=False, **d.values())
+                if ok: self._after()
+        elif k == 'units':
+            from alhisabat.ui.app_dialogs.catalog import ItemUnitsDialog
+            ItemUnitsDialog(self, row).exec(); self._load(self._id)
+        elif k == 'toggle':
+            from alhisabat.ui.components.basic import ask_reason
+            verb = 'تعطيل' if i['is_active'] else 'تفعيل'
+            if ask_reason(self, verb, [f"هل تريد {verb} «{i['name']}»؟"], need_reason=False, confirm_text=verb) is None: return
+            ok, _ = self.guarded(self.svc.set_item_active, i['id'], not i['is_active'], reload=False)
+            if ok: self._after()
+        elif k == 'add_bar':
+            from alhisabat.ui.app_dialogs.item_info import BarcodeDialog
+            d = BarcodeDialog(self, i)
+            if self.exec_form(d):
+                ok, _ = self.guarded(self.svc.item_add_barcode, i['id'], d.code.text(), d.unit.currentData(), d.note.text(), reload=False)
+                if ok: self._load(self._id)
+        elif k == 'rm_bar':
+            if QMessageBox.question(self, self.title, f"حذف الباركود «{self._bar_sel['barcode']}»؟") != QMessageBox.Yes: return
+            ok, _ = self.guarded(self.svc.item_remove_barcode, self._bar_sel['id'], reload=False)
+            if ok: self._load(self._id)
+        elif k == 'card':
+            from alhisabat.ui.app_dialogs.inventory import ItemCardDialog
+            ItemCardDialog(self, row).exec()
+        elif k == 'print':
+            self._print()
+
+    def _print(self):
+        from alhisabat.ui.components import print_service as PS
+        i, sfx = self._info, f' {self._cur or self._base}'.rstrip()
+        extra = [('رقم الصنف', i['code']), ('الصنف', i['name']), ('الاسم الأجنبي', i['name_en'] or '—'), ('المجموعة', i['category'] or '—'),
+                 ('الماركة', i['brand'] or '—'), ('الوحدة', i['unit']), ('الباركود', i['barcode'] or '—'),
+                 ('الرصيد', fmt.fmt_qty(i['qty_milli']) + ' ' + i['unit']), ('متوسط التكلفة', self._money(i['avg_cost']) + sfx),
+                 ('سعر البيع', self._money(i['sale_price']) + sfx if i['sale_price'] else '—'),
+                 ('هامش الربح', '—' if i['margin_pct'] is None else f"{i['margin_pct']:.2f}%"),
+                 ('آخر مورد', i['supplier'] or '—')]
+        cols = [{'key': 'wh', 'label': 'المستودع'}, {'key': 'qty', 'label': 'الكمية', 'numeric': True},
+                {'key': 'avg', 'label': 'متوسط التكلفة', 'numeric': True}, {'key': 'value', 'label': 'القيمة', 'numeric': True}]
+        rows = [{'wh': w['warehouse'], 'qty': Decimal(w['qty_milli']) / 1000, 'avg': _d(w['avg_cost'], self._rate), 'value': _d(w['value_base'], self._rate)}
+                for w in i['warehouses']]
+        spec = {'title': 'بطاقة معلومات الصنف', 'company': self.state.get('company', {}).get('name', ''), 'currency': self._cur or self._base,
+                'extra': extra, 'columns': cols, 'rows': rows, 'totals': [{'label': 'إجمالي القيمة', 'value': sum((r['value'] for r in rows), Decimal(0))}]}
+        try: PS.print_dialog(self, DM.from_print_spec(spec, 'report'), self.window_.prefs.get('paper') or 'A4')
+        except Exception as exc: self.show_error(exc)

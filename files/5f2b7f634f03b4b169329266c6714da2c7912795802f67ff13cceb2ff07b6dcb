@@ -1,0 +1,362 @@
+"""التشغيل السريع (Ctrl+K): نافذة بحث وتنفيذ واحدة لكل شيء في النظام.
+
+الجدول: الشاشة (أيقونة + عنوان) · القائمة · التفاصيل · مفتاح. بلا نص يُعرض «الأخيرة» ثم مهام النظام ثم شاشاته المسموحة
+مجمّعة بأقسام؛ وبالكتابة يمتد البحث إلى السجلات (عملاء، موردون، أصناف، حسابات، فواتير، قيود، مستودعات، صناديق…).
+
+لوحة المفاتيح (التركيز يبقى في مربع البحث دائمًا):
+  ↑ ↓ تنقل (دائري، يتجاوز العناوين) · PageUp/PageDown ثمانية صفوف · Ctrl+Home/End أول/آخر نتيجة
+  Enter فتح · Alt+1…9 تنفيذ مباشر للصف المرقّم · Tab / Shift+Tab أو Ctrl+1…4 تبديل التصنيف · Esc إغلاق
+
+إصلاح الأعمدة: عمود «الشاشة» كان Stretch بينما التفاصيل ResizeToContents، فيأخذ وصفٌ طويل (مثل لوحة التحكم) كل العرض
+ويقتطع العنوان («فاتور…»). الآن: الشاشة والقائمة بعرض محسوب من المحتوى وحصة من عرض الجدول، والتفاصيل هي المتمددة وتُقتطع هي.
+المنطق كله في quick_launch (خالص ومُختبَر)؛ هذا الملف واجهة فقط. يتطلب PySide6.
+"""
+from PySide6.QtCore import QEvent, QSize, Qt, QTimer
+from PySide6.QtGui import QFont, QKeySequence, QShortcut
+from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QDialog, QHBoxLayout, QHeaderView, QLabel,
+                               QLineEdit, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout)
+
+from alhisabat.ui.core import errors
+from alhisabat.ui.design import icons
+from alhisabat.ui.design import tokens as T
+
+from . import quick_launch as Q
+
+DEBOUNCE_MS = 140
+MAX_ALT = 9
+_KIND_LABEL = {'task': 'مهمة', 'screen': 'شاشة', 'record': 'سجل'}
+
+
+class QuickLaunchDialog(QDialog):
+    def __init__(self, window):
+        super().__init__(window)
+        self.win = window
+        self.setObjectName('quickLaunch')
+        self.setWindowTitle('التشغيل السريع')
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.setModal(True)
+        self._all_hits = []                              # كل نتائج البحث قبل مرشّح التصنيف
+        self._row_hits = []                              # لكل صف في الجدول: Hit أو None (عنوان قسم)
+        self._kind = 'all'
+        self._fired = False                              # يمنع التنفيذ المزدوج (Enter يطلق returnPressed والزر الافتراضي معًا)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 14, 16, 12)
+        lay.setSpacing(8)
+
+        title = QLabel('التشغيل السريع')
+        title.setObjectName('qlTitle')
+        title.setAlignment(Qt.AlignCenter)
+        f = QFont(title.font())
+        f.setPointSize(f.pointSize() + 5)
+        f.setBold(True)
+        title.setFont(f)
+        lay.addWidget(title)
+        sub = QLabel('نفّذ مهامّ مباشرة، وابحث عن أي شاشة أو عميل أو صنف أو فاتورة أو قيد أو حساب')
+        sub.setObjectName('ctxKey')
+        sub.setAlignment(Qt.AlignCenter)
+        lay.addWidget(sub)
+
+        self.edit = QLineEdit()
+        self.edit.setObjectName('qlSearch')
+        self.edit.setPlaceholderText('ابدأ الكتابة للبحث…')
+        self.edit.setClearButtonEnabled(True)
+        self.edit.setMinimumHeight(38)
+        self.edit.installEventFilter(self)              # كل مفاتيح التنقل تُعالَج هنا والتركيز يبقى في مربع البحث
+        lay.addWidget(self.edit)
+
+        # شريط التصنيفات (لا يأخذ التركيز: Tab يبدّلها من مربع البحث)
+        chips = QHBoxLayout()
+        chips.setSpacing(6)
+        self._chips = {}
+        grp = QButtonGroup(self)
+        grp.setExclusive(True)
+        for i, (key, label) in enumerate(Q.FILTERS, 1):
+            b = QPushButton(label)
+            b.setObjectName('qlChip')
+            b.setCheckable(True)
+            b.setFocusPolicy(Qt.NoFocus)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setToolTip(f'Ctrl+{i}')
+            b.clicked.connect(lambda _c=False, k=key: self._set_kind(k))
+            grp.addButton(b)
+            chips.addWidget(b)
+            self._chips[key] = b
+        self._chips['all'].setChecked(True)
+        chips.addStretch(1)
+        lay.addLayout(chips)
+
+        self.table = QTableWidget(0, 4)
+        self.table.setObjectName('qlTable')
+        self.table.setHorizontalHeaderLabels(['الشاشة', 'القائمة', 'التفاصيل', 'مفتاح'])
+        self.table.setLayoutDirection(Qt.RightToLeft)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.table.setTextElideMode(Qt.ElideRight)
+        self.table.setWordWrap(False)
+        self.table.setIconSize(QSize(18, 18))
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(36)
+        self.table.setShowGrid(False)
+        self.table.setFocusPolicy(Qt.NoFocus)
+        hh = self.table.horizontalHeader()
+        hh.setStretchLastSection(False)
+        hh.setSectionResizeMode(0, QHeaderView.Interactive)   # الأعمدة 0 و1 و3 بعرض محسوب في _fit_columns
+        hh.setSectionResizeMode(1, QHeaderView.Interactive)
+        hh.setSectionResizeMode(2, QHeaderView.Stretch)       # التفاصيل هي المتمددة (وتُقتطع) لا الشاشة
+        hh.setSectionResizeMode(3, QHeaderView.Interactive)
+        hh.setMinimumSectionSize(48)
+        self.table.itemDoubleClicked.connect(lambda _i: self._open_current())
+        lay.addWidget(self.table, 1)
+
+        foot = QHBoxLayout()
+        self.count = QLabel('')
+        self.count.setObjectName('ctxKey')
+        foot.addWidget(self.count)
+        foot.addStretch(1)
+        lay.addLayout(foot)
+        hint = QLabel('↑↓ تنقل   ·   Enter فتح   ·   Alt+1…9 تنفيذ مباشر   ·   Tab تبديل التصنيف   ·   Esc إغلاق')
+        hint.setObjectName('qlHint')
+        hint.setAlignment(Qt.AlignCenter)
+        lay.addWidget(hint)
+
+        row = QHBoxLayout()
+        self.btn_close = QPushButton('إغلاق (Esc)')
+        self.btn_open = QPushButton('فتح (Enter)')
+        self.btn_open.setObjectName('loginButton')       # نمط الزر الرئيسي الموجود في السمة
+        self.btn_open.setDefault(True)
+        self.btn_open.setAutoDefault(True)
+        for b in (self.btn_open, self.btn_close):
+            b.setFocusPolicy(Qt.NoFocus)
+        self.btn_close.clicked.connect(self.reject)
+        self.btn_open.clicked.connect(self._open_current)
+        row.addWidget(self.btn_open, 2)
+        row.addWidget(self.btn_close, 1)
+        lay.addLayout(row)
+
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(DEBOUNCE_MS)
+        self._timer.timeout.connect(self._run_search)
+        self.edit.textChanged.connect(lambda _t: self._timer.start())
+        self.edit.returnPressed.connect(self._open_current)
+
+        # Alt+1…9 تنفيذ مباشر، وCtrl+1…4 تصنيف (QShortcut تعمل أيًّا كان عنصر التركيز داخل النافذة)
+        for n in range(1, MAX_ALT + 1):
+            QShortcut(QKeySequence(f'Alt+{n}'), self, activated=lambda n=n: self._open_nth(n))
+        for i, (key, _l) in enumerate(Q.FILTERS, 1):
+            QShortcut(QKeySequence(f'Ctrl+{i}'), self, activated=lambda k=key: self._set_kind(k, sync=True))
+
+    # ------------------------------------------------------------------ دورة الحياة والحجم
+    def popup(self):
+        self._fired = False
+        self._kind = 'all'
+        self._chips['all'].setChecked(True)
+        self.edit.clear()
+        self._fit_dialog()
+        self._run_search()
+        g = self.win.geometry()
+        self.move(g.center().x() - self.width() // 2, g.top() + max(30, int(g.height() * 0.07)))
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.edit.setFocus()
+        QTimer.singleShot(0, self._fit_columns)
+
+    def _fit_dialog(self):
+        """حجم النافذة نسبةً إلى النافذة الرئيسية (لا ثابت)، وضمن حدود الشاشة الصغيرة."""
+        g = self.win.geometry()
+        scr = self.win.screen().availableGeometry() if self.win.screen() else None
+        w = max(720, min(980, int(g.width() * 0.74)))
+        h = max(520, min(720, int(g.height() * 0.84)))
+        if scr is not None:
+            w, h = min(w, scr.width() - 40), min(h, scr.height() - 60)
+        self.resize(w, h)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        QTimer.singleShot(0, self._fit_columns)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._fit_columns()
+
+    def _fit_columns(self):
+        """عرض الشاشة والقائمة محسوب من المحتوى (بحدّ أدنى وأقصى) فلا يضيق العنوان مهما طال وصف التفاصيل."""
+        vw = self.table.viewport().width()
+        if vw <= 0:
+            return
+        fm = self.table.fontMetrics()
+        groups = [self.table.item(r, 1).text() for r in range(self.table.rowCount())
+                  if self.table.item(r, 1) is not None and self.table.item(r, 1).text()]
+        w_key = 64
+        w_menu = min(190, max(90, max((fm.horizontalAdvance(t) for t in groups), default=0) + 28))
+        w_title = max(230, int((vw - w_key - w_menu) * 0.52))
+        self.table.setColumnWidth(0, w_title)
+        self.table.setColumnWidth(1, w_menu)
+        self.table.setColumnWidth(3, w_key)
+
+    # ------------------------------------------------------------------ لوحة المفاتيح
+    def eventFilter(self, obj, ev):
+        if obj is self.edit and ev.type() == QEvent.KeyPress:
+            k, mod = ev.key(), ev.modifiers()
+            ctrl = bool(mod & Qt.ControlModifier)
+            if k in (Qt.Key_Down, Qt.Key_Up) and not ctrl:
+                self._move(1 if k == Qt.Key_Down else -1)
+                return True
+            if k in (Qt.Key_PageDown, Qt.Key_PageUp):
+                self._move(8 if k == Qt.Key_PageDown else -8)
+                return True
+            if ctrl and k in (Qt.Key_Home, Qt.Key_End):
+                self._move_to_edge(k == Qt.Key_End)
+                return True
+            if k == Qt.Key_Tab and not ctrl:
+                self._cycle_kind(1)
+                return True
+            if k == Qt.Key_Backtab:
+                self._cycle_kind(-1)
+                return True
+        return super().eventFilter(obj, ev)
+
+    def _selectable(self):
+        return [i for i, h in enumerate(self._row_hits) if h is not None]
+
+    def _move(self, step):
+        sel = self._selectable()
+        if not sel:
+            return
+        self._select_row(Q.step_index(sel, self.table.currentRow(), step))
+
+    def _move_to_edge(self, last):
+        sel = self._selectable()
+        if sel:
+            self._select_row(sel[-1] if last else sel[0])
+
+    def _select_row(self, r):
+        if r < 0:
+            return
+        self.table.selectRow(r)
+        self.table.setCurrentCell(r, 0)
+        item = self.table.item(r, 0)
+        if item is not None:
+            self.table.scrollToItem(item, QAbstractItemView.EnsureVisible)
+        if r == (self._selectable() or [0])[0]:
+            self.table.verticalScrollBar().setValue(0)            # أول نتيجة: أظهر عنوان القسم فوقها
+
+    def _cycle_kind(self, step):
+        keys = [k for k, _l in Q.FILTERS]
+        self._set_kind(keys[(keys.index(self._kind) + step) % len(keys)], sync=True)
+
+    def _set_kind(self, key, sync=False):
+        self._kind = key
+        if sync:
+            self._chips[key].setChecked(True)
+        self._render()
+
+    # ------------------------------------------------------------------ البحث والعرض
+    def _run_search(self):
+        text = self.edit.text()
+        try:
+            self._all_hits = Q.search(self.win.session, self.win.access, text, self.win.features(), show_advanced=True)
+        except Exception as exc:  # noqa: BLE001 — البحث لا يُسقط النافذة؛ الخطأ يُسجَّل ويظهر نصًّا
+            self._all_hits = []
+            self.win.log_error(errors.translate(exc), 'quick_launch')
+        self._render()
+
+    def _recents(self):
+        try:
+            return Q.recent_allowed(self.win.prefs.get_raw(Q.RECENT_KEY, '[]'), self.win.access)
+        except Exception:  # noqa: BLE001 — الأخيرة اختيارية
+            return []
+
+    def _render(self):
+        text = self.edit.text()
+        counts = {k: sum(1 for h in self._all_hits if h.kind == k) for k in ('task', 'screen', 'record')}
+        for key, label in Q.FILTERS:
+            n = len(self._all_hits) if key == 'all' else counts[key]
+            self._chips[key].setText(f'{label}  {n}' if text.strip() else label)
+        rows = Q.layout_rows(self._all_hits, self._recents(), text, self._kind)
+        pal = T.palette(self.win.state.get('mode'))
+        self.table.setUpdatesEnabled(False)
+        self.table.clearSpans()
+        self.table.setRowCount(len(rows))
+        self._row_hits = []
+        bold = QFont(self.table.font())
+        bold.setBold(True)
+        small = QFont(self.table.font())
+        small.setPointSize(max(8, small.pointSize() - 1))
+        n_hit = 0
+        for r, (kind, val) in enumerate(rows):
+            if kind == 'header':
+                self._row_hits.append(None)
+                it = QTableWidgetItem(val)
+                it.setFont(bold)
+                it.setFlags(Qt.ItemIsEnabled)                  # يُعرض ولا يُحدَّد
+                it.setForeground(self._qcolor(pal['accent_soft_text']))
+                it.setBackground(self._qcolor(pal['accent_soft']))
+                self.table.setItem(r, 0, it)
+                self.table.setSpan(r, 0, 1, 4)
+                self.table.setRowHeight(r, 26)
+                continue
+            h = val
+            self._row_hits.append(h)
+            n_hit += 1
+            color = pal['accent'] if h.kind == 'task' else (pal['muted'] if h.kind == 'screen' else pal['text'])
+            it0 = QTableWidgetItem(h.title)
+            it0.setIcon(icons.qicon(h.icon, color, 18))
+            if h.kind == 'task':
+                it0.setFont(bold)
+            it0.setToolTip(h.title)
+            self.table.setItem(r, 0, it0)
+            it1 = QTableWidgetItem(h.group)
+            it1.setForeground(self._qcolor(pal['muted']))
+            self.table.setItem(r, 1, it1)
+            detail = ' · '.join(x for x in (h.detail, h.hint) if x)
+            it2 = QTableWidgetItem(detail)
+            it2.setToolTip(detail)
+            it2.setForeground(self._qcolor(pal['muted']))
+            self.table.setItem(r, 2, it2)
+            it3 = QTableWidgetItem(f'Alt+{n_hit}' if n_hit <= MAX_ALT else '')
+            it3.setFont(small)
+            it3.setTextAlignment(Qt.AlignCenter)
+            it3.setForeground(self._qcolor(pal['muted']))
+            self.table.setItem(r, 3, it3)
+        self.table.setUpdatesEnabled(True)
+        self._fit_columns()
+        sel = self._selectable()
+        if sel:
+            self._select_row(sel[0])
+            self.table.verticalScrollBar().setValue(0)
+        n = len(sel)
+        self.count.setText(('لا توجد نتائج' if text.strip() else 'لا توجد عناصر') if not n else f'{n} نتيجة')
+        self.btn_open.setEnabled(bool(n))
+
+    @staticmethod
+    def _qcolor(hexstr):
+        from PySide6.QtGui import QColor
+        return QColor(hexstr)
+
+    # ------------------------------------------------------------------ التنفيذ
+    def _open_nth(self, n):
+        sel = self._selectable()
+        if 1 <= n <= len(sel):
+            self._select_row(sel[n - 1])
+            self._open_current()
+
+    def _open_current(self):
+        r = self.table.currentRow()
+        if self._fired or not 0 <= r < len(self._row_hits) or self._row_hits[r] is None:
+            return
+        self._fired = True
+        hit = self._row_hits[r]
+        try:
+            self.win.prefs.set_raw(Q.RECENT_KEY, Q.recent_push(self.win.prefs.get_raw(Q.RECENT_KEY, '[]'), hit))
+        except Exception:  # noqa: BLE001 — حفظ «الأخيرة» لا يمنع التنفيذ
+            pass
+        self.accept()
+        QTimer.singleShot(0, lambda: self.win.run_quick_hit(hit))       # بعد إغلاق النافذة ليأخذ الهدف التركيز
+
+
+CommandPalette = QuickLaunchDialog       # اسم قديم تستورده main_window

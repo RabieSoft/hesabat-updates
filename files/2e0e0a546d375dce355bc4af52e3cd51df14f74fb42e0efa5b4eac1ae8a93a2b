@@ -1,0 +1,212 @@
+"""Closing Engine: إقفال السنة المالية بدورة محاسبية حقيقية (وليس UPDATE على حالة السنة فقط).
+1) فحوص ما قبل الإقفال  2) قيد إقفال الحسابات المؤقتة إلى «نتيجة الفترة»  3) ترحيل النتيجة إلى الأرباح المحتجزة (حسب إعداد الشركة)
+4) إقفال الفترة الأخيرة والسنة — كلها في معاملة واحدة: أي فشل = Rollback كامل."""
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.accounting import balance_engine as be, fx_engine, integrity, journal_engine as je, period_engine as pe, opening_engine as oe
+from alhisabat.audit import audit
+from alhisabat.database.tx import transaction
+from alhisabat.security import permissions
+
+NOT_CHECKED = [("مراجعة الضرائب", "لا يوجد محرك ضرائب بعد")]
+
+
+def get_settings(conn, company_id):
+    r = conn.execute("SELECT transfer_to_retained FROM closing_settings WHERE company_id=?", (company_id,)).fetchone()
+    return {"transfer_to_retained": r[0] if r else 1}
+
+
+def set_settings(conn, actor_id, company_id, *, transfer_to_retained):
+    permissions.require(conn, actor_id, company_id, "settings.manage")
+    old = get_settings(conn, company_id)
+    with transaction(conn):
+        conn.execute("INSERT INTO closing_settings(company_id,transfer_to_retained) VALUES(?,?) "
+                     "ON CONFLICT(company_id) DO UPDATE SET transfer_to_retained=excluded.transfer_to_retained",
+                     (company_id, int(transfer_to_retained)))
+        audit.log(conn, actor_id, "set_closing_settings", "closing_settings", company_id, old,
+                  {"transfer_to_retained": int(transfer_to_retained)})
+
+
+def _year(conn, company_id, year_id):
+    y = conn.execute("SELECT * FROM fiscal_years WHERE id=? AND company_id=?", (year_id, company_id)).fetchone()
+    if not y:
+        raise AccountingError("السنة المالية غير موجودة في هذه الشركة")
+    return y
+
+
+def _mapped(conn, company_id, key):
+    r = conn.execute("SELECT a.* FROM account_mappings m JOIN accounts a ON a.id=m.account_id WHERE m.company_id=? AND m.map_key=?",
+                     (company_id, key)).fetchone()
+    return r
+
+
+def _temp_nets(conn, company_id, year_id, include_closing=True):
+    return conn.execute(
+        f"SELECT a.id, a.code, a.name, a.account_type, SUM(l.debit_base-l.credit_base) net FROM journal_lines l "
+        f"JOIN journal_entries e ON e.id=l.entry_id JOIN accounts a ON a.id=l.account_id "
+        f"WHERE e.company_id=? AND e.fiscal_year_id=? AND e.status IN {be.POSTED} AND a.account_type NOT IN {be.PERM_SQL}"
+        + ("" if include_closing else " AND e.entry_type<>'closing'") +
+        " GROUP BY a.id HAVING net<>0 ORDER BY a.code", (company_id, year_id)).fetchall()
+
+
+def year_result(conn, user_id, company_id, year_id, include_closing=False):
+    """نتيجة السنة = الإيرادات - تكلفة النشاط - المصروفات. افتراضيا بدون قيود الإقفال (عرض ما قبل الإقفال)."""
+    permissions.require(conn, user_id, company_id, "report.view", check_branch=False)
+    _year(conn, company_id, year_id)
+    tot = {"revenue": 0, "cogs": 0, "expense": 0}
+    for r in _temp_nets(conn, company_id, year_id, include_closing):
+        tot[r["account_type"]] += r["net"]
+    revenue, cogs, expense = -tot["revenue"], tot["cogs"], tot["expense"]
+    return {"revenue": revenue, "cogs": cogs, "expenses": expense, "net_result": revenue - cogs - expense}
+
+
+def pre_close_checks(conn, user_id, company_id, year_id):
+    permissions.require(conn, user_id, company_id, "report.view", check_branch=False)
+    y = _year(conn, company_id, year_id)
+    ck = []
+
+    def add(name, ok, detail=""):
+        ck.append({"name": name, "status": "pass" if ok else "fail", "detail": detail})
+    add("السنة مفتوحة", y["status"] == "open", "" if y["status"] == "open" else "السنة مقفلة بالفعل")
+    older = conn.execute("SELECT name FROM fiscal_years WHERE company_id=? AND end_date<? AND status='open'",
+                         (company_id, y["start_date"])).fetchall()
+    add("السنوات الأقدم مقفلة", not older, ",".join(r[0] for r in older))
+    drafts = conn.execute("SELECT COUNT(*) FROM journal_entries WHERE company_id=? AND fiscal_year_id=? AND status='draft'",
+                          (company_id, year_id)).fetchone()[0]
+    add("لا توجد قيود مسودة أو مستندات معلقة", drafts == 0, f"{drafts} مسودة" if drafts else "")
+    docs = 0
+    for tbl, col in (("sales_invoices", "invoice_date"), ("purchase_invoices", "invoice_date"), ("cash_vouchers", "voucher_date"),
+                     ("stock_counts", "count_date"), ("payroll_runs", "pay_date"), ("asset_depreciation_runs", "run_date")):
+        docs += conn.execute(f"SELECT COUNT(*) FROM {tbl} WHERE company_id=? AND status='draft' AND {col} BETWEEN ? AND ?",
+                             (company_id, y["start_date"], y["end_date"])).fetchone()[0]
+    add("لا توجد مستندات مسودة (فواتير/سندات/جرد) في السنة", docs == 0, f"{docs} مستند" if docs else "")
+    last = conn.execute("SELECT id FROM fiscal_periods WHERE fiscal_year_id=? ORDER BY period_no DESC LIMIT 1", (year_id,)).fetchone()
+    openp = conn.execute("SELECT name FROM fiscal_periods WHERE fiscal_year_id=? AND status='open' AND id<>?", (year_id, last[0])).fetchall()
+    add("لا توجد فترات مفتوحة غير مقصودة (عدا الأخيرة التي يقفلها الإقفال)", not openp, ",".join(r[0] for r in openp))
+    pr = _mapped(conn, company_id, "period_result")
+    add("حساب نتيجة الفترة مربوط وصالح للحركة", bool(pr) and not pr["is_group"] and pr["is_active"] == 1)
+    if get_settings(conn, company_id)["transfer_to_retained"]:
+        re_ = _mapped(conn, company_id, "retained_earnings")
+        add("حساب الأرباح المحتجزة مربوط وصالح للحركة", bool(re_) and not re_["is_group"] and re_["is_active"] == 1)
+    diffs, missing = fx_engine.unrevalued(conn, company_id, y["end_date"])
+    add("أرصدة العملات الأجنبية النقدية معاد تقييمها بسعر نهاية السنة", not diffs and not missing,
+        ("" if not missing else "لا أسعار: " + ",".join(missing) + " ") + (f"{len(diffs)} حساب/عملة بفرق تقييم" if diffs else ""))
+    integ = integrity.financial_integrity_check(conn, user_id, company_id, as_of=y["end_date"])
+    add("فحص السلامة المالية", integ["ok"], ";".join(f"{c['name']}: {c['detail']}" for c in integ["checks"] if c["status"] == "fail"))
+    for label, needle in (("العملاء", "لـ" + "العملاء"), ("الموردين", "لـ" + "الموردين"), ("المخزون", "المخزون المحاسبي"),
+                          ("الصندوق", "أرصدة الصناديق"), ("البنوك", "مطابقة البنوك"), ("الأصول والإهلاك", "سجل الأصول")):
+        c = next((x for x in integ["checks"] if needle in x["name"]), None)      # مراجعة الأطراف/المخزون = فحص السلامة المقابل إن كان منفذا
+        ck.append({"name": f"مراجعة {label}", "status": c["status"] if c else "not_checked",
+                   "detail": (c["detail"] if c else "") or ("" if c and c["status"] == "pass" else "غير مفعّلة أو غير مربوطة")})
+    for name, why in NOT_CHECKED:
+        ck.append({"name": name, "status": "not_checked", "detail": f"غير منفذ: يتطلب {why}"})
+    return {"ok": all(c["status"] != "fail" for c in ck), "checks": ck}
+
+
+def close_fiscal_year(conn, user_id, company_id, year_id):
+    permissions.require(conn, user_id, company_id, "fiscalyear.close", check_branch=False)
+    permissions.require(conn, user_id, company_id, "journal.create", check_branch=False)
+    permissions.require(conn, user_id, company_id, "journal.post", check_branch=False)
+    y = _year(conn, company_id, year_id)
+    chk = pre_close_checks(conn, user_id, company_id, year_id)
+    if not chk["ok"]:
+        raise AccountingError("تعذر الإقفال: " + "؛ ".join(f"{c['name']} ({c['detail']})" if c["detail"] else c["name"]
+                                                          for c in chk["checks"] if c["status"] == "fail"))
+    settings = get_settings(conn, company_id)
+    base = conn.execute("SELECT base_currency FROM companies WHERE id=?", (company_id,)).fetchone()[0]
+    pr = _mapped(conn, company_id, "period_result")
+    re_ = _mapped(conn, company_id, "retained_earnings")
+    last = conn.execute("SELECT * FROM fiscal_periods WHERE fiscal_year_id=? ORDER BY period_no DESC LIMIT 1", (year_id,)).fetchone()
+    nets = _temp_nets(conn, company_id, year_id)
+    result = -sum(r["net"] for r in nets)        # ربح موجب / خسارة سالبة
+    closing_id = transfer_id = None
+    with transaction(conn):
+        if last["status"] == "closed":            # إعادة إقفال بعد إعادة فتح: الفترة الأخيرة تُفتح داخل نفس المعاملة لترحيل قيد الإقفال
+            conn.execute("UPDATE fiscal_periods SET status='open',closed_by=NULL,closed_at=NULL WHERE id=?", (last["id"],))
+            audit.log(conn, user_id, "reopen_period_for_closing", "fiscal_periods", last["id"], {"status": "closed"}, {"status": "open"},
+                      "فتح مؤقت داخل عملية الإقفال")
+        if nets:
+            lines = [{"account_id": r["id"], "currency": base, "side": "credit" if r["net"] > 0 else "debit",
+                      "orig": abs(r["net"]), "base": abs(r["net"])} for r in nets]
+            if result != 0:
+                lines.append({"account_id": pr["id"], "currency": base, "side": "credit" if result > 0 else "debit",
+                              "orig": abs(result), "base": abs(result)})
+            closing_id = je.create_draft_explicit(conn, company_id, user_id, y["end_date"], lines,
+                                                  f"قيد إقفال الحسابات المؤقتة إلى نتيجة الفترة — سنة {y['name']}", "closing")
+            je.post(conn, closing_id, user_id)
+        if result != 0 and settings["transfer_to_retained"]:
+            debit_pr = result > 0
+            lines = [{"account_id": pr["id"], "currency": base, "side": "debit" if debit_pr else "credit", "orig": abs(result), "base": abs(result)},
+                     {"account_id": re_["id"], "currency": base, "side": "credit" if debit_pr else "debit", "orig": abs(result), "base": abs(result)}]
+            transfer_id = je.create_draft_explicit(conn, company_id, user_id, y["end_date"], lines,
+                                                   f"ترحيل نتيجة سنة {y['name']} إلى الأرباح المحتجزة", "closing")
+            je.post(conn, transfer_id, user_id)
+        conn.execute("UPDATE fiscal_periods SET status='closed',closed_by=?,closed_at=CURRENT_TIMESTAMP WHERE id=?", (user_id, last["id"]))
+        conn.execute("UPDATE fiscal_years SET status='closed' WHERE id=?", (year_id,))
+        conn.execute("INSERT INTO year_closings(company_id,fiscal_year_id,result_base,closing_entry_id,transfer_entry_id,closed_by) "
+                     "VALUES(?,?,?,?,?,?)", (company_id, year_id, result, closing_id, transfer_id, user_id))
+        audit.log(conn, user_id, "close_fiscal_year", "fiscal_years", year_id, {"status": "open"},
+                  {"status": "closed", "result": result, "closing_entry": closing_id, "transfer_entry": transfer_id})
+    return {"year_id": year_id, "result": result, "closing_entry_id": closing_id, "transfer_entry_id": transfer_id}
+
+
+def reopen_fiscal_year(conn, user_id, company_id, year_id, reason):
+    """إعادة فتح سنة مقفلة (صلاحية خاصة + سبب + تدقيق). تُرفض إذا وُجدت حركات فعّالة في سنة لاحقة
+    (غير قيد الافتتاح المعكوس). بعدها تبقى الفترات مقفلة: تُفتح الفترة المطلوبة بصلاحية period.reopen."""
+    permissions.require(conn, user_id, company_id, "fiscalyear.reopen", check_branch=False)
+    if not reason or not reason.strip():
+        raise AccountingError("إعادة فتح السنة تتطلب ذكر السبب")
+    y = _year(conn, company_id, year_id)
+    if y["status"] != "closed":
+        raise AccountingError("السنة ليست مقفلة")
+    blocking = conn.execute(
+        "SELECT e.id FROM journal_entries e JOIN fiscal_years fy ON fy.id=e.fiscal_year_id WHERE e.company_id=? AND fy.start_date>? "
+        "AND e.status='posted' AND NOT (e.entry_type='reversal' AND EXISTS(SELECT 1 FROM journal_entries o WHERE o.id=e.reverses_entry_id AND o.entry_type='opening'))",
+        (company_id, y["start_date"])).fetchall()
+    if blocking:
+        raise AccountingError("توجد قيود فعّالة في سنة لاحقة (مثل قيد الافتتاح): اعكسها أولا")
+    with transaction(conn):
+        conn.execute("UPDATE fiscal_years SET status='open' WHERE id=?", (year_id,))
+        conn.execute("UPDATE year_closings SET status='reopened',reopened_by=?,reopened_at=CURRENT_TIMESTAMP,reopen_reason=? "
+                     "WHERE fiscal_year_id=? AND status='active'", (user_id, reason, year_id))
+        audit.log(conn, user_id, "reopen_fiscal_year", "fiscal_years", year_id, {"status": "closed"}, {"status": "open"}, reason)
+
+
+def close_year_simple(conn, user_id, company_id, year_id):
+    """إقفال السنة بخطوة واحدة (معاملة واحدة، أي فشل = تراجع كامل):
+    1) إقفال الفترات المفتوحة عدا الأخيرة  2) إعادة تقييم العملات الأجنبية إن لزم وتوفرت الأسعار
+    3) فحوصات + قيد الإقفال + ترحيل النتيجة (close_fiscal_year)  4) إنشاء السنة التالية إن لم توجد
+    5) توليد قيد الافتتاح وترحيله. لا يتجاوز أي فحص: المسودات وفروق السلامة تبقى مانعة برسالة واضحة.
+    الإقفال مسموح في أي تاريخ (لا يشترط انتهاء السنة بحسب ساعة الجهاز)."""
+    y = _year(conn, company_id, year_id)
+    if y["status"] != "open":
+        raise AccountingError("السنة مقفلة بالفعل")
+    out = {"periods_closed": 0, "revalued": False, "next_year_id": None, "opening_entry_id": None, "notes": []}
+    with transaction(conn):
+        periods = conn.execute("SELECT id FROM fiscal_periods WHERE fiscal_year_id=? AND status='open' ORDER BY period_no", (year_id,)).fetchall()
+        for p in periods[:-1]:                      # الأخيرة يقفلها الإقفال نفسه
+            pe.close_period(conn, p[0], user_id)
+            out["periods_closed"] += 1
+        diffs, missing = fx_engine.unrevalued(conn, company_id, y["end_date"])
+        if diffs and not missing:
+            fx_engine.revalue(conn, user_id, company_id, y["end_date"], post=True)
+            out["revalued"] = True
+        res = close_fiscal_year(conn, user_id, company_id, year_id)
+        out.update(res)
+        nxt = conn.execute("SELECT id FROM fiscal_years WHERE company_id=? AND start_date>? ORDER BY start_date LIMIT 1",
+                           (company_id, y["end_date"])).fetchone()
+        if nxt:
+            out["next_year_id"] = nxt[0]
+        else:
+            try:
+                out["next_year_id"] = pe.create_next_year(conn, company_id, user_id)
+            except Exception as ex:                  # noqa: BLE001 — لا نُفشل الإقفال بسبب صلاحية إنشاء السنة
+                out["notes"].append(f"لم تُنشأ السنة التالية تلقائيًا: {ex}")
+        if out["next_year_id"]:
+            try:
+                with transaction(conn):             # فشل الافتتاح يتراجع وحده ولا يُلغي الإقفال
+                    eid = oe.generate_opening_entry(conn, user_id, company_id, year_id, out["next_year_id"])
+                    oe.post_opening_checked(conn, user_id, company_id, year_id, out["next_year_id"], eid)   # لا اعتماد مع فروقات غير مبررة
+                out["opening_entry_id"] = eid
+            except AccountingError as ex:
+                out["notes"].append(f"لم يُولَّد قيد الافتتاح تلقائيًا: {ex}")
+    return out

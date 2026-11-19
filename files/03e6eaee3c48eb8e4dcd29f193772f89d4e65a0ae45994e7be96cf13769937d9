@@ -1,0 +1,98 @@
+"""خدمات المبيعات والمشتريات والفواتير والضرائب وأعمار الديون."""
+import json
+from datetime import date
+from decimal import Decimal
+
+from alhisabat.business import aging, purchases, sales, tax
+
+
+class SalesMixin:
+    def invoices(self, kind='sales', limit=300):
+        self.require('sales.view' if kind == 'sales' else 'purchases.view')
+        if kind == 'sales':
+            q = ("SELECT i.id,i.invoice_no,i.invoice_date,p.name party,i.doc_type,i.status,i.grand_total grand_total_minor,"
+                 "i.due_total due_total_minor,i.currency FROM sales_invoices i LEFT JOIN parties p ON p.id=i.customer_id "
+                 "WHERE i.company_id=? ORDER BY i.invoice_date DESC,i.id DESC LIMIT ?")
+        else:
+            q = ("SELECT i.id,i.invoice_no,i.invoice_date,p.name party,i.doc_type,i.status,i.grand_total grand_total_minor,"
+                 "i.due_total due_total_minor,i.currency FROM purchase_invoices i LEFT JOIN parties p ON p.id=i.supplier_id "
+                 "WHERE i.company_id=? ORDER BY i.invoice_date DESC,i.id DESC LIMIT ?")
+        return [dict(r) for r in self.conn.execute(q, (self.company_id, int(limit)))]
+
+    def tax_rates(self, kind=None, active_only=False):
+        return tax.list_tax_rates(self.conn, self.user_id, self.company_id, kind=kind, active_only=active_only)
+
+    def lookup_tax_rates(self, kind=None):
+        return [(r['id'], f"{r['name']} — {Decimal(r['rate_bps'])/100:.2f}%") for r in self.tax_rates(kind, True)]
+
+    def create_tax_rate(self, v):
+        return tax.create_tax_rate(self.conn, self.user_id, self.company_id, v.get('code', ''), v['name'], v['rate'], int(v['account_id']), v.get('kind', 'output'))
+
+    def set_tax_rate_active(self, tax_id, active):
+        return tax.set_tax_active(self.conn, self.user_id, int(tax_id), bool(active))
+
+    def aging(self, kind, as_of=None):
+        return aging.aging(self.conn, self.user_id, self.company_id, kind, as_of or str(date.today()), include_zero=False)
+
+    def aging_documents(self, kind, as_of=None):
+        return aging.aging_documents(self.conn, self.user_id, self.company_id, kind, as_of or str(date.today()))
+
+    def lookup_invoices_for_link(self, kind='sales', limit=100):
+        try:
+            self.require('sales.view' if kind == 'sales' else 'purchases.view')
+        except Exception:
+            return []
+        if kind == 'sales':
+            q = ("SELECT i.id,i.invoice_no,i.invoice_date,p.name party,i.status,i.grand_total "
+                 "FROM sales_invoices i LEFT JOIN parties p ON p.id=i.customer_id "
+                 "WHERE i.company_id=? ORDER BY i.invoice_date DESC,i.id DESC LIMIT ?")
+        else:
+            q = ("SELECT i.id,i.invoice_no,i.invoice_date,p.name party,i.status,i.grand_total "
+                 "FROM purchase_invoices i LEFT JOIN parties p ON p.id=i.supplier_id "
+                 "WHERE i.company_id=? ORDER BY i.invoice_date DESC,i.id DESC LIMIT ?")
+        out = []
+        for r in self.conn.execute(q, (self.company_id, int(limit))):
+            d = dict(r)
+            d['kind'] = kind
+            d['label'] = f"{d['invoice_no']} — {d.get('party') or '—'} — {d['invoice_date']}"
+            out.append(d)
+        return out
+
+    def get_invoice(self, kind, invoice_id):
+        return sales.get_invoice(self.conn, self.user_id, int(invoice_id)) if kind == 'sales' else purchases.get_purchase(self.conn, self.user_id, int(invoice_id))
+
+    def update_invoice(self, kind, invoice_id, v):
+        lines = json.loads(v['lines']) if isinstance(v['lines'], str) else v['lines']
+        common = dict(warehouse_id=int(v['warehouse_id']) if v.get('warehouse_id') else None, currency=v.get('currency') or None,
+                      discount_percent=v.get('discount') or None, notes=v.get('notes', ''))
+        party = int(v['party_id']) if v.get('party_id') else None
+        payments = v.get('payments') or []
+        if kind == 'sales':
+            return sales.update_invoice(self.conn, self.user_id, int(invoice_id), v['date'], lines, customer_id=party, payments=payments, **common)
+        return purchases.update_purchase(self.conn, self.user_id, int(invoice_id), v['date'], lines, supplier_id=party, payments=payments,
+                                         direct_costs=v.get('direct_costs') or [], cost_allocation=v.get('cost_allocation', 'value'), **common)
+
+    def delete_invoice_draft(self, kind, invoice_id):
+        return sales.delete_draft(self.conn, self.user_id, int(invoice_id)) if kind == 'sales' else purchases.delete_draft(self.conn, self.user_id, int(invoice_id))
+
+    def return_invoice(self, kind, original_id, v):
+        lines = v['lines']
+        if kind == 'sales':
+            return sales.create_return(self.conn, self.user_id, int(original_id), v['date'], lines, payments=v.get('payments') or [], notes=v.get('notes', ''))
+        return purchases.create_purchase_return(self.conn, self.user_id, int(original_id), v['date'], lines, payments=v.get('payments') or [], notes=v.get('notes', ''))
+
+    def cancel_invoice(self, kind, invoice_id, cancel_date, reason):
+        return sales.cancel_invoice(self.conn, self.user_id, int(invoice_id), cancel_date, reason) if kind == 'sales' else purchases.cancel_purchase(self.conn, self.user_id, int(invoice_id), cancel_date, reason)
+
+    def create_invoice(self, kind, v):
+        lines = json.loads(v['lines']) if isinstance(v['lines'], str) else v['lines']
+        common = dict(warehouse_id=int(v['warehouse_id']) if v.get('warehouse_id') else None, currency=v.get('currency') or None,
+                      discount_percent=v.get('discount') or None, payments=v.get('payments') or [], notes=v.get('notes', ''),
+                      branch_id=self.branch_id)
+        party = int(v['party_id']) if v.get('party_id') else None
+        if kind == 'sales':
+            return sales.create_invoice(self.conn, self.user_id, self.company_id, v['date'], lines, customer_id=party, **common)
+        return purchases.create_purchase(self.conn, self.user_id, self.company_id, v['date'], lines, supplier_id=party, **common)
+
+    def post_invoice(self, kind, invoice_id):
+        return sales.post_invoice(self.conn, self.user_id, int(invoice_id)) if kind == 'sales' else purchases.post_purchase(self.conn, self.user_id, int(invoice_id))

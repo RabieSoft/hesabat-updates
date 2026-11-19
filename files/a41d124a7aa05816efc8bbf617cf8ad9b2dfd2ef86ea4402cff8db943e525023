@@ -1,0 +1,35 @@
+-- عزل بيانات الفروع: البيانات الأساسية (أطراف/أصناف/تصنيفات/وحدات) تحمل فرعًا اختياريًا (NULL = مشترك بين الفروع).
+-- المستندات المرحّلة القديمة بلا فرع لا تُعدَّل (غير قابلة للتعديل محاسبيًا)؛ تُعامل كتابعة للفرع الرئيسي عند التصفية.
+ALTER TABLE parties ADD COLUMN branch_id INTEGER REFERENCES branches(id);
+ALTER TABLE items ADD COLUMN branch_id INTEGER REFERENCES branches(id);
+ALTER TABLE item_categories ADD COLUMN branch_id INTEGER REFERENCES branches(id);
+ALTER TABLE units ADD COLUMN branch_id INTEGER REFERENCES branches(id);
+
+CREATE TABLE branch_settings(
+  company_id INTEGER PRIMARY KEY REFERENCES companies(id),
+  isolation_mode TEXT NOT NULL DEFAULT 'shared' CHECK(isolation_mode IN ('shared','isolated')));
+
+CREATE INDEX ix_parties_branch ON parties(company_id,branch_id);
+CREATE INDEX ix_items_branch ON items(company_id,branch_id);
+
+-- حارس قاعدة البيانات: مستند فرع لا يستخدم مخزنًا/صندوقًا مربوطًا بفرع آخر
+CREATE TRIGGER si_branch_wh_ins BEFORE INSERT ON sales_invoices
+WHEN NEW.branch_id IS NOT NULL AND NEW.warehouse_id IS NOT NULL
+ AND EXISTS(SELECT 1 FROM warehouses w WHERE w.id=NEW.warehouse_id AND w.branch_id IS NOT NULL AND w.branch_id<>NEW.branch_id)
+BEGIN SELECT RAISE(ABORT,'المخزن يتبع فرعًا آخر غير فرع المستند'); END;
+CREATE TRIGGER si_branch_wh_upd BEFORE UPDATE OF branch_id,warehouse_id ON sales_invoices
+WHEN NEW.branch_id IS NOT NULL AND NEW.warehouse_id IS NOT NULL
+ AND EXISTS(SELECT 1 FROM warehouses w WHERE w.id=NEW.warehouse_id AND w.branch_id IS NOT NULL AND w.branch_id<>NEW.branch_id)
+BEGIN SELECT RAISE(ABORT,'المخزن يتبع فرعًا آخر غير فرع المستند'); END;
+CREATE TRIGGER pi_branch_wh_ins BEFORE INSERT ON purchase_invoices
+WHEN NEW.branch_id IS NOT NULL AND NEW.warehouse_id IS NOT NULL
+ AND EXISTS(SELECT 1 FROM warehouses w WHERE w.id=NEW.warehouse_id AND w.branch_id IS NOT NULL AND w.branch_id<>NEW.branch_id)
+BEGIN SELECT RAISE(ABORT,'المخزن يتبع فرعًا آخر غير فرع المستند'); END;
+CREATE TRIGGER pi_branch_wh_upd BEFORE UPDATE OF branch_id,warehouse_id ON purchase_invoices
+WHEN NEW.branch_id IS NOT NULL AND NEW.warehouse_id IS NOT NULL
+ AND EXISTS(SELECT 1 FROM warehouses w WHERE w.id=NEW.warehouse_id AND w.branch_id IS NOT NULL AND w.branch_id<>NEW.branch_id)
+BEGIN SELECT RAISE(ABORT,'المخزن يتبع فرعًا آخر غير فرع المستند'); END;
+CREATE TRIGGER cv_branch_cash_ins BEFORE INSERT ON cash_vouchers
+WHEN NEW.branch_id IS NOT NULL
+ AND EXISTS(SELECT 1 FROM cash_accounts c WHERE c.id=NEW.cash_account_id AND c.branch_id IS NOT NULL AND c.branch_id<>NEW.branch_id)
+BEGIN SELECT RAISE(ABORT,'الصندوق/البنك يتبع فرعًا آخر غير فرع السند'); END;

@@ -1,0 +1,129 @@
+-- ===== مفاتيح ربط جديدة (خصم المبيعات، مردودات المبيعات): إعادة بناء الجدول =====
+CREATE TABLE account_mappings_new(
+  company_id INTEGER NOT NULL REFERENCES companies(id),
+  map_key TEXT NOT NULL CHECK(map_key IN ('customers','suppliers','inventory','sales','cogs','cash','bank',
+      'retained_earnings','period_result','fx_differences','inventory_adjustment','sales_discount','sales_returns')),
+  account_id INTEGER NOT NULL REFERENCES accounts(id),
+  PRIMARY KEY(company_id,map_key));
+INSERT INTO account_mappings_new SELECT company_id,map_key,account_id FROM account_mappings;
+DROP TABLE account_mappings;
+ALTER TABLE account_mappings_new RENAME TO account_mappings;
+
+-- ===== الحسابات الخاضعة للمستندات: لا قيد يدوي عادي على العملاء/الموردين/المخزون =====
+DROP TRIGGER jl_ins_rules;
+CREATE TRIGGER jl_ins_rules BEFORE INSERT ON journal_lines BEGIN
+  SELECT RAISE(ABORT,'لا يمكن إضافة سطر إلى قيد غير مسودة')
+   WHERE (SELECT status FROM journal_entries WHERE id=NEW.entry_id)<>'draft';
+  SELECT RAISE(ABORT,'القيد تحت المراجعة أو معتمد: أعده إلى المسودة قبل التعديل')
+   WHERE (SELECT workflow_state FROM journal_entries WHERE id=NEW.entry_id)<>'draft';
+  SELECT RAISE(ABORT,'الحساب غير موجود أو غير نشط أو تجميعي: لا تقبل الحركة')
+   WHERE NOT EXISTS(SELECT 1 FROM accounts a JOIN journal_entries e ON e.id=NEW.entry_id
+      WHERE a.id=NEW.account_id AND a.is_group=0 AND a.company_id=e.company_id
+        AND (a.is_active=1 OR e.entry_type IN ('reversal','closing','opening')));
+  SELECT RAISE(ABORT,'قيد الافتتاح يقبل حسابات الميزانية فقط (أصول/خصوم/حقوق ملكية)')
+   WHERE (SELECT entry_type FROM journal_entries WHERE id=NEW.entry_id)='opening'
+     AND (SELECT account_type FROM accounts WHERE id=NEW.account_id) NOT IN ('asset','liability','equity');
+  SELECT RAISE(ABORT,'حسابات العملاء والموردين والمخزون لا تقبل قيدا يدويا عاديا: استخدم المستند المناسب أو قيد تسوية')
+   WHERE (SELECT entry_type FROM journal_entries WHERE id=NEW.entry_id)='general'
+     AND (EXISTS(SELECT 1 FROM parties WHERE account_id=NEW.account_id)
+          OR EXISTS(SELECT 1 FROM account_mappings m WHERE m.account_id=NEW.account_id AND m.map_key='inventory')
+          OR EXISTS(SELECT 1 FROM items WHERE inventory_account_id=NEW.account_id));
+END;
+
+-- ===== محرك الضرائب =====
+CREATE TABLE tax_rates(
+  id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), code TEXT NOT NULL,
+  name TEXT NOT NULL CHECK(length(trim(name))>0), rate_bps INTEGER NOT NULL CHECK(rate_bps BETWEEN 0 AND 10000),
+  kind TEXT NOT NULL DEFAULT 'output' CHECK(kind IN ('output','input')),
+  account_id INTEGER NOT NULL REFERENCES accounts(id), is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
+  created_by INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(company_id,code));
+
+-- ===== المبيعات =====
+CREATE TABLE sales_settings(
+  company_id INTEGER PRIMARY KEY REFERENCES companies(id),
+  credit_limit_mode TEXT NOT NULL DEFAULT 'block' CHECK(credit_limit_mode IN ('block','warn','off')));
+CREATE TABLE doc_sequences(
+  company_id INTEGER NOT NULL REFERENCES companies(id), doc_type TEXT NOT NULL,
+  fiscal_year_id INTEGER NOT NULL REFERENCES fiscal_years(id), last_no INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(company_id,doc_type,fiscal_year_id));
+
+CREATE TABLE sales_invoices(
+  id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), branch_id INTEGER REFERENCES branches(id),
+  warehouse_id INTEGER REFERENCES warehouses(id),
+  doc_type TEXT NOT NULL DEFAULT 'invoice' CHECK(doc_type IN ('invoice','return')),
+  invoice_no TEXT, invoice_date TEXT NOT NULL, due_date TEXT,
+  customer_id INTEGER REFERENCES parties(id), currency TEXT NOT NULL REFERENCES currencies(code), exchange_rate TEXT NOT NULL DEFAULT '1',
+  status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','posted','cancelled')),
+  discount_type TEXT NOT NULL DEFAULT 'none' CHECK(discount_type IN ('none','percent','amount')),
+  discount_value INTEGER NOT NULL DEFAULT 0 CHECK(discount_value>=0),
+  gross_ex_total INTEGER NOT NULL DEFAULT 0, discount_ex_total INTEGER NOT NULL DEFAULT 0, net_ex_total INTEGER NOT NULL DEFAULT 0,
+  tax_total INTEGER NOT NULL DEFAULT 0, grand_total INTEGER NOT NULL DEFAULT 0, paid_total INTEGER NOT NULL DEFAULT 0,
+  due_total INTEGER NOT NULL DEFAULT 0,
+  original_invoice_id INTEGER REFERENCES sales_invoices(id), notes TEXT NOT NULL DEFAULT '',
+  journal_entry_id INTEGER REFERENCES journal_entries(id),
+  created_by INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  posted_by INTEGER REFERENCES users(id), posted_at TEXT,
+  cancelled_by INTEGER REFERENCES users(id), cancelled_at TEXT, cancel_reason TEXT, cancel_entry_id INTEGER REFERENCES journal_entries(id),
+  UNIQUE(company_id,doc_type,invoice_no),
+  CHECK((doc_type='invoice' AND original_invoice_id IS NULL) OR (doc_type='return' AND original_invoice_id IS NOT NULL)),
+  CHECK(paid_total>=0 AND due_total>=0 AND grand_total>=0 AND paid_total+due_total=grand_total));
+CREATE INDEX ix_si_date ON sales_invoices(company_id,invoice_date);
+CREATE INDEX ix_si_customer ON sales_invoices(customer_id);
+CREATE INDEX ix_si_orig ON sales_invoices(original_invoice_id);
+
+CREATE TABLE sales_invoice_lines(
+  id INTEGER PRIMARY KEY, invoice_id INTEGER NOT NULL REFERENCES sales_invoices(id), line_no INTEGER NOT NULL,
+  item_id INTEGER NOT NULL REFERENCES items(id), description TEXT NOT NULL DEFAULT '',
+  qty_milli INTEGER NOT NULL CHECK(qty_milli>0), unit_id INTEGER NOT NULL REFERENCES units(id), factor_milli INTEGER NOT NULL DEFAULT 1000,
+  unit_price_minor INTEGER NOT NULL CHECK(unit_price_minor>=0),
+  line_discount_type TEXT NOT NULL DEFAULT 'none' CHECK(line_discount_type IN ('none','percent','amount')),
+  line_discount_value INTEGER NOT NULL DEFAULT 0 CHECK(line_discount_value>=0),
+  tax_rate_id INTEGER REFERENCES tax_rates(id), tax_bps INTEGER NOT NULL DEFAULT 0, tax_inclusive INTEGER NOT NULL DEFAULT 0 CHECK(tax_inclusive IN (0,1)),
+  amount_minor INTEGER NOT NULL DEFAULT 0, line_discount_minor INTEGER NOT NULL DEFAULT 0, invoice_discount_share INTEGER NOT NULL DEFAULT 0,
+  gross_ex INTEGER NOT NULL DEFAULT 0, discount_ex INTEGER NOT NULL DEFAULT 0, net_ex INTEGER NOT NULL DEFAULT 0,
+  tax_minor INTEGER NOT NULL DEFAULT 0, total_minor INTEGER NOT NULL DEFAULT 0,
+  revenue_account_id INTEGER REFERENCES accounts(id), cost_base_minor INTEGER NOT NULL DEFAULT 0,
+  movement_id INTEGER REFERENCES stock_movements(id), orig_line_id INTEGER REFERENCES sales_invoice_lines(id),
+  UNIQUE(invoice_id,line_no), CHECK(gross_ex-discount_ex=net_ex AND net_ex+tax_minor=total_minor));
+CREATE INDEX ix_sil_invoice ON sales_invoice_lines(invoice_id);
+CREATE INDEX ix_sil_orig ON sales_invoice_lines(orig_line_id);
+CREATE TABLE invoice_payments(
+  id INTEGER PRIMARY KEY, invoice_id INTEGER NOT NULL REFERENCES sales_invoices(id),
+  account_id INTEGER NOT NULL REFERENCES accounts(id), amount_minor INTEGER NOT NULL CHECK(amount_minor>0), note TEXT NOT NULL DEFAULT '');
+
+CREATE TRIGGER sil_lock_ins BEFORE INSERT ON sales_invoice_lines
+WHEN (SELECT status FROM sales_invoices WHERE id=NEW.invoice_id)<>'draft' BEGIN SELECT RAISE(ABORT,'المستند مرحّل: لا يمكن تعديل بنوده'); END;
+CREATE TRIGGER sil_lock_upd BEFORE UPDATE ON sales_invoice_lines
+WHEN (SELECT status FROM sales_invoices WHERE id=OLD.invoice_id)<>'draft'
+ AND NOT (OLD.movement_id IS NULL AND NEW.movement_id IS NOT NULL AND (SELECT status FROM sales_invoices WHERE id=OLD.invoice_id)='draft') BEGIN
+  SELECT RAISE(ABORT,'المستند مرحّل: لا يمكن تعديل بنوده'); END;
+CREATE TRIGGER sil_lock_del BEFORE DELETE ON sales_invoice_lines
+WHEN (SELECT status FROM sales_invoices WHERE id=OLD.invoice_id)<>'draft' BEGIN SELECT RAISE(ABORT,'المستند مرحّل: لا يمكن تعديل بنوده'); END;
+CREATE TRIGGER pay_lock_ins BEFORE INSERT ON invoice_payments
+WHEN (SELECT status FROM sales_invoices WHERE id=NEW.invoice_id)<>'draft' BEGIN SELECT RAISE(ABORT,'المستند مرحّل: لا يمكن تعديل دفعاته'); END;
+CREATE TRIGGER pay_lock_del BEFORE DELETE ON invoice_payments
+WHEN (SELECT status FROM sales_invoices WHERE id=OLD.invoice_id)<>'draft' BEGIN SELECT RAISE(ABORT,'المستند مرحّل: لا يمكن تعديل دفعاته'); END;
+CREATE TRIGGER si_no_delete BEFORE DELETE ON sales_invoices WHEN OLD.status<>'draft' BEGIN SELECT RAISE(ABORT,'لا يحذف مستند مرحّل: يُلغى بقيد عكسي'); END;
+CREATE TRIGGER si_upd_rules BEFORE UPDATE ON sales_invoices WHEN OLD.status<>'draft' BEGIN
+  SELECT RAISE(ABORT,'لا يمكن تعديل مستند مرحّل أو ملغى: التصحيح بالإلغاء أو بمرتجع')
+   WHERE NOT (OLD.status='posted' AND NEW.status='cancelled' AND NEW.company_id=OLD.company_id AND NEW.doc_type=OLD.doc_type
+     AND NEW.invoice_no IS OLD.invoice_no AND NEW.invoice_date=OLD.invoice_date AND NEW.customer_id IS OLD.customer_id
+     AND NEW.currency=OLD.currency AND NEW.exchange_rate=OLD.exchange_rate AND NEW.gross_ex_total=OLD.gross_ex_total
+     AND NEW.discount_ex_total=OLD.discount_ex_total AND NEW.net_ex_total=OLD.net_ex_total AND NEW.tax_total=OLD.tax_total
+     AND NEW.grand_total=OLD.grand_total AND NEW.paid_total=OLD.paid_total AND NEW.due_total=OLD.due_total
+     AND NEW.journal_entry_id IS OLD.journal_entry_id AND NEW.original_invoice_id IS OLD.original_invoice_id
+     AND NEW.cancel_reason IS NOT NULL AND length(trim(NEW.cancel_reason))>0);
+END;
+CREATE TRIGGER tax_immutable BEFORE UPDATE OF rate_bps,kind,account_id ON tax_rates
+WHEN EXISTS(SELECT 1 FROM sales_invoice_lines WHERE tax_rate_id=OLD.id) BEGIN
+  SELECT RAISE(ABORT,'لا يمكن تغيير نسبة أو حساب ضريبة استُخدمت في مستندات: أنشئ نسبة جديدة'); END;
+
+INSERT INTO permissions(code,name_ar,is_sensitive) VALUES
+ ('sales.view','عرض المبيعات',0),('sales.create','إنشاء فواتير ومرتجعات مبيعات (مسودة)',0),
+ ('sales.post','ترحيل فواتير ومرتجعات المبيعات',0),('sales.cancel','إلغاء مستندات المبيعات',1),
+ ('tax.manage','إدارة نسب الضرائب',1);
+INSERT INTO role_permissions SELECT r.id,'sales.view' FROM roles r WHERE r.id IN (1,2,3,4);
+INSERT INTO role_permissions SELECT r.id,p.code FROM roles r, permissions p WHERE r.id IN (1,2,3) AND p.code IN ('sales.create','sales.post');
+INSERT INTO role_permissions SELECT r.id,'sales.cancel' FROM roles r WHERE r.id IN (1,2);
+INSERT INTO role_permissions SELECT r.id,'tax.manage' FROM roles r WHERE r.id IN (1,2);

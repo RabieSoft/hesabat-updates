@@ -1,0 +1,88 @@
+"""أوامر خدمة المزامنة:
+
+  python -m alhisabat.sync_api serve   [--db PATH] [--host 0.0.0.0] [--port 8765]
+  python -m alhisabat.sync_api pair    [--db PATH] --user admin [--branch ID] [--url http://100.x.y.z:8765]
+  python -m alhisabat.sync_api devices [--db PATH]
+  python -m alhisabat.sync_api revoke  [--db PATH] ID
+
+الافتراضي لمسار القاعدة: نفس قاعدة التطبيق المكتبي (%APPDATA%/AlhisabatPro/alhisabat.db).
+"""
+import argparse
+import getpass
+import os
+import sys
+from pathlib import Path
+
+from alhisabat.accounting.errors import AccountingError
+
+from .service import SyncService
+
+DEFAULT_DB = Path(os.getenv("APPDATA") or Path.home()) / "AlhisabatPro" / "alhisabat.db"
+
+
+def _save_qr(payload):
+    """يحفظ رمز الاقتران كصورة QR (pairing_qr.png) ويفتحها على ويندوز ليمسحها الهاتف. يحتاج: pip install qrcode"""
+    try:
+        import qrcode
+    except ImportError:
+        print("لعرض رمز QR للمسح بالهاتف ثبّت المكتبة: pip install qrcode")
+        return
+    path = Path.cwd() / "pairing_qr.png"
+    qrcode.make(payload).save(str(path))
+    print("صورة QR:", path, "(احذفها بعد الاقتران)")
+    if sys.platform == "win32":
+        try:
+            os.startfile(str(path))
+        except OSError:
+            pass
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="python -m alhisabat.sync_api")
+    p.add_argument("--db", default=str(DEFAULT_DB))
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sv = sub.add_parser("serve")
+    sv.add_argument("--host", default="127.0.0.1")
+    sv.add_argument("--port", type=int, default=8765)
+    pr = sub.add_parser("pair")
+    pr.add_argument("--user", required=True)
+    pr.add_argument("--branch", type=int)
+    pr.add_argument("--url", default="")
+    sub.add_parser("devices")
+    rv = sub.add_parser("revoke")
+    rv.add_argument("device_id", type=int)
+    a = p.parse_args(argv)
+
+    if not Path(a.db).exists():
+        print(f"قاعدة البيانات غير موجودة: {a.db}", file=sys.stderr)
+        return 2
+    svc = SyncService(a.db)
+    if a.cmd == "serve":
+        import uvicorn
+        from .app import create_app
+        uvicorn.run(create_app(a.db), host=a.host, port=a.port)
+        return 0
+    if a.cmd == "pair":
+        try:
+            r = svc.create_pairing(a.user, getpass.getpass("كلمة مرور المستخدم: "), branch_id=a.branch)
+        except AccountingError as e:
+            print(f"تعذر إنشاء رمز الاقتران: {e}", file=sys.stderr)
+            return 1
+        print(f"رمز الاقتران: {r['code']}   (صالح 10 دقائق، لمرة واحدة)\nالشركة: {r['company']} — الفرع: {r['branch']}")
+        if a.url:
+            payload = svc.qr_payload(r["code"], a.url)
+            print("حمولة QR:", payload)
+            _save_qr(payload)
+        return 0
+    if a.cmd == "devices":
+        for d in svc.list_devices():
+            print(d["id"], d["name"], d["username"], "فرع", d["branch_id"], "آخر ظهور:", d["last_seen_at"] or "—",
+                  "(ملغى)" if d["revoked_at"] else "")
+        return 0
+    if a.cmd == "revoke":
+        print("تم إلغاء الربط" if svc.revoke_device(a.device_id) else "لا يوجد جهاز فعّال بهذا الرقم")
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

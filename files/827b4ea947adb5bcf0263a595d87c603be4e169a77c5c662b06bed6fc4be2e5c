@@ -1,0 +1,45 @@
+"""القيود المفضلة: قائمة مفاتيح قوالب القيود الجاهزة (journal_recipes) يفضّلها المستخدم للوصول السريع.
+
+منطق صرف بلا Qt: التخزين عبر دالتي قراءة/كتابة (QSettings في الواجهة)، والمفاتيح غير الصالحة (قالب حُذف/تغيّر) تُهمل.
+"""
+SEP = ','
+
+
+def parse(text):
+    out = []
+    for k in str(text or '').split(SEP):
+        k = k.strip()
+        if k and k not in out:
+            out.append(k)
+    return out
+
+
+def dump(keys):
+    return SEP.join(keys)
+
+
+class FavoriteStore:
+    def __init__(self, getter, setter, all_keys):
+        self._get, self._set, self._all = getter, setter, set(all_keys)
+
+    def keys(self):
+        return [k for k in parse(self._get()) if k in self._all]
+
+    def has(self, key):
+        return key in self.keys()
+
+    def add(self, key):
+        ks = self.keys()
+        if key in self._all and key not in ks:
+            self._set(dump(ks + [key]))
+
+    def remove(self, key):
+        self._set(dump([k for k in self.keys() if k != key]))
+
+    def toggle(self, key):
+        """يعيد True إن أصبح القالب مفضلًا، False إن أُزيل."""
+        if self.has(key):
+            self.remove(key)
+            return False
+        self.add(key)
+        return True

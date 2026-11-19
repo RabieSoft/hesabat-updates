@@ -1,0 +1,153 @@
+"""كشف حساب مجموعة: عملاء أو موردين (مجموعات الأطراف) أو أصناف (تصنيفات الأصناف).
+
+- عملاء/موردون: صف لكل طرف في المجموعة: رصيد أول المدة، مدين، دائن، الرصيد الختامي، من دفتر الأستاذ نفسه
+  (فتتطابق الأرقام مع كشف حساب الطرف). مع currency: مبالغ تلك العملة وحدها بأصلها.
+- أصناف: صف لكل صنف في التصنيف (وفروعه): كمية أول المدة، وارد، صادر، الكمية الختامية وقيمتها.
+الصلاحيات تُفرض في دوال الاستعلام نفسها (party.view / ledger / inventory.view).
+"""
+from datetime import date as _date, timedelta
+from decimal import Decimal
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.accounting import ledger_engine as le
+from alhisabat.business import branch_scope, inventory as inv, item_catalog
+from alhisabat.reporting import printing as pr
+from alhisabat.security import permissions
+
+ALL_GROUPS = -1          # معرّف خاص: كل المجموعات (أطراف) / كل التصنيفات (أصناف)
+GROUP_KINDS = {"customer": "عملاء", "supplier": "موردين", "item": "أصناف"}
+
+
+def group_report_print(conn, user_id, company_id, group_kind, group_id, date_from, date_to, *,
+                       currency=None, branch_id=None, balance_side=None):
+    """المدخل الوحيد: group_kind ∈ customer/supplier/item. group_id لأطراف: 0 أو None = بلا مجموعة، ALL_GROUPS (-1) = كل المجموعات."""
+    if group_kind in ("customer", "supplier"):
+        return _party_group(conn, user_id, company_id, group_kind, group_id, date_from, date_to,
+                            (currency or "").strip().upper() or None, branch_id, pr.norm_side(balance_side))
+    if group_kind == "item":
+        if not group_id:
+            raise AccountingError("اختر تصنيف الأصناف لعرض كشفه.")
+        return _item_group(conn, user_id, company_id, int(group_id), date_from, date_to, branch_id)
+    raise AccountingError("نوع المجموعة غير معروف")
+
+
+def _party_group(conn, user_id, company_id, kind, group_id, d_from, d_to, cur, branch_id, side="all"):
+    permissions.require(conn, user_id, company_id, "party.view", check_branch=False)
+    all_groups = group_id == ALL_GROUPS
+    q = ("SELECT p.id, p.code, p.name, p.account_id, p.is_active, "
+         "COALESCE((SELECT ga.name FROM accounts ga WHERE ga.id=g.account_id), 'بلا مجموعة') grp FROM parties p "
+         "JOIN accounts a ON a.id=p.account_id LEFT JOIN party_groups g ON g.account_id=a.parent_id "
+         "WHERE p.company_id=? AND p.kind=?")
+    args = [company_id, kind]
+    if all_groups:
+        gname = "كل المجموعات"
+    elif group_id:
+        g = conn.execute("SELECT pg.id, a.name FROM party_groups pg JOIN accounts a ON a.id=pg.account_id "
+                         "WHERE pg.id=? AND pg.company_id=? AND pg.kind=?", (int(group_id), company_id, kind)).fetchone()
+        if not g:
+            raise AccountingError("المجموعة غير موجودة")
+        q += " AND g.id=?"; args.append(g["id"]); gname = g["name"]
+    else:
+        q += " AND g.id IS NULL"; gname = "بلا مجموعة"
+    f, fa = branch_scope.master_clause(conn, company_id, branch_id, col="p.branch_id")
+    q += f + " ORDER BY p.code"; args += fa
+    sfx = f" ({cur})" if cur else ""
+    rows, tot = [], [Decimal(0)] * 4
+    for p in conn.execute(q, args).fetchall():
+        r = le.ledger(conn, user_id, company_id, p["account_id"], d_from, d_to, include_children=False,
+                      branch_id=branch_id, currency=cur, limit=1)
+        o, dr, cr, cl = ((r["opening_balance_orig"], r["total_debit_orig"], r["total_credit_orig"], r["closing_balance_orig"])
+                         if cur else (r["opening_balance"], r["total_debit"], r["total_credit"], r["closing_balance"]))
+        if not (o or dr or cr or cl):
+            continue                                            # لا حركة ولا رصيد: لا يُعرض
+        if side != "all":                                       # ترشيح مدينون/دائنون بإشارة الرصيد الختامي (مدين − دائن)
+            _cl = cl if r["account"]["nature"] == "debit" else -cl
+            if not pr.side_match(_cl, side):
+                continue
+        vals = [pr._u(o), pr._u(dr), pr._u(cr), pr._u(cl)]
+        tot = [t + v for t, v in zip(tot, vals)]
+        rows.append({"code": p["code"], "name": p["name"] + ("" if p["is_active"] else " (معطل)"), "group": p["grp"], "opening": vals[0],
+                     "debit": vals[1], "credit": vals[2], "closing": vals[3], "account_id": p["account_id"]})
+    cols = [{"key": "code", "label": "الكود"}, {"key": "name", "label": "الاسم"}]
+    if all_groups:
+        cols.append({"key": "group", "label": "المجموعة"})
+    cols += [{"key": "opening", "label": "رصيد أول المدة" + sfx, "numeric": True},
+            {"key": "debit", "label": "مدين" + sfx, "numeric": True},
+            {"key": "credit", "label": "دائن" + sfx, "numeric": True},
+            {"key": "closing", "label": "الرصيد الختامي" + sfx, "numeric": True}]
+    drop = {"debit": 2, "credit": 1}.get(side)        # مدينون فقط ← يُخفى عمود/إجمالي الدائن؛ دائنون فقط ← يُخفى المدين
+    if drop is not None:
+        hide_key = "credit" if side == "debit" else "debit"
+        cols = [c for c in cols if c["key"] != hide_key]
+    company, branch = pr._company_header(conn, company_id, branch_id)
+    base = conn.execute("SELECT base_currency FROM companies WHERE id=?", (company_id,)).fetchone()[0]
+    label = "العملاء" if kind == "customer" else "الموردين"
+    extra = [("المجموعة", f"{label}: {gname}"), ("عدد الأطراف", str(len(rows)))]
+    if side != "all":
+        extra.append(("الرصيد", pr.BALANCE_SIDES[side]))
+    if cur:
+        extra.append(("العملة", cur))
+    totals = [{"label": "إجمالي المجموعة — رصيد أول المدة" + sfx, "value": tot[0]},
+              {"label": "إجمالي المدين" + sfx, "value": tot[1]}, {"label": "إجمالي الدائن" + sfx, "value": tot[2]},
+              {"label": "إجمالي الرصيد الختامي" + sfx, "value": tot[3]}]
+    if drop is not None:
+        del totals[drop]
+    return pr._with_words(conn, company_id, pr._spec("كشف حساب مجموعة" + (f" — {cur}" if cur else ""), company=company, branch=branch,
+                                                     currency=cur or base, period=f"{d_from} — {d_to}", extra=extra, columns=cols,
+                                                     rows=rows, totals=totals))
+
+
+def _qty(milli):
+    return Decimal(int(milli or 0)) / 1000
+
+
+def _item_group(conn, user_id, company_id, category_id, d_from, d_to, branch_id):
+    permissions.require(conn, user_id, company_id, "inventory.view", check_branch=False)
+    if category_id == ALL_GROUPS:
+        cat = {"name": "كل التصنيفات"}
+        items = {r["id"]: r for r in conn.execute(
+            "SELECT id, code, name FROM items WHERE company_id=? AND item_type='stock'", (company_id,))}
+    else:
+        cat = conn.execute("SELECT name FROM item_categories WHERE id=? AND company_id=?", (category_id, company_id)).fetchone()
+        if not cat:
+            raise AccountingError("تصنيف الأصناف غير موجود")
+        cats = set(item_catalog.descendants_ids(conn, category_id))
+        items = {r["id"]: r for r in conn.execute(
+            "SELECT id, code, name FROM items WHERE company_id=? AND item_type='stock' AND category_id IN (%s)" % ",".join("?" * len(cats)),
+            [company_id, *cats])}
+    before = (_date.fromisoformat(d_from) - timedelta(days=1)).isoformat()
+    kw = dict(include_zero=True, branch_id=branch_id)
+    opening = inv.stock_report(conn, user_id, company_id, as_of=before, **kw)
+    closing = inv.stock_report(conn, user_id, company_id, as_of=d_to, **kw)
+    agg = {i: {"oq": 0, "cq": 0, "cv": 0, "in": 0, "out": 0} for i in items}
+    for r in opening:
+        if r["item_id"] in agg:
+            agg[r["item_id"]]["oq"] += r["qty_milli"]
+    whs = set()
+    for r in closing:
+        if r["item_id"] in agg:
+            agg[r["item_id"]]["cq"] += r["qty_milli"]; agg[r["item_id"]]["cv"] += r["value_base"]; whs.add(r["warehouse_id"])
+    if items and whs:
+        q = ("SELECT item_id, direction, SUM(qty_milli) q FROM stock_movements WHERE company_id=? AND item_id IN (%s) "
+             "AND warehouse_id IN (%s) AND movement_date BETWEEN ? AND ? GROUP BY item_id, direction"
+             % (",".join("?" * len(items)), ",".join("?" * len(whs))))
+        for m in conn.execute(q, [company_id, *items, *whs, d_from, d_to]):
+            agg[m["item_id"]]["in" if m["direction"] == "in" else "out"] += m["q"]
+    rows, total_value = [], Decimal(0)
+    for iid, it in sorted(items.items(), key=lambda kv: kv[1]["code"]):
+        a = agg[iid]
+        if not any(a.values()):
+            continue
+        total_value += pr._u(a["cv"])
+        rows.append({"code": it["code"], "name": it["name"], "opening": _qty(a["oq"]), "in": _qty(a["in"]),
+                     "out": _qty(a["out"]), "closing": _qty(a["cq"]), "value": pr._u(a["cv"])})
+    cols = [{"key": "code", "label": "كود الصنف"}, {"key": "name", "label": "الصنف"},
+            {"key": "opening", "label": "كمية أول المدة", "numeric": True}, {"key": "in", "label": "وارد", "numeric": True},
+            {"key": "out", "label": "صادر", "numeric": True}, {"key": "closing", "label": "الكمية الختامية", "numeric": True},
+            {"key": "value", "label": "قيمة الرصيد الختامي", "numeric": True}]
+    company, branch = pr._company_header(conn, company_id, branch_id)
+    base = conn.execute("SELECT base_currency FROM companies WHERE id=?", (company_id,)).fetchone()[0]
+    extra = [("المجموعة", f"أصناف: {cat['name']}"), ("عدد الأصناف", str(len(rows))),
+             ("ملاحظة", "الوارد والصادر يشملان التحويلات بين المخازن؛ القيم بالعملة الأساسية")]
+    return pr._with_words(conn, company_id, pr._spec("كشف حساب مجموعة أصناف", company=company, branch=branch, currency=base,
+                                                     period=f"{d_from} — {d_to}", extra=extra, columns=cols, rows=rows,
+                                                     totals=[{"label": "إجمالي قيمة المخزون الختامي", "value": total_value}]))

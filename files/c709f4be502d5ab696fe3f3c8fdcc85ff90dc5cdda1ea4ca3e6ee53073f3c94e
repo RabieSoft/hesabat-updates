@@ -1,0 +1,4 @@
+INSERT INTO permissions(code,name_ar,is_sensitive) VALUES('report.view','عرض التقارير المحاسبية والأرصدة',0);
+INSERT INTO role_permissions SELECT r.id,'report.view' FROM roles r WHERE r.id IN (1,2,3,4);
+CREATE INDEX ix_je_company_status_date ON journal_entries(company_id,status,entry_date);
+CREATE INDEX ix_jl_entry_account ON journal_lines(entry_id,account_id);

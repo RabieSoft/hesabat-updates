@@ -1,0 +1,107 @@
+"""منطق نموذج الإدخال المدمج (داخل الصفحة فوق الجدول) للعملاء والموردين. خالص: بلا PySide6 ولا SQL ولا float.
+
+الهدف: إدخال متتابع سريع — اكتب الاسم ثم Enter فيُحفظ ويعود المؤشر لحقل الاسم والجدول يتحدّث.
+التحقق والتنظيف مأخوذان من entry_logic (المصدر الوحيد)، والمحرك هو الحَكَم النهائي عند الحفظ.
+"""
+from dataclasses import dataclass, field
+from decimal import Decimal
+
+from . import entry_logic as EL
+
+PRIMARY = ('name', 'phone', 'terms', 'credit')           # حقول الصف الأول بترتيب Tab (credit للعملاء فقط)
+EXTRA = ('email', 'address', 'opening_amount')           # حقول «تفاصيل إضافية» (مطوية افتراضيًا)
+KIND_LABEL = {'customer': 'عميل', 'supplier': 'مورد'}
+
+
+def blank(kind):
+    """حقول فارغة لنموذج جديد."""
+    return {'name': '', 'phone': '', 'email': '', 'address': '', 'credit': '', 'terms': '0', 'opening_amount': ''}
+
+
+def tab_order(kind, extra_open=False):
+    order = [f for f in PRIMARY if not (f == 'credit' and kind != 'customer')]
+    return order + (list(EXTRA) if extra_open else [])
+
+
+def sticky_after_save(kind, group_id=None, opening_direction=1):
+    """ما يبقى بعد الحفظ للإدخال المتتابع: النوع والمجموعة واتجاه الرصيد؛ والباقي يُفرَّغ."""
+    return {'kind': kind, 'group_id': group_id, 'opening_direction': opening_direction}
+
+
+def raw_from_row(row):
+    """حقول النموذج من صف الجدول (للتعديل داخل الصفحة)."""
+    out = blank(row.get('kind') or 'customer')
+    out['name'] = row.get('name') or ''
+    out['phone'] = row.get('phone') or ''
+    out['email'] = row.get('email') or ''
+    out['address'] = row.get('address') or ''
+    out['terms'] = str(row.get('payment_terms_days') or row.get('terms') or 0)
+    minor = row.get('credit_limit_minor') or 0
+    out['credit'] = '' if not minor else str(Decimal(int(minor)) / 100)
+    return out
+
+
+@dataclass
+class FormState:
+    errors: dict = field(default_factory=dict)
+    shown: list = field(default_factory=list)            # رسائل تُعرض (لا نعرض «الاسم مطلوب» قبل أن يكتب شيئًا)
+    duplicate: str = ''                                  # اسم مشابه موجود
+    can_save: bool = False
+
+
+def evaluate(kind, raw, existing_names=(), editing_name=None):
+    errs = EL.party_errors(kind, raw)
+    name = (raw.get('name') or '').strip()
+    shown = [m for k, m in errs.items() if not (k == 'name' and not name)]
+    names = [n for n in existing_names if editing_name is None or n != editing_name]
+    dup = EL.find_similar_name(name, names) or ''
+    return FormState(errors=errs, shown=shown, duplicate=dup, can_save=not errs)
+
+
+def name_only(raw):
+    """True إن كان الاسم وحده هو المُدخل (باقي الحقول فارغة/افتراضية) — يسمح بالحفظ بـEnter مباشرة من حقل الاسم."""
+    if not (raw.get('name') or '').strip():
+        return False
+    if (raw.get('phone') or '').strip() or (raw.get('credit') or '').strip() or (raw.get('opening_amount') or '').strip():
+        return False
+    if (raw.get('email') or '').strip() or (raw.get('address') or '').strip():
+        return False
+    return (raw.get('terms') or '0').strip() in ('', '0')
+
+
+def enter_action(kind, field_name, raw, extra_open=False):
+    """ماذا يفعل Enter في الحقل: 'save' أو 'next'. الحفظ: الاسم وحده، أو آخر حقل في ترتيب Tab."""
+    if field_name == 'name' and name_only(raw):
+        return 'save'
+    order = tab_order(kind, extra_open)
+    return 'save' if field_name == order[-1] else 'next'
+
+
+def create_values(kind, raw, group_id=None, opening_direction=1, opening_date=None):
+    """قيم جاهزة لـPartiesService.create."""
+    out = EL.clean_party_values(kind, raw)
+    out['group_id'] = group_id
+    if str(out.get('opening_amount') or '').strip():
+        out['opening_direction'] = opening_direction
+        out['opening_date'] = opening_date
+    return out
+
+
+def edit_values(kind, raw):
+    """قيم جاهزة لـPartiesService.edit (بلا رصيد افتتاحي ولا مجموعة: لهما مساران مستقلان)."""
+    out = EL.clean_party_values(kind, raw)
+    for k in ('opening_amount', 'opening_direction', 'opening_date', 'group_id'):
+        out.pop(k, None)
+    return out
+
+
+def saved_message(kind, name, res=None, editing=False):
+    label = KIND_LABEL.get(kind, 'طرف')
+    if editing:
+        return f'تم حفظ تعديل {label}: {name}'
+    res = res or {}
+    if res.get('opening_error'):
+        return f"تمت إضافة {label}: {name}، لكن تعذّر تسجيل الرصيد الافتتاحي: {res['opening_error']}"
+    if res.get('opening_entry_id'):
+        return f"تمت إضافة {label}: {name} — الرصيد الافتتاحي قيد مسودة رقم {res['opening_entry_id']} بانتظار الترحيل."
+    return f'تمت إضافة {label}: {name}'

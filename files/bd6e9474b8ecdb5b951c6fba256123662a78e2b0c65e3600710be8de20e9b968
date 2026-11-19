@@ -1,0 +1,228 @@
+"""صفحة إدارة العملات وأسعار الصرف (المرحلة 3 وقسم 6.8)."""
+from datetime import date
+from decimal import Decimal
+
+from PySide6.QtCore import Qt, QDate
+from PySide6.QtWidgets import (
+    QComboBox, QDateEdit, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
+    QLabel, QLineEdit, QMessageBox, QPushButton, QTabWidget, QVBoxLayout, QWidget, QCheckBox
+)
+
+from alhisabat.ui.components.datagrid import DataGrid
+from alhisabat.ui.components.grid_logic import Column
+from alhisabat.ui.core.actions import Action, ActionGroup
+from alhisabat.ui.core.base_page import BasePage
+from alhisabat.ui.core.currencies_service import CurrenciesService
+from alhisabat.ui.core.permissions import ActionState
+from alhisabat.ui.app_dialogs.currencies import AddCurrencyDialog, SetRateDialog
+
+
+class CurrenciesPage(BasePage):
+    key = 'currencies'
+    title = 'العملات وأسعار الصرف'
+    icon = 'coins'
+    required_permission = ('currency.manage', 'currency.rates')
+
+    def build(self):
+        self._built = True
+        self.svc = CurrenciesService(self.session)
+        self._selected_currency = None
+        self._selected_rate = None
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(6, 6, 6, 6)
+
+        self.tabs = QTabWidget()
+
+        # ---------------- التبويب 1: العملات ----------------
+        cur_panel = QWidget()
+        cl = QVBoxLayout(cur_panel)
+        cl.setContentsMargins(0, 0, 0, 0)
+
+        cur_cols = [
+            Column('code', 'الرمز', width=80),
+            Column('name_ar', 'اسم العملة', width=160),
+            Column('symbol', 'العلامة', width=80),
+            Column('status_label', 'الحالة في الشركة', width=120),
+            Column('base_label', 'العملة الأساسية', width=110),
+            Column('default_label', 'عملة الإدخال الافتراضية', width=150),
+        ]
+        self.cur_grid = DataGrid(cur_cols, grid_id='currencies_grid')
+        self.cur_grid.selectionChangedRows.connect(self._on_cur_select)
+        cl.addWidget(self.cur_grid, 1)
+
+        self.tabs.addTab(cur_panel, "دليل العملات")
+
+        # ---------------- التبويب 2: أسعار الصرف ----------------
+        rates_panel = QWidget()
+        rl = QVBoxLayout(rates_panel)
+        rl.setContentsMargins(0, 0, 0, 0)
+
+        r_bar = QHBoxLayout()
+        r_bar.addWidget(QLabel("العملة:"))
+        self.rate_cur_combo = QComboBox()
+        self.rate_cur_combo.addItem("الكل", None)
+        self.rate_cur_combo.currentIndexChanged.connect(lambda *_: self._refresh_rates())
+        r_bar.addWidget(self.rate_cur_combo)
+
+        r_bar.addWidget(QLabel("من:"))
+        self.frm = QDateEdit(QDate(date.today().year, 1, 1))
+        r_bar.addWidget(self.frm)
+        r_bar.addWidget(QLabel("إلى:"))
+        self.to = QDateEdit(QDate.currentDate())
+        r_bar.addWidget(self.to)
+        for w in (self.frm, self.to):
+            w.setCalendarPopup(True)
+            w.setDisplayFormat('yyyy-MM-dd')
+            w.dateChanged.connect(lambda *_: self._refresh_rates())
+
+        btn_filter = QPushButton("تصفية")
+        btn_filter.clicked.connect(self._refresh_rates)
+        r_bar.addWidget(btn_filter)
+        r_bar.addStretch(1)
+        rl.addLayout(r_bar)
+
+        rates_cols = [
+            Column('currency', 'العملة', width=80),
+            Column('rate_date', 'التاريخ', 'date', 100),
+            Column('rate', 'سعر الصرف (للأساسية)', width=140),
+            Column('created_at', 'تاريخ التسجيل', width=140),
+        ]
+        self.rates_grid = DataGrid(rates_cols, grid_id='exchange_rates_grid')
+        rl.addWidget(self.rates_grid, 1)
+
+        self.tabs.addTab(rates_panel, "سجل أسعار الصرف")
+        lay.addWidget(self.tabs, 1)
+
+    def refresh(self):
+        if not getattr(self, '_built', False):
+            return
+        self._refresh_currencies()
+        self._refresh_rates()
+        self.actions_changed.emit()
+
+    def _refresh_currencies(self):
+        try:
+            rows = self.svc.currencies()
+            for r in rows:
+                r['status_label'] = 'مفعلة' if r.get('is_enabled') else 'معطلة'
+                r['base_label'] = 'نعم (الأساس)' if r.get('is_base') else 'لا'
+                r['default_label'] = '✔ افتراضية' if r.get('is_default') else ''
+            self.cur_grid.set_rows(rows)
+
+            cur_curr = self.rate_cur_combo.currentData()
+            self.rate_cur_combo.blockSignals(True)
+            self.rate_cur_combo.clear()
+            self.rate_cur_combo.addItem("الكل", None)
+            for r in rows:
+                if not r.get('is_base'):
+                    self.rate_cur_combo.addItem(f"{r['code']} - {r['name_ar']}", r['code'])
+            if cur_curr:
+                idx = self.rate_cur_combo.findData(cur_curr)
+                if idx >= 0:
+                    self.rate_cur_combo.setCurrentIndex(idx)
+            self.rate_cur_combo.blockSignals(False)
+        except Exception as e:
+            self.show_error(e)
+
+    def _refresh_rates(self):
+        try:
+            curr = self.rate_cur_combo.currentData()
+            d_from = self.frm.date().toPython().isoformat()
+            d_to = self.to.date().toPython().isoformat()
+            rates = self.svc.list_rates(currency=curr, date_from=d_from, date_to=d_to)
+            self.rates_grid.set_rows(rates)
+        except Exception as e:
+            self.show_error(e)
+
+    def _on_cur_select(self, rows):
+        self._selected_currency = rows[0] if len(rows) == 1 else None
+        self.actions_changed.emit()
+
+    def _state(self, action_key):
+        if action_key == 'add_currency':
+            return self.access.state('currency.manage')
+        if action_key == 'toggle_currency':
+            if not self._selected_currency:
+                return ActionState(False, 'حدد عملة أولًا')
+            if self._selected_currency.get('is_base'):
+                return ActionState(False, 'لا يمكن تعطيل العملة الأساسية')
+            return self.access.state('currency.manage')
+        if action_key == 'set_default':
+            c = self._selected_currency
+            if not c:
+                return ActionState(False, 'حدد عملة أولًا')
+            if c.get('is_default'):
+                return ActionState(False, 'هذه هي العملة الافتراضية حاليًا')
+            if not c.get('is_enabled') and not c.get('is_base'):
+                return ActionState(False, 'فعّل العملة أولًا')
+            return self.access.state('currency.manage')
+        if action_key == 'set_rate':
+            return self.access.state('currency.rates')
+        return ActionState(True)
+
+    def ribbon_groups(self):
+        def a(k, lab, icon, **kw):
+            return Action(k, lab, icon, state_fn=lambda kk=k: self._state(kk), handler=lambda kk=k: self.do(kk), **kw)
+
+        return [
+            ActionGroup('العملات', [
+                a('add_currency', '+ إضافة عملة', 'new', primary=True),
+                a('toggle_currency', 'تفعيل/تعطيل', 'refresh'),
+                a('set_default', 'تعيين كعملة افتراضية', 'coins'),
+                a('set_rate', '+ تسجيل سعر صرف', 'coins'),
+            ]),
+            ActionGroup('عرض', [
+                Action('refresh', 'تحديث', 'refresh', handler=self.refresh),
+            ]),
+        ]
+
+    def do(self, key):
+        st = self._state(key)
+        if not st.enabled:
+            return QMessageBox.information(self, self.title, st.reason)
+
+        if key == 'add_currency':
+            d = AddCurrencyDialog(self)
+            if self.exec_form(d):
+                v = d.values()
+                ok, _ = self.guarded(self.svc.add_currency, v['code'], v['name_ar'], v['symbol'], reload=False)
+                if ok:
+                    self.refresh()
+                    self.window_.data_changed(self.key)
+
+        elif key == 'toggle_currency':
+            cur = self._selected_currency
+            if not cur:
+                return
+            new_val = not bool(cur.get('is_enabled'))
+            ok, _ = self.guarded(self.svc.set_currency_enabled, cur['code'], new_val, reload=False)
+            if ok:
+                self.refresh()
+                self.window_.data_changed(self.key)
+
+        elif key == 'set_default':
+            cur = self._selected_currency
+            if not cur:
+                return
+            ok, _ = self.guarded(self.svc.set_default_currency, cur['code'], reload=False)
+            if ok:
+                self.notify(f"أصبحت {cur.get('name_ar') or cur['code']} هي العملة الافتراضية للمستندات الجديدة")
+                self.refresh()
+                self.window_.data_changed(self.key)
+
+        elif key == 'set_rate':
+            currencies = [r['code'] for r in self.svc.currencies() if not r.get('is_base')]
+            if not currencies:
+                return QMessageBox.information(self, self.title, "لا توجد عملات أجنبية مسجلة.")
+            d = SetRateDialog(self, currencies)
+            if self.exec_form(d):
+                v = d.values()
+                ok, _ = self.guarded(
+                    self.svc.set_rate,
+                    v['currency'], v['rate_date'], v['rate'],
+                    reason=v['reason'], force=v['force'], reload=False
+                )
+                if ok:
+                    self.refresh()
+                    self.window_.data_changed(self.key)

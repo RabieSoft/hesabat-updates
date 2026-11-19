@@ -1,0 +1,514 @@
+"""المبيعات والمشتريات: قائمة + ورقة المستند الواقعية + سير المستند.
+
+الدورة: مسودة ← (تعديل/حذف) ← ترحيل/مرتجع/إلغاء. كل الإجراءات عبر InvoiceService.
+"""
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QMessageBox, QSizePolicy, QSplitter, QVBoxLayout, QWidget
+
+from alhisabat.ui.app_dialogs.invoice import InvoiceEditor, ReturnEditor
+from alhisabat.ui.components import document_model as DM
+from alhisabat.ui.components.basic import ask_reason
+from alhisabat.ui.components.datagrid import DataGrid
+from alhisabat.ui.components.document_sheet import DocumentSheet
+from alhisabat.ui.components.grid_logic import Column
+from alhisabat.ui.components.panels import RelatedPanel
+from alhisabat.ui.core import state as ST
+from alhisabat.ui.core.actions import Action, ActionGroup
+from alhisabat.ui.core.base_page import BasePage
+from alhisabat.ui.core.invoice_service import InvoiceService
+from alhisabat.ui.core.permissions import ActionState
+
+FILTERS = [('الكل', 'all'), ('مسودة', 'draft'), ('مرحل', 'posted'), ('ملغى', 'cancelled'), ('مرتجع', 'return')]
+
+
+def _build_invoice_page(self):
+    self.svc = InvoiceService(self.session)
+    self._rows = []
+    self._sel = None
+    self._inv = None
+    self._ro = ''
+    lay = QVBoxLayout(self)
+    lay.setContentsMargins(6, 6, 6, 6)
+    bar = QHBoxLayout()
+    self.f = QComboBox()
+    for lab, val in FILTERS:
+        self.f.addItem(lab, val)
+    self.f.currentIndexChanged.connect(lambda _i: self.refresh())
+    bar.addWidget(QLabel('الحالة:'))
+    bar.addWidget(self.f)
+    self.f_cur = QComboBox()                               # تصفية الفواتير بعملتها
+    self.f_cur.addItem('كل العملات', None)
+    try:
+        for c in self.svc.currency_options():
+            self.f_cur.addItem(f"{c.get('name_ar') or c['code']} ({c['code']})", c['code'])
+    except Exception:  # noqa: BLE001
+        pass
+    self.f_cur.currentIndexChanged.connect(lambda _i: self.refresh())
+    bar.addWidget(QLabel('العملة:'))
+    bar.addWidget(self.f_cur)
+    bar.addStretch(1)
+    self.count = QLabel('')
+    self.count.setObjectName('ctxKey')
+    bar.addWidget(self.count)
+    lay.addLayout(bar)
+    split = QSplitter(Qt.Horizontal)
+    cols = [
+        Column('invoice_no', 'رقم المستند', width=110),
+        Column('invoice_date', 'التاريخ', 'date', 95),
+        Column('party', 'العميل' if self._kind() == 'sales' else 'المورد', width=180),
+        Column('doc_type_ar', 'النوع', width=70),
+        Column('currency_ar', 'العملة', width=100),
+        Column('grand_total_minor', 'الإجمالي', 'money', 110, minor=True),
+        Column('due_total_minor', 'المتبقي', 'money', 100, minor=True),
+        Column('status', 'الحالة', 'status', 90),
+    ]
+    self.grid = DataGrid(cols, grid_id=f"inv_{self._kind()}_v2")   # مفتاح جديد: لا تُستعاد عروض أعمدة قديمة
+    self.grid.set_dense(22, 8.5)
+    self.grid.set_free_resize()                                    # كالقيود: السحب يتبع حد العمود في الاتجاهين
+    self.grid.selectionChangedRows.connect(self._on_select)
+    self.grid.rowActivated.connect(self._on_activate)
+    split.addWidget(self.grid)
+    right = QWidget()
+    rl = QVBoxLayout(right)
+    rl.setContentsMargins(0, 0, 0, 0)
+    self.sheet = DocumentSheet(self.window_.prefs.get('paper'))
+    self.sheet.paperChanged.connect(lambda p: self.window_.prefs.set('paper', p))
+    self.related = RelatedPanel()
+    self.related.setMaximumHeight(120)
+    self.related.openRequested.connect(self._open_related)
+    rl.addWidget(self.sheet, 1)
+    rl.addWidget(self.related)
+    split.addWidget(right)
+    split.setStretchFactor(0, 3)
+    split.setStretchFactor(1, 2)
+    self.sheet.set_compact(True)
+    right.setMinimumWidth(340)
+    right.setMaximumWidth(780)
+    right.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+    self.sheet.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+    split.setChildrenCollapsible(True)
+    QTimer.singleShot(0, lambda: split.setSizes([max(480, int(split.width() * 0.56)), max(380, int(split.width() * 0.44))]))
+    from alhisabat.ui.components.invoice_popup import InvoicePopup
+    self.panel = InvoicePopup(self)                        # نافذة الفاتورة المنبثقة (مخفية حتى «فاتورة جديدة» Ctrl+N أو تعديل مسودة)
+    lay.addWidget(split, 1)
+    self._empty = QLabel('لا توجد فواتير بعد. اضغط «فاتورة جديدة» (Ctrl+N) لإدخال أول فاتورة.')
+    self._empty.setAlignment(Qt.AlignCenter)
+    lay.addWidget(self._empty)
+
+
+def _refresh_invoice_page(self):
+    if not getattr(self, '_built', False):
+        return
+    keep = self._sel['id'] if self._sel else None
+    if keep is None and getattr(self, 'params', None):
+        if isinstance(self.params, dict):
+            keep = self.params.get('id') or self.params.get('invoice_id')
+        elif isinstance(self.params, int):
+            keep = self.params
+        self.params = None
+    try:
+        rows = self.svc.list(self._kind())
+    except Exception as exc:
+        self.show_error(exc)
+        rows = []
+    # إذا طُلب مستند محدد، تأكد من إظهاره حتى لو كانت التصفية مختلفة
+    if keep is not None and not any(r.get('id') == keep for r in rows):
+        self.f.blockSignals(True)
+        self.f.setCurrentIndex(0)
+        self.f.blockSignals(False)
+        self.f_cur.blockSignals(True)
+        self.f_cur.setCurrentIndex(0)
+        self.f_cur.blockSignals(False)
+    cur_f = self.f_cur.currentData()
+    if cur_f:
+        rows = [r for r in rows if (r.get('currency') or '') == cur_f]
+    f = self.f.currentData()
+    if f != 'all':
+        filtered = []
+        for r in rows:
+            if f == 'return':
+                if r.get('doc_type') == 'return':
+                    filtered.append(r)
+            else:
+                if r.get('doc_type') != 'return' and r.get('status') == f:
+                    filtered.append(r)
+        rows = filtered
+    try:
+        names = {c['code']: c.get('name_ar') for c in self.svc.currency_options() if c.get('name_ar')}
+    except Exception:  # noqa: BLE001
+        names = {}
+    for r in rows:      # عرض عربي فقط؛ المفاتيح الأصلية تبقى للتصفية والمنطق
+        r['doc_type_ar'] = _DOC_TYPE_AR.get(r.get('doc_type'), r.get('doc_type') or '')
+        r['currency_ar'] = names.get(r.get('currency')) or _CUR_AR.get(r.get('currency'), r.get('currency') or '')
+    self._rows = rows
+    self.grid.set_rows(rows)
+    self.count.setText(f'{len(rows)} مستند')
+    self._empty.setVisible(not rows)
+    if keep is not None:
+        if not self.grid.select_where(lambda r: r['id'] == keep):
+            self._on_select([])
+    else:
+        self._on_select([])
+
+
+def _on_select_invoice(self, rows):
+    self._sel = rows[0] if len(rows) == 1 else None
+    self._inv = None
+    self._ro = ''
+    if self._sel:
+        try:
+            self._inv = self.svc.get(self._kind(), self._sel['id'])
+            self._ro = ST.period_reason(self.session.period_info(self._inv.get('invoice_date') or self._sel.get('invoice_date') or ''))
+            self.sheet.set_document(self._doc())
+        except Exception as exc:
+            self.show_error(exc)
+            self.sheet.set_document(None)
+    else:
+        self.sheet.set_document(None)
+    self._fill_related()
+    self.actions_changed.emit()
+
+
+def _doc_invoice(self):
+    inv = self._inv
+    spec = self.svc.print_spec(self._kind(), inv['id'])
+    return DM.from_print_spec(spec, 'invoice', status=inv.get('status') or '')
+
+
+def _fill_related_invoice(self):
+    items = []
+    if self._inv:
+        if self._inv.get('journal_entry_id'):
+            items.append(('القيد', f"قيد #{self._inv['journal_entry_id']}", 'journal', None))
+        paid = self._inv.get('paid_total')
+        from alhisabat.ui.core import format as fmt
+        paid_str = fmt.fmt_money(paid, minor=True) if paid is not None else '—'
+        items.append(('الدفعات', f"المدفوع: {paid_str}", None, None))
+    self.related.set_items(items)
+
+
+def _action_state_invoice(self, key):
+    ro = self._ro
+    if ro:
+        return ActionState(False, ro)
+    if key == 'new':
+        return self.access.state('sales.create' if self._kind() == 'sales' else 'purchases.create')
+    if not self._inv:
+        return ActionState(False, 'حدد مستندا اولا')
+    st = self._inv.get('status')
+    dt = self._inv.get('doc_type')
+    if key == 'edit':
+        return ActionState(st == 'draft' and dt == 'invoice', 'التعديل متاح للمسودة فقط')
+    if key == 'edit_posted':
+        if self._kind() != 'sales' or not (st == 'posted' and dt == 'invoice'):
+            return ActionState(False, 'تعديل المرحّلة لفاتورة مبيعات مرحّلة فقط')
+        if not self.access.has('sales.edit_posted'):
+            return ActionState(False, 'تتطلب صلاحية «تعديل فاتورة مبيعات مرحّلة»')
+        try:
+            on = bool(self.svc.policies().get('allow_edit_posted_invoice'))
+        except Exception:
+            on = False
+        return ActionState(on, 'غير مفعّل: يفعّله مدير النظام من الإعدادات')
+    if key == 'delete':
+        return ActionState(st == 'draft', 'الحذف للمسودة فقط')
+    if key == 'post':
+        return ActionState(st == 'draft', 'الترحيل للمسودة فقط')
+    if key == 'return':
+        return ActionState(st == 'posted' and dt == 'invoice', 'المرتجع للفاتورة المرحلة فقط')
+    if key == 'cancel':
+        return ActionState(st == 'posted' and dt == 'invoice', 'الالغاء للفاتورة المرحلة فقط')
+    if key == 'whatsapp':
+        if not self._inv:
+            return ActionState(False, 'حدد مستندا اولا')
+        if self._kind() != 'sales':
+            return ActionState(False, 'متاح لفواتير المبيعات فقط')
+        if st != 'posted':
+            return ActionState(False, 'إرسال واتساب متاح للفاتورة المرحلة فقط')
+        if not self.access.has('message.send'):
+            return ActionState(False, 'تتطلب صلاحية «إرسال رسائل واتساب»')
+        return ActionState(True)
+    return ActionState(True)
+
+
+def _do_invoice(self, key):
+    if key == 'new':
+        return self._new()
+    if not self._inv:
+        return QMessageBox.information(self, self.title, 'حدد مستندا اولا.')
+    st = self._action_state(key)
+    if not st.enabled:
+        return QMessageBox.information(self, self.title, st.reason)
+    if key == 'edit':
+        return self._edit()
+    if key == 'edit_posted':
+        return self._edit_posted()
+    if key == 'delete':
+        if ask_reason(self, 'حذف المسودة', ['ستحذف المسودة نهائيا.'], need_reason=False, confirm_text='حذف') is None:
+            return
+        ok, _ = self.guarded(self.svc.delete_draft, self._kind(), self._inv['id'], reload=False)
+        if ok:
+            self.notify('حذفت المسودة')
+            self.refresh()
+            self.window_.data_changed(self.key)
+        return
+    if key == 'post':
+        if ask_reason(self, 'تاكيد الترحيل', ['سينشا القيد والحركة المخزنية ويثبت المستند.'], need_reason=False, confirm_text='ترحيل') is None:
+            return
+        ok, _ = self.guarded(self.svc.post, self._kind(), self._inv['id'], reload=False)
+        if ok:
+            self.notify('تم الترحيل')
+            self.refresh()
+            self.window_.data_changed(self.key)
+        return
+    if key == 'return':
+        return self._do_return()
+    if key == 'cancel':
+        r = ask_reason(self, 'الغاء الفاتورة', ['سينشا قيد عكسي موثق للمستند.'], True, 'الغاء المستند')
+        if r is None:
+            return
+        ok, _ = self.guarded(self.svc.cancel, self._kind(), self._inv['id'], self._inv.get('invoice_date') or '', r, reload=False)
+        if ok:
+            self.notify('تم الغاء المستند')
+            self.refresh()
+            self.window_.data_changed(self.key)
+        return
+    if key == 'whatsapp':
+        return self._send_whatsapp()
+
+
+def _new_invoice(self, resume=False):
+    """فاتورة جديدة: تُفتح في نافذة منبثقة متوسطة (تبقى مفتوحة بعد الحفظ؛ سبب المنع يظهر في رسالة إن لم تُسمح)."""
+    self.panel.start_new(resume=resume)
+
+
+def _edit_invoice(self, posted=False):
+    if self._inv:
+        self.panel.start_edit(self._inv, posted=posted)
+
+
+def _page_dirty(self):
+    return bool(getattr(self, 'panel', None) is not None and self.panel.is_dirty())
+
+
+def _page_context(self, keys):
+    BasePage.on_context_changed(self, keys)
+    if getattr(self, '_built', False) and getattr(self, 'panel', None) is not None:
+        self.panel.reload_context()
+
+
+_DOC_TYPE_AR = {'invoice': 'فاتورة', 'return': 'مرتجع'}
+_CUR_AR = {'YER': 'ريال يمني', 'SAR': 'ريال سعودي', 'USD': 'دولار', 'AED': 'درهم إماراتي', 'EUR': 'يورو',
+           'GBP': 'جنيه إسترليني', 'QAR': 'ريال قطري', 'OMR': 'ريال عماني', 'KWD': 'دينار كويتي',
+           'EGP': 'جنيه مصري', 'JOD': 'دينار أردني'}
+
+class SalesPage(BasePage):
+    key = 'sales'
+    source_targets = {'sales_invoice': ('grid', None, 0), 'sales_return': ('grid', None, 0)}
+
+    def relax_filters(self):
+        self.f.setCurrentIndex(0)
+        self.f_cur.setCurrentIndex(0)
+
+    title = 'المبيعات'
+    icon = 'cart'
+    required_permission = 'sales.view'
+
+    def _kind(self):
+        return 'sales'
+
+    def is_dirty(self):
+        return _page_dirty(self)
+
+    def on_context_changed(self, keys):
+        _page_context(self, keys)
+
+    def build(self):
+        _build_invoice_page(self)
+
+    def refresh(self):
+        _refresh_invoice_page(self)
+
+    def _on_select(self, rows):
+        _on_select_invoice(self, rows)
+
+    def _on_activate(self, _r):
+        if self._action_state('edit').enabled:
+            self.do('edit')
+
+    def _doc(self):
+        return _doc_invoice(self)
+
+    def _fill_related(self):
+        _fill_related_invoice(self)
+
+    def _open_related(self, page, params):
+        if page != '':
+            self.open_page_requested.emit(page, params)
+
+    def _action_state(self, key):
+        return _action_state_invoice(self, key)
+
+    def ribbon_groups(self):
+        def a(k, lab, icon, **kw):
+            return Action(k, lab, icon, state_fn=lambda kk=k: self._action_state(kk), handler=lambda kk=k: self.do(kk), **kw)
+        return [
+            ActionGroup('مستند', [a('new', 'فاتورة جديدة', 'new', shortcut='Ctrl+N', primary=True), a('edit', 'تعديل المسودة', 'edit', shortcut='F2'), a('edit_posted', 'تعديل مرحّلة', 'edit', shortcut='Shift+F2'), a('delete', 'حذف المسودة', 'delete', danger=True)]),
+            ActionGroup('دورة', [a('post', 'ترحيل', 'post', shortcut='F9', primary=True), a('return', 'مرتجع', 'return'), a('cancel', 'الغاء', 'delete', danger=True)]),
+            ActionGroup('عرض', [Action('print', 'طباعة', 'print', shortcut='Ctrl+P', state_fn=lambda: ActionState(bool(self._inv), 'حدد مستندا اولا') if self._inv else ActionState(False, 'حدد مستندا اولا'), handler=lambda: self.sheet.print_()), a('whatsapp', 'إرسال واتساب', 'mail'), Action('refresh', 'تحديث', 'refresh', handler=self.refresh)]),
+        ]
+
+    def _send_whatsapp(self):
+        if not self._inv:
+            return
+        party_id = self._inv.get('party_id') or self._inv.get('customer_id')
+        party_name = self._inv.get('party') or self._inv.get('customer_name') or ''
+        phone = ''
+        if party_id:
+            try:
+                p = self.session.party(party_id)
+                if p:
+                    phone = (p.get('phone') or '').strip()
+                    party_name = (p.get('name') or party_name).strip()
+            except Exception:
+                pass
+        inv_no = self._inv.get('invoice_no') or str(self._inv.get('id', ''))
+        total = self._inv.get('grand_total_minor', 0)
+        from alhisabat.ui.core import format as fmt
+        total_str = fmt.fmt_money(total, minor=True)
+        cur = self._inv.get('currency') or ''
+        msg_text = f"مرحبًا {party_name}، مرفق فاتورتكم رقم {inv_no} بمبلغ {total_str} {cur}. شكراً لتعاملكم معنا!"
+        pdf_path = ""
+        try:
+            import tempfile, os
+            from alhisabat.ui.components import print_service as PS
+            doc = self._doc()
+            if doc:
+                tfile = os.path.join(tempfile.gettempdir(), f"invoice_{inv_no}.pdf")
+                paper = self.window_.prefs.get('paper') or 'A4'
+                PS.export_pdf(doc, tfile, paper=paper)
+                pdf_path = tfile
+        except Exception:
+            pdf_path = ""
+        from alhisabat.ui.components.whatsapp_preview import WhatsAppPreviewDialog
+        dlg = WhatsAppPreviewDialog(
+            self,
+            db_path=self.session.db_path,
+            phone=phone,
+            party_name=party_name,
+            message_text=msg_text,
+            party_id=party_id,
+            attachment_path=pdf_path,
+            ref_type='sales_invoice',
+            ref_id=self._inv.get('id'),
+            branch_id=getattr(self.session, 'branch_id', None),
+            user_id=getattr(self.session, 'user_id', None),
+        )
+        self.exec_form(dlg)
+
+    def do(self, key):
+        return _do_invoice(self, key)
+
+    def resume_draft(self, dialog_id):
+        """استئناف فاتورة جديدة من مسودة محفوظة (بعد انقطاع الكهرباء)."""
+        if dialog_id == f'invoice_{self._kind()}_new':
+            self._new(resume=True)
+
+    def _new(self, resume=False):
+        return _new_invoice(self, resume)
+
+    def _edit(self):
+        return _edit_invoice(self)
+
+    def _edit_posted(self):
+        return _edit_invoice(self, posted=True)
+
+    def _do_return(self):
+        d = ReturnEditor(self, self._kind(), self._inv)
+        if self.exec_form(d):
+            v = d.values()
+            ok, _ = self.guarded(self.svc.do_return, self._kind(), self._inv['id'], v, reload=False)
+            if ok:
+                self.notify('تم انشاء المرتجع')
+                self.refresh()
+                self.window_.data_changed(self.key)
+
+
+class PurchasesPage(BasePage):
+    key = 'purchases'
+    source_targets = {'purchase_invoice': ('grid', None, 0), 'purchase_return': ('grid', None, 0)}
+
+    def relax_filters(self):
+        self.f.setCurrentIndex(0)
+        self.f_cur.setCurrentIndex(0)
+
+    title = 'المشتريات'
+    icon = 'truck'
+    required_permission = 'purchases.view'
+
+    def _kind(self):
+        return 'purchase'
+
+    def is_dirty(self):
+        return _page_dirty(self)
+
+    def on_context_changed(self, keys):
+        _page_context(self, keys)
+
+    def build(self):
+        _build_invoice_page(self)
+
+    def refresh(self):
+        _refresh_invoice_page(self)
+
+    def _on_select(self, rows):
+        _on_select_invoice(self, rows)
+
+    def _on_activate(self, _r):
+        if self._action_state('edit').enabled:
+            self.do('edit')
+
+    def _doc(self):
+        return _doc_invoice(self)
+
+    def _fill_related(self):
+        _fill_related_invoice(self)
+
+    def _open_related(self, page, params):
+        if page != '':
+            self.open_page_requested.emit(page, params)
+
+    def _action_state(self, key):
+        return _action_state_invoice(self, key)
+
+    def ribbon_groups(self):
+        def a(k, lab, icon, **kw):
+            return Action(k, lab, icon, state_fn=lambda kk=k: self._action_state(kk), handler=lambda kk=k: self.do(kk), **kw)
+        return [
+            ActionGroup('مستند', [a('new', 'فاتورة جديدة', 'new', shortcut='Ctrl+N', primary=True), a('edit', 'تعديل المسودة', 'edit', shortcut='F2'), a('delete', 'حذف المسودة', 'delete', danger=True)]),
+            ActionGroup('دورة', [a('post', 'ترحيل', 'post', shortcut='F9', primary=True), a('return', 'مرتجع', 'return'), a('cancel', 'الغاء', 'delete', danger=True)]),
+            ActionGroup('عرض', [Action('print', 'طباعة', 'print', shortcut='Ctrl+P', state_fn=lambda: ActionState(bool(self._inv), 'حدد مستندا اولا') if self._inv else ActionState(False, 'حدد مستندا اولا'), handler=lambda: self.sheet.print_()), Action('refresh', 'تحديث', 'refresh', handler=self.refresh)]),
+        ]
+
+    def do(self, key):
+        return _do_invoice(self, key)
+
+    def resume_draft(self, dialog_id):
+        """استئناف فاتورة جديدة من مسودة محفوظة (بعد انقطاع الكهرباء)."""
+        if dialog_id == f'invoice_{self._kind()}_new':
+            self._new(resume=True)
+
+    def _new(self, resume=False):
+        return _new_invoice(self, resume)
+
+    def _edit(self):
+        return _edit_invoice(self)
+
+    def _do_return(self):
+        d = ReturnEditor(self, self._kind(), self._inv)
+        if self.exec_form(d):
+            v = d.values()
+            ok, _ = self.guarded(self.svc.do_return, self._kind(), self._inv['id'], v, reload=False)
+            if ok:
+                self.notify('تم انشاء المرتجع')
+                self.refresh()
+                self.window_.data_changed(self.key)

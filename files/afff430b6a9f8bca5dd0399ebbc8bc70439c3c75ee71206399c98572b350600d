@@ -1,0 +1,349 @@
+"""طلبات المزامنة v2: إضافة عميل/مورد (مع رصيد افتتاحي)، رصيد افتتاحي لطرف موجود، إضافة صنف، قيد يومية، وإرسال رسائل واتساب عبر طابور المكتبي.
+
+كل دالة تأخذ جلسة AppSession جاهزة (بصلاحيات مستخدم الجهاز وفرعه) وتُستدعى داخل معاملة SyncService.submit،
+فإذا رُفض شيء في المنتصف تُلغى كل التغييرات ويُسجَّل الطلب مرفوضًا. لا منطق محاسبي هنا: كله عبر نفس طبقة الأعمال المكتبية.
+"""
+from datetime import date
+from decimal import Decimal, InvalidOperation
+
+from alhisabat.accounting import rates as fxr
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.business import parties as business_parties
+from alhisabat.audit import audit
+from alhisabat.messaging import queue
+
+REQUEST_TYPES_V2 = ("party_create", "party_opening", "item_create", "whatsapp", "journal",
+                    "party_update", "party_delete", "item_update", "item_delete")
+PARTY_KINDS = ("customer", "supplier")
+MAX_WA_BODY = 4000
+
+
+def _text(d, key, limit=200):
+    v = str(d.get(key) or "").strip()
+    if len(v) > limit:
+        raise AccountingError(f"الحقل «{key}» أطول من المسموح ({limit} حرفًا)")
+    return v
+
+
+def _dec(v, label, allow_negative=False):
+    try:
+        x = Decimal(str(v if v not in (None, "") else 0))
+    except (InvalidOperation, ValueError):
+        raise AccountingError(f"قيمة غير صالحة في «{label}»")
+    if not x.is_finite():
+        raise AccountingError(f"قيمة غير صالحة في «{label}»")
+    if x < 0 and not allow_negative:
+        raise AccountingError(f"«{label}» لا تقبل قيمة سالبة")
+    return x
+
+
+def _iso_date(v):
+    v = str(v or "").strip() or str(date.today())
+    try:
+        date.fromisoformat(v)
+    except ValueError:
+        raise AccountingError("صيغة التاريخ يجب أن تكون YYYY-MM-DD")
+    return v
+
+
+# ------------------------------------------------------------------ عميل / مورد
+def party_create(s, d, want_post):
+    """data = {kind, name, phone?, email?, address?, credit?, terms?, wa_consent?, as_of?, note?,
+               opening?: [{amount(موقّع: موجب = الرصيد الطبيعي للطرف), currency?, rate?}]}
+    الرصيد الافتتاحي يُنشأ كقيد مسودة؛ ويُرحَّل إن طُلب post=true وكان للمستخدم صلاحية الترحيل."""
+    kind = str(d.get("kind") or "customer")
+    if kind not in PARTY_KINDS:
+        raise AccountingError("النوع يجب أن يكون customer أو supplier")
+    name = _text(d, "name", 120)
+    if not name:
+        raise AccountingError("الاسم مطلوب")
+    opening = []
+    for it in d.get("opening") or []:
+        amt = _dec(it.get("amount"), "الرصيد الافتتاحي", allow_negative=True)
+        if amt != 0:
+            opening.append({"amount": amt, "currency": str(it.get("currency") or "").strip().upper() or None,
+                            "rate": str(it.get("rate") or "").strip() or None})
+    pid = s.create_party(kind, {"name": name, "phone": _text(d, "phone", 40), "email": _text(d, "email", 120),
+                                "address": _text(d, "address", 250),
+                                "credit": _dec(d.get("credit"), "الحد الائتماني") if kind == "customer" else 0,
+                                "terms": int(_dec(d.get("terms"), "مدة السداد"))})
+    if d.get("wa_consent") is False:
+        s.conn.execute("UPDATE parties SET wa_consent=0 WHERE id=?", (pid,))
+    code = s.conn.execute("SELECT code FROM parties WHERE id=?", (pid,)).fetchone()[0]
+    result = {"status": "posted", "party_id": pid, "doc_no": code, "type": "party_create"}
+    if opening:
+        eid = business_parties.post_opening_balances(
+            s.conn, s.user_id, s.company_id, pid, opening, as_of=_iso_date(d.get("as_of")), note=_text(d, "note", 250))
+        result["entry_id"] = eid
+        result["opening_status"] = "draft"
+        if want_post and eid:
+            try:
+                s.post_journal(eid)
+                result["opening_status"] = "posted"
+            except AccountingError as e:
+                result["status"] = "draft"
+                result["post_error"] = f"أُنشئ الطرف والرصيد الافتتاحي كمسودة ولم يُرحَّل: {e}"
+        elif eid:
+            result["status"] = "draft"
+            result["post_error"] = "الرصيد الافتتاحي بانتظار الترحيل من شاشة القيود في المكتبي"
+    return result
+
+
+def party_opening(s, d, want_post):
+    """رصيد افتتاحي لعميل/مورد **موجود** (2.0.13). data = {party_id, kind?, as_of?, note?,
+    opening: [{amount(موقّع: موجب = الرصيد الطبيعي للطرف: عليه للعميل / له للمورد), currency?, rate?}]}
+    يُنشئ قيد رصيد افتتاحي **جديدًا** (مسودة) عبر `parties.post_opening_balances` نفسه الذي تستعمله party_create،
+    ولا يعدّل قيدًا سابقًا؛ ويُرحَّل إن طُلب post=true وكان للمستخدم صلاحية الترحيل. يتطلب opening.manage وربط «الأرصدة الافتتاحية المعلّقة».
+    يُرفض الطلب إن كان الطرف غير موجود في الشركة أو نوعه يخالف kind أو كانت المبالغ كلها صفرًا.
+    إن وُجد للطرف رصيد افتتاحي سابق غير ملغى يحمل الرد previous_openings (عدد القيود) ليراجع المستخدم احتمال التكرار."""
+    s.require("opening.manage")
+    try:
+        pid = int(d["party_id"])
+    except (KeyError, TypeError, ValueError):
+        raise AccountingError("party_id مطلوب")
+    p = s.conn.execute("SELECT id,kind,name,code,company_id FROM parties WHERE id=?", (pid,)).fetchone()
+    if not p or p["company_id"] != s.company_id:
+        raise AccountingError("العميل/المورد غير موجود في هذه الشركة")
+    kind = str(d.get("kind") or p["kind"])
+    if kind not in PARTY_KINDS:
+        raise AccountingError("النوع يجب أن يكون customer أو supplier")
+    if kind != p["kind"]:
+        raise AccountingError(f"«{p['name']}» ليس {'عميلًا' if kind == 'customer' else 'موردًا'}")
+    opening = []
+    for it in d.get("opening") or []:
+        amt = _dec(it.get("amount"), "الرصيد الافتتاحي", allow_negative=True)
+        if amt != 0:
+            opening.append({"amount": amt, "currency": str(it.get("currency") or "").strip().upper() or None,
+                            "rate": str(it.get("rate") or "").strip() or None})
+    if not opening:
+        raise AccountingError("أدخل مبلغ الرصيد الافتتاحي (أكبر من صفر)")
+    previous = s.conn.execute(
+        "SELECT COUNT(*) FROM journal_entries WHERE company_id=? AND source_type='party_opening' AND source_id=? "
+        "AND status<>'reversed'", (s.company_id, pid)).fetchone()[0]
+    eid = business_parties.post_opening_balances(
+        s.conn, s.user_id, s.company_id, pid, opening, as_of=_iso_date(d.get("as_of")), note=_text(d, "note", 250))
+    result = {"status": "posted", "party_id": pid, "doc_no": p["code"], "type": "party_opening", "entry_id": eid,
+              "opening_status": "draft"}
+    if previous:
+        result["previous_openings"] = previous
+    if want_post and eid:
+        try:
+            s.post_journal(eid)
+            result["opening_status"] = "posted"
+        except AccountingError as e:
+            result["status"] = "draft"
+            result["post_error"] = f"أُنشئ الرصيد الافتتاحي كمسودة ولم يُرحَّل: {e}"
+    elif eid:
+        result["status"] = "draft"
+        result["post_error"] = "الرصيد الافتتاحي بانتظار الترحيل من شاشة القيود في المكتبي"
+    return result
+
+
+# ------------------------------------------------------------------ صنف
+def item_create(s, d, want_post):
+    """data = {name, unit?(اسم) | unit_id?, code?, barcode?, category_id?, min_qty?,
+               opening_qty?, unit_cost?, warehouse_id?}  — الكمية الافتتاحية اختيارية وتُسجَّل كحركة مخزون واردة."""
+    name = _text(d, "name", 160)
+    if not name:
+        raise AccountingError("اسم الصنف مطلوب")
+    v = {"name": name, "unit": _text(d, "unit", 40) or "قطعة", "code": _text(d, "code", 40), "barcode": _text(d, "barcode", 64),
+         "min_qty": _dec(d.get("min_qty"), "الحد الأدنى")}
+    if d.get("unit_id"):
+        v["unit_id"] = int(d["unit_id"])
+    if d.get("category_id"):
+        v["category_id"] = int(d["category_id"])
+    qty = _dec(d.get("opening_qty"), "الكمية الافتتاحية")
+    if qty and not d.get("warehouse_id"):
+        raise AccountingError("اختر المخزن لتسجيل الكمية الافتتاحية")
+    item_id = s.create_item(v)
+    result = {"status": "posted", "item_id": item_id, "type": "item_create",
+              "doc_no": s.conn.execute("SELECT code FROM items WHERE id=?", (item_id,)).fetchone()[0]}
+    if qty:
+        # رصيد افتتاحي حقيقي (وليس «تسوية مخزون»): مدين المخزون / دائن «الأرصدة الافتتاحية المعلّقة» (حقوق ملكية)،
+        # لا «خسائر أخرى» 6402 التي كانت تُضخّم الأرباح. يُرحَّل تلقائيًا، وإن فشل الترحيل (صلاحية) يبقى مسودة.
+        if d.get("unit_cost") in (None, ""):
+            raise AccountingError("تكلفة الوحدة مطلوبة لتسجيل الرصيد الافتتاحي")
+        r = s.post_opening_stock({"date": _iso_date(d.get("as_of")), "note": "رصيد افتتاحي من الهاتف",
+                                  "rows": [{"item_id": item_id, "warehouse_id": int(d["warehouse_id"]), "qty": qty,
+                                            "unit_cost": _dec(d.get("unit_cost"), "تكلفة الوحدة")}]})
+        result["opening_qty_posted"] = str(qty)
+        eid = r.get("entry_id")
+        if eid:
+            result["entry_id"] = eid
+            result["opening_status"] = "draft"
+            try:                                   # يُرحَّل دائمًا (كما كانت التسوية سابقًا) كي لا يسبق قيد التكلفة قيد المخزون
+                s.post_journal(eid)
+                result["opening_status"] = "posted"
+            except AccountingError as e:
+                result["status"] = "draft"
+                result["post_error"] = f"أُنشئ الصنف والرصيد الافتتاحي كمسودة ولم يُرحَّل: {e}"
+    return result
+
+
+# ------------------------------------------------------------------ واتساب (طابور المكتبي)
+def whatsapp(s, d, want_post):
+    """data = {party_id, body, ref_type?} — يُدرج الرسالة في طابور واتساب بالمكتبي (موافقة الطرف وقائمة الحظر وحدود الإرسال تُطبَّق هناك).
+    التكرار محكوم بـ client_uid، لذا لا نستعمل مفتاح منع التكرار اليومي كي يمكن إرسال كشف جديد في اليوم نفسه."""
+    s.require("party.view")
+    body = str(d.get("body") or "").strip()
+    if not body:
+        raise AccountingError("نص الرسالة فارغ")
+    if len(body) > MAX_WA_BODY:
+        raise AccountingError(f"الرسالة أطول من {MAX_WA_BODY} حرفًا")
+    try:
+        pid = int(d["party_id"])
+    except (KeyError, TypeError, ValueError):
+        raise AccountingError("party_id مطلوب")
+    p = s.conn.execute("SELECT id,phone,name,company_id FROM parties WHERE id=?", (pid,)).fetchone()
+    if not p or p["company_id"] != s.company_id:
+        raise AccountingError("العميل/المورد غير موجود في هذه الشركة")
+    phone = str(d.get("phone") or p["phone"] or "").strip()
+    if not phone:
+        raise AccountingError(f"لا يوجد رقم هاتف للطرف «{p['name']}»")
+    cfg = queue.get_settings(s.conn, s.branch_id)
+    try:           # نفس اتصال الطلب → المستند وسجل الطلب والرسالة في معاملة واحدة
+        oid = queue.enqueue_message(s.conn, branch_id=s.branch_id, phone=phone, body=body, party_id=pid, kind="text",
+                                    ref_type=str(d.get("ref_type") or "mobile")[:30], ref_id=None, created_by=s.user_id,
+                                    bypass_idempotency=True, default_country_code=cfg.get("country_code", "+967"))
+    except ValueError as e:                      # رقم غير صالح / opt-out / بلا موافقة / طرف معطّل
+        raise AccountingError(str(e))
+    audit.log(s.conn, s.user_id, "wa_message_enqueue", "wa_outbox", oid, after={"phone": phone, "via": "mobile"})
+    return {"status": "posted", "type": "whatsapp", "party_id": pid, "outbox_id": oid, "doc_no": f"WA{oid}"}
+
+
+# ------------------------------------------------------------------ قيد يومية (بسيط أو متعدد الأطراف)
+MAX_JOURNAL_LINES = 50
+
+
+def journal(s, d, want_post):
+    """data = {date?, description?, currency?, lines:[{account_id, debit, credit, currency?, memo?}, ...]} — قيد «عام» عبر محرك المكتبي نفسه.
+    العملة (v5): currency على مستوى القيد = عملة كل الأسطر ما لم يحمل السطر currency خاصًا به (قيد متعدد العملات). المبالغ بعملة السطر،
+    والسعر من جدول الأسعار بتاريخ القيد (لا يُقبل سعر من الهاتف). غيابها = العملة الأساسية كما كان.
+    التوازن وحسابات المخزون (تُرفض في القيد العام) والفترات المقفلة يتحقق منها المحرك برسالة عربية.
+    الترحيل المباشر يتطلب journal.post؛ بدونه (أو إن فشل) يبقى مسودة بانتظار المكتبي."""
+    s.require("journal.create")
+    lines = d.get("lines")
+    if not isinstance(lines, list) or len(lines) < 2:
+        raise AccountingError("القيد يحتاج سطرين على الأقل")
+    if len(lines) > MAX_JOURNAL_LINES:
+        raise AccountingError(f"عدد أسطر القيد أكبر من المسموح ({MAX_JOURNAL_LINES})")
+    base = fxr.base_currency(s.conn, s.company_id)
+    entry_cur = str(d.get("currency") or "").strip().upper() or base
+    clean, sums = [], {}
+    for n, ln in enumerate(lines, 1):
+        if not isinstance(ln, dict) or not ln.get("account_id"):
+            raise AccountingError(f"السطر {n}: اختر الحساب")
+        dr, cr = _dec(ln.get("debit"), "مدين"), _dec(ln.get("credit"), "دائن")
+        if dr > 0 and cr > 0:
+            raise AccountingError(f"السطر {n}: لا يصح أن يكون مدينًا ودائنًا معًا")
+        if dr == 0 and cr == 0:
+            raise AccountingError(f"السطر {n}: أدخل مبلغًا")
+        cur = str(ln.get("currency") or "").strip().upper() or entry_cur
+        if cur != base and not fxr.currency_enabled(s.conn, s.company_id, cur):
+            raise AccountingError(f"السطر {n}: العملة {cur} غير مفعّلة")
+        tot = sums.setdefault(cur, [Decimal(0), Decimal(0)])
+        tot[0] += dr
+        tot[1] += cr
+        row = {"account_id": int(ln["account_id"]), "debit": str(dr), "credit": str(cr), "currency": cur}
+        memo = str(ln.get("memo") or "").strip()
+        if memo:
+            row["memo"] = memo[:200]
+        clean.append(row)
+    if len(sums) == 1:                                   # عملة واحدة: يتوازن المدين والدائن بها مباشرة
+        (cur, (total_d, total_c)), = sums.items()
+        if total_d != total_c:
+            raise AccountingError(f"القيد غير متوازن ({cur}): المدين {total_d} والدائن {total_c}")
+    # عدة عملات: لا يصح مقارنة المبالغ الأصلية؛ المحرك يتحقق من توازن المعادل الأساسي بأسعار الجدول
+    eid = s.create_journal({"date": _iso_date(d.get("date")), "description": _text(d, "description", 300), "lines": clean})
+    result = {"status": "draft", "entry_id": eid, "type": "journal"}
+    if want_post and s.can("journal.post"):
+        try:
+            s.post_journal(eid)
+            result["status"] = "posted"
+        except AccountingError as e:
+            result["post_error"] = f"أُنشئ القيد كمسودة ولم يُرحَّل: {e}"
+    elif want_post:
+        result["post_error"] = "لا تملك صلاحية ترحيل القيود: القيد مسودة بانتظار الترحيل من المكتبي"
+    return result
+
+
+# ---------------------------------------------------------------- تعديل/حذف عميل·مورد·صنف (2.1.11، الهاتف 3.14.1+)
+def _party_id(s, d):
+    try:
+        pid = int(d["party_id"])
+    except (KeyError, TypeError, ValueError):
+        raise AccountingError("party_id مطلوب")
+    row = s.conn.execute("SELECT kind FROM parties WHERE id=? AND company_id=?", (pid, s.company_id)).fetchone()
+    if not row:
+        raise AccountingError("العميل/المورد غير موجود")
+    kind = str(d.get("kind") or "")
+    if kind and kind in PARTY_KINDS and row["kind"] != kind:
+        raise AccountingError("نوع الطرف لا يطابق السجل")
+    return pid
+
+
+def party_update(s, d, want_post):
+    """data = {party_id, kind?, name?, phone?, address?, credit?, terms?, wa_consent?} — الحقول المتغيّرة فقط؛ الغائب لا يُمسح."""
+    s.require("party.edit")
+    pid = _party_id(s, d)
+    v = {}
+    for key, limit in (("name", 120), ("phone", 40), ("address", 250)):
+        if key in d:
+            v[key] = _text(d, key, limit)
+    if "name" in v and not v["name"]:
+        raise AccountingError("الاسم لا يكون فارغًا")
+    if "credit" in d:
+        v["credit"] = _dec(d.get("credit"), "الحد الائتماني")
+    if "terms" in d:
+        v["terms"] = int(_dec(d.get("terms"), "مدة السداد"))
+    if v:
+        s.edit_party(pid, v)
+    if "wa_consent" in d:
+        s.conn.execute("UPDATE parties SET wa_consent=? WHERE id=?", (1 if d.get("wa_consent") else 0, pid))
+    return {"status": "posted", "party_id": pid, "type": "party_update"}
+
+
+def party_delete(s, d, want_post):
+    """يرفض المكتبي حذف طرف له حركات (حتى المسودات) ويقترح التعطيل."""
+    s.require("party.delete")
+    pid = _party_id(s, d)
+    s.delete_party(pid)
+    return {"status": "posted", "party_id": pid, "type": "party_delete"}
+
+
+def _item_id(s, d):
+    try:
+        iid = int(d["item_id"])
+    except (KeyError, TypeError, ValueError):
+        raise AccountingError("item_id مطلوب")
+    if not s.conn.execute("SELECT 1 FROM items WHERE id=? AND company_id=?", (iid, s.company_id)).fetchone():
+        raise AccountingError("الصنف غير موجود")
+    return iid
+
+
+def item_update(s, d, want_post):
+    """data = {item_id, name?, barcode?}. كود الصنف يُعدَّل من المكتبي فقط."""
+    iid = _item_id(s, d)
+    if "code" in d and str(d.get("code") or "").strip():
+        cur = s.conn.execute("SELECT code FROM items WHERE id=?", (iid,)).fetchone()[0]
+        if str(d["code"]).strip() != str(cur or "").strip():
+            raise AccountingError("تعديل كود الصنف غير مدعوم من الهاتف؛ عدّله من المكتبي")
+    v = {}
+    if "name" in d:
+        v["name"] = _text(d, "name", 160)
+        if not v["name"]:
+            raise AccountingError("اسم الصنف لا يكون فارغًا")
+    if "barcode" in d:
+        v["barcode"] = _text(d, "barcode", 80)
+        if v["barcode"] and s.conn.execute("SELECT 1 FROM items WHERE company_id=? AND barcode=? AND id<>?", (s.company_id, v["barcode"], iid)).fetchone():
+            raise AccountingError("هذا الباركود مسجّل لصنف آخر")
+    if v:
+        s.edit_item(iid, v)
+    return {"status": "posted", "item_id": iid, "type": "item_update"}
+
+
+def item_delete(s, d, want_post):
+    """حذف صنف بلا حركات فقط (نفس قاعدة «حذف الأصناف غير المستخدمة» في المكتبي)."""
+    iid = _item_id(s, d)
+    s.delete_unused_items([iid])
+    return {"status": "posted", "item_id": iid, "type": "item_delete"}

@@ -1,0 +1,55 @@
+"""منطق نافذة تنظيف الأصناف الخالص (بلا PySide6): بناء الصفوف، الاختيار المسبق، وفحص بقاء نسخة من كل اسم.
+
+النافذة (app_dialogs/item_cleanup.py) تعرض فقط؛ القواعد هنا قابلة للاختبار في أي بيئة. المحرك هو الحَكَم النهائي.
+"""
+
+
+def build_rows(mode, data):
+    """mode='unused': data قائمة أصناف. mode='duplicates': data مجموعات [{items:[…]}].
+    يُرجع [{'group','item','checked'}]؛ الصنف المستخدم لا يُحدَّد أبدًا. في «بدون حركات» الكل محدد مسبقًا،
+    وفي المكررات المحدد مسبقًا هو المقترح حذفه فقط."""
+    if mode == 'unused':
+        return [{'group': 0, 'item': it, 'checked': not it['used']} for it in data]
+    rows = []
+    for n, g in enumerate(data, 1):
+        for it in g['items']:
+            rows.append({'group': n, 'item': it, 'checked': bool(it.get('suggested')) and not it['used']})
+    return rows
+
+
+def group_members(rows):
+    """{رقم المجموعة: [معرّفات كل أعضائها]}."""
+    out = {}
+    for r in rows:
+        out.setdefault(r['group'], []).append(r['item']['id'])
+    return out
+
+
+def selection(rows, checked_ids):
+    """الصفوف المحددة فعلًا (بترتيب العرض) بعد استبعاد المستخدمة ولو حُدِّدت خطأً."""
+    chosen = set(checked_ids)
+    return [r for r in rows if r['item']['id'] in chosen and not r['item']['used']]
+
+
+def fully_selected_group_name(mode, rows, sel):
+    """في المكررات: اسم أول مجموعة حُدِّد كل أعضائها (فلا تبقى نسخة)، وإلا None."""
+    if mode != 'duplicates':
+        return None
+    members = group_members(rows)
+    chosen = {r['item']['id'] for r in sel}
+    for r in sel:
+        if all(m in chosen for m in members[r['group']]):
+            return r['item']['name']
+    return None
+
+
+def confirm_lines(sel, limit=8):
+    lines = [f'سيُحذف {len(sel)} صنف نهائيًا ولا يمكن التراجع، ويُسجَّل في سجل التدقيق.']
+    lines += [f"— {r['item']['name']} ({r['item']['code']})" for r in sel[:limit]]
+    if len(sel) > limit:
+        lines.append(f'… و{len(sel) - limit} أخرى')
+    return lines
+
+
+def status_text(item):
+    return ('له: ' + '، '.join(item['usage'])) if item['used'] else 'بلا حركات ولا رصيد افتتاحي'

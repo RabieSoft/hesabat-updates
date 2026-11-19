@@ -1,0 +1,300 @@
+"""محرك النسخ الاحتياطي والاستعادة (§75-76). قاعدة البيانات SQLite واحدة لكل التشغيل (كل الشركات فيها)، فالنسخ
+والاستعادة على مستوى الملف بالكامل، وليسا لكل شركة على حدة — قيد معروف موثَّق. لا يعمل مع ':memory:' (لا معنى
+لنسخ قاعدة تُمحى بانتهاء العملية). الدورة: تحقق من النسخة → تحقق من الإصدار → نسخة أمان من الحالية → استعادة →
+فحص سلامة → اتصال جاهز للعمل (§76)، وليس مجرد استبدال ملف بلا تحقق."""
+import hashlib
+import json
+import os
+import shutil
+import sqlite3
+import tempfile
+import time
+import zipfile
+from contextlib import contextmanager
+from zlib import error as zlib_error
+from datetime import datetime
+from pathlib import Path
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.audit import audit
+from alhisabat.database.connection import MIGRATIONS_DIR, connect, migrate
+from alhisabat.database.tx import transaction
+from alhisabat.security import permissions
+
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _last_migration(conn):
+    r = conn.execute("SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1").fetchone()
+    return r[0] if r else None
+
+
+def create_backup(conn, actor_id, company_id, dest_path, reason=""):
+    """نسخة فعلية متسقة عبر Backup API الأصلية في SQLite (تعمل حتى مع اتصال نشط بمعاملة جارية)."""
+    permissions.require(conn, actor_id, company_id, "backup.manage", check_branch=False)
+    if os.path.exists(dest_path):
+        raise AccountingError("الملف الهدف موجود بالفعل: اختر مسارا آخر")
+    Path(dest_path).parent.mkdir(parents=True, exist_ok=True)
+    dest = sqlite3.connect(dest_path)
+    try:
+        conn.backup(dest)
+    finally:
+        dest.close()
+    size = os.path.getsize(dest_path)
+    checksum = _sha256(dest_path)
+    last_mig = _last_migration(conn)
+    with transaction(conn):
+        conn.execute("INSERT INTO backups(path,size_bytes,checksum,last_migration,reason,created_by) VALUES(?,?,?,?,?,?)",
+                     (dest_path, size, checksum, last_mig, reason, actor_id))
+        audit.log(conn, actor_id, "create_backup", "backups", None, after={"path": dest_path, "size": size, "checksum": checksum})
+    return {"path": dest_path, "size_bytes": size, "checksum": checksum, "last_migration": last_mig}
+
+
+def _verify_db(path):
+    """يفتح ملف النسخة للقراءة فقط، مستقلا عن أي اتصال آخر، ويشغّل PRAGMA integrity_check الحقيقي."""
+    if not os.path.exists(path):
+        raise AccountingError("ملف النسخة الاحتياطية غير موجود")
+    try:
+        c = sqlite3.connect(f"file:{Path(path).as_posix()}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        raise AccountingError("تعذّر فتح ملف النسخة الاحتياطية")
+    try:
+        try:
+            rows = c.execute("PRAGMA integrity_check").fetchall()
+            ok = len(rows) == 1 and rows[0][0] == "ok"
+            detail = [r[0] for r in rows]
+        except sqlite3.DatabaseError as e:
+            ok, detail = False, [str(e)]
+        last_mig = None
+        try:
+            r = c.execute("SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1").fetchone()
+            last_mig = r[0] if r else None
+        except sqlite3.Error:
+            pass
+    finally:
+        c.close()
+    return {"path": path, "integrity_ok": ok, "integrity_detail": detail, "last_migration": last_mig,
+           "size_bytes": os.path.getsize(path), "checksum": _sha256(path)}
+
+
+def restore_database(actor_id, company_id, current_path, backup_path, *, safety_dir=None):
+    """يرجع اتصالا جديدا جاهزا على current_path بعد الاستعادة (خطوة "تشغيل النظام" في §76).
+    backup_path: ملف .db خام، أو ملف .zip مضغوط من create_zip_backup (يُفك في مجلد مؤقت ويُتحقق من بصمته أولًا)."""
+    with open_backup(backup_path) as db_file:
+        return _restore_from_db(actor_id, company_id, current_path, db_file, backup_path, safety_dir)
+
+
+def _restore_from_db(actor_id, company_id, current_path, backup_path, original_path, safety_dir):
+    if str(current_path) == ":memory:":
+        raise AccountingError("لا يمكن استعادة نسخة فوق قاعدة بيانات في الذاكرة")
+    if os.path.exists(current_path):
+        cur = connect(current_path)
+        try:
+            permissions.require(cur, actor_id, company_id, "backup.restore", check_branch=False)
+        finally:
+            cur.close()
+    v = _verify_db(backup_path)
+    if not v["integrity_ok"]:
+        raise AccountingError("النسخة الاحتياطية تالفة: فشل فحص السلامة (PRAGMA integrity_check)")
+    known = {f.stem for f in Path(MIGRATIONS_DIR).glob("*.sql")}
+    if v["last_migration"] and v["last_migration"] not in known:
+        raise AccountingError(f"النسخة الاحتياطية من إصدار أحدث ({v['last_migration']}) لا يتعرف عليه هذا الإصدار من البرنامج: حدِّث البرنامج أولا")
+    safety_path = None
+    if os.path.exists(current_path):
+        d = safety_dir or (os.path.dirname(current_path) or ".")
+        Path(d).mkdir(parents=True, exist_ok=True)
+        safety_path = os.path.join(d, f"safety_before_restore_{datetime.now():%Y%m%d%H%M%S}.db")
+        shutil.copy2(current_path, safety_path)
+    shutil.copy2(backup_path, current_path)
+    new_conn = connect(current_path)
+    applied = migrate(new_conn)
+    integrity = new_conn.execute("PRAGMA integrity_check").fetchone()[0]
+    if integrity != "ok":
+        new_conn.close()
+        raise AccountingError("فشل فحص السلامة بعد الاستعادة: القاعدة المستعادة تالفة")
+    with transaction(new_conn):
+        new_conn.execute("INSERT INTO backups(path,size_bytes,checksum,last_migration,reason,created_by) VALUES(?,?,?,?,?,?)",
+                         (str(original_path), v["size_bytes"], v["checksum"], v["last_migration"], "restore_source", actor_id))
+        audit.log(new_conn, actor_id, "restore_database", "backups", None,
+                  after={"backup_path": str(original_path), "safety_backup_path": safety_path, "applied_migrations": applied})
+    return {"connection": new_conn, "safety_backup_path": safety_path, "applied_migrations": applied, "integrity": integrity}
+
+
+def list_backups(conn, user_id, company_id, limit=50):
+    permissions.require(conn, user_id, company_id, "backup.manage", check_branch=False)
+    return [dict(r) for r in conn.execute("SELECT * FROM backups ORDER BY id DESC LIMIT ?", (min(int(limit), 200),))]
+
+
+# ---------------------------------------------------------------------------------------------
+# النسخ المضغوط (zip) والنسخ التلقائي إلى مجلد محدد: الملف = قاعدة البيانات + manifest.json ببصمتها.
+# ---------------------------------------------------------------------------------------------
+DB_NAME = "alhisabat.db"
+MANIFEST = "manifest.json"
+MANUAL_PREFIX, AUTO_PREFIX = "alhisabat_backup", "alhisabat_auto"
+ZIP_FORMAT = 1
+
+
+def is_zip_backup(path):
+    return str(path).lower().endswith(".zip")
+
+
+BACKUP_TIMEOUT = 120          # ثوانٍ: أقصى انتظار لقاعدة مشغولة بمستخدمين آخرين قبل إلغاء النسخة بدل التعليق
+STALE_PART_SECONDS = 24 * 3600
+
+
+def _snapshot(conn, db_tmp, timeout=BACKUP_TIMEOUT, cancel=None):
+    """لقطة متسقة بخطوات صغيرة مع مهلة وإلغاء. Connection.backup الافتراضي يعيد المحاولة بلا نهاية إن كان مصدر آخر يكتب في القاعدة
+    (حالة السيرفر بعدة مستخدمين) فيعلّق البرنامج؛ لذا نمرّر progress الذي يرفع خطأً عند انتهاء المهلة أو طلب الإلغاء."""
+    deadline = time.monotonic() + float(timeout)
+
+    def _progress(_status, _remaining, _total):
+        if cancel is not None and cancel():
+            raise AccountingError("أُلغيت النسخة الاحتياطية")
+        if time.monotonic() > deadline:
+            raise AccountingError("انتهت مهلة النسخ الاحتياطي: قاعدة البيانات مشغولة بمستخدمين آخرين. أعد المحاولة بعد لحظات")
+
+    snap = sqlite3.connect(db_tmp)
+    try:
+        conn.backup(snap, pages=256, progress=_progress, sleep=0.1)
+    finally:
+        snap.close()
+
+
+def _unique_zip_path(dest_dir, prefix, now):
+    base = Path(dest_dir) / f"{prefix}_{now:%Y%m%d_%H%M%S}"
+    p, n = Path(f"{base}.zip"), 1
+    while p.exists():
+        n += 1
+        p = Path(f"{base}_{n}.zip")
+    return p
+
+
+def create_zip_backup(conn, actor_id, company_id, dest_dir, reason="", *, auto=False, keep=None, timeout=BACKUP_TIMEOUT, cancel=None):
+    """نسخة متسقة (Backup API) تُضغط في ملف zip داخل dest_dir؛ الكتابة إلى ملف مؤقت ثم إعادة تسمية ذرّية فلا يبقى ملف نصف مكتوب.
+    auto=True: اسم بادئته alhisabat_auto، وإن مُرِّر keep يُحذف الأقدم من النسخ التلقائية فقط (لا تُمَسّ النسخ اليدوية)."""
+    permissions.require(conn, actor_id, company_id, "backup.manage", check_branch=False)
+    if not dest_dir:
+        raise AccountingError("لم يُحدَّد مجلد النسخ الاحتياطي")
+    dest = Path(dest_dir)
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        raise AccountingError("تعذّر الوصول إلى مجلد النسخ الاحتياطي: تأكد أنه موجود وأن القرص متصل")
+    now = datetime.now()
+    zip_path = _unique_zip_path(dest, AUTO_PREFIX if auto else MANUAL_PREFIX, now)
+    part = Path(f"{zip_path}.part")
+    try:
+        with tempfile.TemporaryDirectory(prefix="alhisabat_bk_") as td:
+            db_tmp = os.path.join(td, DB_NAME)
+            _snapshot(conn, db_tmp, timeout, cancel)
+            last_mig = _last_migration(conn)
+            manifest = {"format": ZIP_FORMAT, "created_at": now.isoformat(timespec="seconds"), "db_name": DB_NAME,
+                        "db_sha256": _sha256(db_tmp), "db_size": os.path.getsize(db_tmp), "last_migration": last_mig,
+                        "auto": bool(auto), "reason": reason}
+            with zipfile.ZipFile(part, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+                z.write(db_tmp, DB_NAME)
+                z.writestr(MANIFEST, json.dumps(manifest, ensure_ascii=False, indent=1))
+        os.replace(part, zip_path)
+    except BaseException as exc:
+        if part.exists():
+            try:
+                part.unlink()
+            except OSError:
+                pass
+        if not isinstance(exc, OSError):
+            raise                                            # AccountingError (مهلة/إلغاء) وغيره يمر كما هو
+        raise AccountingError("تعذّرت كتابة النسخة الاحتياطية في المجلد (مساحة غير كافية أو القرص غير متاح أو لا صلاحية كتابة)")
+    size, checksum = os.path.getsize(zip_path), _sha256(zip_path)
+    with transaction(conn):
+        conn.execute("INSERT INTO backups(path,size_bytes,checksum,last_migration,reason,created_by) VALUES(?,?,?,?,?,?)",
+                     (str(zip_path), size, checksum, manifest["last_migration"], reason, actor_id))
+        audit.log(conn, actor_id, "create_backup", "backups", None, after={"path": str(zip_path), "size": size, "checksum": checksum, "auto": bool(auto)})
+    removed = prune_auto_backups(dest, keep) if (auto and keep) else []
+    return {"path": str(zip_path), "size_bytes": size, "checksum": checksum, "last_migration": manifest["last_migration"], "pruned": removed}
+
+
+@contextmanager
+def open_backup(path):
+    """يعطي مسار ملف .db جاهزًا للفحص/الاستعادة: الخام كما هو، والمضغوط يُفك (ملف القاعدة وحده، باسم نختاره نحن: لا zip-slip)
+    في مجلد مؤقت يُحذف بعد الاستخدام، مع التحقق من البصمة المسجّلة في manifest."""
+    path = str(path)
+    if not os.path.exists(path):
+        raise AccountingError("ملف النسخة الاحتياطية غير موجود")
+    if not is_zip_backup(path):
+        yield path
+        return
+    if not zipfile.is_zipfile(path):
+        raise AccountingError("الملف ليس نسخة احتياطية مضغوطة صالحة")
+    with tempfile.TemporaryDirectory(prefix="alhisabat_rs_") as td:
+        out = os.path.join(td, DB_NAME)
+        try:
+            with zipfile.ZipFile(path) as z:
+                names = set(z.namelist())
+                if DB_NAME not in names:
+                    raise AccountingError("الملف المضغوط لا يحوي قاعدة بيانات الحسابات برو")
+                manifest = json.loads(z.read(MANIFEST).decode("utf-8")) if MANIFEST in names else {}
+                with z.open(DB_NAME) as src, open(out, "wb") as dst:
+                    shutil.copyfileobj(src, dst, 1 << 20)
+        except (zipfile.BadZipFile, zlib_error, EOFError, json.JSONDecodeError, UnicodeDecodeError):
+            raise AccountingError("الملف المضغوط تالف ولا يمكن فكّه")
+        want = manifest.get("db_sha256")
+        if want and _sha256(out) != want:
+            raise AccountingError("بصمة النسخة لا تطابق المسجّلة داخل الملف: الملف تالف أو عُدِّل")
+        yield out
+
+
+def verify_backup(path):
+    """يتحقق من نسخة خام (.db) أو مضغوطة (.zip): سلامة الملف ثم PRAGMA integrity_check على القاعدة داخله."""
+    with open_backup(path) as db_file:
+        r = _verify_db(db_file)
+    if is_zip_backup(path):
+        r.update(path=str(path), size_bytes=os.path.getsize(path), checksum=_sha256(path), zip=True)
+    return r
+
+
+def _auto_files(dest_dir):
+    d = Path(dest_dir)
+    if not d.is_dir():
+        return []
+    return sorted((f for f in d.glob(f"{AUTO_PREFIX}_*.zip") if f.is_file()), key=lambda f: f.name, reverse=True)
+
+
+def prune_auto_backups(dest_dir, keep):
+    """يُبقي أحدث keep نسخة تلقائية ويحذف الباقي؛ يرجع الأسماء المحذوفة. لا يلمس النسخ اليدوية ولا أي ملف آخر."""
+    keep = max(int(keep), 1)
+    removed = []
+    try:                                                     # بقايا ملفات ناقصة (.part) من نسخة قُطعت: تُحذف بعد يوم
+        for f in Path(dest_dir).glob(f"{AUTO_PREFIX}_*.zip.part"):
+            if time.time() - f.stat().st_mtime > STALE_PART_SECONDS:
+                f.unlink()
+    except OSError:
+        pass
+    for f in _auto_files(dest_dir)[keep:]:
+        try:
+            f.unlink()
+            removed.append(f.name)
+        except OSError:
+            pass
+    return removed
+
+
+def list_folder_backups(dest_dir, limit=200):
+    """نسخ zip في المجلد (يدوية وتلقائية) الأحدث أولًا: [{name, path, size_bytes, modified, auto}]."""
+    d = Path(dest_dir) if dest_dir else None
+    if not d or not d.is_dir():
+        return []
+    rows = []
+    for f in d.glob("alhisabat_*.zip"):
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        rows.append({"name": f.name, "path": str(f), "size_bytes": st.st_size,
+                     "modified": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"), "auto": f.name.startswith(AUTO_PREFIX)})
+    rows.sort(key=lambda r: r["modified"], reverse=True)
+    return rows[:limit]

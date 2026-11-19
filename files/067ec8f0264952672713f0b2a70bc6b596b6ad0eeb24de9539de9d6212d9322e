@@ -1,0 +1,409 @@
+"""نوافذ النظام: ضريبة، مستخدم، دور، إعدادات.
+"""
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+                               QMessageBox, QCheckBox, QPushButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout)
+
+
+from alhisabat.ui.components.basic import DateField
+
+class TaxDialog(QDialog):
+    def __init__(self, page):
+        super().__init__(page); self.setWindowTitle('نسبة ضريبة جديدة'); self.setLayoutDirection(Qt.RightToLeft); self.setMinimumWidth(420)
+        form=QFormLayout(self)
+        self.code=QLineEdit(); self.name=QLineEdit(); self.rate=QLineEdit(); self.rate.setPlaceholderText('مثل 15 للـ15%')
+        self.kind=QComboBox(); self.kind.addItems(['output','input']); self.kind.setItemText(0,'مبيعات'); self.kind.setItemText(1,'مشتريات')
+        self.account=QComboBox()
+        try:
+            for aid,lab in page.session.lookup_accounts(groups=False): self.account.addItem(lab, aid)
+        except Exception: pass
+        form.addRow('الكود', self.code); form.addRow('الاسم *', self.name); form.addRow('النسبة % *', self.rate); form.addRow('النوع', self.kind); form.addRow('حساب الضريبة *', self.account)
+        bb=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel); bb.accepted.connect(self._accept); bb.rejected.connect(self.reject); form.addRow(bb)
+    def _accept(self):
+        if not self.name.text().strip(): return QMessageBox.warning(self,'خطأ','الاسم مطلوب')
+        if not self.rate.text().strip(): return QMessageBox.warning(self,'خطأ','النسبة مطلوبة')
+        if self.account.currentData() is None: return QMessageBox.warning(self,'خطأ','اختر حساب الضريبة')
+        self.accept()
+    def values(self): return {'code':self.code.text().strip(),'name':self.name.text().strip(),'rate':self.rate.text().strip().replace(',', ''),'kind':'output' if self.kind.currentIndex()==0 else 'input','account_id':self.account.currentData()}
+
+class UserDialog(QDialog):
+    def __init__(self, page):
+        super().__init__(page); self.setWindowTitle('مستخدم جديد'); self.setLayoutDirection(Qt.RightToLeft); self.setMinimumWidth(420)
+        form=QFormLayout(self)
+        self.username=QLineEdit(); self.fullname=QLineEdit(); self.password=QLineEdit(); self.password.setEchoMode(QLineEdit.Password)
+        self.role=QComboBox()
+        try:
+            for rid,label in page.session.lookup_roles(): self.role.addItem(label, rid)
+        except Exception: pass
+        form.addRow('اسم المستخدم *', self.username); form.addRow('الاسم الكامل', self.fullname); form.addRow('كلمة المرور *', self.password); form.addRow('الدور', self.role)
+        bb=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel); bb.accepted.connect(self._accept); bb.rejected.connect(self.reject); form.addRow(bb)
+    def _accept(self):
+        if not self.username.text().strip(): return QMessageBox.warning(self,'خطأ','اسم المستخدم مطلوب')
+        if not self.password.text(): return QMessageBox.warning(self,'خطأ','كلمة المرور مطلوبة')
+        self.accept()
+    def values(self): return {'username':self.username.text().strip(),'name':self.fullname.text().strip() or self.username.text().strip(),'password':self.password.text(),'role':self.role.currentData()}
+
+class _PwMixin:
+    """تحقق مشترك لكلمة المرور الجديدة (اختيارية) وتأكيدها."""
+    MIN_PW = 8
+
+    def _check_new_pw(self, pw, confirm):
+        if not pw and not confirm:
+            return True
+        if len(pw) < self.MIN_PW:
+            QMessageBox.warning(self, 'خطأ', f'كلمة المرور الجديدة يجب ألا تقل عن {self.MIN_PW} أحرف'); return False
+        if pw != confirm:
+            QMessageBox.warning(self, 'خطأ', 'تأكيد كلمة المرور لا يطابق الكلمة الجديدة'); return False
+        return True
+
+
+class UserEditDialog(_PwMixin, QDialog):
+    """تعديل بيانات مستخدم (مدير النظام): اسم الدخول والاسم الكامل وكلمة مرور جديدة اختيارية (فارغة = بلا تغيير)."""
+    def __init__(self, page, user):
+        super().__init__(page); self.setWindowTitle('تعديل بيانات المستخدم'); self.setLayoutDirection(Qt.RightToLeft); self.setMinimumWidth(440)
+        form=QFormLayout(self)
+        self.username=QLineEdit(user.get('username') or ''); self.fullname=QLineEdit(user.get('full_name') or '')
+        self.password=QLineEdit(); self.password.setEchoMode(QLineEdit.Password); self.password.setPlaceholderText('اتركها فارغة لعدم التغيير')
+        self.confirm=QLineEdit(); self.confirm.setEchoMode(QLineEdit.Password)
+        form.addRow('اسم المستخدم *', self.username); form.addRow('الاسم الكامل *', self.fullname)
+        form.addRow('كلمة مرور جديدة', self.password); form.addRow('تأكيد كلمة المرور', self.confirm)
+        note=QLabel('تغيير اسم المستخدم يغيّر اسم الدخول؛ أبلغ صاحب الحساب به. إعدادات الطباعة المحفوظة باسم الدخول القديم تعود للافتراضي.'); note.setWordWrap(True); note.setObjectName('ctxKey'); form.addRow(note)
+        bb=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel); bb.accepted.connect(self._accept); bb.rejected.connect(self.reject); form.addRow(bb)
+    def _accept(self):
+        if not self.username.text().strip(): return QMessageBox.warning(self,'خطأ','اسم المستخدم مطلوب')
+        if not self.fullname.text().strip(): return QMessageBox.warning(self,'خطأ','الاسم الكامل مطلوب')
+        if not self._check_new_pw(self.password.text(), self.confirm.text()): return
+        self.accept()
+    def values(self): return {'username':self.username.text().strip(),'name':self.fullname.text().strip(),'password':self.password.text()}
+
+class MyProfileDialog(_PwMixin, QDialog):
+    """بيانات المستخدم الحالي: الاسم الكامل وتغيير كلمة المرور (يتطلب كلمة المرور الحالية)."""
+    def __init__(self, page, full_name='', username=''):
+        super().__init__(page); self.setWindowTitle('بيانات المستخدم'); self.setLayoutDirection(Qt.RightToLeft); self.setMinimumWidth(440)
+        form=QFormLayout(self)
+        lbl=QLabel(username); lbl.setObjectName('ctxKey')
+        self.fullname=QLineEdit(full_name)
+        self.current=QLineEdit(); self.current.setEchoMode(QLineEdit.Password)
+        self.password=QLineEdit(); self.password.setEchoMode(QLineEdit.Password); self.password.setPlaceholderText('اتركها فارغة لعدم التغيير')
+        self.confirm=QLineEdit(); self.confirm.setEchoMode(QLineEdit.Password)
+        form.addRow('اسم المستخدم', lbl); form.addRow('الاسم الكامل *', self.fullname)
+        form.addRow('كلمة المرور الحالية *', self.current)
+        form.addRow('كلمة مرور جديدة', self.password); form.addRow('تأكيد كلمة المرور', self.confirm)
+        bb=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel); bb.accepted.connect(self._accept); bb.rejected.connect(self.reject); form.addRow(bb)
+    def _accept(self):
+        if not self.fullname.text().strip(): return QMessageBox.warning(self,'خطأ','الاسم الكامل مطلوب')
+        if not self.current.text(): return QMessageBox.warning(self,'خطأ','أدخل كلمة المرور الحالية للتأكيد')
+        if not self._check_new_pw(self.password.text(), self.confirm.text()): return
+        self.accept()
+    def values(self): return {'name':self.fullname.text().strip(),'current_password':self.current.text(),'new_password':self.password.text()}
+
+class RoleDialog(QDialog):
+    """مجموعات صلاحيات المستخدم: قائمة بعلامات اختيار (يمكن أكثر من مجموعة) وتُستبدل بها مجموعاته الحالية."""
+    def __init__(self, page, current_ids=()):
+        super().__init__(page); self.setWindowTitle('مجموعات صلاحيات المستخدم'); self.setLayoutDirection(Qt.RightToLeft); self.setMinimumWidth(360)
+        lay=QVBoxLayout(self); lay.addWidget(QLabel('اختر مجموعة أو أكثر؛ تُستبدل بها المجموعات الحالية:'))
+        self.lst=QListWidget(); lay.addWidget(self.lst)
+        cur={int(i) for i in current_ids}
+        try:
+            for rid,label in page.session.lookup_roles():
+                it=QListWidgetItem(label); it.setData(Qt.UserRole, int(rid)); it.setFlags(it.flags()|Qt.ItemIsUserCheckable)
+                it.setCheckState(Qt.Checked if int(rid) in cur else Qt.Unchecked); self.lst.addItem(it)
+        except Exception: pass
+        bb=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel); bb.accepted.connect(self._accept); bb.rejected.connect(self.reject); lay.addWidget(bb)
+    def _accept(self):
+        if not self.values()['role_ids']: return QMessageBox.warning(self,'خطأ','اختر مجموعة واحدة على الأقل')
+        self.accept()
+    def values(self):
+        return {'role_ids':[self.lst.item(i).data(Qt.UserRole) for i in range(self.lst.count()) if self.lst.item(i).checkState()==Qt.Checked]}
+
+
+# مقاطع رموز الصلاحيات (قبل النقطة) ← عنوان المجموعة بالعربية في شجرة الصلاحيات
+PERM_GROUPS = {
+    'account':'الحسابات','journal':'القيود اليومية','period':'الفترات المحاسبية','fiscalyear':'السنوات المالية','opening':'الأرصدة الافتتاحية',
+    'cash':'الصناديق والبنوك','party':'العملاء والموردون','sales':'المبيعات','purchase':'المشتريات','inventory':'المخزون','stock':'المخزون',
+    'item':'الأصناف','asset':'الأصول الثابتة','employee':'الموظفون','payroll':'الرواتب','hr':'الموارد البشرية','currency':'العملات','fx':'العملات',
+    'tax':'الضرائب','costcenter':'مراكز التكلفة','branch':'الفروع','report':'التقارير','reports':'التقارير','data':'الاستيراد والتصدير',
+    'backup':'النسخ الاحتياطي','audit':'سجل التدقيق','user':'المستخدمون والصلاحيات','settings':'الإعدادات','message':'رسائل واتساب','print':'الطباعة',
+}
+
+
+class RolesManagerDialog(QDialog):
+    """إدارة مجموعات الصلاحيات: قائمة المجموعات يمينًا وشجرة الصلاحيات مجمّعة حسب القسم؛ المدير يحدد ما يُمنح لكل مجموعة.
+    «مدير النظام» ثابتة (كل الصلاحيات). المجموعات النظامية تُعدَّل صلاحياتها لا أسماؤها. المخصّصة تُنشأ وتُعدَّل وتُحذف."""
+    no_inline = True
+
+    def __init__(self, page):
+        super().__init__(page); self._page=page; self.svc=page.svc; self._rid=None; self._loading=False; self._dirty=False
+        self.setWindowTitle('مجموعات الصلاحيات'); self.setLayoutDirection(Qt.RightToLeft); self.resize(820,560)
+        root=QHBoxLayout(self)
+        # قائمة المجموعات
+        left=QVBoxLayout(); self.lst=QListWidget(); self.lst.setMaximumWidth(250); left.addWidget(QLabel('المجموعات')); left.addWidget(self.lst,1)
+        b_new=QPushButton('+ مجموعة جديدة'); b_new.clicked.connect(self._new); self.b_del=QPushButton('حذف المجموعة'); self.b_del.clicked.connect(self._delete)
+        left.addWidget(b_new); left.addWidget(self.b_del); root.addLayout(left)
+        # التفاصيل
+        right=QVBoxLayout(); form=QFormLayout(); self.name=QLineEdit(); form.addRow('اسم المجموعة', self.name); right.addLayout(form)
+        self.note=QLabel(''); self.note.setWordWrap(True); right.addWidget(self.note)
+        row=QHBoxLayout(); b_all=QPushButton('تحديد الكل'); b_none=QPushButton('إلغاء الكل'); b_all.clicked.connect(lambda: self._set_all(Qt.Checked)); b_none.clicked.connect(lambda: self._set_all(Qt.Unchecked))
+        row.addWidget(b_all); row.addWidget(b_none); row.addStretch(1); right.addLayout(row)
+        self.tree=QTreeWidget(); self.tree.setHeaderHidden(True); self.tree.setLayoutDirection(Qt.RightToLeft); right.addWidget(self.tree,1)
+        row2=QHBoxLayout(); self.b_save=QPushButton('حفظ'); self.b_save.clicked.connect(self._save); b_close=QPushButton('إغلاق'); b_close.clicked.connect(self.accept)
+        row2.addStretch(1); row2.addWidget(self.b_save); row2.addWidget(b_close); right.addLayout(row2); root.addLayout(right,1)
+        self._build_tree(); self._load_roles()
+        self.lst.currentRowChanged.connect(self._on_pick); self.name.textEdited.connect(lambda _t: self._mark()); self.tree.itemChanged.connect(lambda *_a: self._mark())
+        if self.lst.count(): self.lst.setCurrentRow(0)
+
+    # ---- بناء الشجرة
+    def _build_tree(self):
+        self._items={}; groups={}; self.tree.blockSignals(True)
+        try: cat=self.svc.permissions_catalog()
+        except Exception as exc: QMessageBox.warning(self,'خطأ',str(exc)); cat=[]
+        for p in cat:
+            seg=p['code'].split('.')[0]; title=PERM_GROUPS.get(seg, f'أخرى ({seg})')
+            g=groups.get(title)
+            if g is None:
+                g=QTreeWidgetItem([title]); g.setFlags(g.flags()|Qt.ItemIsUserCheckable|Qt.ItemIsAutoTristate); g.setCheckState(0,Qt.Unchecked); self.tree.addTopLevelItem(g); groups[title]=g
+            label=p['name_ar']+('  ⚠' if p.get('is_sensitive') else '')
+            it=QTreeWidgetItem([label]); it.setData(0,Qt.UserRole,p['code']); it.setFlags(it.flags()|Qt.ItemIsUserCheckable); it.setCheckState(0,Qt.Unchecked)
+            it.setToolTip(0,p['code'])
+            if not self._page.access.has(p['code']):                  # لا تُمنح صلاحية لا يملكها المنفِّذ
+                it.setFlags(it.flags() & ~Qt.ItemIsEnabled); it.setToolTip(0,'لا تملك هذه الصلاحية فلا يمكنك منحها')
+            g.addChild(it); self._items[p['code']]=it
+        self.tree.expandAll(); self.tree.blockSignals(False)
+
+    def _load_roles(self, select_id=None):
+        self._loading=True; self.lst.clear()
+        try: rows=self.svc.roles()
+        except Exception as exc: QMessageBox.warning(self,'خطأ',str(exc)); rows=[]
+        self._roles={r['id']:r for r in rows}
+        for r in rows:
+            it=QListWidgetItem(f"{r['name_ar']}  ({r['user_count']} مستخدم)"); it.setData(Qt.UserRole,r['id']); self.lst.addItem(it)
+            if select_id is not None and r['id']==select_id: self.lst.setCurrentItem(it)
+        self._loading=False
+
+    # ---- اختيار/عرض مجموعة
+    def _confirm_discard(self):
+        if not self._dirty: return True
+        return QMessageBox.question(self,'تعديلات غير محفوظة','هناك تعديلات لم تُحفظ. تجاهلها؟')==QMessageBox.Yes
+
+    def _on_pick(self, row):
+        if self._loading or row<0: return
+        rid=self.lst.item(row).data(Qt.UserRole)
+        if rid!=self._rid and not self._confirm_discard():
+            self._loading=True; self._select_rid(self._rid); self._loading=False; return
+        self._show(rid)
+
+    def _select_rid(self, rid):
+        for i in range(self.lst.count()):
+            if self.lst.item(i).data(Qt.UserRole)==rid: self.lst.setCurrentRow(i); return
+
+    def _show(self, rid):
+        self._rid=rid; r=self._roles.get(rid) or {}
+        try: codes=set(self.svc.role_permissions(rid)) if rid else set()
+        except Exception as exc: QMessageBox.warning(self,'خطأ',str(exc)); codes=set()
+        self._loading=True; self.tree.blockSignals(True)
+        self.name.setText(r.get('name_ar',''))
+        for code,it in self._items.items(): it.setCheckState(0,Qt.Checked if code in codes else Qt.Unchecked)
+        self.tree.blockSignals(False); self._loading=False; self._dirty=False
+        admin=(rid==1); system=bool(r.get('is_system'))
+        self.name.setEnabled(not system); self.tree.setEnabled(not admin); self.b_save.setEnabled(not admin); self.b_del.setEnabled(not system)
+        self.note.setText('«مدير النظام» ثابتة بكل الصلاحيات ولا تُعدَّل.' if admin else
+                          ('مجموعة نظامية: تُعدَّل صلاحياتها دون اسمها ولا تُحذف.' if system else 'مجموعة مخصّصة: عدّل اسمها وصلاحياتها أو احذفها إن لم يكن لها مستخدمون.'))
+
+    def _mark(self):
+        if not self._loading: self._dirty=True
+
+    def _set_all(self, state):
+        self._loading=True
+        for it in self._items.values():
+            if it.flags() & Qt.ItemIsEnabled: it.setCheckState(0,state)
+        self._loading=False; self._dirty=True
+
+    def _checked(self):
+        return [c for c,it in self._items.items() if it.checkState(0)==Qt.Checked]
+
+    # ---- إجراءات
+    def _new(self):
+        if not self._confirm_discard(): return
+        name,ok=QInputDialog.getText(self,'مجموعة جديدة','اسم المجموعة:')
+        name=(name or '').strip()
+        if not ok or not name: return
+        usable=[c for c,it in self._items.items() if it.flags() & Qt.ItemIsEnabled]          # تبدأ المجموعة بصلاحية عرض واحدة ثم يحدد المدير الباقي
+        start=['account.view'] if 'account.view' in usable else usable[:1]
+        try: rid=self.svc.create_role(name, start)
+        except Exception as exc: return QMessageBox.warning(self,'خطأ',str(exc))
+        self._load_roles(rid); self._show(rid); self._page.notify('تم إنشاء المجموعة: حدّد صلاحياتها ثم احفظ')
+
+    def _save(self):
+        if self._rid is None: return
+        try: self.svc.update_role(self._rid, self.name.text().strip(), self._checked())
+        except Exception as exc: return QMessageBox.warning(self,'خطأ',str(exc))
+        self._dirty=False; self._load_roles(self._rid); self._show(self._rid); self._page.notify('تم حفظ صلاحيات المجموعة')
+
+    def _delete(self):
+        if self._rid is None: return
+        if QMessageBox.question(self,'حذف المجموعة',f"حذف المجموعة «{self.name.text()}»؟")!=QMessageBox.Yes: return
+        try: self.svc.delete_role(self._rid)
+        except Exception as exc: return QMessageBox.warning(self,'خطأ',str(exc))
+        self._dirty=False; self._rid=None; self._load_roles()
+        if self.lst.count(): self.lst.setCurrentRow(0)
+
+    def reject(self):
+        if self._confirm_discard(): super().reject()
+
+    def accept(self):
+        if self._confirm_discard(): super().accept()
+
+class SettingsDialog(QDialog):
+    def __init__(self, page):
+        super().__init__(page); self.setWindowTitle('إعدادات القيود والمبيعات والمخزون'); self.setLayoutDirection(Qt.RightToLeft); form=QFormLayout(self)
+        self.require_review=QCheckBox('المراجعة إلزامية قبل الترحيل'); self.require_approval=QCheckBox('الاعتماد إلزامي قبل الترحيل'); self.enforce_sep=QCheckBox('فصل المهام (لا يراجع منشئ القيد قيده)')
+        self.allow_party=QCheckBox('السماح بقيد يدوي (بسيط/مركب) على حسابات العملاء والموردين — لمدير النظام فقط')
+        self.allow_party.setToolTip('يُرحَّل القيد على الحساب التفصيلي للعميل/المورد فيظهر في كشف حسابه، ويبقى الحساب الرقابي = مجموع الأطراف. حسابات المخزون تبقى ممنوعة. يتطلب بيانًا للقيد ويُسجَّل في التدقيق.')
+        self._can_party=page.access.has('journal.party_manual'); self.allow_party.setEnabled(self._can_party)
+        self.allow_edit_entries=QCheckBox('السماح بتعديل القيود المرحّلة — لمدير النظام فقط')
+        self.allow_edit_entries.setToolTip('يظهر زر «تعديل مرحّل» في القيود: يُعكس القيد القديم بقيد عكسي ويُرحَّل قيد جديد بالقيم الصحيحة، ويُسجَّل السبب. للقيود اليدوية فقط، وفي فترة مفتوحة.')
+        self._can_edit_entries=page.access.has('journal.edit_posted'); self.allow_edit_entries.setEnabled(self._can_edit_entries)
+        self.allow_delete_entries=QCheckBox('السماح بحذف القيود المرحّلة (لقيد خاطئ يعرقل الإقفال) — لمدير النظام فقط')
+        self.allow_delete_entries.setToolTip('يظهر زر «حذف مرحّل» في القيود: حذف فعلي للقيد اليدوي (وعكسه إن وُجد) من فترة مفتوحة فقط، مع حفظ نسخة كاملة منه والسبب في سجل لا يُعدَّل. القيود المولّدة من فواتير أو سندات لا تُحذف من هنا.')
+        self._can_delete_entries=page.access.has('journal.delete_posted'); self.allow_delete_entries.setEnabled(self._can_delete_entries)
+        self.allow_edit_posted=QCheckBox('السماح بتعديل الفاتورة المرحّلة (تعديل أصنافها أو أسعارها) — لمدير النظام فقط')
+        self.allow_edit_posted.setToolTip('عند التفعيل يظهر زر «تعديل مرحّلة» في المبيعات: يُعكس القيد القديم والحركات المخزنية بقيد عكسي ثم تُرحَّل الفاتورة بالقيم الجديدة بنفس رقمها، ويُسجَّل السبب في التدقيق. لا تُعدَّل فاتورة عليها مرتجعات أو سندات قبض مرحّلة.')
+        self._can_edit_posted=page.access.has('sales.edit_posted'); self.allow_edit_posted.setEnabled(self._can_edit_posted)
+        self.allow_negative=QCheckBox('السماح ببيع كمية سالبة من المخزون (يُحسب الرصيد بالسالب) — لمدير النظام فقط')
+        self.allow_negative.setToolTip('يُسمح ببيع كمية تتجاوز الرصيد فيظهر الرصيد بالسالب، وتُقيَّم الكمية الزائدة بآخر تكلفة معروفة. عند إضافة مخزون (فاتورة شراء) تُوازَن الكمية تلقائيًا ويُحمَّل فرق التكلفة على تكلفة المبيعات.')
+        self._can_negative=page.access.has('stock.allow_negative'); self.allow_negative.setEnabled(self._can_negative)
+        self.credit_mode=QComboBox(); self.credit_mode.addItems(['block','warn','off']); self.credit_mode.setItemText(0,'منع تجاوز الحد'); self.credit_mode.setItemText(1,'تحذير فقط'); self.credit_mode.setItemText(2,'بدون فحص')
+        # تحميل القيم الحالية من الشبكة
+        try:
+            rows=page.svc.settings()
+            m={r['key']:r['value'] for r in rows}
+            self.require_review.setChecked(m.get('المراجعة إلزامية')=='نعم')
+            self.require_approval.setChecked(m.get('الاعتماد إلزامي')=='نعم')
+            self.enforce_sep.setChecked(m.get('فصل المهام')=='نعم')
+            self.allow_party.setChecked(m.get('السماح بقيد يدوي على العملاء والموردين')=='نعم')
+            self.allow_edit_entries.setChecked(m.get('السماح بتعديل القيود المرحّلة')=='نعم')
+            self.allow_delete_entries.setChecked(m.get('السماح بحذف القيود المرحّلة')=='نعم')
+            self.allow_edit_posted.setChecked(m.get('السماح بتعديل الفاتورة المرحّلة (أصنافها/أسعارها)')=='نعم')
+            self.allow_negative.setChecked(m.get('السماح ببيع كمية سالبة من المخزون')=='نعم')
+            cur=m.get('وضع الحد الائتماني') or 'block'
+            idx=self.credit_mode.findText(cur)
+            if idx<0:
+                idx={'block':0,'warn':1,'off':2}.get(cur,0)
+            self.credit_mode.setCurrentIndex(idx)
+        except Exception: pass
+        form.addRow(self.require_review); form.addRow(self.require_approval); form.addRow(self.enforce_sep); form.addRow(self.allow_party); form.addRow(self.allow_edit_entries); form.addRow(self.allow_delete_entries); form.addRow(self.allow_edit_posted); form.addRow(self.allow_negative); form.addRow('وضع الحد الائتماني', self.credit_mode)
+        bb=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel); bb.accepted.connect(self.accept); bb.rejected.connect(self.reject); form.addRow(bb)
+    def values(self):
+        v={'require_review':self.require_review.isChecked(),'require_approval':self.require_approval.isChecked(),'enforce_separation':self.enforce_sep.isChecked(),'credit_limit_mode':['block','warn','off'][self.credit_mode.currentIndex()]}
+        if self._can_party: v['allow_manual_party_entries']=self.allow_party.isChecked()
+        if self._can_edit_entries: v['allow_edit_posted_entries']=self.allow_edit_entries.isChecked()
+        if self._can_delete_entries: v['allow_delete_posted_entries']=self.allow_delete_entries.isChecked()
+        if self._can_edit_posted: v['allow_edit_posted_invoice']=self.allow_edit_posted.isChecked()
+        if self._can_negative: v['allow_negative_stock']=self.allow_negative.isChecked()
+        return v
+
+
+class UserRestrictionDialog(QDialog):
+    """تقييد صلاحيات المستخدم بنطاق الفروع أو المستودعات أو حسابات النقدية."""
+    def __init__(self, page, user):
+        super().__init__(page)
+        self.page = page
+        self.user = user
+        self.setWindowTitle(f"تقييد النطاق — {user.get('username', '')} ({user.get('full_name', '')})")
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.resize(540, 420)
+
+        from PySide6.QtWidgets import QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QGroupBox, QListWidget
+        lay = QVBoxLayout(self)
+
+        # 1. فروع
+        gb_branch = QGroupBox("التقييد بالفروع")
+        b_lay = QHBoxLayout(gb_branch)
+        self.cb_branch = QComboBox()
+        try:
+            for b in page.svc.branches():
+                self.cb_branch.addItem(f"{b.get('code','')} — {b.get('name','')}", b['id'])
+        except Exception: pass
+        btn_add_b = QPushButton("+ إضافة تقييد فرع")
+        btn_add_b.clicked.connect(self._add_branch)
+        b_lay.addWidget(self.cb_branch, 1)
+        b_lay.addWidget(btn_add_b)
+        lay.addWidget(gb_branch)
+
+        # 2. مستودعات
+        gb_wh = QGroupBox("التقييد بالمستودعات")
+        wh_lay = QHBoxLayout(gb_wh)
+        self.cb_wh = QComboBox()
+        try:
+            for w in page.session.warehouses(all_branches=True):
+                self.cb_wh.addItem(f"{w.get('code','')} — {w.get('name','')}", w['id'])
+        except Exception: pass
+        btn_add_wh = QPushButton("+ إضافة تقييد مستودع")
+        btn_add_wh.clicked.connect(self._add_wh)
+        wh_lay.addWidget(self.cb_wh, 1)
+        wh_lay.addWidget(btn_add_wh)
+        lay.addWidget(gb_wh)
+
+        # 3. حسابات نقدية
+        gb_cash = QGroupBox("التقييد بحسابات النقدية والبنوك")
+        c_lay = QHBoxLayout(gb_cash)
+        self.cb_cash = QComboBox()
+        try:
+            for cid, lab in page.session.lookup_cash():
+                self.cb_cash.addItem(lab, cid)
+        except Exception: pass
+        btn_add_c = QPushButton("+ إضافة تقييد حساب")
+        btn_add_c.clicked.connect(self._add_cash)
+        c_lay.addWidget(self.cb_cash, 1)
+        c_lay.addWidget(btn_add_c)
+        lay.addWidget(gb_cash)
+
+        # ملخص التقييدات الحالية
+        self.lbl_current = QLabel("التقييدات الحالية المسجلة:")
+        self.lbl_current.setWordWrap(True)
+        lay.addWidget(self.lbl_current)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Close)
+        bb.rejected.connect(self.accept)
+        lay.addWidget(bb)
+
+        self._load_current()
+
+    def _load_current(self):
+        try:
+            r = self.page.svc.user_restrictions(self.user['id'])
+            b_cnt = len(r.get('branches', []))
+            w_cnt = len(r.get('warehouses', []))
+            c_cnt = len(r.get('cash_accounts', []))
+            names = lambda cb, ids: "، ".join(cb.itemText(i) for i in range(cb.count()) if cb.itemData(i) in ids) or "—"
+            txt = (f"القيود المفروضة: {b_cnt} فرع | {w_cnt} مستودع | {c_cnt} حساب نقدية\n"
+                   f"الفروع المسموحة: {names(self.cb_branch, r.get('branches', [])) if b_cnt else 'كل الفروع (بلا تقييد)'}\n"
+                   f"المستودعات المسموحة: {names(self.cb_wh, r.get('warehouses', [])) if w_cnt else 'كل المستودعات (بلا تقييد)'}\n"
+                   f"الصناديق/البنوك المسموحة: {names(self.cb_cash, r.get('cash_accounts', [])) if c_cnt else 'كل الحسابات (بلا تقييد)'}\n"
+                   "(المستخدم بلا أي قيد في قسم ما يصل لكل عناصره؛ قيّده من القسم المطلوب)")
+            self.lbl_current.setText(txt)
+        except Exception: pass
+
+    def _add_branch(self):
+        bid = self.cb_branch.currentData()
+        if not bid: return
+        ok, _ = self.page.guarded(self.page.svc.restrict_to_branch, self.user['id'], bid, reload=False)
+        if ok:
+            self.page.notify("تم تقييد المستخدم بالفرع المحدد")
+            self._load_current()
+
+    def _add_wh(self):
+        wid = self.cb_wh.currentData()
+        if not wid: return
+        ok, _ = self.page.guarded(self.page.svc.restrict_to_warehouse, self.user['id'], wid, reload=False)
+        if ok:
+            self.page.notify("تم تقييد المستخدم بالمستودع المحدد")
+            self._load_current()
+
+    def _add_cash(self):
+        cid = self.cb_cash.currentData()
+        if not cid: return
+        ok, _ = self.page.guarded(self.page.svc.restrict_to_cash_account, self.user['id'], cid, reload=False)
+        if ok:
+            self.page.notify("تم تقييد المستخدم بحساب النقدية المحدد")
+            self._load_current()

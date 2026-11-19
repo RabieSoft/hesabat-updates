@@ -1,0 +1,88 @@
+"""دفتر الأستاذ / كشف الحساب: حركات القيود المرحّلة مع رصيد جارٍ وقابلية Drill Down إلى القيد والمستند والمستخدم."""
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.accounting import balance_engine as be
+from alhisabat.security import permissions
+
+
+def ledger(conn, user_id, company_id, account_id, date_from, date_to, *, include_children=True, branch_id=None,
+           currency=None, limit=200, offset=0):
+    permissions.require(conn, user_id, company_id, "account.view", check_branch=False)
+    permissions.require(conn, user_id, company_id, "report.view", check_branch=False)
+    accs = be.load_accounts(conn, company_id)
+    a = accs.get(account_id)
+    if not a:
+        raise AccountingError("الحساب غير موجود في هذه الشركة")
+    ys = be.same_year(conn, company_id, date_from, date_to) if a["account_type"] not in be.PERMANENT \
+        else be.year_start(conn, company_id, date_from)
+    if date_from > date_to:
+        raise AccountingError("تاريخ البداية بعد تاريخ النهاية")
+    branches = be.branch_scope(conn, user_id, branch_id)
+    ids = be.subtree_ids(conn, account_id) if include_children else [account_id]
+    ids = [i for i in ids if i in accs]
+    eff, counted, extra = be.frag("x")
+    args = {"c": company_id, "f": date_from, "t": date_to, "ys": ys, "fl": be.perm_floor(conn, company_id, ys)}
+    where = ""
+    if branches is not None:
+        where += " AND e.branch_id IN (%s)" % ",".join(f":b{i}" for i in range(len(branches)))
+        args.update({f"b{i}": b for i, b in enumerate(branches)})
+    where += " AND l.account_id IN (%s)" % ",".join(f":a{i}" for i in range(len(ids)))
+    args.update({f"a{i}": x for i, x in enumerate(ids)})
+    if currency:
+        where += " AND l.currency=:cur"; args["cur"] = currency
+    base = (f"FROM journal_lines l JOIN journal_entries e ON e.id=l.entry_id JOIN accounts x ON x.id=l.account_id "
+            f"WHERE e.company_id=:c AND e.status IN {be.POSTED} AND e.entry_date<=:t AND {counted} {where}")
+    opening = conn.execute(f"SELECT COALESCE(SUM(l.debit_base-l.credit_base),0) {base} AND {eff} < :f", args).fetchone()[0]
+    tot = conn.execute(f"SELECT COUNT(*),COALESCE(SUM(l.debit_base),0),COALESCE(SUM(l.credit_base),0) {base} "
+                       f"AND {eff} BETWEEN :f AND :t", args).fetchone()
+    # بالعملة الأصلية (ذات معنى عند ترشيح عملة واحدة: كشف «اليمني» برصيد يمني لا معادل أساسي)
+    opening_o = conn.execute(f"SELECT COALESCE(SUM(l.debit_orig-l.credit_orig),0) {base} AND {eff} < :f", args).fetchone()[0]
+    tot_o = conn.execute(f"SELECT COALESCE(SUM(l.debit_orig),0),COALESCE(SUM(l.credit_orig),0) {base} "
+                         f"AND {eff} BETWEEN :f AND :t", args).fetchone()
+    # ملخص لكل عملة على حدة (كشف «كل العملات»: رصيد افتتاحي ومدين/دائن وعدد حركات وختامي لكل عملة بمبالغها الأصلية)
+    by_cur = []
+    for c in conn.execute(
+            f"SELECT l.currency cur, "
+            f"COALESCE(SUM(CASE WHEN {eff} < :f THEN l.debit_orig-l.credit_orig END),0) open_o, "
+            f"COALESCE(SUM(CASE WHEN {eff} BETWEEN :f AND :t THEN l.debit_orig END),0) d_o, "
+            f"COALESCE(SUM(CASE WHEN {eff} BETWEEN :f AND :t THEN l.credit_orig END),0) c_o, "
+            f"COALESCE(SUM(CASE WHEN {eff} BETWEEN :f AND :t THEN 1 END),0) n "
+            f"{base} GROUP BY l.currency ORDER BY l.currency", args).fetchall():
+        by_cur.append({"currency": c["cur"], "opening_net_orig": c["open_o"], "debit_orig": c["d_o"], "credit_orig": c["c_o"],
+                       "count": c["n"], "closing_net_orig": c["open_o"] + c["d_o"] - c["c_o"]})
+    args.update({"open": opening, "open_o": opening_o, "lim": min(int(limit), 1000), "off": int(offset)})
+    rows = conn.execute(
+        f"""SELECT * FROM (
+              SELECT l.id line_id, l.line_no, e.id entry_id, e.posted_no, e.entry_no, e.entry_date, e.entry_type, e.status,
+                     e.description, e.source_type, e.source_id, e.reverses_entry_id, e.branch_id,
+                     e.created_by, e.posted_by, e.posted_at,
+                     l.account_id, x.code account_code, x.name account_name, l.currency, l.exchange_rate,
+                     l.debit_orig, l.credit_orig, l.debit_base, l.credit_base, l.memo,
+                     :open + SUM(l.debit_base-l.credit_base) OVER (ORDER BY e.entry_date,e.posted_no,e.id,l.line_no
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) running_net,
+                     :open_o + SUM(l.debit_orig-l.credit_orig) OVER (ORDER BY e.entry_date,e.posted_no,e.id,l.line_no
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) running_net_orig
+              {base} AND {eff} BETWEEN :f AND :t)
+            ORDER BY entry_date,posted_no,entry_id,line_no LIMIT :lim OFFSET :off""", args).fetchall()
+    sign = 1 if a["nature"] == "debit" else -1
+    vids = sorted({r["source_id"] for r in rows if r["source_type"] == "cash_voucher" and r["source_id"]})
+    notes = {}                                       # بيان سندات القبض/الصرف (ملاحظة/رقم السند الدفتري): هو البيان والمرجع في الكشف
+    for i in range(0, len(vids), 500):
+        part = vids[i:i + 500]
+        for v in conn.execute(f"SELECT id, description FROM cash_vouchers WHERE id IN ({','.join('?' for _ in part)})", part):
+            notes[v["id"]] = (v["description"] or "").strip()
+    out = []
+    for r in rows:
+        d = dict(r); d["running_balance"] = sign * d["running_net"]; d["running_balance_orig"] = sign * d["running_net_orig"]
+        note = notes.get(d["source_id"]) if d["source_type"] == "cash_voucher" else None
+        d["voucher_note"] = note or None
+        d["ref"] = note or ""
+        d["display_description"] = note or d["description"]
+        out.append(d)
+    return {"account": {"id": a["id"], "code": a["code"], "name": a["name"], "nature": a["nature"]},
+            "opening_net": opening, "opening_balance": sign * opening,
+            "total_debit": tot[1], "total_credit": tot[2], "count": tot[0],
+            "closing_net": opening + tot[1] - tot[2], "closing_balance": sign * (opening + tot[1] - tot[2]),
+            "currency": currency or None,
+            "opening_balance_orig": sign * opening_o, "total_debit_orig": tot_o[0], "total_credit_orig": tot_o[1],
+            "closing_balance_orig": sign * (opening_o + tot_o[0] - tot_o[1]),
+            "by_currency": by_cur, "rows": out, "has_more": int(offset) + len(out) < tot[0]}

@@ -1,0 +1,101 @@
+"""أرشفة سنة بعد إقفالها: نسخة كاملة من القاعدة باسم «الحسابات برو <سنة الإقفال>» + اختصار سطح مكتب يفتحها للعرض فقط.
+القاعدة الحية تستمر بالسنة الجديدة وباختصار «الحسابات برو» الأصلي. بلا PySide6."""
+import base64
+import os
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+from alhisabat import branding
+
+_ARCHIVE_LABEL = None          # يُضبط عند فتح البرنامج بوضع الأرشيف (--archive)
+
+
+def set_archive_mode(label):
+    global _ARCHIVE_LABEL
+    _ARCHIVE_LABEL = str(label) if label else None
+
+
+def archive_label():
+    return _ARCHIVE_LABEL
+
+
+def _safe(name):
+    return "".join(ch for ch in str(name) if ch not in '\\/:*?"<>|').strip() or "archive"
+
+
+def make_archive(db_path, year_name, app_dir):
+    """نسخة متسقة من القاعدة (واجهة النسخ في SQLite) داخل app_dir/archives. تُرجع المسار."""
+    folder = Path(app_dir) / "archives"
+    folder.mkdir(parents=True, exist_ok=True)
+    dest = folder / f"alhisabat_{_safe(year_name)}.db"
+    if dest.exists():
+        dest = folder / f"alhisabat_{_safe(year_name)}_{datetime.now():%Y%m%d_%H%M%S}.db"
+    src = sqlite3.connect(str(db_path))
+    try:
+        out = sqlite3.connect(str(dest))
+        try:
+            src.backup(out)
+        finally:
+            out.close()
+    finally:
+        src.close()
+    return dest
+
+
+def _launch_command():
+    """(الهدف، مقدمة الوسائط): exe المجمَّع، أو pythonw مع run_app.py عند التشغيل من المصدر."""
+    if getattr(sys, "frozen", False):
+        return sys.executable, ""
+    exe = Path(sys.executable)
+    pyw = exe.with_name("pythonw.exe")
+    script = Path(__file__).resolve().parents[2] / "run_app.py"
+    return str(pyw if pyw.exists() else exe), f'"{script}" '
+
+
+def _powershell(script):
+    enc = base64.b64encode(script.encode("utf-16-le")).decode()
+    return subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", enc],
+                          capture_output=True, text=True, timeout=30)
+
+
+def create_desktop_shortcut(name, extra_args="", only_if_missing=False):
+    """ينشئ اختصارًا على سطح المكتب (ويندوز فقط). يُرجع (تم، رسالة)."""
+    if os.name != "nt":
+        return False, "إنشاء اختصار سطح المكتب متاح على ويندوز فقط"
+    target, pre = _launch_command()
+    args = (pre + extra_args).strip()
+    icon = branding.icon_ico_path()
+    q = lambda s: str(s).replace("'", "''")        # noqa: E731
+    ps = (f"$d=[Environment]::GetFolderPath('Desktop');$p=Join-Path $d '{q(_safe(name))}.lnk';"
+          + ("if(Test-Path $p){exit 3};" if only_if_missing else "")
+          + f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut($p);$s.TargetPath='{q(target)}';"
+          f"$s.Arguments='{q(args)}';$s.WorkingDirectory='{q(Path(target).parent)}';"
+          + (f"$s.IconLocation='{q(icon)}';" if icon else "") + "$s.Save()")
+    try:
+        r = _powershell(ps)
+    except Exception as ex:  # noqa: BLE001
+        return False, f"تعذر إنشاء الاختصار: {ex}"
+    if r.returncode == 3:
+        return False, "الاختصار موجود"
+    return r.returncode == 0, (r.stderr or "").strip()[:200]
+
+
+def archive_after_close(db_path, year_name, app_dir):
+    """يُستدعى بعد نجاح إقفال السنة: أرشيف + اختصاران (الأرشيف باسم النظام وسنة الإقفال، والاختصار الحي إن لم يوجد)."""
+    res = {"archive_path": None, "shortcut": None, "notes": []}
+    try:
+        p = make_archive(db_path, year_name, app_dir)
+    except Exception as ex:  # noqa: BLE001
+        res["notes"].append(f"تعذر حفظ أرشيف السنة: {ex}")
+        return res
+    res["archive_path"] = str(p)
+    name = f"{branding.PRODUCT_NAME} {year_name}"
+    ok, msg = create_desktop_shortcut(name, f'--db "{p}" --archive "{year_name}"')
+    res["shortcut"] = name if ok else None
+    if not ok:
+        res["notes"].append(f"اختصار الأرشيف: {msg}")
+    create_desktop_shortcut(branding.PRODUCT_NAME, "", only_if_missing=True)
+    return res

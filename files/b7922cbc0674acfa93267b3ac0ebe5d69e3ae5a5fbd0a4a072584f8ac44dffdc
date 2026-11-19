@@ -1,0 +1,137 @@
+"""نموذج المستند الورقي (DocumentSpec): يُبنى من مواصفة الطباعة الموجودة (reporting/printing) دون منطق محاسبي جديد.
+
+الأرقام كلها تأتي من المحرك عبر printing.*_print؛ هنا ترتيب وعرض فقط. بلا PySide6.
+"""
+from dataclasses import dataclass, field
+from decimal import Decimal
+from typing import List
+
+from alhisabat.reporting import words as report_words
+from alhisabat.ui.core import print_settings as PSET
+from alhisabat.ui.design import tokens as T
+
+# خانات التوقيع الافتراضية لكل نوع مستند
+SIGNATURES = {
+    'invoice': ['المُعِدّ', 'المراجع', 'المستلم'],
+    'voucher': ['المُعِدّ', 'المحاسب', 'المدير المالي', 'المستلم'],
+    'journal': ['المُعِدّ', 'المراجع', 'المعتمد'],
+    'statement': [],
+    'report': [],
+    'count': ['المُعِدّ', 'أمين المخزن', 'المعتمد'],
+    'payroll': ['المُعِدّ', 'المحاسب', 'المدير'],
+    'receipt': [],
+}
+
+# ورق: (العرض مم، الارتفاع مم أو None للإيصال المتصل، الهامش مم)
+PAPERS = {
+    'A4': (210, 297, 15),
+    'A5': (148, 210, 10),
+    'RECEIPT80': (80, None, 3),
+}
+PAPER_LABELS = {'A4': 'A4', 'A5': 'A5', 'RECEIPT80': 'إيصال 80 مم'}
+
+
+def effective_dims(paper, opts=None):
+    """(العرض مم، الارتفاع مم أو None، الهامش مم) بعد تطبيق اتجاه الورق وهامش المستخدم (إعدادات الطباعة).
+    الإيصال المتصل لا يدور ويُقيَّد هامشه بـ10 مم."""
+    opts = opts or PSET.active()
+    w, h, m = PAPERS[paper]
+    if h is None:
+        return w, h, (min(opts.margin_mm, 10) if opts.margin_mm else m)
+    if opts.orientation == 'landscape':
+        w, h = h, w
+    return w, h, (opts.margin_mm or m)
+
+_STATUS_STAMP = {'draft': 'مسودة', 'posted': 'مرحّل', 'cancelled': 'ملغى', 'reversed': 'معكوس', 'reviewed': 'قيد المراجعة', 'approved': 'معتمد'}
+_EMPHASIS = ('الإجمالي', 'الرصيد الختامي', 'المتبقي', 'الإجماليات', 'صافي')
+
+
+@dataclass
+class DocumentSpec:
+    title: str
+    kind: str = 'report'
+    company: str = ''
+    branch: str = ''
+    currency: str = ''
+    period: str = ''
+    number: str = ''
+    date: str = ''
+    status: str = ''                       # رمز الحالة (posted/draft/...) → ختم على الورقة
+    info: List[tuple] = field(default_factory=list)   # أزواج (عنوان، قيمة) في رأس المستند
+    columns: List[dict] = field(default_factory=list)
+    rows: List[dict] = field(default_factory=list)
+    totals: List[dict] = field(default_factory=list)
+    notes: str = ''
+    signatures: List[str] = field(default_factory=list)
+    amount_words: str = ''                 # مبلغ كتابةً (يُحسب خارجيًا عبر core.format.amount_in_words)
+    printed_at: str = ''
+    footer_note: str = ''
+    opening: object = None                 # رصيد افتتاحي (مدين موجب) لكشف الحساب؛ None = ليس كشفًا
+    sums: object = None                    # {'debit','credit','count','party'} لإجماليات الكشف (قالب الربيع)
+    printed_by: str = ''
+    voucher: object = None                 # تفاصيل سند القبض/الصرف (printing._voucher_details)؛ None = قالب عام
+    invoice: object = None                 # بيانات قالب الفاتورة (printing.invoice_print['invoice']): الطرف/الدفع/الرصيد؛ None = قالب عام
+
+    @property
+    def stamp(self):
+        return _STATUS_STAMP.get(self.status, '')
+
+    def is_emphasis(self, label):
+        return any(label.startswith(e) for e in _EMPHASIS)
+
+
+def from_print_spec(spec, kind='report', status=None, signatures=None, amount_words='', notes='', footer_note=''):
+    """printing spec (dict) → DocumentSpec. يستخرج الرقم والتاريخ والحالة من `extra` حين لا تُمرَّر صراحة."""
+    info, number, date, st = [], '', '', status or ''
+    for e in spec.get('extra', []):
+        k, v = e if isinstance(e, (tuple, list)) and len(e) == 2 else ('ملاحظة', e)   # نص مفرد = ملاحظة (لا ينهار ملخص المبيعات/المشتريات)
+        if k in ('رقم المستند', 'رقم السند', 'رقم القيد') and not number:
+            number = str(v or '')
+        elif k == 'التاريخ' and not date:
+            date = str(v or '')
+        elif k == 'الحالة':
+            if not st:
+                st = str(v or '')
+        else:
+            info.append((k, v))
+    return DocumentSpec(
+        title=spec.get('title', ''), kind=kind, company=spec.get('company') or '', branch=spec.get('branch') or '',
+        currency=spec.get('currency') or '', period=spec.get('period') or '', number=number, date=date, status=st,
+        info=info, columns=list(spec.get('columns', [])), rows=list(spec.get('rows', [])), totals=list(spec.get('totals', [])),
+        notes=notes or spec.get('notes') or '',
+        signatures=(list(spec['signatures']) if spec.get('signatures') else SIGNATURES.get(kind, [])) if signatures is None else list(signatures),
+        amount_words=amount_words or spec.get('amount_words') or report_words.words_for_spec(spec), printed_at=spec.get('printed_at', ''),
+        footer_note=footer_note or spec.get('footer_note') or '',
+        opening=spec.get('opening'), sums=spec.get('sums'), printed_by=spec.get('printed_by') or PSET.user(), invoice=spec.get('invoice') if kind == 'invoice' else None,
+        voucher=spec.get('voucher') if kind == 'voucher' else None)
+
+
+def grand_total(doc):
+    """قيمة الإجمالي الرئيسي للمستند (لحساب المبلغ كتابةً): أول بند يبدأ بـ«الإجمالي» غير «قبل»، وإلا آخر بند."""
+    for t in doc.totals:
+        lbl = t.get('label', '')
+        if lbl.startswith('الإجمالي') and 'قبل' not in lbl and isinstance(t.get('value'), Decimal):
+            return t['value']
+    for t in reversed(doc.totals):
+        if isinstance(t.get('value'), Decimal):
+            return t['value']
+    return None
+
+
+_DEBIT_KEYS = ('debit', 'debit_base', 'opening_debit', 'period_debit', 'closing_debit')
+_CREDIT_KEYS = ('credit', 'credit_base', 'opening_credit', 'period_credit', 'closing_credit')
+_BALANCE_KEYS = ('balance', 'running_balance', 'closing', 'opening', 'net', 'amount', 'total')
+
+
+def column_tint(key, index=0):
+    """لون خلفية عمود المعاينة (الورقة بيضاء دائمًا فألوانه من اللوحة الفاتحة): مدين أخضر خفيف، دائن وردي خفيف، رصيد/ختامي ذهبي فاتح،
+    وبقية الأعمدة بالتناوب (الفردية بلون عاجي) لتسهيل تتبّع العمود بالعين. None = بلا تلوين."""
+    p = T.PALETTES['light']
+    k = str(key or '')
+    if k in _DEBIT_KEYS:
+        return p['paper_col_debit']
+    if k in _CREDIT_KEYS:
+        return p['paper_col_credit']
+    if k in _BALANCE_KEYS:
+        return p['paper_col_balance']
+    return p['paper_col_alt'] if index % 2 else None

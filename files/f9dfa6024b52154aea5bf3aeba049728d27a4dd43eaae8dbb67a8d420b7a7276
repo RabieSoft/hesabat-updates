@@ -1,0 +1,160 @@
+"""خدمات المحاسبة والقيود وشجرة الحسابات والربط المحاسبي."""
+import json
+from datetime import date
+from decimal import Decimal
+from pathlib import Path
+
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.business import chart_of_accounts as coa
+
+
+class AccountingMixin:
+    def accounts(self):
+        self.require('account.view')
+        return coa.get_tree(self.conn, self.company_id, include_inactive=True, branch_id=self.branch_id)
+
+    def edit_account(self, account_id, v):
+        return coa.edit_account(self.conn, self.user_id, int(account_id), name=v.get('name'), description=v.get('description'))
+
+    def set_account_active(self, account_id, active, reason=''):
+        return coa.set_active(self.conn, self.user_id, int(account_id), bool(active), reason)
+
+    def create_account(self, v):
+        return coa.add_account(self.conn, self.user_id, self.company_id, v['name'], v['type'],
+                               parent_id=int(v['parent']) if v.get('parent') else None, code=v.get('code') or None,
+                               is_group=bool(v.get('is_group')), description=v.get('description', ''))
+
+    def load_default_chart(self):
+        return coa.load_default_template(self.conn, self.user_id, self.company_id)
+
+    def journal_entries(self, limit=200, offset=0):
+        self.require('journal.view')
+        has_att = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='journal_attachments'").fetchone()
+        att = ("(SELECT COUNT(*) FROM journal_attachments a WHERE a.entry_id=journal_entries.id)"
+               if has_att else "0")
+        q = (
+            "SELECT id,COALESCE(posted_no,entry_no) entry_no,entry_date,description,status,workflow_state,entry_type,"
+            "source_type,source_id,reverses_entry_id,"
+            "(SELECT COALESCE(r.posted_no,r.entry_no) FROM journal_entries r WHERE r.id=journal_entries.reverses_entry_id) reverses_no,"
+            "(SELECT COALESCE(r.posted_no,r.entry_no) FROM journal_entries r WHERE r.reverses_entry_id=journal_entries.id LIMIT 1) reversed_by_no,"
+            f"{att} attachment_count "
+            "FROM journal_entries WHERE company_id=? ORDER BY entry_date DESC,id DESC LIMIT ? OFFSET ?"
+        )
+        out = []
+        for r in self.conn.execute(q, (self.company_id, int(limit), int(offset))).fetchall():
+            d = dict(r)
+            d['state'] = d['workflow_state'] if d['status'] == 'draft' and d['workflow_state'] in ('reviewed', 'approved') else d['status']
+            if d.get('reverses_no') is not None:
+                d['link'] = f"يعكس القيد رقم {d['reverses_no']}"
+            elif d.get('reversed_by_no') is not None:
+                d['link'] = f"عُكس بالقيد رقم {d['reversed_by_no']}"
+            else:
+                d['link'] = ''
+            out.append(d)
+        return out
+
+    def mappings(self):
+        from alhisabat.ui.core.logic import MAP_KEYS_AR
+        self.require('account.view')
+        linked = {r['map_key']: r for r in self.conn.execute(
+            "SELECT m.map_key, m.account_id, a.code, a.name FROM account_mappings m JOIN accounts a ON a.id=m.account_id "
+            "WHERE m.company_id=?", (self.company_id,))}
+        out = []
+        for key in list(MAP_KEYS_AR) + sorted(k for k in linked if k not in MAP_KEYS_AR):
+            r = linked.get(key)
+            out.append({'key': key, 'account_id': r['account_id'] if r else None,
+                        'account': f"{r['code']} — {r['name']}" if r else '—'})
+        return out
+
+    def set_mapping(self, key, account_id):
+        self.require('account.system_edit')
+        return coa.set_mapping(self.conn, self.user_id, self.company_id, key, int(account_id))
+
+    def create_journal(self, v):
+        from alhisabat.ui.core.journal_service import JournalService
+        lines = json.loads(v['lines']) if isinstance(v['lines'], str) else v['lines']
+        return JournalService(self).create(v['date'], v.get('description', ''), lines, v.get('pending_attachments') or [],
+                                           source_type=v.get('source_type'),
+                                           source_id=int(v['source_id']) if v.get('source_id') else None)
+
+    def post_journal(self, entry_id):
+        return self.journal_action(entry_id, 'post')
+
+    def journal_action(self, entry_id, action, **kw):
+        from alhisabat.accounting import journal_engine as je
+        if action in ('review', 'approve', 'post', 'delete_draft'):
+            return getattr(je, action)(self.conn, int(entry_id), self.user_id)
+        if action == 'return_to_draft':
+            return je.return_to_draft(self.conn, int(entry_id), self.user_id, (kw.get('reason') or '').strip())
+        if action == 'reverse':
+            return je.reverse(self.conn, int(entry_id), self.user_id, kw.get('date') or str(date.today()), kw.get('reason') or 'عكس من الواجهة')
+        raise AccountingError('إجراء غير معروف على القيد')
+
+    def get_journal_entry(self, entry_id):
+        from alhisabat.accounting import journal_engine as je
+        e = je.get_entry(self.conn, self.user_id, int(entry_id))
+        lines = []
+        for ln in e.get('lines') or []:
+            lines.append({
+                'account_id': ln['account_id'],
+                'account_code': ln.get('account_code'),
+                'account_name': ln.get('account_name'),
+                'debit': Decimal(ln['debit_base'] or 0) / 100,
+                'credit': Decimal(ln['credit_base'] or 0) / 100,
+                'memo': ln.get('memo') or '',
+            })
+        e['lines'] = lines
+        return e
+
+    def last_journal_entry(self):
+        self.require('journal.view')
+        row = self.conn.execute(
+            "SELECT id FROM journal_entries WHERE company_id=? ORDER BY id DESC LIMIT 1",
+            (self.company_id,)).fetchone()
+        if not row:
+            return None
+        return self.get_journal_entry(row['id'])
+
+    def list_journal_templates(self):
+        from alhisabat.business import journal_extras as X
+        return X.list_templates(self.conn, self.user_id, self.company_id)
+
+    def save_journal_template(self, name, description, lines, valuation_method='weighted_avg'):
+        from alhisabat.business import journal_extras as X
+        return X.save_template(self.conn, self.user_id, self.company_id, name, description, lines, valuation_method)
+
+    def delete_journal_template(self, template_id):
+        from alhisabat.business import journal_extras as X
+        X.delete_template(self.conn, self.user_id, self.company_id, template_id)
+
+    def get_journal_template(self, template_id):
+        from alhisabat.business import journal_extras as X
+        return X.get_template(self.conn, self.user_id, self.company_id, template_id)
+
+    def _attachments_dir(self, entry_id=None):
+        base = Path(self.db_path).resolve().parent / 'attachments' / str(self.company_id)
+        if entry_id is not None:
+            base = base / str(entry_id)
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+
+    def add_journal_attachment(self, entry_id, file_path, display_name=None):
+        from alhisabat.business import journal_extras as X
+        return X.add_attachment(self.conn, self.user_id, self.company_id, Path(self.db_path).resolve().parent, entry_id, file_path, display_name)
+
+    def list_journal_attachments(self, entry_id):
+        from alhisabat.business import journal_extras as X
+        return X.list_attachments(self.conn, self.user_id, self.company_id, entry_id)
+
+    def get_journal_attachment_path(self, attachment_id):
+        from alhisabat.business import journal_extras as X
+        return X.attachment_path(self.conn, self.user_id, self.company_id, Path(self.db_path).resolve().parent, attachment_id)
+
+    def delete_journal_attachment(self, attachment_id):
+        from alhisabat.business import journal_extras as X
+        X.delete_attachment(self.conn, self.user_id, self.company_id, Path(self.db_path).resolve().parent, attachment_id)
+
+    def parse_journal_csv(self, text_or_path):
+        from alhisabat.business import journal_extras as X
+        return X.parse_lines_csv(self.conn, self.user_id, self.company_id, text_or_path)

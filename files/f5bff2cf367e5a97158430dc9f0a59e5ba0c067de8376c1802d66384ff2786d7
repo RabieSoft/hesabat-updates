@@ -1,0 +1,175 @@
+"""نوافذ الحسابات والربط.
+"""
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLabel, QLineEdit, QMessageBox
+
+from alhisabat.ui.core import strings_ar as S
+
+class AccountCreateDialog(QDialog):
+    def __init__(self, page, parent_id=None, parent_type=None):
+        super().__init__(page); self.setWindowTitle('حساب فرعي جديد' if parent_id else 'حساب جديد'); self.setLayoutDirection(Qt.RightToLeft); self.setMinimumWidth(420)
+        form=QFormLayout(self)
+        self.name=QLineEdit(); self.code=QLineEdit(); self.desc=QLineEdit()
+        self.type=QComboBox()
+        from alhisabat.ui.core import logic as L
+        for code,label in L.ACCOUNT_TYPES: self.type.addItem(label, code)
+        if parent_type:
+            idx=self.type.findData(parent_type)
+            if idx>=0: self.type.setCurrentIndex(idx)
+        self.parent=QComboBox(); self.parent.addItem('— بدون أب (حساب رئيسي) —', None)
+        try:
+            for aid,label in page.session.lookup_accounts(groups=True): self.parent.addItem(label, aid)
+        except Exception: pass
+        if parent_id is not None:
+            idx=self.parent.findData(int(parent_id))
+            if idx>=0: self.parent.setCurrentIndex(idx)
+        self.is_group=QCheckBox('مجلد تجميعي (لا يقبل حركات مباشرة)')
+        form.addRow('اسم الحساب *', self.name); form.addRow('نوع الحساب', self.type); form.addRow('الحساب الأب', self.parent); form.addRow('', self.is_group); form.addRow('الكود (فارغ=تلقائي)', self.code); form.addRow('الوصف', self.desc)
+        bb=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel); bb.accepted.connect(self._accept); bb.rejected.connect(self.reject); form.addRow(bb)
+    def _accept(self):
+        if not self.name.text().strip(): return QMessageBox.warning(self,'خطأ','اسم الحساب مطلوب')
+        self.accept()
+    def values(self): return {'name':self.name.text().strip(),'type':self.type.currentData(),'parent':self.parent.currentData(),'is_group':self.is_group.isChecked(),'code':self.code.text().strip() or None,'description':self.desc.text().strip()}
+
+class AccountEditDialog(QDialog):
+    def __init__(self, page, node):
+        super().__init__(page); self.setWindowTitle('تعديل الحساب'); self.setLayoutDirection(Qt.RightToLeft); self.setMinimumWidth(420)
+        form=QFormLayout(self)
+        self.name=QLineEdit(node.get('name','')); self.desc=QLineEdit(node.get('description','') or '')
+        form.addRow('اسم الحساب *', self.name); form.addRow('الوصف', self.desc)
+        bb=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel); bb.accepted.connect(self._accept); bb.rejected.connect(self.reject); form.addRow(bb)
+    def _accept(self):
+        if not self.name.text().strip(): return QMessageBox.warning(self,'خطأ','الاسم مطلوب')
+        self.accept()
+    def values(self): return {'name':self.name.text().strip(),'description':self.desc.text().strip()}
+
+class MappingDialog(QDialog):
+    def __init__(self, page, row):
+        super().__init__(page); self.setWindowTitle('ربط: '+ (row.get('label') or row.get('key'))); self.setLayoutDirection(Qt.RightToLeft); self.setMinimumWidth(500)
+        form=QFormLayout(self)
+        form.addRow(QLabel('المفتاح: '+ (row.get('key') or '')))
+        self.account=QComboBox()
+        try:
+            for aid,label in page.session.lookup_accounts(groups=None): self.account.addItem(label, aid)
+        except Exception: pass
+        idx=self.account.findData(row.get('account_id'))
+        if idx>=0: self.account.setCurrentIndex(idx)
+        form.addRow('الحساب *', self.account)
+        form.addRow(QLabel('مفاتيح «الموظفون/العملاء/الموردون» تتطلب حسابًا تجميعيًا رقابيًا؛ يتحقق المحرك ويعرض السبب عند الرفض.'))
+        bb=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel); bb.accepted.connect(self._accept); bb.rejected.connect(self.reject); form.addRow(bb)
+    def _accept(self):
+        if self.account.currentData() is None: return QMessageBox.warning(self,'خطأ','اختر الحساب')
+        self.accept()
+    def values(self): return {'account_id':self.account.currentData()}
+
+
+class AccountMoveDialog(QDialog):
+    def __init__(self, page, node):
+        super().__init__(page)
+        self.page = page
+        self.node = node
+        self.setWindowTitle(f"نقل الحساب: {node.get('code','')} — {node.get('name','')}")
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.setMinimumWidth(480)
+
+        from PySide6.QtWidgets import QVBoxLayout, QHBoxLayout, QPushButton, QTableWidget, QTableWidgetItem, QHeaderView
+        lay = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.parent_combo = QComboBox()
+        self.parent_combo.addItem('— بدون أب (حساب رئيسي) —', None)
+        try:
+            for aid, label in page.session.lookup_accounts(groups=True):
+                if aid != node['id']:
+                    self.parent_combo.addItem(label, aid)
+        except Exception:
+            pass
+        form.addRow('الأب الجديد:', self.parent_combo)
+        lay.addLayout(form)
+
+        btn_row = QHBoxLayout()
+        self.btn_preview = QPushButton('معاينة الأثر')
+        self.btn_preview.clicked.connect(self._do_preview)
+        btn_row.addWidget(self.btn_preview)
+        btn_row.addStretch(1)
+        lay.addLayout(btn_row)
+
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(['الحساب', 'الكود القديم', 'الكود الجديد'])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        lay.addWidget(self.table)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setText('تنفيذ النقل')
+        bb.accepted.connect(self._accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def _do_preview(self):
+        try:
+            new_parent = self.parent_combo.currentData()
+            res = self.page.svc.move_account(self.node['id'], new_parent, preview=True)
+            self.table.setRowCount(len(res))
+            for i, (aid, old_c, new_c, lvl) in enumerate(res):
+                from PySide6.QtWidgets import QTableWidgetItem
+                self.table.setItem(i, 0, QTableWidgetItem(f"حساب #{aid}"))
+                self.table.setItem(i, 1, QTableWidgetItem(str(old_c)))
+                self.table.setItem(i, 2, QTableWidgetItem(f"{new_c} (مستوى {lvl})"))
+        except Exception as exc:
+            self.page.show_error(exc)
+
+    def _accept(self):
+        self.accept()
+
+    def values(self):
+        return {'new_parent_id': self.parent_combo.currentData()}
+
+
+class AccountMergeDialog(QDialog):
+    def __init__(self, page, node):
+        super().__init__(page)
+        self.node = node
+        self.setWindowTitle(f"دمج الحساب: {node.get('code','')} — {node.get('name','')}")
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.setMinimumWidth(450)
+
+        lay = QVBoxLayout(self)
+        warn = QLabel("تحذير: دمج الحساب سيعطّل هذا الحساب وينقل كل قيود المسودات إلى الحساب الهدف.")
+        warn.setStyleSheet("color: #b71c1c; font-weight: bold;")
+        warn.setWordWrap(True)
+        lay.addWidget(warn)
+
+        form = QFormLayout()
+        self.target_combo = QComboBox()
+        try:
+            for aid, label in page.session.lookup_accounts(groups=False):
+                if aid != node['id']:
+                    self.target_combo.addItem(label, aid)
+        except Exception:
+            pass
+        form.addRow('دمج في الحساب الهدف *:', self.target_combo)
+
+        self.reason_edit = QLineEdit()
+        self.reason_edit.setPlaceholderText('سبب الدمج إلزامي')
+        form.addRow('سبب الدمج *:', self.reason_edit)
+        lay.addLayout(form)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setText('تأكيد الدمج')
+        bb.accepted.connect(self._accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def _accept(self):
+        if not self.target_combo.currentData():
+            return QMessageBox.warning(self, 'خطأ', 'اختر الحساب الهدف')
+        if not self.reason_edit.text().strip():
+            return QMessageBox.warning(self, 'خطأ', 'سبب الدمج إلزامي')
+        self.accept()
+
+    def values(self):
+        return {
+            'target_id': self.target_combo.currentData(),
+            'reason': self.reason_edit.text().strip(),
+        }
+

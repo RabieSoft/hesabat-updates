@@ -1,0 +1,34 @@
+from contextlib import contextmanager
+import itertools
+import sqlite3
+from alhisabat.accounting.errors import AccountingError
+
+_counter = itertools.count(1)
+
+
+@contextmanager
+def transaction(conn):
+    """معاملة واحدة: أي خطأ = Rollback كامل. تدعم التداخل عبر SAVEPOINT (عملية كبرى مثل إقفال السنة = معاملة واحدة)."""
+    if conn.in_transaction:
+        sp = f"sp_{next(_counter)}"
+        conn.execute(f"SAVEPOINT {sp}")
+        try:
+            yield
+            conn.execute(f"RELEASE {sp}")
+        except sqlite3.IntegrityError as e:
+            conn.execute(f"ROLLBACK TO {sp}"); conn.execute(f"RELEASE {sp}")
+            raise AccountingError(str(e)) from e
+        except Exception:
+            conn.execute(f"ROLLBACK TO {sp}"); conn.execute(f"RELEASE {sp}")
+            raise
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+        conn.execute("COMMIT")
+    except sqlite3.IntegrityError as e:
+        conn.execute("ROLLBACK")
+        raise AccountingError(str(e)) from e
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise

@@ -1,0 +1,225 @@
+"""النسخ الاحتياطي التلقائي للنافذة الرئيسية: مجلد يُحدَّد أول مرة، ونسخة مضغوطة (zip) عند فتح البرنامج (مرة في اليوم) وعند إغلاقه.
+
+المنطق والقرارات في core/backup_logic.py (خالص)، والمحرك في system/backup.py. هنا فقط ربط Qt: السؤال الأول، التشغيل في الخلفية عبر TaskRunner،
+ونسخة الإغلاق المتزامنة القصيرة. أي فشل يُسجَّل ويظهر في شريط الحالة بلا نافذة معطِّلة (عدا زر «نسخ الآن» اليدوي). يتطلب PySide6.
+"""
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+
+from PySide6.QtCore import QEventLoop, QObject, QTimer, Qt
+from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QHBoxLayout, QLabel, QMessageBox, QPushButton, QVBoxLayout
+
+from alhisabat.ui.core import backup_logic as BL, errors
+from alhisabat.ui.core.system_service import SystemService
+
+START_DELAY_MS = 4000          # بعد نافذة استئناف المسودات (1.3ث) كي لا تتراكم نوافذ مشروطة
+RETRY_MS, MAX_RETRIES = 3000, 6
+CLOSE_TIMEOUT_S = 45           # أقصى انتظار عند الإغلاق؛ بعدها يُغلق البرنامج دون النسخة
+SHOW_DIALOG_AFTER_S = 0.7      # لا نومض نافذة الانتظار لنسخة سريعة
+
+
+class AutoBackup(QObject):
+    def __init__(self, window):
+        super().__init__(window)
+        self.w = window
+        self._busy = False
+        self._retries = 0
+
+    # ------------------------------------------------------------------ حالة
+    def cfg(self):
+        return BL.load(self.w.prefs)
+
+    def can(self):
+        try:
+            return bool(self.w.session.can('backup.manage'))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _archive_mode(self):
+        return bool(getattr(self.w, 'is_archive', False))           # نسخة أرشيف السنة: لا نسخ تلقائي
+
+    @property
+    def busy(self):
+        return self._busy
+
+    # ------------------------------------------------------------------ عند الفتح
+    def start(self):
+        QTimer.singleShot(START_DELAY_MS, self._on_start)
+
+    def _on_start(self):
+        if self._archive_mode() or not self.can():
+            return
+        if QApplication.activeModalWidget() is not None and self._retries < MAX_RETRIES:
+            self._retries += 1                                  # نافذة مشروطة أخرى مفتوحة: نؤجّل بدل التراكم فوقها
+            QTimer.singleShot(RETRY_MS, self._on_start)
+            return
+        cfg = self.cfg()
+        if BL.needs_first_prompt(cfg, True):
+            self.prompt_first_time()
+            return
+        if BL.is_due(cfg, BL.STARTUP, datetime.now()):
+            self.run(BL.STARTUP)
+
+    def prompt_first_time(self):
+        """أول مرة فقط: يسأل عن مجلد النسخ الاحتياطي التلقائي. «لاحقًا» يعيد السؤال عند الفتح التالي، و«لا تسأل مجددًا» يوقفه."""
+        box = QMessageBox(self.w)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle('النسخ الاحتياطي التلقائي')
+        box.setText('لم تُحدِّد مجلدًا للنسخ الاحتياطي التلقائي بعد.')
+        box.setInformativeText('يحفظ البرنامج نسخة مضغوطة من بياناتك تلقائيًا عند الفتح (مرة يوميًا) وعند الإغلاق.\n'
+                               'يُفضَّل اختيار مجلد على قرص آخر أو فلاشة أو مجلد مزامنة سحابية، حتى لا تضيع النسخ مع القرص الأصلي.')
+        box.setLayoutDirection(Qt.RightToLeft)
+        b_y = box.addButton('اختيار المجلد الآن', QMessageBox.AcceptRole)
+        b_l = box.addButton('لاحقًا', QMessageBox.RejectRole)
+        b_n = box.addButton('لا تسأل مجددًا', QMessageBox.DestructiveRole)
+        box.setDefaultButton(b_y)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is b_n:
+            BL.never_ask(self.w.prefs)
+        elif clicked is b_y:
+            if self.choose_folder(self.w):
+                self.run(BL.MANUAL, reason='أول نسخة بعد تحديد المجلد')
+
+    def choose_folder(self, parent=None):
+        """يفتح اختيار المجلد ويتحقق من قابلية الكتابة ثم يحفظه ويفعّل النسخ التلقائي. True عند الحفظ."""
+        parent = parent or self.w
+        start = self.cfg()['dir'] or str(Path.home() / 'Documents')
+        for _ in range(3):
+            path = QFileDialog.getExistingDirectory(parent, 'اختر مجلد النسخ الاحتياطي', start)
+            if not path:
+                return False
+            ok, why = BL.check_dir_timeout(path)
+            if ok:
+                BL.save_dir(self.w.prefs, path)
+                return True
+            QMessageBox.warning(parent, 'النسخ الاحتياطي', why)
+            start = path
+        return False
+
+    # ------------------------------------------------------------------ التشغيل
+    def run(self, trigger, reason=None, on_done=None, on_error=None):
+        """نسخة في الخلفية (جلسة مستقلة). بلا مجلد محدد لا شيء يحدث."""
+        cfg = self.cfg()
+        if self._busy or not BL.is_configured(cfg):
+            return False
+        folder, keep, auto = cfg['dir'], cfg['keep'], trigger != BL.MANUAL
+        why = reason or ('نسخة تلقائية عند فتح البرنامج' if trigger == BL.STARTUP else 'نسخة يدوية إلى مجلد النسخ')
+        self._busy = True
+        self.w.msg.setText('جارٍ أخذ نسخة احتياطية…')
+
+        def _bg(s, _ctx):
+            return SystemService(s).create_zip_backup(folder, why, auto=auto, keep=keep)
+
+        def _ok(res):
+            self._busy = False
+            BL.mark_done(self.w.prefs, datetime.now())
+            self.w.msg.setText(BL.success_text(trigger, Path(res['path']).name))
+            try:
+                self.w.data_changed('backup')
+            except Exception:  # noqa: BLE001
+                pass
+            if on_done:
+                on_done(res)
+
+        def _fail(exc):
+            self._busy = False
+            msg = self._text(exc)
+            self.w.log_error(msg, 'auto_backup')
+            self.w.msg.setText(f'تعذّرت النسخة الاحتياطية: {msg}')
+            if on_error:
+                on_error(exc)
+
+        self.w.runner.run(_bg, on_done=_ok, on_error=_fail)
+        return True
+
+    @staticmethod
+    def _text(exc):
+        try:
+            return errors.translate(exc).text
+        except Exception:  # noqa: BLE001
+            return str(exc)
+
+    # ------------------------------------------------------------------ عند الإغلاق
+    def _wait(self, is_done, cancel, text, timeout_s):
+        """ينتظر دون تجميد الواجهة: حلقة أحداث قصيرة، ونافذة «تخطي» تظهر إن طال الانتظار. يرجع True إن انتهت المهمة قبل التخطي/المهلة."""
+        t0 = time.monotonic()
+        loop, state = QEventLoop(self), {'skip': False}
+        dlg = QDialog(self.w)
+        dlg.setWindowTitle('النسخ الاحتياطي'); dlg.setLayoutDirection(Qt.RightToLeft); dlg.setModal(True)
+        dlg.setWindowFlags(Qt.Dialog | Qt.CustomizeWindowHint | Qt.WindowTitleHint)
+        v = QVBoxLayout(dlg); v.addWidget(QLabel(text))
+        h = QHBoxLayout(); b = QPushButton('تخطي النسخة والإغلاق'); b.setAutoDefault(False); h.addStretch(1); h.addWidget(b); v.addLayout(h)
+        dlg.setMinimumWidth(380)
+
+        def _skip():
+            state['skip'] = True
+            cancel()
+            loop.quit()
+        b.clicked.connect(_skip)
+        timer = QTimer(self); timer.setInterval(100)
+
+        def _tick():
+            el = time.monotonic() - t0
+            if is_done():
+                loop.quit()
+            elif el > timeout_s:
+                state['skip'] = True
+                cancel()
+                loop.quit()
+            elif el > SHOW_DIALOG_AFTER_S and not dlg.isVisible():
+                dlg.show()
+        timer.timeout.connect(_tick)
+        timer.start()
+        _tick()
+        if not is_done() and not state['skip']:
+            loop.exec()
+        timer.stop(); dlg.close(); dlg.deleteLater()
+        return is_done() and not state['skip']
+
+    def on_close(self):
+        """قبل الإغلاق: ينتظر نسخة جارية إن وُجدت، ثم يأخذ نسخة (إن مضى على آخر نسخة أكثر من 30 دقيقة) في خيط خلفي مع مهلة وزر «تخطي».
+        لا يمنع الإغلاق أبدًا ولا يجمّد الواجهة على قرص/مشاركة شبكية بطيئة أو قاعدة مشغولة بمستخدمين آخرين."""
+        try:
+            if self._archive_mode() or not self.can():
+                return
+            if self._busy:
+                self._wait(lambda: not self._busy, lambda: None, 'جارٍ إكمال النسخة الاحتياطية الجارية…', CLOSE_TIMEOUT_S)
+            cfg = self.cfg()
+            if self._busy or not BL.is_due(cfg, BL.CLOSE, datetime.now()):
+                return
+            self.w.msg.setText('جارٍ حفظ نسخة احتياطية قبل الإغلاق…')
+            cancel, res = threading.Event(), {}
+            folder, keep = cfg['dir'], cfg['keep']
+
+            def _work():
+                sess = None
+                try:
+                    sess = self.w.session.clone()                 # اتصال مستقل داخل هذا الخيط
+                    SystemService(sess).create_zip_backup(folder, 'نسخة تلقائية عند إغلاق البرنامج', auto=True, keep=keep,
+                                                          timeout=CLOSE_TIMEOUT_S, cancel=cancel.is_set)
+                    res['ok'] = True
+                except Exception as exc:  # noqa: BLE001
+                    res['err'] = exc
+                finally:
+                    try:
+                        if sess is not None:
+                            sess.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+            th = threading.Thread(target=_work, daemon=True)     # daemon: لا يمنع خروج العملية إن علق على القرص
+            th.start()
+            done = self._wait(lambda: not th.is_alive(), cancel.set, 'جارٍ حفظ نسخة احتياطية قبل الإغلاق…', CLOSE_TIMEOUT_S)
+            if done and res.get('ok'):
+                BL.mark_done(self.w.prefs, datetime.now())
+            elif res.get('err') is not None:
+                self.w.log_error(self._text(res['err']), 'auto_backup_close')
+            elif not done:
+                self.w.log_error('تُخطّيت نسخة الإغلاق (مهلة أو تخطٍّ من المستخدم)', 'auto_backup_close')
+        except Exception as exc:  # noqa: BLE001 — فشل النسخة لا يجوز أن يعلّق الإغلاق
+            try:
+                self.w.log_error(self._text(exc), 'auto_backup_close')
+            except Exception:  # noqa: BLE001
+                pass

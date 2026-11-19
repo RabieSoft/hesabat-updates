@@ -1,0 +1,299 @@
+"""مولّد ورقة الأنماط من Tokens فقط (لا ألوان ثابتة هنا). نص خالص بلا PySide6.
+
+الاستبدال بصيغة @token@ لتفادي تعارض الأقواس المعقوفة مع QSS.
+"""
+import re
+
+from . import tokens as T
+from .scroll_arrows import arrow_urls
+
+_TEMPLATE = r"""
+* { font-family: @font@; font-size: @pt@pt; }
+QWidget { color: @text@; background: transparent; }
+QMainWindow, QDialog { background: @bg@; }
+QToolTip { background: @surface@; color: @text@; border: 1px solid @border_strong@; border-radius: 6px; padding: 4px 8px; }
+
+/* ---------- القوائم (شريط القوائم التقليدي) ---------- */
+QMenuBar { background: @menu_bg@; color: @menu_text@; border-bottom: 1px solid @border@; padding: 1px 4px; }
+QMenuBar::item { padding: 4px 10px; background: transparent; border-radius: @radius@px; }
+QMenuBar::item:selected, QMenuBar::item:pressed { background: @menu_hover@; }
+QMenu { background: @surface@; color: @text@; border: 1px solid @border_strong@; border-radius: 8px; padding: 4px; }
+QMenu::item { padding: 4px 22px 4px 22px; border-radius: 6px; }
+QMenu::item:selected { background: @menu_hover@; color: @menu_text@; }
+QMenu::item:disabled { color: @disabled_text@; }
+QMenu::separator { height: 1px; background: @border@; margin: 3px 6px; }
+
+/* ---------- شريط الإجراءات (صف أفقي واحد مضغوط) ---------- */
+QFrame#ribbon { background: @toolbar@; border-bottom: 1px solid @border@; }
+QFrame#ribbonSep { background: @border@; border: none; min-width: 1px; max-width: 1px; margin: 6px 4px; }
+QToolButton#ribbonBtn { background: transparent; border: 1px solid transparent; border-radius: 6px; padding: 2px 10px; min-height: @ctl_h@px; max-height: @ctl_h@px; color: @text@; font-weight: 600; }
+QToolButton#ribbonBtn:hover { background: @accent_soft@; border-color: @accent@; color: @accent_soft_text@; }
+QToolButton#ribbonBtn:pressed { background: @selection@; border-color: @accent_hover@; }
+QToolButton#ribbonBtn:disabled { background: transparent; color: @disabled_text@; border-color: transparent; }
+QToolButton#ribbonBtn[primary="true"] { background: @accent@; border-color: @accent_hover@; color: @accent_text@; }
+QToolButton#ribbonBtn[primary="true"]:hover { background: @accent_hover@; border-color: @accent_hover@; color: @accent_text@; }
+QToolButton#ribbonBtn[primary="true"]:disabled { background: @disabled_bg@; color: @disabled_text@; border-color: @border@; }
+QToolButton#ribbonBtn[danger="true"] { color: @danger@; }
+QToolButton#ribbonBtn[danger="true"]:hover { background: @danger_soft@; color: @danger@; border-color: @danger@; }
+
+/* ---------- لوحة الإدخال داخل الصفحة (بدل النوافذ العائمة) ---------- */
+QFrame#entryDock { background: @surface@; border: 1px solid @border@; border-top: 2px solid @accent@; border-radius: 6px; }
+QLabel#entryDockTitle { font-weight: bold; color: @accent_soft_text@; padding: 0 2px; }
+QFrame#inlineEntry { background: @surface@; border: 1px solid @border@; border-top: 2px solid @accent@; border-radius: 6px; }
+QScrollArea#entryDockScroll { background: transparent; border: none; }
+
+/* ---------- نافذة الفاتورة المنبثقة + الإشعار الأخضر ---------- */
+QDialog#invPopup { background: @bg@; }
+QFrame#invPopupHead { background: @surface@; border: 1px solid @border@; border-top: 3px solid @accent@; border-radius: 8px; }
+QLabel#invPopupTitle { font-size: 15pt; font-weight: bold; color: @accent_soft_text@; }
+QLabel#invPopupSub { color: @muted@; }
+QLabel#invToast { background: @success@; color: #ffffff; font-weight: bold; font-size: 11pt; border-radius: 9px; padding: 9px 26px; }
+QScrollArea#entryDockScroll > QWidget > QWidget { background: transparent; }
+
+/* ---------- الشريط العلوي الثابت (أزرار الوحدات بقوائم منسدلة) ---------- */
+QFrame#topNav { background: @nav_bg@; border-bottom: 2px solid @nav_active@; }
+QLabel#topBrand { color: @nav_text@; font-size: @pt_large@pt; font-weight: bold; padding: 0 2px; }
+QFrame#navLogoBadge { background: @paper@; border-radius: 8px; }
+QToolButton#topNavBtn { background: transparent; color: @nav_text@; border: none; border-radius: 8px; padding: 5px 10px; font-weight: 600; }
+QToolButton#topNavBtn::menu-indicator { image: none; width: 0px; }
+QToolButton#topNavBtn:hover, QToolButton#topNavBtn:pressed, QToolButton#topNavBtn:open { background: @nav_hover@; color: @nav_text@; }
+QToolButton#topNavBtn[active="true"] { background: @nav_active@; color: @nav_active_text@; font-weight: bold; }
+QToolButton#topNavSearch { background: @nav_hover@; color: @nav_text@; border: 1px solid @nav_hover@; border-radius: 14px; padding: 3px 12px; min-width: 150px; }
+QToolButton#topNavSearch:hover { border-color: @nav_active@; }
+
+/* ---------- شاشة الدخول والإعداد الأول ---------- */
+QDialog#loginDialog, QDialog#bootstrapDialog { background: @surface@; }
+QFrame#brandStrip { min-height: 4px; max-height: 4px; border: none; background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 @brand_navy@, stop:0.55 @brand_green@, stop:1 @brand_gold@); }
+QLabel#loginTagline { color: @muted@; font-size: @pt_small@pt; }
+QLabel#loginWelcome { color: @text@; font-size: @pt_large@pt; font-weight: bold; }
+QLabel#loginScope { color: @muted@; background: @surface2@; border: 1px solid @border@; border-radius: @radius@px; padding: 5px 8px; }
+QLabel#loginFooter { color: @muted@; font-size: @pt_small@pt; }
+QLabel#loginError { background: @danger_soft@; color: @danger@; border: 1px solid @danger@; border-radius: @radius@px; padding: 6px 8px; }
+QDialog#loginDialog QLabel#fieldLabel, QDialog#bootstrapDialog QLabel#fieldLabel { color: @text@; font-weight: bold; }
+QDialog#loginDialog QLineEdit, QDialog#loginDialog QComboBox, QDialog#bootstrapDialog QLineEdit { min-height: 30px; }
+QDialog#loginDialog QLineEdit:focus, QDialog#loginDialog QComboBox:focus, QDialog#bootstrapDialog QLineEdit:focus { border: 1px solid @accent@; }
+QPushButton#loginButton { background: @accent@; color: @accent_text@; border: 1px solid @accent_hover@; border-radius: @radius@px; font-weight: bold; min-height: 34px; }
+QPushButton#loginButton:hover { background: @accent_hover@; border-color: @accent_hover@; }
+QPushButton#loginButton:pressed { background: @accent_soft_text@; border-color: @accent_soft_text@; }
+
+/* ---------- شريط السياق وشريط الحالة ---------- */
+QFrame#contextBar { background: @surface2@; border-bottom: 1px solid @border@; }
+QLabel#ctxKey { color: @muted@; }
+QLabel#ctxVal { font-weight: bold; }
+QLabel#readOnlyBadge { background: @danger_soft@; color: @danger@; border: 1px solid @danger@; border-radius: @radius@px; padding: 1px 8px; font-weight: bold; }
+QStatusBar { background: @menu_bg@; border-top: 1px solid @border@; color: @muted@; }
+QStatusBar::item { border: none; }
+QStatusBar QLabel { color: @muted@; padding: 0 8px; }
+
+/* ---------- التبويبات (MDI بتبويبات) ---------- */
+QTabWidget#workTabs::pane { border: 1px solid @border@; background: @workspace@; top: -1px; }
+QTabWidget#workTabs QTabBar::tab { background: @surface2@; border: 1px solid @border@; border-top: 2px solid @border@; border-bottom: none; padding: 4px 14px; margin-left: 3px; border-top-left-radius: 10px; border-top-right-radius: 10px; color: @muted@; }
+QTabWidget#workTabs QTabBar::tab:selected { background: @surface@; color: @text@; font-weight: bold; border-top: 2px solid @accent@; border-bottom: 1px solid @surface@; }
+QTabWidget#workTabs QTabBar::tab:hover:!selected { background: @accent_soft@; color: @accent_soft_text@; }
+
+/* ---------- الجداول بخطوط شبكة واضحة ---------- */
+QTableView, QTreeView, QListView, QTableWidget { background: @surface@; alternate-background-color: @row_alt@; gridline-color: @grid@; border: 1px solid @border@; selection-background-color: @selection@; selection-color: @selection_text@; outline: none; }
+QTableView::item { padding: 0 4px; }
+QHeaderView::section { background: @surface2@; color: @text@; border: none; border-left: 1px solid @grid@; border-bottom: 1px solid @border_strong@; padding: 3px 6px; font-weight: bold; }
+QTableCornerButton::section { background: @surface2@; border: none; border-bottom: 1px solid @border_strong@; }
+
+/* ---------- التشغيل السريع (Ctrl+K) ---------- */
+QDialog#quickLaunch { background: @surface@; border: 1px solid @border_strong@; }
+QLabel#qlTitle { color: @text@; }
+QLabel#qlHint { color: @muted@; font-size: @pt_small@pt; }
+QLineEdit#qlSearch { border: 1px solid @border_strong@; border-radius: 10px; padding: 4px 12px; font-size: @pt_large@pt; }
+QLineEdit#qlSearch:focus { border: 2px solid @accent@; padding: 3px 11px; }
+QPushButton#qlChip { background: @surface2@; color: @text@; border: 1px solid @border@; border-radius: 13px; padding: 3px 14px; min-height: 22px; }
+QPushButton#qlChip:hover { background: @accent_soft@; color: @accent_soft_text@; }
+QPushButton#qlChip:checked { background: @accent@; color: @accent_text@; border-color: @accent_hover@; font-weight: bold; }
+QTableWidget#qlTable { border: 1px solid @border@; border-radius: 8px; }
+QTableWidget#qlTable::item { padding: 0 6px; }
+QTableWidget#qlTable::item:selected { background: @accent_soft@; color: @accent_soft_text@; }
+
+/* ---------- الحقول ---------- */
+QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QDateEdit, QComboBox { background: @surface@; border: 1px solid @border_strong@; border-radius: @radius@px; padding: 1px 8px; min-height: @ctl_h@px; selection-background-color: @selection@; selection-color: @selection_text@; }
+QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus { border: 2px solid @accent@; padding: 0px 7px; }
+QComboBox:focus, QDateEdit:focus { border: 1px solid @accent@; }
+QLineEdit:read-only { background: @surface2@; }
+QLineEdit:disabled, QComboBox:disabled, QDateEdit:disabled { background: @disabled_bg@; color: @disabled_text@; }
+QLineEdit[invalid="true"] { border: 1px solid @danger@; background: @danger_soft@; }
+QComboBox QAbstractItemView { background: @surface@; border: 1px solid @border_strong@; selection-background-color: @selection@; selection-color: @selection_text@; }
+
+/* ---------- الأزرار ---------- */
+QPushButton { background: @surface@; border: 1px solid @border_strong@; border-radius: @radius@px; padding: 1px 14px; min-height: @ctl_h@px; font-weight: 600; }
+/* أزرار تذييل النوافذ: عرض أدنى واحد ليتساوى (حفظ/إلغاء/إغلاق) */
+QDialogButtonBox QPushButton, QPushButton[std="true"] { min-width: @btn_w@px; }
+QPushButton[compact="true"] { padding: 1px 4px; min-width: 24px; }
+QComboBox { min-width: 90px; padding-right: 8px; }
+QDateEdit { min-width: 120px; }
+QSpinBox { min-width: 70px; }
+QPushButton:hover { background: @accent_soft@; border-color: @accent@; }
+QPushButton:pressed { background: @selection@; }
+QPushButton:disabled { background: @disabled_bg@; color: @disabled_text@; border-color: @border@; }
+QPushButton[primary="true"] { background: @accent@; color: @accent_text@; border-color: @accent_hover@; font-weight: bold; }
+QPushButton[primary="true"]:hover { background: @accent_hover@; }
+QPushButton[primary="true"]:pressed { background: @accent_soft_text@; border-color: @accent_soft_text@; }
+QPushButton[primary="true"]:disabled { background: @disabled_bg@; color: @disabled_text@; border-color: @border@; }
+QPushButton[danger="true"] { background: @danger_soft@; color: @danger@; border-color: @danger@; }
+QPushButton[danger="true"]:hover { background: @danger@; color: @surface@; }
+QPushButton:focus { border: 1px solid @accent@; }
+
+/* ---------- الشارات ---------- */
+QLabel[badge="true"] { border-radius: @radius@px; padding: 1px 8px; font-weight: bold; }
+@badges@
+
+/* ---------- بطاقات المؤشرات واللوحات ---------- */
+QFrame#kpiCard, QFrame#panel { background: @surface@; border: 1px solid @border@; border-radius: @radius@px; }
+QLabel#kpiTitle { color: @muted@; }
+QLabel#kpiValue { font-size: @pt_kpi@pt; font-weight: bold; }
+QLabel#panelTitle { font-weight: bold; padding: 2px 0; }
+QGroupBox { background: @surface@; border: 1px solid @border@; border-radius: 8px; margin-top: 10px; padding-top: 8px; }
+QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 6px; color: @accent_soft_text@; font-weight: bold; }
+
+/* ---------- لوحة التحكم ---------- */
+QFrame#dashHeader, QFrame#dashPanel, QFrame#dashCard { background: @surface@; border: 1px solid @border@; border-radius: 14px; }
+QFrame#dashCard { background: @surface2@; }
+QFrame#dashIcon { background: @accent_soft@; border: none; border-radius: 14px; }
+QLabel#dashPageTitle { font-size: @pt_kpi@pt; font-weight: bold; }
+QLabel#dashCardTitle { font-weight: bold; }
+QLabel#dashCardValue { font-size: @pt_kpi@pt; font-weight: bold; }
+QLabel#dashPanelTitle { font-size: @pt_large@pt; font-weight: bold; }
+QLabel#dashDelta { color: @muted@; font-weight: bold; }
+QLabel#dashDelta[tone="good"] { color: @success@; }
+QLabel#dashDelta[tone="bad"] { color: @danger@; }
+QLabel#dashCardSub { color: @muted@; }
+QPushButton#dashLink { background: transparent; border: none; color: @accent@; font-weight: bold; text-align: right; padding: 2px 4px; }
+QPushButton#dashLink:hover { color: @accent_hover@; text-decoration: underline; }
+QTableWidget#dashTable { background: @surface@; alternate-background-color: @row_alt@; gridline-color: @grid@; }
+
+/* ---------- الورقة الواقعية (مساحة العرض الرمادية) ---------- */
+QScrollArea#paperArea { background: @workspace@; border: none; }
+QWidget#paperHost { background: @workspace@; }
+QFrame#paperToolbar { background: @toolbar@; border-bottom: 1px solid @border@; }
+
+/* ---------- أشرطة التمرير ---------- */
+QScrollBar:vertical { background: transparent; width: 14px; margin: 16px 0 16px 0; }
+QScrollBar::handle:vertical { background: @border_strong@; min-height: 30px; border-radius: 4px; margin: 2px 3px; }
+QScrollBar::handle:vertical:hover { background: @accent@; }
+QScrollBar::sub-line:vertical { subcontrol-origin: margin; subcontrol-position: top; height: 16px; width: 14px; background: @surface2@; border: none; border-radius: 3px; }
+QScrollBar::add-line:vertical { subcontrol-origin: margin; subcontrol-position: bottom; height: 16px; width: 14px; background: @surface2@; border: none; border-radius: 3px; }
+QScrollBar::sub-line:vertical:hover, QScrollBar::add-line:vertical:hover { background: @accent_soft@; }
+QScrollBar::sub-line:vertical:pressed, QScrollBar::add-line:vertical:pressed { background: @selection@; }
+QScrollBar::up-arrow:vertical { image: url(@arrow_up@); width: 10px; height: 10px; }
+QScrollBar::down-arrow:vertical { image: url(@arrow_down@); width: 10px; height: 10px; }
+QScrollBar:horizontal { background: transparent; height: 12px; margin: 0; }
+QScrollBar::handle:horizontal { background: @border_strong@; min-width: 30px; border-radius: 4px; margin: 3px 2px; }
+QScrollBar::handle:horizontal:hover { background: @accent@; }
+QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; height: 0; }
+QProgressBar { border: 1px solid @border_strong@; border-radius: @radius@px; background: @surface2@; text-align: center; min-height: 14px; }
+QProgressBar::chunk { background: @accent@; }
+QCheckBox, QRadioButton { spacing: 6px; }
+
+/* ---------- الإجماليات الملوّنة (موحّدة: قيود/فواتير/سندات/جداول) ---------- */
+/* خانة الإجمالي الرئيسي: تدرّج كحلي→تركواز بنص أبيض؛ داخل/قبض أخضر، خارج/صرف أحمر */
+QFrame#totHero, QFrame#invTotalBox { background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 @tot_grand_a@, stop:1 @tot_grand_b@); border: 1px solid @tot_grand_a@; border-radius: 10px; }
+QFrame#totHero[dir="in"] { background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 @tot_in_a@, stop:1 @tot_in_b@); border-color: @tot_in_a@; }
+QFrame#totHero[dir="out"] { background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 @tot_out_a@, stop:1 @tot_out_b@); border-color: @tot_out_a@; }
+QLabel#totHeroKey, QLabel#invBigKey { color: @tot_grand_key@; font-weight: bold; font-size: @pt_small@pt; background: transparent; }
+QLabel#totHeroVal { color: @tot_grand_text@; font-weight: bold; font-size: @pt_kpi@pt; background: transparent; }
+QLabel#invBigVal { color: @tot_grand_text@; font-weight: bold; font-size: @pt_large@pt; background: transparent; }
+QLabel#totHeroDetail { color: @tot_grand_key@; font-size: @pt_small@pt; background: transparent; }
+
+/* المتبقي في الفاتورة: أحمر إن بقي مبلغ، أخضر إن سُدِّدت كاملة */
+QFrame#invDueBox { background: @surface2@; border: 1px solid @border_strong@; border-radius: 10px; }
+QFrame#invDueBox QLabel#invBigKey { color: @muted@; }
+QFrame#invDueBox QLabel#invBigVal { color: @text@; }
+QFrame#invDueBox[state="due"] { background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 @tot_out_a@, stop:1 @tot_out_b@); border-color: @tot_out_a@; }
+QFrame#invDueBox[state="zero"] { background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 @tot_in_a@, stop:1 @tot_in_b@); border-color: @tot_in_a@; }
+QFrame#invDueBox[state="due"] QLabel#invBigKey, QFrame#invDueBox[state="zero"] QLabel#invBigKey { color: @tot_grand_key@; }
+QFrame#invDueBox[state="due"] QLabel#invBigVal, QFrame#invDueBox[state="zero"] QLabel#invBigVal { color: @tot_grand_text@; }
+
+/* شريط عنوان الفاتورة: مبيعات = تدرّج تركوازي، مشتريات = تدرّج عنبري + شارة الإجمالي الحي */
+QFrame#invTitleBar { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 @tot_grand_a@, stop:1 @tot_grand_b@); border-radius: 10px; }
+QFrame#invTitleBar[kind="purchase"], QFrame#invTitleBar[kind="purchases"] { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 @tot_buy_a@, stop:1 @tot_buy_b@); }
+QLabel#invTitle { color: @tot_grand_text@; font-size: @pt_large@pt; font-weight: bold; background: transparent; }
+QLabel#invTitleSub { color: @tot_grand_key@; background: transparent; }
+QFrame#invChip { background: rgba(255,255,255,0.16); border: 1px solid rgba(255,255,255,0.45); border-radius: 9px; }
+QLabel#invChipKey { color: @tot_grand_key@; font-weight: bold; background: transparent; }
+QLabel#invChipVal { color: @tot_grand_text@; font-size: @pt_large@pt; font-weight: bold; background: transparent; }
+
+/* شريط ملخص الفاتورة: كل رقم بلون دلالته */
+QFrame#invCard { background: @surface@; border: 1px solid @border@; border-radius: 8px; }
+QLabel#invSumKey { color: @muted@; }
+QLabel#invSumVal { font-weight: bold; padding: 1px 8px; border-radius: 6px; background: @surface2@; color: @text@; }
+QLabel#invSumVal[sk="gross"] { background: @surface2@; color: @text@; }
+QLabel#invSumVal[sk="discount"] { background: @tot_credit_soft@; color: @tot_credit_text@; }
+QLabel#invSumVal[sk="net"], QLabel#invSumVal[sk="total"] { background: @tot_debit_soft@; color: @tot_debit_text@; }
+QLabel#invSumVal[sk="tax"] { background: @warning_soft@; color: @warning@; }
+QLabel#invSumVal[sk="paid"], QLabel#invSumVal[sk="refund"] { background: @success_soft@; color: @success@; }
+QLabel#invSumVal[sk="rest"] { background: @danger_soft@; color: @danger@; }
+QLabel#invSumVal[sk="profit"] { background: @tot_gold_soft@; color: @tot_gold_text@; }
+
+/* خانات المدين/الدائن/الفرق (القيد المركب) */
+QFrame#totChip { border-radius: 9px; border: 1px solid @border@; background: @surface2@; }
+QLabel#totChipKey { font-size: @pt_small@pt; font-weight: bold; color: @muted@; background: transparent; }
+QLabel#totChipVal { font-size: @pt_large@pt; font-weight: bold; color: @text@; background: transparent; }
+QFrame#totChip[tk="debit"] { background: @tot_debit_soft@; border: 1px solid @tot_debit@; border-right: 5px solid @tot_debit@; }
+QFrame#totChip[tk="debit"] QLabel#totChipKey, QFrame#totChip[tk="debit"] QLabel#totChipVal { color: @tot_debit_text@; }
+QFrame#totChip[tk="credit"] { background: @tot_credit_soft@; border: 1px solid @tot_credit@; border-right: 5px solid @tot_credit@; }
+QFrame#totChip[tk="credit"] QLabel#totChipKey, QFrame#totChip[tk="credit"] QLabel#totChipVal { color: @tot_credit_text@; }
+QFrame#totChip[tk="gold"] { background: @tot_gold_soft@; border: 1px solid @tot_gold@; border-right: 5px solid @tot_gold@; }
+QFrame#totChip[tk="gold"] QLabel#totChipKey, QFrame#totChip[tk="gold"] QLabel#totChipVal { color: @tot_gold_text@; }
+QFrame#totChip[tk="diff"][state="ok"] { background: @success_soft@; border: 1px solid @success@; border-right: 5px solid @success@; }
+QFrame#totChip[tk="diff"][state="ok"] QLabel#totChipKey, QFrame#totChip[tk="diff"][state="ok"] QLabel#totChipVal { color: @success@; }
+QFrame#totChip[tk="diff"][state="bad"] { background: @danger_soft@; border: 1px solid @danger@; border-right: 5px solid @danger@; }
+QFrame#totChip[tk="diff"][state="bad"] QLabel#totChipKey, QFrame#totChip[tk="diff"][state="bad"] QLabel#totChipVal { color: @danger@; }
+
+/* المبلغ كتابةً: شريط ذهبي هادئ */
+QLabel#totWords { background: @tot_gold_soft@; color: @tot_gold_text@; border: 1px solid @tot_gold@; border-radius: 8px; padding: 4px 12px; font-weight: bold; }
+/* إجمالي مضغوط داخل شريط أدوات/جدول بنود */
+QLabel#totInline { background: @accent_soft@; color: @accent_soft_text@; border: 1px solid @accent@; border-radius: 8px; padding: 2px 12px; font-weight: bold; }
+
+/* السند: مسار «من ← إلى» وملاحظة المدين/الدائن */
+QLabel#voucherFlow { background: @accent_soft@; color: @accent_soft_text@; border-radius: 8px; padding: 4px 10px; font-weight: bold; }
+QFrame#voucherNote { background: @surface2@; border: 1px solid @border@; border-radius: 8px; }
+QLabel#voucherNoteTxt { color: @text@; }
+QLineEdit#amountField { font-size: @pt_large@pt; font-weight: bold; padding: 3px 10px; }
+"""
+
+_BADGE_TMPL = 'QLabel[tone="@tone@"] { background: @@tone@_soft@; color: @@tone@@; border: 1px solid @@tone@@; }'
+
+
+def build_qss(mode='light', density='compact'):
+    p = T.palette(mode)
+    pt = T.FONT_PT.get(density, T.FONT_PT['compact'])
+    ctx = dict(p)
+    ctx.update({f'brand_{k}': v for k, v in T.BRAND.items()})
+    ctx.update({
+        'font': T.FONT_STACK, 'pt': pt, 'pt_small': max(pt - 1, 8), 'pt_large': pt + 3, 'pt_kpi': pt + 7,
+        'mono': T.MONO_STACK, 'radius': T.RADIUS, 'field_h': T.ROW_HEIGHT.get(density, 24) - 6,
+        'ctl_h': T.CONTROL_H, 'btn_w': T.BUTTON_MIN_W,
+    })
+    badges = '\n'.join(_fill(_BADGE_TMPL, {'tone': t, **p}) for t in T.TONES)
+    ctx['badges'] = badges
+    _a = arrow_urls(p['muted'])                    # أسهم أزرار شريط التمرير العمودي بلون النص الثانوي
+    ctx['arrow_up'], ctx['arrow_down'] = _a['up'], _a['down']
+    return _fill(_TEMPLATE, ctx)
+
+
+def _fill(text, ctx):
+    # استبدال متكرر: القوالب الداخلية مثل @@tone@_soft@ تُحل على مرحلتين
+    def sub(m):
+        k = m.group(1)
+        if k not in ctx:
+            raise KeyError(f'رمز غير معرّف في QSS: {k}')
+        return str(ctx[k])
+    prev = None
+    out = text
+    for _ in range(3):
+        out = re.sub(r'@([a-z_0-9]+)@', sub, out)
+        if out == prev:
+            break
+        prev = out
+    return out
+
+
+def unresolved(qss):
+    """أي @رمز@ متبقٍ = خطأ في القالب (يستعمله الاختبار)."""
+    return re.findall(r'@[a-zA-Z_0-9]+@', qss)

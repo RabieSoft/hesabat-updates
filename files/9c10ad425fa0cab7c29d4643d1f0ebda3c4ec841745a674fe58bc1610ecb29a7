@@ -1,0 +1,87 @@
+"""خدمات العملاء والموردين: واجهة رفيعة فوق AppSession/business.parties (لا SQL مباشر).
+
+بلا PySide6، بلا float.
+"""
+from decimal import Decimal
+from alhisabat.business import parties
+
+class PartiesService:
+    def __init__(self, session):
+        self.s = session
+    def list(self, kind=None, limit=500, group_id=None, currency=None): return self.s.parties(kind=kind, limit=limit, group_id=group_id, currency=currency)
+    def names(self, kind): return [p['name'] for p in self.s.parties(kind=kind, limit=5000)]
+    def create(self, kind, v):
+        """ينشئ الطرف، ثم إن أُدخل رصيد افتتاحي يسجله كقيد مسودة منفصل لا يُفشل إنشاء الطرف إن تعذّر
+        (مثلا: حساب الأرصدة الافتتاحية غير مربوط بعد) — يُرجع dict فيه id والطرف وأي خطأ في الرصيد الافتتاحي."""
+        self.s.require('party.create')
+        gid = v.get('group_id')
+        gid = int(gid) if gid not in (None, '', 0, '0') else None
+        climit = Decimal(str(v['credit'])) if v.get('credit') not in (None, '') and kind=='customer' else None
+        pterms = int(v['terms']) if v.get('terms') not in (None, '') else None
+        pid = parties.create_party(self.s.conn, self.s.user_id, self.s.company_id, kind, v['name'],
+            phone=v.get('phone',''), email=v.get('email',''), address=v.get('address',''),
+            credit_limit=climit, payment_terms_days=pterms, branch_id=self.s._master_branch(),
+            group_id=gid, id_type=v.get('id_type',''), id_number=v.get('id_number',''),
+            id_issuer=v.get('id_issuer',''), id_issue_date=v.get('id_issue_date',''))
+        result = {'id': pid, 'opening_entry_id': None, 'opening_error': None}
+        opening_amt = str(v.get('opening_amount') or '').strip()
+        if opening_amt:
+            try:
+                signed = Decimal(opening_amt) * int(v.get('opening_direction') or 1)
+                result['opening_entry_id'] = parties.post_opening_balance(
+                    self.s.conn, self.s.user_id, self.s.company_id, pid, signed,
+                    as_of=v.get('opening_date') or None)
+            except Exception as exc:
+                result['opening_error'] = str(exc)
+        return result
+
+    def default_view_label(self):
+        from alhisabat.ui.core import readmodel
+        return readmodel.default_view_label(self.s.conn, self.s.company_id)
+
+    def currency_options(self):
+        """العملات المفعّلة للشركة (الأساسية أولًا) لاختيارها في الرصيد الافتتاحي: [{code, name_ar, is_base}]."""
+        from alhisabat.ui.core import readmodel
+        return [c for c in readmodel.currencies_list(self.s.conn, self.s.company_id) if c.get('is_enabled') or c.get('is_base')]
+
+    def post_opening_balances(self, party_id, items, as_of=None, note=''):
+        """رصيد افتتاحي بعدة عملات للطرف الواحد في قيد مسودة واحد. items: [{amount(موقّع), currency('' = الأساسية), rate('' = سعر الجدول)}]."""
+        clean = [{'amount': Decimal(str(i['amount'])), 'currency': (i.get('currency') or '').strip().upper() or None,
+                  'rate': (str(i.get('rate') or '').strip() or None)} for i in items]
+        return parties.post_opening_balances(self.s.conn, self.s.user_id, self.s.company_id, int(party_id), clean,
+                                              as_of=as_of or None, note=note)
+
+    def post_opening_balance(self, party_id, amount, as_of=None, note=''):
+        return parties.post_opening_balance(self.s.conn, self.s.user_id, self.s.company_id, int(party_id),
+                                             Decimal(str(amount)), as_of=as_of or None, note=note)
+    def edit(self, party_id, v):
+        kw={}
+        for k in ('name','phone','email','address','id_type','id_number','id_issuer','id_issue_date'):
+            if k in v: kw[k]=v[k]
+        if 'credit' in v and str(v['credit'] or '').strip()!='': kw['credit_limit']=Decimal(str(v['credit']))
+        if 'terms' in v and str(v['terms'] or '').strip()!='': kw['payment_terms_days']=int(v['terms'])
+        return parties.edit_party(self.s.conn, self.s.user_id, int(party_id), **kw)
+    def set_active(self, party_id, active, reason=''):
+        return parties.set_active(self.s.conn, self.s.user_id, int(party_id), bool(active), reason)
+    def delete(self, party_id):
+        return parties.delete_party(self.s.conn, self.s.user_id, int(party_id))
+
+    def statement(self, party_id, date_from, date_to):
+        self.s.require('party.view')
+        return parties.party_statement(self.s.conn, self.s.user_id, self.s.company_id, int(party_id), date_from, date_to)
+
+    def statement_spec(self, party_id, date_from, date_to, currency=None):
+        """مواصفة كشف حساب الطرف للمعاينة والطباعة. currency فارغة = «كل العملات»: كل حركة بعملتها وعمود للعملة وأرصدة لكل عملة؛ وإلا حركات تلك العملة بمبالغها الأصلية."""
+        self.s.require('party.view')
+        from alhisabat.reporting import printing
+        return printing.party_statement_print(self.s.conn, self.s.user_id, self.s.company_id, int(party_id), date_from, date_to,
+                                              currency=(currency or None), multi_currency=not currency)
+
+    def balance_by_currency(self, party_id, as_of=None):
+        self.s.require('party.view')
+        return parties.balance_by_currency(self.s.conn, self.s.user_id, self.s.company_id, int(party_id), as_of=as_of)
+
+    def credit_status(self, customer_id, additional=0, as_of=None):
+        self.s.require('party.view')
+        return parties.credit_status(self.s.conn, self.s.user_id, self.s.company_id, int(customer_id), additional=additional, as_of=as_of)
+

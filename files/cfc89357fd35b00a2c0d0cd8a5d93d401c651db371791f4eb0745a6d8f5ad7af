@@ -1,0 +1,186 @@
+"""تحديث البرنامج بزر واحد: «البحث عن تحديثات».
+
+1. العميل يضغط الزر (لوحة التحكم أو قائمة مساعدة).
+2. إن وُجد تحديث (اختياري دائمًا) يُسأل: تنزيل الآن / ليس الآن.
+3. التنزيل يجري في الخلفية والبرنامج مفتوح ويمكنه مواصلة عمله؛ التقدم يظهر على الزر وفي شريط الحالة.
+4. عند الاكتمال يُطلب إغلاق البرنامج لتطبيق التحديث (إغلاق وتحديث الآن / لاحقًا).
+   «لاحقًا» لا يضيّع شيئًا: يُفعَّل التحديث تلقائيًا عند فتح البرنامج المرة القادمة.
+المنطق كله في alhisabat.updater.client؛ هذا الملف واجهة فقط. يتطلب PySide6.
+"""
+import os
+import subprocess
+import sys
+
+from PySide6.QtCore import QObject, QThread, Qt, Signal
+from PySide6.QtWidgets import QDialog, QDialogButtonBox, QFormLayout, QLabel, QLineEdit, QMessageBox
+
+from alhisabat.updater import client
+
+TITLE = 'تحديث البرنامج'
+
+
+class _CheckThread(QThread):
+    done = Signal(object, str)                     # (UpdateInfo أو None، نص الخطأ)
+
+    def run(self):
+        try:
+            self.done.emit(client.check(), '')
+        except Exception as e:  # noqa: BLE001
+            self.done.emit(None, str(e) or 'حدث خطأ غير متوقع أثناء البحث عن التحديثات.')
+
+
+class _DownloadThread(QThread):
+    progress = Signal(int)
+    done = Signal(str)                             # '' = نجاح، وإلا نص الخطأ
+
+    def __init__(self, info, parent=None):
+        super().__init__(parent)
+        self.info = info
+
+    def run(self):
+        try:
+            client.download(self.info, lambda d, t, _r: self.progress.emit(int(d * 100 / max(t, 1))))
+            self.done.emit('')
+        except Exception as e:  # noqa: BLE001
+            self.done.emit(str(e) or 'حدث خطأ غير متوقع أثناء التنزيل.')
+
+
+def restart_app():
+    """يشغّل نسخة جديدة من البرنامج (من exe أو من المصدر). يُستدعى بعد إغلاق قاعدة البيانات."""
+    env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT='1')       # onefile: نسخة جديدة بمجلد مؤقت جديد
+    cmd = [sys.executable] if getattr(sys, 'frozen', False) else [sys.executable] + sys.argv
+    subprocess.Popen(cmd, env=env, close_fds=True)
+
+
+class UpdateSettingsDialog(QDialog):
+    """رابط التحديثات والمفتاح العام (يُلصقان مرة واحدة من مخرجات publish_update.py init)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('إعداد التحديثات')
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.setMinimumWidth(520)
+        url, key = client.load_config()
+        self.url = QLineEdit(url)
+        self.url.setPlaceholderText('https://example.com/updates/manifest.json')
+        self.key = QLineEdit(key)
+        self.key.setPlaceholderText('المفتاح العام (Base64)')
+        form = QFormLayout(self)
+        note = QLabel('يضبطهما مدير النظام مرة واحدة. تركهما فارغين يُعطّل البحث عن تحديثات.')
+        note.setWordWrap(True)
+        form.addRow(note)
+        form.addRow('رابط التحديثات', self.url)
+        form.addRow('المفتاح العام', self.key)
+        bb = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Save).setText('حفظ')
+        bb.button(QDialogButtonBox.Cancel).setText('إلغاء')
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        form.addRow(bb)
+
+    def values(self):
+        return self.url.text().strip(), self.key.text().strip()
+
+
+class UpdateController(QObject):
+    """يملكه MainWindow (window.updates). الأزرار والقوائم تستدعي check_now() فقط."""
+    busyChanged = Signal(bool, str)                # (مشغول؟، نص الزر)
+
+    LABEL = 'البحث عن تحديثات'
+
+    def __init__(self, window):
+        super().__init__(window)
+        self.w = window
+        self.busy = False
+        self._thread = None
+
+    # ------------------------------------------------------------------ نقطة الدخول
+    def check_now(self):
+        if self.busy:
+            return
+        pending = client.pending_version()
+        if pending:                                 # نُزّل سابقًا ولم يُفعَّل
+            self._ask_restart(pending)
+            return
+        if not client.enabled():
+            QMessageBox.information(self.w, TITLE, 'التحديثات غير مضبوطة بعد.\nيضبطها مدير النظام من لوحة التحكم ← إعداد التحديثات.')
+            return
+        self._set_busy(True, 'جارٍ البحث…')
+        self._thread = _CheckThread(self)
+        self._thread.done.connect(self._on_checked)
+        self._thread.start()
+
+    def configure(self):
+        d = UpdateSettingsDialog(self.w)
+        if d.exec() == QDialog.Accepted:
+            client.save_config(*d.values())
+            self._say('تم حفظ إعداد التحديثات')
+
+    # ------------------------------------------------------------------ مراحل التدفق
+    def _on_checked(self, info, error):
+        self._set_busy(False)
+        if error:
+            QMessageBox.warning(self.w, TITLE, error)
+            return
+        if info is None:
+            from alhisabat.ui.shell.main_window import VERSION
+            QMessageBox.information(self.w, TITLE, f'أنت تستخدم أحدث إصدار ({VERSION}).')
+            return
+        notes = ('\n• ' + '\n• '.join(info.notes)) if info.notes else ''
+        if info.needs_full:
+            link = f'\nرابط التنزيل: {info.full_url}' if info.full_url else '\nتواصل مع الدعم للحصول عليها.'
+            QMessageBox.information(self.w, TITLE, f'يتوفر الإصدار {info.version} ويحتاج نسخة البرنامج الكاملة الجديدة.{notes}{link}')
+            return
+        size = f'\nحجم التنزيل: {max(info.total_bytes / 1024, 1):.0f} ك.ب.' if info.total_bytes else ''
+        box = QMessageBox(self.w)
+        box.setWindowTitle(TITLE)
+        box.setIcon(QMessageBox.Question)
+        box.setText(f'يتوفر تحديث جديد (الإصدار {info.version}).{notes}{size}\n\n'
+                    'سيُنزَّل أثناء عملك دون أن يتوقف البرنامج، وعند اكتماله نطلب منك إغلاقه لتطبيق التحديث.')
+        yes = box.addButton('تنزيل التحديث', QMessageBox.AcceptRole)
+        box.addButton('ليس الآن', QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is yes:
+            self._download(info)
+
+    def _download(self, info):
+        self._set_busy(True, 'جارٍ التنزيل… 0%')
+        self._thread = _DownloadThread(info, self)
+        self._thread.progress.connect(lambda pct: self._set_busy(True, f'جارٍ التنزيل… {pct}%'))
+        self._thread.done.connect(lambda err, v=info.version: self._on_downloaded(v, err))
+        self._thread.start()
+
+    def _on_downloaded(self, version, error):
+        self._set_busy(False)
+        if error:
+            QMessageBox.warning(self.w, TITLE, f'لم يكتمل التنزيل ولم يتغير شيء في البرنامج.\n{error}\nيمكنك المتابعة بالنسخة الحالية وإعادة المحاولة لاحقًا.')
+            return
+        self._ask_restart(version)
+
+    def _ask_restart(self, version):
+        box = QMessageBox(self.w)
+        box.setWindowTitle(TITLE)
+        box.setIcon(QMessageBox.Information)
+        box.setText(f'اكتمل تنزيل التحديث (الإصدار {version}).\nلتطبيقه يجب إغلاق البرنامج؛ سيُعاد فتحه تلقائيًا بعد التحديث.')
+        now = box.addButton('إغلاق وتحديث الآن', QMessageBox.AcceptRole)
+        box.addButton('لاحقًا', QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is now:
+            self.w.restart_requested = True
+            if not self.w.close():                  # الإغلاق مُنع (عمل غير محفوظ): نبقى ولا نعيد التشغيل
+                self.w.restart_requested = False
+        else:
+            self._say(f'التحديث {version} جاهز وسيُطبَّق تلقائيًا عند فتح البرنامج المرة القادمة')
+
+    # ------------------------------------------------------------------ مساعدات
+    def _set_busy(self, busy, text=''):
+        self.busy = busy
+        self.busyChanged.emit(busy, text or self.LABEL)
+        if busy:
+            self._say(text)
+
+    def _say(self, text):
+        try:
+            self.w.msg.setText(text)
+        except Exception:  # noqa: BLE001
+            pass

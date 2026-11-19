@@ -1,0 +1,649 @@
+"""الصناديق والبنوك وسندات القبض/الدفع والتحويلات وجرد الصندوق.
+- كل صندوق/بنك كيان مرتبط بحساب أصل (Cashbox/Bank ↔ Account) بعملة وصلاحيات وصول ومنع الرصيد السالب للصناديق.
+- سند القبض/الدفع يُرحَّل بقيد آلي ويُخصَّص على فواتير البيع/الشراء الآجلة (والباقي دفعة مقدمة على حساب الطرف).
+- التسوية بعملة أجنبية تُخرج الطرف بقيمته الدفترية (لا بسعر السند) والفرق فروقات محققة في حساب فروقات العملة.
+- الإلغاء بعكس القيد وتحرير التخصيصات، ويُمنع إن طُوبق القيد مع كشف البنك."""
+from datetime import date as _date
+from decimal import Decimal
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.accounting import balance_engine as be, journal_engine as je, ledger_engine as le, period_engine, rates as fxr
+from alhisabat.audit import audit
+from alhisabat.business import branch_scope
+from alhisabat.business import chart_of_accounts as coa, sales
+from alhisabat.database.tx import transaction
+from alhisabat.security import permissions
+
+_r, _u = sales._r, sales._u
+
+
+def _mapping(conn, company_id, key):
+    r = conn.execute("SELECT account_id FROM account_mappings WHERE company_id=? AND map_key=?", (company_id, key)).fetchone()
+    return r[0] if r else None
+
+
+# ---------------- الوصول ----------------
+def can_use_cash(conn, user_id, cash_id):
+    n = conn.execute("SELECT COUNT(*) FROM user_cash_access WHERE user_id=?", (user_id,)).fetchone()[0]
+    return not n or conn.execute("SELECT 1 FROM user_cash_access WHERE user_id=? AND cash_account_id=?", (user_id, cash_id)).fetchone() is not None
+
+
+def _req(conn, user_id, company_id, code, *cash_ids):
+    permissions.require(conn, user_id, company_id, code, check_branch=False)
+    for c in cash_ids:
+        if c is not None and not can_use_cash(conn, user_id, c):
+            audit.log(conn, user_id, "permission_denied", "cash_accounts", c, after={"permission": code})
+            raise permissions.PermissionDenied("ليس لديك صلاحية العمل على هذا الصندوق/البنك")
+
+
+def _ca(conn, cash_id, company_id=None):
+    r = conn.execute("SELECT * FROM cash_accounts WHERE id=?", (cash_id,)).fetchone()
+    if not r or (company_id is not None and r["company_id"] != company_id):
+        raise AccountingError("الصندوق/البنك غير موجود في هذه الشركة")
+    return r
+
+
+# ---------------- الصناديق والبنوك ----------------
+def create_cash_account(conn, actor_id, company_id, kind, name, *, account_id=None, parent_id=None, currency=None, bank_name="",
+                        account_no="", allow_negative=None, branch_id=None, code=None):
+    _req(conn, actor_id, company_id, "cash.manage")
+    if kind not in ("cashbox", "bank"):
+        raise AccountingError("نوع غير معروف")
+    base = fxr.base_currency(conn, company_id)
+    currency = currency or base
+    if currency != base and not fxr.currency_enabled(conn, company_id, currency):
+        raise AccountingError(f"العملة {currency} غير مفعّلة")
+    with transaction(conn):
+        if account_id is None:
+            parent = parent_id or _mapping(conn, company_id, "cash" if kind == "cashbox" else "bank")
+            if not parent:
+                raise AccountingError("اربط حساب النقدية/البنوك (Account Mapping) أو حدد حسابا أبا")
+            if conn.execute("SELECT 1 FROM cash_accounts WHERE account_id=?", (parent,)).fetchone():
+                raise AccountingError("الحساب الأب مسجَّل كصندوق/بنك: حدد حسابا أبا آخر أو أنشئ حسابا يدويا")
+            account_id = coa.add_account(conn, actor_id, company_id, name, "asset", parent)
+        a = conn.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+        if not a or a["company_id"] != company_id or a["is_group"] or not a["is_active"] or a["account_type"] != "asset":
+            raise AccountingError("حساب الصندوق/البنك يجب أن يكون حساب أصل حركة نشطا")
+        if coa.party_of_account(conn, account_id) or conn.execute(
+                "SELECT 1 FROM account_mappings WHERE account_id=? AND map_key IN ('inventory','customers','suppliers')", (account_id,)).fetchone() \
+                or conn.execute("SELECT 1 FROM items WHERE inventory_account_id=?", (account_id,)).fetchone():
+            raise AccountingError("هذا حساب أطراف/مخزون: لا يصلح صندوقا أو بنكا")
+        if not code:
+            pre = "CB" if kind == "cashbox" else "BK"
+            code = "%s%02d" % (pre, conn.execute("SELECT COUNT(*)+1 FROM cash_accounts WHERE company_id=? AND kind=?", (company_id, kind)).fetchone()[0])
+        neg = (0 if kind == "cashbox" else 1) if allow_negative is None else int(allow_negative)
+        cid = conn.execute("INSERT INTO cash_accounts(company_id,kind,code,name,account_id,currency,branch_id,bank_name,account_no,allow_negative,created_by) "
+                           "VALUES(?,?,?,?,?,?,?,?,?,?,?)", (company_id, kind, code, (name or "").strip(), account_id, currency, branch_id, bank_name, account_no, neg, actor_id)).lastrowid
+        conn.execute("UPDATE accounts SET revalue_fx=1 WHERE id=?", (account_id,))
+        audit.log(conn, actor_id, "create_cash_account", "cash_accounts", cid, after={"code": code, "kind": kind, "account": account_id})
+    return cid
+
+
+def set_cash_active(conn, actor_id, cash_id, active: bool):
+    ca = _ca(conn, cash_id)
+    _req(conn, actor_id, ca["company_id"], "cash.manage")
+    if not active:
+        b = cash_balance(conn, actor_id, ca["company_id"], cash_id)
+        if any(v["net_orig"] != 0 for v in b):
+            raise AccountingError("لا يمكن تعطيل صندوق/بنك رصيده غير صفري")
+    with transaction(conn):
+        conn.execute("UPDATE cash_accounts SET is_active=? WHERE id=?", (int(active), cash_id))
+        audit.log(conn, actor_id, "cash_active", "cash_accounts", cash_id, after={"active": active})
+
+
+def set_allow_negative(conn, actor_id, cash_id, allow: bool):
+    ca = _ca(conn, cash_id)
+    _req(conn, actor_id, ca["company_id"], "cash.manage")
+    with transaction(conn):
+        conn.execute("UPDATE cash_accounts SET allow_negative=? WHERE id=?", (int(allow), cash_id))
+        audit.log(conn, actor_id, "cash_allow_negative", "cash_accounts", cash_id, {"allow": ca["allow_negative"]}, {"allow": int(allow)})
+
+
+def restrict_to_cash_account(conn, actor_id, company_id, user_id, cash_id):
+    permissions.require(conn, actor_id, company_id, "user.manage")
+    _ca(conn, cash_id, company_id)
+    with transaction(conn):
+        conn.execute("INSERT OR IGNORE INTO user_cash_access VALUES(?,?)", (user_id, cash_id))
+        audit.log(conn, actor_id, "restrict_cash", "user_cash_access", user_id, after={"cash": cash_id})
+
+
+def cash_balance(conn, user_id, company_id, cash_id, as_of=None):
+    """رصيد الصندوق/البنك لكل عملة: [{currency, net_orig, net_base}] من القيود المرحّلة (بقواعد الأرصدة الموحّدة)."""
+    _req(conn, user_id, company_id, "cash.view", cash_id)
+    ca = _ca(conn, cash_id, company_id)
+    as_of = as_of or conn.execute("SELECT MAX(end_date) FROM fiscal_years WHERE company_id=?", (company_id,)).fetchone()[0]
+    ys = be.year_start(conn, company_id, as_of)
+    eff, counted, _x = be.frag("a")
+    return [dict(r) for r in conn.execute(
+        f"SELECT l.currency,SUM(l.debit_orig-l.credit_orig) net_orig,SUM(l.debit_base-l.credit_base) net_base FROM journal_lines l "
+        f"JOIN journal_entries e ON e.id=l.entry_id JOIN accounts a ON a.id=l.account_id WHERE l.account_id=:acc AND e.company_id=:c "
+        f"AND e.status IN {be.POSTED} AND e.entry_date<=:t AND {counted} GROUP BY l.currency ORDER BY l.currency",
+        {"acc": ca["account_id"], "c": company_id, "t": as_of, "ys": ys, "fl": be.perm_floor(conn, company_id, ys)})]
+
+
+def cash_statement(conn, user_id, company_id, cash_id, date_from, date_to, **kw):
+    _req(conn, user_id, company_id, "cash.view", cash_id)
+    ca = _ca(conn, cash_id, company_id)
+    return le.ledger(conn, user_id, company_id, ca["account_id"], date_from, date_to, include_children=False, **kw)
+
+
+# ---------------- السندات ----------------
+def _doc_table(vtype):
+    return ("sales_invoices", "sales_invoice") if vtype == "receipt" else ("purchase_invoices", "purchase_invoice")
+
+
+def outstanding(conn, doc_type, doc_id, as_of=None):
+    """المتبقي على فاتورة آجلة = المستحق − تخصيصات السندات المرحّلة − ما ائتُمن بمرتجعات مرحّلة."""
+    tbl = "sales_invoices" if doc_type == "sales_invoice" else "purchase_invoices"
+    h = conn.execute(f"SELECT * FROM {tbl} WHERE id=?", (doc_id,)).fetchone()
+    if not h or h["status"] != "posted" or h["doc_type"] != "invoice":
+        return 0
+    q, a = ("SELECT COALESCE(SUM(va.amount_minor),0) FROM voucher_allocations va JOIN cash_vouchers cv ON cv.id=va.voucher_id "
+            "WHERE va.doc_type=? AND va.doc_id=? AND cv.status='posted'"), [doc_type, doc_id]
+    if as_of:
+        q += " AND cv.voucher_date<=?"; a.append(as_of)
+    alloc = conn.execute(q, a).fetchone()[0]
+    rq = f"SELECT COALESCE(SUM(due_total),0) FROM {tbl} WHERE original_invoice_id=? AND status='posted'" + (" AND invoice_date<=?" if as_of else "")
+    ret = conn.execute(rq, (doc_id, *([as_of] if as_of else []))).fetchone()[0]
+    return max(0, h["due_total"] - alloc - ret)
+
+
+def is_blocked_counter(conn, account_id):
+    """حساب لا يصلح بندًا مقابلًا في سند نقدية: حساب طرف، أو رقابي للأطراف/المخزون، أو مخزون صنف."""
+    return bool(coa.party_of_account(conn, account_id)
+                or conn.execute("SELECT 1 FROM account_mappings WHERE account_id=? AND map_key IN ('inventory','customers','suppliers')", (account_id,)).fetchone()
+                or conn.execute("SELECT 1 FROM party_groups WHERE account_id=?", (account_id,)).fetchone()
+                or conn.execute("SELECT 1 FROM items WHERE inventory_account_id=?", (account_id,)).fetchone())
+
+
+def counter_block_reason(conn, company_id, account_id):
+    p = coa.party_of_account(conn, account_id)
+    if p:
+        return "هذا حساب عميل/مورد: اختره من قائمة الأطراف (عميل/مورد) ليُسجَّل السند باسمه"
+    if conn.execute("SELECT 1 FROM party_groups WHERE account_id=?", (account_id,)).fetchone() or conn.execute(
+            "SELECT 1 FROM account_mappings WHERE account_id=? AND map_key IN ('customers','suppliers')", (account_id,)).fetchone():
+        return "هذا حساب رقابي للعملاء/الموردين: اختر العميل أو المورد نفسه لا الحساب الرقابي"
+    return "حساب المخزون لا يُستعمل في سند نقدية: استخدم فاتورة أو قيد جرد/تسوية مخزون"
+
+
+def resolve_counter(conn, company_id, account_id):
+    """يحوّل الحساب المقابل المختار إلى ('party', id) إن كان حساب عميل/مورد/موظف، وإلا ('account', id) بعد التحقق."""
+    p = coa.party_of_account(conn, account_id)
+    if p:
+        return "party", p["id"]
+    if is_blocked_counter(conn, account_id):
+        raise AccountingError(counter_block_reason(conn, company_id, account_id))
+    return "account", account_id
+
+
+
+def _counter_ok(conn, company_id, account_id, cash_account_id):
+    a = conn.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+    if not a or a["company_id"] != company_id or a["is_group"] or not a["is_active"]:
+        raise AccountingError("حساب البند غير صالح (حساب حركة نشط)")
+    if coa.party_of_account(conn, account_id) or conn.execute("SELECT 1 FROM account_mappings WHERE account_id=? AND map_key IN ('inventory','customers','suppliers')", (account_id,)).fetchone() \
+            or conn.execute("SELECT 1 FROM items WHERE inventory_account_id=?", (account_id,)).fetchone():
+        raise AccountingError(counter_block_reason(conn, company_id, account_id))
+    if conn.execute("SELECT 1 FROM cash_accounts WHERE account_id=?", (account_id,)).fetchone():
+        raise AccountingError("التحويل بين الصناديق والبنوك يتم بمستند التحويل لا بسند قبض/دفع")
+
+
+def _validate_allocations(conn, company_id, vtype, party, currency, voucher_date, allocations, amount, exclude=None):
+    tbl, dtype = _doc_table(vtype)
+    out, seen, tot = [], set(), 0
+    for al in allocations or []:
+        did = al["doc_id"]
+        if did in seen:
+            raise AccountingError("مستند مكرر في التخصيص")
+        seen.add(did)
+        h = conn.execute(f"SELECT * FROM {tbl} WHERE id=? AND company_id=?", (did, company_id)).fetchone()
+        pcol = "customer_id" if vtype == "receipt" else "supplier_id"
+        if not h or h["doc_type"] != "invoice" or h["status"] != "posted" or h[pcol] != party["id"]:
+            raise AccountingError("مستند التخصيص غير صالح (يجب فاتورة مرحّلة لنفس الطرف)")
+        if h["currency"] != currency:
+            raise AccountingError("عملة السند يجب أن تطابق عملة الفاتورة المخصَّص عليها")
+        if h["invoice_date"] > voucher_date:
+            raise AccountingError("تاريخ السند أقدم من تاريخ الفاتورة")
+        amt = je._minor(al["amount"])
+        if amt <= 0:
+            raise AccountingError("مبلغ التخصيص يجب أن يكون أكبر من صفر")
+        out_ = outstanding(conn, dtype, did)
+        if exclude:
+            out_ += conn.execute("SELECT COALESCE(SUM(amount_minor),0) FROM voucher_allocations WHERE voucher_id=? AND doc_type=? AND doc_id=?", (exclude, dtype, did)).fetchone()[0] \
+                if conn.execute("SELECT status FROM cash_vouchers WHERE id=?", (exclude,)).fetchone()[0] == "posted" else 0
+        if amt > out_:
+            raise AccountingError("مبلغ التخصيص يتجاوز المتبقي على الفاتورة")
+        tot += amt
+        out.append((dtype, did, amt))
+    if tot > amount:
+        raise AccountingError("مجموع التخصيصات يتجاوز مبلغ السند")
+    return out
+
+
+def _prepare_voucher(conn, actor_id, company_id, vtype, voucher_date, cash_id, amount, party_id, allocations, lines, branch_id, party_kinds=None):
+    """كل تحققات السند (الصلاحية، الصندوق، الطرف، التخصيصات، البنود) قبل أي كتابة: مشتركة بين الإنشاء والتعديل."""
+    branch_id = branch_scope.resolve_for_user(conn, company_id, actor_id, branch_id)
+    _req(conn, actor_id, company_id, "cash.voucher", cash_id)
+    ca = _ca(conn, cash_id, company_id)
+    if not ca["is_active"]:
+        raise AccountingError("الصندوق/البنك غير نشط")
+    branch_scope.check_cash(conn, company_id, branch_id, cash_id)
+    branch_scope.check_party(conn, company_id, branch_id, party_id)
+    try:
+        _date.fromisoformat(voucher_date)
+    except Exception:
+        raise AccountingError("تاريخ غير صالح")
+    amt = je._minor(amount)
+    if amt <= 0:
+        raise AccountingError("المبلغ يجب أن يكون أكبر من صفر")
+    party, norm_lines = None, []
+    if party_id is not None:
+        allowed_kinds = party_kinds or (("customer",) if vtype == "receipt" else ("supplier",))
+        q = ",".join("?" * len(allowed_kinds))
+        party = conn.execute(f"SELECT * FROM parties WHERE id=? AND company_id=? AND kind IN ({q})", (party_id, company_id, *allowed_kinds)).fetchone()
+        if not party:
+            raise AccountingError("الطرف غير موجود أو نوعه لا يناسب السند")
+        if not party["is_active"]:
+            raise AccountingError("الطرف غير نشط")
+        if lines:
+            raise AccountingError("سند الطرف لا يقبل بنود حسابات")
+        if allocations and party["kind"] != ("customer" if vtype == "receipt" else "supplier"):
+            raise AccountingError("التخصيص على الفواتير متاح لقبض العملاء وصرف الموردين فقط")
+        allocs = _validate_allocations(conn, company_id, vtype, party, ca["currency"], voucher_date, allocations, amt)
+    else:
+        if allocations:
+            raise AccountingError("التخصيص على الفواتير يتطلب طرفا")
+        if not lines:
+            raise AccountingError("السند بلا طرف يحتاج بنود حسابات")
+        allocs = []
+        for l in lines:
+            m = je._minor(l["amount"])
+            if m <= 0:
+                raise AccountingError("مبلغ البند يجب أن يكون أكبر من صفر")
+            _counter_ok(conn, company_id, l["account_id"], ca["account_id"])
+            norm_lines.append((l["account_id"], m, l.get("description", "")))
+        if sum(x[1] for x in norm_lines) != amt:
+            raise AccountingError("مجموع البنود لا يساوي مبلغ السند")
+    return {"branch_id": branch_id, "ca": ca, "amt": amt, "allocs": allocs, "lines": norm_lines}
+
+
+def _create_voucher(conn, actor_id, company_id, vtype, voucher_date, cash_id, amount, party_id, allocations, lines, description, branch_id, party_kinds=None):
+    p = _prepare_voucher(conn, actor_id, company_id, vtype, voucher_date, cash_id, amount, party_id, allocations, lines, branch_id, party_kinds)
+    branch_id, ca, amt, allocs, norm_lines = p["branch_id"], p["ca"], p["amt"], p["allocs"], p["lines"]
+    with transaction(conn):
+        vid = conn.execute("INSERT INTO cash_vouchers(company_id,branch_id,voucher_type,voucher_date,cash_account_id,party_id,currency,amount_minor,description,created_by) "
+                           "VALUES(?,?,?,?,?,?,?,?,?,?)", (company_id, branch_id, vtype, voucher_date, cash_id, party_id, ca["currency"], amt, description or "", actor_id)).lastrowid
+        for i, (acc, m, d) in enumerate(norm_lines, 1):
+            conn.execute("INSERT INTO cash_voucher_lines(voucher_id,line_no,account_id,amount_minor,description) VALUES(?,?,?,?,?)", (vid, i, acc, m, d))
+        for (dt, did, a) in allocs:
+            conn.execute("INSERT INTO voucher_allocations(voucher_id,doc_type,doc_id,amount_minor) VALUES(?,?,?,?)", (vid, dt, did, a))
+        audit.log(conn, actor_id, "create_voucher", "cash_vouchers", vid, after={"type": vtype, "amount": amt})
+    return vid
+
+
+def create_receipt(conn, actor_id, company_id, voucher_date, cash_id, amount, *, customer_id=None, supplier_id=None, allocations=None, lines=None, description="", branch_id=None):
+    """قبض: من عميل (الأصل)، أو من مورد (مرتجع/استرداد دفعة) عبر supplier_id."""
+    if customer_id is not None and supplier_id is not None:
+        raise AccountingError("اختر طرفا واحدا للسند")
+    pid = customer_id if customer_id is not None else supplier_id
+    kinds = ("supplier",) if supplier_id is not None else ("customer",)
+    return _create_voucher(conn, actor_id, company_id, "receipt", voucher_date, cash_id, amount, pid, allocations, lines, description, branch_id, party_kinds=kinds)
+
+
+def create_payment(conn, actor_id, company_id, voucher_date, cash_id, amount, *, supplier_id=None, employee_id=None, customer_id=None, allocations=None, lines=None, description="", branch_id=None):
+    """صرف: لمورد (الأصل) أو موظف، أو لعميل (رد مبلغ/مرتجع) عبر customer_id."""
+    given = [x for x in (supplier_id, employee_id, customer_id) if x is not None]
+    if len(given) > 1:
+        raise AccountingError("اختر طرفا واحدا للسند")
+    party_id = given[0] if given else None
+    if customer_id is not None:
+        kinds = ("customer",)
+    elif employee_id is not None:
+        kinds = ("employee",)
+    elif supplier_id is not None:
+        kinds = ("supplier",)
+    else:
+        kinds = ("supplier", "employee")
+    return _create_voucher(conn, actor_id, company_id, "payment", voucher_date, cash_id, amount, party_id, allocations, lines, description, branch_id, party_kinds=kinds)
+
+
+def _load_voucher(conn, vid):
+    v = conn.execute("SELECT * FROM cash_vouchers WHERE id=?", (vid,)).fetchone()
+    if not v:
+        raise AccountingError("السند غير موجود")
+    return v
+
+
+def delete_voucher_draft(conn, actor_id, vid):
+    v = _load_voucher(conn, vid)
+    _req(conn, actor_id, v["company_id"], "cash.voucher", v["cash_account_id"])
+    if v["status"] != "draft":
+        raise AccountingError("لا يُحذف إلا المسودة")
+    with transaction(conn):
+        for t in ("cash_voucher_lines", "voucher_allocations"):
+            conn.execute(f"DELETE FROM {t} WHERE voucher_id=?", (vid,))
+        conn.execute("DELETE FROM cash_vouchers WHERE id=?", (vid,))
+        audit.log(conn, actor_id, "delete_voucher_draft", "cash_vouchers", vid)
+
+
+def _party_base(conn, company_id, party, currency, X, rate, as_of, natural=True):
+    """القيمة الأساسية التي يُخرَج بها الطرف عند تسوية X بعملة أجنبية: بالقيمة الدفترية (وما يزيد عن الرصيد بسعر السند)."""
+    ys = be.year_start(conn, company_id, as_of)
+    eff, counted, _x = be.frag("a")
+    r = conn.execute(
+        f"SELECT COALESCE(SUM(l.debit_orig-l.credit_orig),0) n,COALESCE(SUM(l.debit_base-l.credit_base),0) b FROM journal_lines l "
+        f"JOIN journal_entries e ON e.id=l.entry_id JOIN accounts a ON a.id=l.account_id WHERE l.account_id=:acc AND e.company_id=:c "
+        f"AND e.status IN {be.POSTED} AND e.entry_date<=:t AND l.currency=:cur AND {counted}",
+        {"acc": party["account_id"], "c": company_id, "t": as_of, "ys": ys, "fl": be.perm_floor(conn, company_id, ys), "cur": currency}).fetchone()
+    if not natural:          # قبض من مورد / صرف لعميل: يزيد الرصيد لا يُسوّيه، فلا إخراج بقيمة دفترية
+        return _r(Decimal(X) * rate)
+    sign = 1 if party["kind"] == "customer" else -1
+    N, B = sign * r["n"], sign * r["b"]
+    if N > 0 and B > 0:
+        s = min(X, N)
+        return (B if s == N else _r(Decimal(B) * s / N)) + _r(Decimal(X - s) * rate)
+    return _r(Decimal(X) * rate)
+
+
+def _entry_desc(v, is_rec, vid):
+    """بيان القيد الناتج عن السند: بيان السند نفسه (ملاحظة/رقم السند الدفتري) إن أُدخل، وإلا النص العام «سند قبض/صرف رقم N»."""
+    note = (v["description"] or "").strip()
+    return note or (("سند قبض" if is_rec else "سند صرف") + f" رقم {vid}")
+
+
+def post_voucher(conn, actor_id, vid):
+    v = _load_voucher(conn, vid)
+    cid = v["company_id"]
+    _req(conn, actor_id, cid, "cash.voucher", v["cash_account_id"])
+    permissions.require(conn, actor_id, cid, "journal.create", check_branch=False)
+    permissions.require(conn, actor_id, cid, "journal.post", check_branch=False)
+    if v["status"] != "draft":
+        raise AccountingError("السند ليس مسودة")
+    ca = _ca(conn, v["cash_account_id"], cid)
+    if not ca["is_active"]:
+        raise AccountingError("الصندوق/البنك غير نشط")
+    per = period_engine.find_period(conn, cid, v["voucher_date"])
+    je._assert_open(per)
+    base = fxr.base_currency(conn, cid)
+    cur, X, is_rec = v["currency"], v["amount_minor"], v["voucher_type"] == "receipt"
+    rate = fxr.get_rate(conn, cid, cur, v["voucher_date"])
+    party = conn.execute("SELECT * FROM parties WHERE id=?", (v["party_id"],)).fetchone() if v["party_id"] else None
+    if party and not party["is_active"]:
+        raise AccountingError("الطرف غير نشط")
+    with transaction(conn):
+        allocs = conn.execute("SELECT * FROM voucher_allocations WHERE voucher_id=?", (vid,)).fetchall()
+        if party:
+            re_ = _validate_allocations(conn, cid, v["voucher_type"], party, cur, v["voucher_date"],
+                                        [{"doc_id": a["doc_id"], "amount": Decimal(a["amount_minor"]) / 100} for a in allocs], X)
+            cash_base = X if cur == base else _r(Decimal(X) * rate)
+            natural = (party["kind"] == "customer") == is_rec or (party["kind"] != "customer" and not is_rec)
+            party_base = X if cur == base else _party_base(conn, cid, party, cur, X, rate, v["voucher_date"], natural=natural)
+            if party_base <= 0 or cash_base <= 0:
+                raise AccountingError("قيمة أساسية غير صالحة للسند")
+            fx = (cash_base - party_base) if is_rec else (party_base - cash_base)
+            lines = [{"account_id": ca["account_id"], "currency": cur, "side": "debit" if is_rec else "credit", "orig": X, "base": cash_base},
+                     {"account_id": party["account_id"], "currency": cur, "side": "credit" if is_rec else "debit", "orig": X, "base": party_base}]
+            if fx:
+                fxa = _mapping(conn, cid, "fx_differences")
+                if not fxa:
+                    raise AccountingError("اربط حساب فروقات العملة (Account Mapping: fx_differences)")
+                lines.append({"account_id": fxa, "currency": base, "side": "credit" if fx > 0 else "debit", "orig": abs(fx), "base": abs(fx)})
+            eid = je.create_draft_explicit(conn, cid, actor_id, v["voucher_date"], lines,
+                                           _entry_desc(v, is_rec, vid), "auto", branch_id=v["branch_id"],
+                                           source_type="cash_voucher", source_id=vid)
+        else:
+            fx = 0
+            vl = conn.execute("SELECT * FROM cash_voucher_lines WHERE voucher_id=? ORDER BY line_no", (vid,)).fetchall()
+            for l in vl:
+                _counter_ok(conn, cid, l["account_id"], ca["account_id"])
+            jl = [{"account_id": ca["account_id"], "currency": cur, "debit": _u(X) if is_rec else 0, "credit": 0 if is_rec else _u(X)}]
+            for l in vl:
+                jl.append({"account_id": l["account_id"], "currency": cur, "debit": 0 if is_rec else _u(l["amount_minor"]), "credit": _u(l["amount_minor"]) if is_rec else 0})
+            eid = je.create_draft(conn, cid, actor_id, v["voucher_date"], jl, _entry_desc(v, is_rec, vid), branch_id=v["branch_id"],
+                                  entry_type="auto", source_type="cash_voucher", source_id=vid, trusted_rates=True, rounding_tolerance=3)
+        je.post(conn, eid, actor_id)
+        no = sales._next_number(conn, cid, v["voucher_type"], per["yid"])
+        conn.execute("UPDATE cash_vouchers SET status='posted',voucher_no=?,journal_entry_id=?,exchange_rate=?,realized_fx_minor=?,posted_by=?,posted_at=CURRENT_TIMESTAMP WHERE id=?",
+                     (no, eid, str(rate), fx, actor_id, vid))
+        audit.log(conn, actor_id, "post_voucher", "cash_vouchers", vid, after={"no": no, "entry": eid, "realized_fx": fx})
+    return {"voucher_id": vid, "voucher_no": no, "entry_id": eid, "realized_fx": fx}
+
+
+def _entry_reconciled(conn, entry_id):
+    return conn.execute("SELECT 1 FROM bank_matches m JOIN journal_lines l ON l.id=m.journal_line_id WHERE l.entry_id=? LIMIT 1", (entry_id,)).fetchone() is not None
+
+
+def cancel_voucher(conn, actor_id, vid, cancel_date, reason):
+    v = _load_voucher(conn, vid)
+    cid = v["company_id"]
+    _req(conn, actor_id, cid, "cash.cancel", v["cash_account_id"])
+    permissions.require(conn, actor_id, cid, "journal.reverse", check_branch=False)
+    if not reason or not reason.strip():
+        raise AccountingError("الإلغاء يتطلب ذكر السبب")
+    if v["status"] != "posted":
+        raise AccountingError("يُلغى السند المرحّل فقط")
+    if cancel_date < v["voucher_date"]:
+        raise AccountingError("تاريخ الإلغاء أقدم من تاريخ السند")
+    if _entry_reconciled(conn, v["journal_entry_id"]):
+        raise AccountingError("السند طُوبق مع كشف البنك: ألغِ المطابقة أولا")
+    with transaction(conn):
+        rid = je.reverse(conn, v["journal_entry_id"], actor_id, cancel_date, reason)
+        conn.execute("UPDATE cash_vouchers SET status='cancelled',cancelled_by=?,cancelled_at=CURRENT_TIMESTAMP,cancel_reason=?,cancel_entry_id=? WHERE id=?",
+                     (actor_id, reason, rid, vid))
+        audit.log(conn, actor_id, "cancel_voucher", "cash_vouchers", vid, {"status": "posted"}, {"status": "cancelled", "reversal": rid}, reason)
+    return {"voucher_id": vid, "reversal_entry_id": rid}
+
+
+def _carry_allocations(conn, v, vtype, party_id, new_currency, new_amount_minor):
+    """تخصيصات السند على الفواتير تبقى عند تعديله إن بقي الطرف والنوع والعملة؛ تُفكّ إن تغيّر الطرف أو النوع، ويُرفض النقص عنها."""
+    rows = conn.execute("SELECT doc_id,amount_minor FROM voucher_allocations WHERE voucher_id=? ORDER BY id", (v["id"],)).fetchall()
+    if not rows or party_id is None or party_id != v["party_id"] or vtype != v["voucher_type"]:
+        return None
+    if new_currency != v["currency"]:
+        raise AccountingError("السند مخصَّص على فواتير بعملته الحالية: لا تغيّر عملة الصندوق/البنك قبل فك التخصيص (أنشئ سندًا جديدًا)")
+    tot = sum(r["amount_minor"] for r in rows)
+    if new_amount_minor < tot:
+        raise AccountingError(f"السند مخصَّص على فواتير بمبلغ {tot / 100:,.2f}: لا يمكن أن يقل مبلغه عن ذلك")
+    return [{"doc_id": r["doc_id"], "amount": Decimal(r["amount_minor"]) / 100} for r in rows]
+
+
+def update_voucher(conn, actor_id, vid, vtype, voucher_date, cash_id, amount, *, party_id=None, account_id=None, description="", reason=None):
+    """تعديل سند قبض/صرف (طرف واحد أو حساب مقابل واحد).
+    - المسودة: تُحدَّث في مكانها بنفس المعرّف.
+    - المرحَّل (يتطلب reason + صلاحيتي cash.cancel وjournal.reverse): في معاملة واحدة يُلغى السند القديم بقيد عكسي بتاريخه ثم يُنشأ سند جديد ويُرحَّل بالقيم الصحيحة (برقم جديد)؛
+      يبقى القديم ظاهرًا «ملغى» وسببه «تعديل السند» ويُسجَّل التعديل في التدقيق. أي فشل = Rollback كامل (يبقى السند القديم كما كان).
+    - تبقى التخصيصات على الفواتير إن لم يتغيّر الطرف والنوع والعملة. السند الملغى لا يُعدَّل. يعيد {voucher_id, voucher_no, old_voucher_id, entry_id, reversal_entry_id}."""
+    v = _load_voucher(conn, vid)
+    cid = v["company_id"]
+    if vtype not in ("receipt", "payment"):
+        raise AccountingError("نوع السند غير صالح")
+    if v["status"] == "cancelled":
+        raise AccountingError("السند ملغى: لا يُعدَّل")
+    party_id = int(party_id) if party_id else None
+    account_id = int(account_id) if account_id else None
+    if party_id and account_id:
+        raise AccountingError("اختر طرفاً أو حساباً مقابلاً، وليس الاثنين معاً.")
+    if not party_id and not account_id:
+        raise AccountingError("حدد الطرف أو الحساب المقابل للسند.")
+    if account_id:                              # حساب عميل/مورد/موظف مختار كحساب مقابل → يتحول تلقائياً إلى سند طرف
+        k, i = resolve_counter(conn, cid, account_id)
+        if k == "party":
+            party_id, account_id = i, None
+    amt_dec = Decimal(str(amount))
+    lines, kinds = None, None
+    if account_id:
+        lines = [{"account_id": account_id, "amount": amt_dec, "description": description or ""}]
+    else:
+        pk = conn.execute("SELECT kind FROM parties WHERE id=? AND company_id=?", (party_id, cid)).fetchone()
+        if not pk:
+            raise AccountingError("الطرف غير موجود")
+        if vtype == "receipt" and pk[0] == "employee":
+            raise AccountingError("القبض من موظف غير مدعوم هنا؛ استخدم قيداً يومياً")
+        kinds = (pk[0],)
+    new_ca = _ca(conn, cash_id, cid)
+    allocs_in = _carry_allocations(conn, v, vtype, party_id, new_ca["currency"], je._minor(amt_dec))
+    before = {"type": v["voucher_type"], "date": v["voucher_date"], "cash": v["cash_account_id"], "party": v["party_id"], "amount": v["amount_minor"], "desc": v["description"]}
+    _req(conn, actor_id, cid, "cash.voucher", v["cash_account_id"])
+    if v["status"] == "draft":
+        p = _prepare_voucher(conn, actor_id, cid, vtype, voucher_date, cash_id, amt_dec, party_id, allocs_in, lines, v["branch_id"], kinds)
+        with transaction(conn):
+            conn.execute("UPDATE cash_vouchers SET voucher_type=?,voucher_date=?,cash_account_id=?,party_id=?,currency=?,amount_minor=?,description=? WHERE id=?",
+                         (vtype, voucher_date, cash_id, party_id, p["ca"]["currency"], p["amt"], description or "", vid))
+            for t in ("cash_voucher_lines", "voucher_allocations"):
+                conn.execute(f"DELETE FROM {t} WHERE voucher_id=?", (vid,))
+            for n, (acc, m, d) in enumerate(p["lines"], 1):
+                conn.execute("INSERT INTO cash_voucher_lines(voucher_id,line_no,account_id,amount_minor,description) VALUES(?,?,?,?,?)", (vid, n, acc, m, d))
+            for (dt, did, a) in p["allocs"]:
+                conn.execute("INSERT INTO voucher_allocations(voucher_id,doc_type,doc_id,amount_minor) VALUES(?,?,?,?)", (vid, dt, did, a))
+            audit.log(conn, actor_id, "edit_voucher_draft", "cash_vouchers", vid, before,
+                      {"type": vtype, "date": voucher_date, "cash": cash_id, "party": party_id, "amount": p["amt"], "desc": description or ""})
+        return {"voucher_id": vid, "voucher_no": v["voucher_no"], "old_voucher_id": vid, "entry_id": None, "reversal_entry_id": None}
+    # مرحَّل: إلغاء + إنشاء + ترحيل بمعاملة واحدة
+    if not reason or not reason.strip():
+        raise AccountingError("تعديل سند مرحّل يتطلب ذكر السبب")
+    reason = reason.strip()
+    _req(conn, actor_id, cid, "cash.cancel", v["cash_account_id"])
+    permissions.require(conn, actor_id, cid, "journal.reverse", check_branch=False)
+    with transaction(conn):
+        rc = cancel_voucher(conn, actor_id, vid, v["voucher_date"], f"تعديل السند: {reason}")
+        nid = _create_voucher(conn, actor_id, cid, vtype, voucher_date, cash_id, amt_dec, party_id, allocs_in, lines, description, v["branch_id"], party_kinds=kinds)
+        res = post_voucher(conn, actor_id, nid)
+        audit.log(conn, actor_id, "edit_posted_voucher", "cash_vouchers", vid, {**before, "no": v["voucher_no"], "entry": v["journal_entry_id"]},
+                  {"new_voucher": nid, "no": res["voucher_no"], "entry": res["entry_id"], "reversal": rc["reversal_entry_id"], "amount": je._minor(amt_dec)}, reason)
+    return {"voucher_id": nid, "voucher_no": res["voucher_no"], "old_voucher_id": vid, "entry_id": res["entry_id"], "reversal_entry_id": rc["reversal_entry_id"]}
+
+
+def get_voucher(conn, user_id, vid):
+    v = _load_voucher(conn, vid)
+    _req(conn, user_id, v["company_id"], "cash.view", v["cash_account_id"])
+    return {**dict(v), "lines": [dict(r) for r in conn.execute("SELECT * FROM cash_voucher_lines WHERE voucher_id=? ORDER BY line_no", (vid,))],
+            "allocations": [dict(r) for r in conn.execute("SELECT * FROM voucher_allocations WHERE voucher_id=?", (vid,))]}
+
+
+def list_vouchers(conn, user_id, company_id, *, voucher_type=None, status=None, cash_id=None, party_id=None, date_from=None, date_to=None, limit=50, offset=0, branch_id=None):
+    permissions.require(conn, user_id, company_id, "cash.view", check_branch=False)
+    q, a = "SELECT * FROM cash_vouchers WHERE company_id=?", [company_id]
+    for col, val, op in (("voucher_type", voucher_type, "="), ("status", status, "="), ("cash_account_id", cash_id, "="), ("party_id", party_id, "="),
+                         ("voucher_date", date_from, ">="), ("voucher_date", date_to, "<=")):
+        if val is not None:
+            q += f" AND {col}{op}?"; a.append(val)
+    restricted = [r[0] for r in conn.execute("SELECT cash_account_id FROM user_cash_access WHERE user_id=?", (user_id,))]
+    if restricted:
+        q += " AND cash_account_id IN (%s)" % ",".join("?" * len(restricted)); a += restricted
+    f, fa = branch_scope.txn_clause(conn, company_id, branch_id)
+    q += f; a += fa
+    return [dict(r) for r in conn.execute(q + " ORDER BY voucher_date DESC,id DESC LIMIT ? OFFSET ?", (*a, min(int(limit), 500), int(offset)))]
+
+
+# ---------------- التحويلات ----------------
+def transfer(conn, actor_id, company_id, transfer_date, from_cash_id, to_cash_id, from_amount, *, to_amount=None, fee=0, fee_account_id=None, description=""):
+    """تحويل بين صندوقين/بنكين بقيد آلي. بعملتين مختلفتين يلزم to_amount؛ فرق القيمة الأساسية يُرحَّل فروقات عملة محققة. الرسوم تُخصم من المصدر."""
+    if from_cash_id == to_cash_id:
+        raise AccountingError("المصدر والهدف متطابقان")
+    _req(conn, actor_id, company_id, "cash.voucher", from_cash_id, to_cash_id)
+    permissions.require(conn, actor_id, company_id, "journal.create", check_branch=False)
+    permissions.require(conn, actor_id, company_id, "journal.post", check_branch=False)
+    f, t = _ca(conn, from_cash_id, company_id), _ca(conn, to_cash_id, company_id)
+    if not f["is_active"] or not t["is_active"]:
+        raise AccountingError("الصندوق/البنك غير نشط")
+    fa = je._minor(from_amount)
+    ta = je._minor(to_amount) if to_amount is not None else None
+    fee_m = je._minor(fee)
+    if fa <= 0 or fee_m < 0:
+        raise AccountingError("المبلغ يجب أن يكون أكبر من صفر")
+    if f["currency"] == t["currency"]:
+        ta = fa if ta is None else ta
+        if ta != fa:
+            raise AccountingError("بنفس العملة يجب أن يتساوى المبلغان")
+    elif ta is None or ta <= 0:
+        raise AccountingError("التحويل بين عملتين مختلفتين يتطلب المبلغ المستلَم")
+    if fee_m and (fee_account_id is None):
+        raise AccountingError("حدد حساب الرسوم")
+    if fee_m:
+        _counter_ok(conn, company_id, fee_account_id, f["account_id"])
+    per = period_engine.find_period(conn, company_id, transfer_date)
+    je._assert_open(per)
+    base = fxr.base_currency(conn, company_id)
+    rf, rt = fxr.get_rate(conn, company_id, f["currency"], transfer_date), fxr.get_rate(conn, company_id, t["currency"], transfer_date)
+    out_base = _r(Decimal(fa + fee_m) * rf)
+    in_base = _r(Decimal(ta) * rt)
+    fee_base = _r(Decimal(fee_m) * rf) if fee_m else 0
+    fx = out_base - in_base - fee_base
+    lines = [{"account_id": t["account_id"], "currency": t["currency"], "side": "debit", "orig": ta, "base": in_base},
+             {"account_id": f["account_id"], "currency": f["currency"], "side": "credit", "orig": fa + fee_m, "base": out_base}]
+    if fee_m:
+        lines.append({"account_id": fee_account_id, "currency": f["currency"], "side": "debit", "orig": fee_m, "base": fee_base})
+    if fx:
+        fxa = _mapping(conn, company_id, "fx_differences")
+        if not fxa:
+            raise AccountingError("اربط حساب فروقات العملة (Account Mapping: fx_differences)")
+        lines.append({"account_id": fxa, "currency": base, "side": "debit" if fx > 0 else "credit", "orig": abs(fx), "base": abs(fx)})
+    with transaction(conn):
+        tid = conn.execute("SELECT COALESCE(MAX(id),0)+1 FROM cash_transfers").fetchone()[0]           # داخل معاملة فورية: رقم المستند معروف للقيد
+        eid = je.create_draft_explicit(conn, company_id, actor_id, transfer_date, lines, f"تحويل من {f['name']} إلى {t['name']}", "auto",
+                                       source_type="cash_transfer", source_id=tid)
+        je.post(conn, eid, actor_id)
+        no = sales._next_number(conn, company_id, "transfer", per["yid"])
+        conn.execute("INSERT INTO cash_transfers(id,company_id,transfer_no,transfer_date,from_cash_id,to_cash_id,from_amount_minor,to_amount_minor,fee_minor,"
+                     "realized_fx_minor,description,journal_entry_id,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                     (tid, company_id, no, transfer_date, from_cash_id, to_cash_id, fa, ta, fee_m, -fx, description or "", eid, actor_id))
+        audit.log(conn, actor_id, "transfer", "cash_transfers", tid, after={"no": no, "from": from_cash_id, "to": to_cash_id, "fa": fa, "ta": ta, "fx": -fx})
+    return {"transfer_id": tid, "transfer_no": no, "entry_id": eid, "realized_fx": -fx}
+
+
+def cancel_transfer(conn, actor_id, tid, cancel_date, reason):
+    t = conn.execute("SELECT * FROM cash_transfers WHERE id=?", (tid,)).fetchone()
+    if not t:
+        raise AccountingError("التحويل غير موجود")
+    _req(conn, actor_id, t["company_id"], "cash.cancel", t["from_cash_id"], t["to_cash_id"])
+    permissions.require(conn, actor_id, t["company_id"], "journal.reverse", check_branch=False)
+    if not reason or not reason.strip():
+        raise AccountingError("الإلغاء يتطلب ذكر السبب")
+    if t["status"] != "posted":
+        raise AccountingError("التحويل ملغى بالفعل")
+    if cancel_date < t["transfer_date"]:
+        raise AccountingError("تاريخ الإلغاء أقدم من تاريخ التحويل")
+    if _entry_reconciled(conn, t["journal_entry_id"]):
+        raise AccountingError("التحويل طُوبق مع كشف البنك: ألغِ المطابقة أولا")
+    with transaction(conn):
+        rid = je.reverse(conn, t["journal_entry_id"], actor_id, cancel_date, reason)
+        conn.execute("UPDATE cash_transfers SET status='cancelled',cancelled_by=?,cancelled_at=CURRENT_TIMESTAMP,cancel_reason=?,cancel_entry_id=? WHERE id=?",
+                     (actor_id, reason, rid, tid))
+        audit.log(conn, actor_id, "cancel_transfer", "cash_transfers", tid, {"status": "posted"}, {"status": "cancelled", "reversal": rid}, reason)
+    return {"transfer_id": tid, "reversal_entry_id": rid}
+
+
+# ---------------- جرد الصندوق ----------------
+def cash_count(conn, actor_id, cash_id, count_date, counted_amount, note=""):
+    """جرد فعلي لصندوق (بعملته): الفرق عن الرصيد الدفتري يُرحَّل قيدا آليا مقابل حساب فروقات الصندوق (Account Mapping)."""
+    ca = _ca(conn, cash_id)
+    cid = ca["company_id"]
+    _req(conn, actor_id, cid, "cash.count", cash_id)
+    permissions.require(conn, actor_id, cid, "journal.create", check_branch=False)
+    permissions.require(conn, actor_id, cid, "journal.post", check_branch=False)
+    if ca["kind"] != "cashbox":
+        raise AccountingError("الجرد للصناديق فقط (البنوك بمطابقة الكشف)")
+    counted = je._minor(counted_amount)
+    if counted < 0:
+        raise AccountingError("المبلغ المعدود لا يقبل قيمة سالبة")
+    per = period_engine.find_period(conn, cid, count_date)
+    je._assert_open(per)
+    book = sum(x["net_orig"] for x in cash_balance(conn, actor_id, cid, cash_id, count_date) if x["currency"] == ca["currency"])
+    diff = counted - book
+    with transaction(conn):
+        eid = None
+        kid = conn.execute("SELECT COALESCE(MAX(id),0)+1 FROM cash_counts").fetchone()[0]
+        if diff:
+            dacc = _mapping(conn, cid, "cash_difference")
+            if not dacc:
+                raise AccountingError("اربط حساب فروقات الصندوق (Account Mapping: cash_difference)")
+            rate = fxr.get_rate(conn, cid, ca["currency"], count_date)
+            base_amt = abs(diff) if ca["currency"] == fxr.base_currency(conn, cid) else _r(Decimal(abs(diff)) * rate)
+            lines = [{"account_id": ca["account_id"], "currency": ca["currency"], "side": "debit" if diff > 0 else "credit", "orig": abs(diff), "base": base_amt},
+                     {"account_id": dacc, "currency": fxr.base_currency(conn, cid), "side": "credit" if diff > 0 else "debit", "orig": base_amt, "base": base_amt}]
+            eid = je.create_draft_explicit(conn, cid, actor_id, count_date, lines, f"تسوية جرد الصندوق {ca['name']}", "auto", source_type="cash_count", source_id=kid)
+            je.post(conn, eid, actor_id)
+        conn.execute("INSERT INTO cash_counts(id,company_id,cash_account_id,count_date,book_minor,counted_minor,diff_minor,journal_entry_id,note,created_by) "
+                     "VALUES(?,?,?,?,?,?,?,?,?,?)", (kid, cid, cash_id, count_date, book, counted, diff, eid, note, actor_id))
+        k = kid
+        audit.log(conn, actor_id, "cash_count", "cash_counts", k, after={"book": book, "counted": counted, "diff": diff})
+    return {"count_id": k, "book": book, "counted": counted, "diff": diff, "entry_id": eid}

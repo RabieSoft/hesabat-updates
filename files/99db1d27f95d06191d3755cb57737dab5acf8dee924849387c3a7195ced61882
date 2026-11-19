@@ -1,0 +1,4 @@
+-- كل فرع مستقل عن الآخر بالكامل (كأنه نظام جديد): العملاء/الموردون/الأصناف/الوحدات/التصنيفات لا تُشارَك بين الفروع.
+-- السجلات القديمة بلا فرع تتبع الفرع الرئيسي. يمكن للمدير الرجوع إلى «مشترك» من إعدادات ← الفروع.
+INSERT INTO branch_settings(company_id,isolation_mode) SELECT id,'isolated' FROM companies WHERE true
+ON CONFLICT(company_id) DO UPDATE SET isolation_mode='isolated';

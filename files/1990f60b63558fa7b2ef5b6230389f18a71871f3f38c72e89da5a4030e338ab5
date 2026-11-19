@@ -1,0 +1,87 @@
+"""إعادة تقييم أرصدة العملات الأجنبية للبنود النقدية (الحسابات ذات revalue_fx=1: نقدية، بنوك، عملاء، موردون).
+القيمة الأساسية الدفترية لكل (حساب، عملة) = مجموع القيم الأساسية للحركات (بما فيها تسويات التقييم السابقة).
+القيمة المستهدفة = الرصيد الأصلي × سعر تاريخ التقييم. الفرق يُرحَّل في قيد تسوية واحد مقابل حساب فروقات العملة (Account Mapping).
+الرصيد الأصلي لا يتغير أبدا؛ التسوية تمس القيمة الأساسية فقط."""
+import json
+from decimal import Decimal, ROUND_HALF_UP
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.accounting import balance_engine as be, journal_engine as je, rates as fxr
+from alhisabat.audit import audit
+from alhisabat.database.tx import transaction
+from alhisabat.security import permissions
+
+
+def carrying(conn, company_id, as_of):
+    """[(account_id, currency, net_orig, net_base)] للبنود النقدية الأجنبية حتى as_of (بنفس قواعد الأرصدة)."""
+    base = fxr.base_currency(conn, company_id)
+    ys = be.year_start(conn, company_id, as_of)
+    eff, counted, _ = be.frag("a")
+    args = {"c": company_id, "t": as_of, "ys": ys, "fl": be.perm_floor(conn, company_id, ys), "base": base}
+    return conn.execute(
+        f"SELECT l.account_id, l.currency, SUM(l.debit_orig-l.credit_orig) o, SUM(l.debit_base-l.credit_base) b "
+        f"FROM journal_lines l JOIN journal_entries e ON e.id=l.entry_id JOIN accounts a ON a.id=l.account_id "
+        f"WHERE e.company_id=:c AND e.status IN {be.POSTED} AND e.entry_date<=:t AND a.revalue_fx=1 AND l.currency<>:base "
+        f"AND {counted} GROUP BY l.account_id,l.currency HAVING o<>0 OR b<>0 ORDER BY l.account_id,l.currency", args).fetchall()
+
+
+def _rows(conn, company_id, as_of):
+    accs = be.load_accounts(conn, company_id)
+    rows, missing = [], set()
+    for r in carrying(conn, company_id, as_of):
+        rate, target = None, 0
+        if r["o"] != 0:
+            try:
+                rate = fxr.get_rate(conn, company_id, r["currency"], as_of)
+            except AccountingError:
+                missing.add(r["currency"]); continue
+            target = int((Decimal(r["o"]) * rate).quantize(Decimal(1), ROUND_HALF_UP))
+        rows.append({"account_id": r["account_id"], "code": accs[r["account_id"]]["code"], "name": accs[r["account_id"]]["name"],
+                     "currency": r["currency"], "net_orig": r["o"], "carrying_base": r["b"],
+                     "rate": str(rate) if rate is not None else None, "target_base": target, "diff": target - r["b"]})
+    return rows, sorted(missing)
+
+
+def unrevalued(conn, company_id, as_of):
+    """(صفوف بفرق غير صفري، عملات بلا سعر) — تُستخدم في فحص ما قبل الإقفال."""
+    rows, missing = _rows(conn, company_id, as_of)
+    return [r for r in rows if r["diff"] != 0], missing
+
+
+def revaluation_preview(conn, user_id, company_id, as_of):
+    permissions.require(conn, user_id, company_id, "fx.revalue", check_branch=False)
+    rows, missing = _rows(conn, company_id, as_of)
+    return {"as_of": as_of, "rows": rows, "missing_rates": missing,
+            "total_diff": sum(r["diff"] for r in rows if r["diff"])}
+
+
+def revalue(conn, actor_id, company_id, as_of, *, post=False):
+    """ينشئ (ويرحّل عند post=True) قيد إعادة التقييم. لا فروق ⇒ لا قيد (entry_id=None)."""
+    permissions.require(conn, actor_id, company_id, "fx.revalue", check_branch=False)
+    permissions.require(conn, actor_id, company_id, "journal.create", check_branch=False)
+    if post:
+        permissions.require(conn, actor_id, company_id, "journal.post", check_branch=False)
+    rows, missing = _rows(conn, company_id, as_of)
+    if missing:
+        raise AccountingError("لا توجد أسعار صرف للعملات: " + "، ".join(missing) + f" (حتى {as_of})")
+    diffs = [r for r in rows if r["diff"] != 0]
+    if not diffs:
+        return {"entry_id": None, "rows": rows, "posted": False}
+    m = conn.execute("SELECT account_id FROM account_mappings WHERE company_id=? AND map_key='fx_differences'", (company_id,)).fetchone()
+    if not m:
+        raise AccountingError("اربط حساب فروقات العملة (Account Mapping: fx_differences) قبل إعادة التقييم")
+    base = fxr.base_currency(conn, company_id)
+    lines = [{"account_id": r["account_id"], "currency": r["currency"], "side": "debit" if r["diff"] > 0 else "credit",
+              "orig": 0, "base": abs(r["diff"]), "memo": f"إعادة تقييم {r['currency']} بسعر {r['rate'] or 'صفر'}"} for r in diffs]
+    d = sum(l["base"] for l in lines if l["side"] == "debit"); c = sum(l["base"] for l in lines if l["side"] == "credit")
+    if d != c:
+        lines.append({"account_id": m[0], "currency": base, "side": "credit" if d > c else "debit", "orig": abs(d - c),
+                      "base": abs(d - c), "memo": "فروقات إعادة تقييم العملات"})
+    with transaction(conn):
+        eid = je.create_draft_explicit(conn, company_id, actor_id, as_of, lines, f"إعادة تقييم أرصدة العملات الأجنبية بتاريخ {as_of}",
+                                       "adjustment", source_type="revaluation")
+        conn.execute("INSERT INTO fx_revaluations(company_id,as_of,entry_id,rates_json,created_by) VALUES(?,?,?,?,?)",
+                     (company_id, as_of, eid, json.dumps({r["currency"]: r["rate"] for r in diffs if r["rate"]}), actor_id))
+        audit.log(conn, actor_id, "revalue_fx", "journal_entries", eid, after={"as_of": as_of, "accounts": len(diffs)})
+        if post:
+            je.post(conn, eid, actor_id)
+    return {"entry_id": eid, "rows": rows, "posted": post}

@@ -1,0 +1,154 @@
+CREATE TABLE currencies(
+  code TEXT PRIMARY KEY, name_ar TEXT NOT NULL, symbol TEXT NOT NULL,
+  minor_digits INTEGER NOT NULL DEFAULT 2 CHECK(minor_digits BETWEEN 0 AND 4),
+  is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)));
+INSERT INTO currencies(code,name_ar,symbol) VALUES
+ ('SAR','ريال سعودي','ر.س'),('YER','ريال يمني','ر.ي'),('USD','دولار أمريكي','$'),('AED','درهم إماراتي','د.إ');
+
+CREATE TABLE companies(
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+  base_currency TEXT NOT NULL DEFAULT 'SAR' REFERENCES currencies(code),
+  is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE branches(
+  id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id),
+  name TEXT NOT NULL, is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
+  UNIQUE(company_id,name));
+CREATE TABLE users(
+  id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE, full_name TEXT NOT NULL,
+  password_hash TEXT NOT NULL DEFAULT '', is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+
+CREATE TABLE fiscal_years(
+  id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id),
+  name TEXT NOT NULL, start_date TEXT NOT NULL, end_date TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','closed')),
+  CHECK(start_date < end_date), UNIQUE(company_id,name));
+CREATE TABLE fiscal_periods(
+  id INTEGER PRIMARY KEY, fiscal_year_id INTEGER NOT NULL REFERENCES fiscal_years(id),
+  period_no INTEGER NOT NULL, name TEXT NOT NULL, start_date TEXT NOT NULL, end_date TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','closed')),
+  closed_by INTEGER REFERENCES users(id), closed_at TEXT,
+  CHECK(start_date <= end_date), UNIQUE(fiscal_year_id,period_no));
+CREATE INDEX ix_periods_dates ON fiscal_periods(start_date,end_date);
+
+CREATE TABLE accounts(
+  id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id),
+  code TEXT NOT NULL, name TEXT NOT NULL,
+  parent_id INTEGER REFERENCES accounts(id), level INTEGER NOT NULL DEFAULT 1 CHECK(level>=1),
+  account_type TEXT NOT NULL CHECK(account_type IN ('asset','liability','equity','revenue','cogs','expense')),
+  nature TEXT NOT NULL CHECK(nature IN ('debit','credit')),
+  nature_override INTEGER NOT NULL DEFAULT 0 CHECK(nature_override IN (0,1)),
+  is_group INTEGER NOT NULL DEFAULT 0 CHECK(is_group IN (0,1)),
+  is_control INTEGER NOT NULL DEFAULT 0 CHECK(is_control IN (0,1)),
+  is_system INTEGER NOT NULL DEFAULT 0 CHECK(is_system IN (0,1)),
+  is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
+  branch_id INTEGER REFERENCES branches(id), default_currency TEXT REFERENCES currencies(code),
+  created_by INTEGER REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(company_id,code),
+  CHECK(nature_override=1 OR (account_type IN ('asset','cogs','expense') AND nature='debit')
+        OR (account_type IN ('liability','equity','revenue') AND nature='credit')));
+CREATE INDEX ix_accounts_parent ON accounts(parent_id);
+
+CREATE TABLE journal_entries(
+  id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id),
+  branch_id INTEGER REFERENCES branches(id),
+  fiscal_year_id INTEGER NOT NULL REFERENCES fiscal_years(id),
+  period_id INTEGER NOT NULL REFERENCES fiscal_periods(id),
+  entry_no INTEGER NOT NULL, entry_date TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+  entry_type TEXT NOT NULL DEFAULT 'general' CHECK(entry_type IN ('general','opening','closing','adjustment','reversal','auto')),
+  status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','posted','reversed')),
+  source_type TEXT, source_id INTEGER,
+  reverses_entry_id INTEGER REFERENCES journal_entries(id),
+  created_by INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  posted_by INTEGER REFERENCES users(id), posted_at TEXT,
+  UNIQUE(company_id,fiscal_year_id,entry_no));
+CREATE INDEX ix_je_date ON journal_entries(company_id,entry_date);
+CREATE INDEX ix_je_source ON journal_entries(source_type,source_id);
+
+CREATE TABLE journal_lines(
+  id INTEGER PRIMARY KEY, entry_id INTEGER NOT NULL REFERENCES journal_entries(id),
+  line_no INTEGER NOT NULL, account_id INTEGER NOT NULL REFERENCES accounts(id),
+  currency TEXT NOT NULL REFERENCES currencies(code),
+  debit_orig INTEGER NOT NULL DEFAULT 0 CHECK(debit_orig>=0),
+  credit_orig INTEGER NOT NULL DEFAULT 0 CHECK(credit_orig>=0),
+  exchange_rate TEXT NOT NULL DEFAULT '1',
+  debit_base INTEGER NOT NULL DEFAULT 0 CHECK(debit_base>=0),
+  credit_base INTEGER NOT NULL DEFAULT 0 CHECK(credit_base>=0),
+  cost_center_id INTEGER, memo TEXT NOT NULL DEFAULT '',
+  UNIQUE(entry_id,line_no),
+  CHECK((debit_base>0 AND credit_base=0) OR (credit_base>0 AND debit_base=0)));
+CREATE INDEX ix_jl_account ON journal_lines(account_id);
+CREATE INDEX ix_jl_entry ON journal_lines(entry_id);
+
+CREATE TABLE audit_log(
+  id INTEGER PRIMARY KEY, at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  user_id INTEGER REFERENCES users(id), action TEXT NOT NULL,
+  table_name TEXT NOT NULL, record_id INTEGER,
+  before_json TEXT, after_json TEXT, reason TEXT);
+CREATE TRIGGER audit_no_update BEFORE UPDATE ON audit_log BEGIN SELECT RAISE(ABORT,'سجل التدقيق لا يقبل التعديل'); END;
+CREATE TRIGGER audit_no_delete BEFORE DELETE ON audit_log BEGIN SELECT RAISE(ABORT,'سجل التدقيق لا يقبل الحذف'); END;
+
+CREATE TRIGGER acc_ins_rules BEFORE INSERT ON accounts
+WHEN NEW.parent_id IS NOT NULL BEGIN
+  SELECT RAISE(ABORT,'الحساب الأب غير موجود أو ليس تجميعيا')
+   WHERE NOT EXISTS(SELECT 1 FROM accounts p WHERE p.id=NEW.parent_id AND p.is_group=1 AND p.company_id=NEW.company_id);
+  SELECT RAISE(ABORT,'رقم الحساب غير متوافق مع رقم الحساب الأب')
+   WHERE NOT EXISTS(SELECT 1 FROM accounts p WHERE p.id=NEW.parent_id
+     AND substr(NEW.code,1,length(p.code))=p.code AND length(NEW.code)>length(p.code));
+END;
+CREATE TRIGGER acc_no_delete BEFORE DELETE ON accounts BEGIN
+  SELECT RAISE(ABORT,'لا يمكن حذف الحساب: استخدم التعطيل')
+   WHERE EXISTS(SELECT 1 FROM journal_lines WHERE account_id=OLD.id)
+      OR EXISTS(SELECT 1 FROM accounts WHERE parent_id=OLD.id) OR OLD.is_system=1;
+END;
+CREATE TRIGGER acc_upd_rules BEFORE UPDATE ON accounts BEGIN
+  SELECT RAISE(ABORT,'لا يمكن تحويل حساب له حركات إلى تجميعي')
+   WHERE NEW.is_group=1 AND OLD.is_group=0 AND EXISTS(SELECT 1 FROM journal_lines WHERE account_id=OLD.id);
+  SELECT RAISE(ABORT,'لا يمكن تغيير نوع أو طبيعة حساب له حركات')
+   WHERE (NEW.account_type<>OLD.account_type OR NEW.nature<>OLD.nature)
+     AND EXISTS(SELECT 1 FROM journal_lines WHERE account_id=OLD.id);
+  SELECT RAISE(ABORT,'نقل الحساب سيُنشئ دائرة أو إلى نفسه/أحد أبنائه')
+   WHERE NEW.parent_id IS NOT OLD.parent_id AND NEW.parent_id IS NOT NULL AND (
+     NEW.parent_id=OLD.id OR EXISTS(
+      WITH RECURSIVE anc(id) AS (SELECT NEW.parent_id UNION ALL SELECT a.parent_id FROM accounts a JOIN anc ON a.id=anc.id WHERE a.parent_id IS NOT NULL)
+      SELECT 1 FROM anc WHERE id=OLD.id));
+END;
+
+CREATE TRIGGER jl_ins_rules BEFORE INSERT ON journal_lines BEGIN
+  SELECT RAISE(ABORT,'لا يمكن إضافة سطر إلى قيد غير مسودة')
+   WHERE (SELECT status FROM journal_entries WHERE id=NEW.entry_id)<>'draft';
+  SELECT RAISE(ABORT,'الحساب غير موجود أو غير نشط أو تجميعي: لا تقبل الحركة')
+   WHERE NOT EXISTS(SELECT 1 FROM accounts a JOIN journal_entries e ON e.id=NEW.entry_id
+      WHERE a.id=NEW.account_id AND a.is_active=1 AND a.is_group=0 AND a.company_id=e.company_id);
+END;
+CREATE TRIGGER jl_no_update BEFORE UPDATE ON journal_lines BEGIN
+  SELECT RAISE(ABORT,'لا يمكن تعديل سطر في قيد مرحّل')
+   WHERE (SELECT status FROM journal_entries WHERE id=OLD.entry_id)<>'draft';
+END;
+CREATE TRIGGER jl_no_delete BEFORE DELETE ON journal_lines BEGIN
+  SELECT RAISE(ABORT,'لا يمكن حذف سطر من قيد مرحّل')
+   WHERE (SELECT status FROM journal_entries WHERE id=OLD.entry_id)<>'draft';
+END;
+CREATE TRIGGER je_no_delete BEFORE DELETE ON journal_entries WHEN OLD.status<>'draft' BEGIN
+  SELECT RAISE(ABORT,'لا يمكن حذف قيد مرحّل: استخدم العكس');
+END;
+CREATE TRIGGER je_ins_draft BEFORE INSERT ON journal_entries WHEN NEW.status<>'draft' BEGIN
+  SELECT RAISE(ABORT,'يجب إنشاء القيد كمسودة ثم ترحيله');
+END;
+CREATE TRIGGER je_upd_rules BEFORE UPDATE ON journal_entries BEGIN
+  SELECT RAISE(ABORT,'لا يمكن تعديل قيد مرحّل: التصحيح بالعكس وقيد تصحيح')
+   WHERE OLD.status<>'draft' AND NOT (OLD.status='posted' AND NEW.status='reversed'
+     AND NEW.entry_date=OLD.entry_date AND NEW.description=OLD.description AND NEW.company_id=OLD.company_id);
+  SELECT RAISE(ABORT,'السنة المالية أو الفترة مغلقة: يُمنع الترحيل')
+   WHERE OLD.status='draft' AND NEW.status='posted' AND NOT EXISTS(
+     SELECT 1 FROM fiscal_periods p JOIN fiscal_years y ON y.id=p.fiscal_year_id
+     WHERE p.id=NEW.period_id AND p.status='open' AND y.status='open' AND y.id=NEW.fiscal_year_id
+       AND NEW.entry_date BETWEEN p.start_date AND p.end_date AND y.company_id=NEW.company_id);
+  SELECT RAISE(ABORT,'القيد يجب أن يحتوي سطرين على الأقل')
+   WHERE OLD.status='draft' AND NEW.status='posted' AND (SELECT COUNT(*) FROM journal_lines WHERE entry_id=OLD.id)<2;
+  SELECT RAISE(ABORT,'القيد غير متوازن: إجمالي المدين لا يساوي إجمالي الدائن')
+   WHERE OLD.status='draft' AND NEW.status='posted' AND
+     (SELECT SUM(debit_base) FROM journal_lines WHERE entry_id=OLD.id)
+     <> (SELECT SUM(credit_base) FROM journal_lines WHERE entry_id=OLD.id);
+END;

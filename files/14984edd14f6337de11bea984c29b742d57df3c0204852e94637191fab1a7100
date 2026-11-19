@@ -1,0 +1,116 @@
+"""سياسة النوافذ الموحّدة: مرشّح أحداث عام يوحّد حجم وموضع وأزرار كل نوافذ الحوار عند أول عرض لها.
+
+بدل أحجام ومواضع عشوائية (resize/setMinimumWidth متفرقة في ~70 نافذة): كل نافذة تُصنَّف في فئة عرض واحدة من أربع،
+وتُحصر بالشاشة، وتظهر دائمًا أعلى منتصف النافذة الرئيسية، وأزرار تذييلها بعرض وارتفاع واحد، وهوامش ومسافات النماذج واحدة.
+لا يغيّر أعلام النافذة ولا منطقها (حفظ/تحقق/حماية الإغلاق). المنطق الحسابي في design/metrics.py. يتطلب PySide6.
+"""
+from PySide6.QtCore import QEvent, QObject, Qt
+from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QFormLayout, QPushButton, QToolButton)
+
+from alhisabat.ui.design import metrics as M, tokens as T
+
+_AR_STD = {QDialogButtonBox.Ok: 'موافق', QDialogButtonBox.Cancel: 'إلغاء', QDialogButtonBox.Close: 'إغلاق',
+           QDialogButtonBox.Save: 'حفظ', QDialogButtonBox.Yes: 'نعم', QDialogButtonBox.No: 'لا', QDialogButtonBox.Apply: 'تطبيق',
+           QDialogButtonBox.Discard: 'تجاهل', QDialogButtonBox.Reset: 'إعادة تعيين', QDialogButtonBox.Help: 'مساعدة'}
+_BIG = 16777215          # QWIDGETSIZE_MAX
+
+
+def _class_names(obj):
+    return [c.__name__ for c in type(obj).__mro__]
+
+
+class _DialogFilter(QObject):
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Show and isinstance(obj, QDialog) and obj.isWindow():
+            try:
+                normalize(obj)
+            except Exception:  # noqa: BLE001 — توحيد الشكل لا يجوز أن يمنع فتح أي نافذة
+                pass
+        return False
+
+
+def install(app=None):
+    """يُستدعى مرة واحدة بعد إنشاء QApplication."""
+    app = app or QApplication.instance()
+    if app is None or getattr(app, '_dialog_policy', None) is not None:
+        return
+    app._dialog_policy = _DialogFilter(app)
+    app.installEventFilter(app._dialog_policy)
+
+
+def normalize(dlg):
+    """يوحّد نافذة واحدة (مرة واحدة فقط لكل نافذة)."""
+    if getattr(dlg, '_unified', False) or getattr(dlg, 'unified_size', True) is False:
+        return
+    if M.excluded(_class_names(dlg), dlg.objectName()):
+        return
+    dlg._unified = True
+    _normalize_buttons(dlg)
+    _normalize_layouts(dlg)
+    _normalize_geometry(dlg)
+
+
+def _normalize_buttons(dlg):
+    """ارتفاع واحد لكل الأزرار، وعرض أدنى واحد لأزرار التذييل؛ يُلغى أي حجم ثابت مبالغ فيه."""
+    cap = T.CONTROL_H + 8
+    for b in list(dlg.findChildren(QPushButton)) + list(dlg.findChildren(QToolButton)):
+        if b.objectName() in ('miniEdit',):
+            continue
+        if b.minimumHeight() > cap:
+            b.setMinimumHeight(0)
+        if cap < b.maximumHeight() < _BIG:
+            b.setMaximumHeight(_BIG)
+    for box in dlg.findChildren(QDialogButtonBox):
+        for b in box.buttons():
+            ar = _AR_STD.get(box.standardButton(b))              # نصوص Qt القياسية تظهر بالإنجليزية (OK/Cancel): تُعرَّب
+            if ar:
+                b.setText(ar)
+            b.setMaximumWidth(max(120, b.sizeHint().width()))    # لا يتمدد زر التذييل أكثر من حاجته
+            b.setProperty('std', True)
+            b.style().unpolish(b)
+            b.style().polish(b)
+
+
+def _normalize_layouts(dlg):
+    lay = dlg.layout()
+    if lay is not None:
+        lay.setContentsMargins(14, 12, 14, 12)
+        if lay.spacing() < 0 or lay.spacing() > 10:
+            lay.setSpacing(8)
+    for f in dlg.findChildren(QFormLayout):
+        f.setHorizontalSpacing(10)
+        f.setVerticalSpacing(6)
+        f.setRowWrapPolicy(QFormLayout.DontWrapRows)
+        f.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        f.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+
+def _screen_rect(dlg):
+    h = dlg.windowHandle()
+    scr = (h.screen() if h is not None else None) or QApplication.primaryScreen()
+    return scr.availableGeometry()
+
+
+def _normalize_geometry(dlg):
+    if dlg.minimumWidth() == dlg.maximumWidth() and dlg.minimumWidth() > 0:      # عرض ثابت عمدًا (دخول/تفعيل)
+        return
+    if dlg.isMaximized() or dlg.isFullScreen():
+        return
+    av = _screen_rect(dlg)
+    hint = dlg.sizeHint()
+    w, h = M.target_size(hint.width(), hint.height(), 0, 0, av.width(), av.height(),
+                         dlg.minimumWidth(), dlg.minimumHeight())
+    if dlg.testAttribute(Qt.WA_Resized):      # المؤلف ضبط الحجم صراحةً بـresize(): نيّة حجم نصنّفها ثم نوحّدها
+        w, h = M.target_size(hint.width(), hint.height(), dlg.width(), dlg.height(), av.width(), av.height(),
+                             dlg.minimumWidth(), dlg.minimumHeight())
+    dlg.resize(max(w, dlg.minimumWidth()), max(h, dlg.minimumHeight()))
+    if M.width_class(w) in ('L', 'XL'):
+        dlg.setSizeGripEnabled(True)
+    par = dlg.parentWidget().window() if dlg.parentWidget() is not None else None
+    if par is not None and par.isVisible():
+        g = par.frameGeometry()
+        x, y = M.anchor_pos(g.x(), g.y(), g.width(), g.height(), dlg.width(), dlg.height(),
+                            av.x(), av.y(), av.width(), av.height())
+    else:
+        x, y = M.anchor_pos(0, 0, 0, 0, dlg.width(), dlg.height(), av.x(), av.y(), av.width(), av.height())
+    dlg.move(x, y)

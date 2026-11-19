@@ -1,0 +1,484 @@
+"""دليل تصنيفات الأصناف (شجرة) ودليل الوحدات.
+
+- التصنيف: شجرة بعدد مستويات غير محدود؛ الصنف يرتبط بتصنيف واحد (items.category_id) ويُزامَن
+  العمود النصي items.category بالمسار الكامل («مواد غذائية / زيوت») للتوافق مع الاستيراد والتقارير.
+- الوحدة: كود + اسم + تفعيل؛ لا تُحذف وهي مستخدمة (يُكتشف الاستخدام ديناميكيًا من المفاتيح الأجنبية).
+- العرض بصلاحية inventory.view، والتعديل بصلاحية inventory.manage، وكل تعديل يُسجَّل في التدقيق.
+"""
+import re
+
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.audit import audit
+from alhisabat.business import branch_scope
+from alhisabat.database.tx import transaction
+from alhisabat.security import permissions
+
+SEP = " / "
+
+
+def _req(conn, actor_id, company_id, code="inventory.manage"):
+    permissions.require(conn, actor_id, company_id, code, check_branch=False)
+
+
+def _clean(s):
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+
+# =============================================================== التصنيفات
+COST_METHODS = {"avg": "المتوسط المرجّح", "fifo": "الوارد أولًا صادر أولًا (FIFO)", "lifo": "الوارد أخيرًا صادر أولًا (LIFO)"}
+DEFAULT_COST_METHOD = "avg"
+
+
+def clean_cost_method(m):
+    """'' = وراثة؛ وإلا إحدى avg/fifo/lifo."""
+    m = (m or "").strip().lower()
+    if m and m not in COST_METHODS:
+        raise AccountingError("طريقة تقييم المخزون غير معروفة")
+    return m
+
+
+def category_cost_method(conn, cat_id):
+    """الطريقة الفعلية لتصنيف: أقرب تصنيف (صعودًا في الشجرة) له طريقة، وإلا الافتراضية."""
+    seen = set()
+    while cat_id and cat_id not in seen:
+        seen.add(cat_id)
+        r = conn.execute("SELECT cost_method,parent_id FROM item_categories WHERE id=?", (cat_id,)).fetchone()
+        if not r:
+            break
+        if r[0]:
+            return r[0]
+        cat_id = r[1]
+    return DEFAULT_COST_METHOD
+
+
+def effective_cost_method(conn, item_id):
+    r = conn.execute("SELECT cost_method,category_id FROM items WHERE id=?", (item_id,)).fetchone()
+    if not r:
+        raise AccountingError("الصنف غير موجود")
+    return r[0] or category_cost_method(conn, r[1])
+
+
+def moved_methods(conn, item_ids):
+    """{item_id: الطريقة الفعلية} للأصناف التي لها حركات فقط — لقياس أثر تغيير يمسّ الوراثة."""
+    out = {}
+    for i in item_ids:
+        if conn.execute("SELECT 1 FROM stock_movements WHERE item_id=? LIMIT 1", (i,)).fetchone():
+            out[i] = effective_cost_method(conn, i)
+    return out
+
+
+def assert_methods_unchanged(conn, before):
+    for iid, m in before.items():
+        if effective_cost_method(conn, iid) != m:
+            raise AccountingError("لا يمكن هذا التغيير: يغيّر طريقة تقييم أصناف لها حركات مخزنية. "
+                                  "حدّد الطريقة قبل أول حركة، أو ثبّتها على الصنف نفسه.")
+
+
+def _items_under(conn, cat_ids):
+    ids = list(cat_ids)
+    if not ids:
+        return []
+    return [r[0] for r in conn.execute(f"SELECT id FROM items WHERE category_id IN ({','.join('?' * len(ids))})", ids)]
+
+
+def _cat(conn, cat_id, company_id):
+    r = conn.execute("SELECT * FROM item_categories WHERE id=? AND company_id=?", (int(cat_id), company_id)).fetchone()
+    if not r:
+        raise AccountingError("التصنيف غير موجود في هذه الشركة")
+    return r
+
+
+def _all_cats(conn, company_id):
+    return {r["id"]: dict(r) for r in conn.execute("SELECT * FROM item_categories WHERE company_id=?", (company_id,))}
+
+
+def _path(cats, cat_id):
+    names, seen = [], set()
+    while cat_id and cat_id in cats and cat_id not in seen:
+        seen.add(cat_id)
+        names.append(cats[cat_id]["name"])
+        cat_id = cats[cat_id]["parent_id"]
+    return SEP.join(reversed(names))
+
+
+def category_path(conn, cat_id):
+    r = conn.execute("SELECT company_id FROM item_categories WHERE id=?", (int(cat_id),)).fetchone()
+    return _path(_all_cats(conn, r[0]), int(cat_id)) if r else ""
+
+
+def descendants_ids(conn, cat_id, include_self=True):
+    """معرّفات التصنيف وكل فروعه (لتصفية الأصناف حسب تصنيف وما تحته)."""
+    out, stack = [], [int(cat_id)]
+    while stack:
+        cur = stack.pop()
+        out.append(cur)
+        stack += [r[0] for r in conn.execute("SELECT id FROM item_categories WHERE parent_id=?", (cur,))]
+    return out if include_self else out[1:]
+
+
+def _next_cat_code(conn, company_id):
+    n = conn.execute("SELECT COALESCE(MAX(CAST(substr(code,2) AS INTEGER)),0)+1 FROM item_categories "
+                     "WHERE company_id=? AND code GLOB 'C[0-9]*'", (company_id,)).fetchone()[0]
+    return "C%03d" % n
+
+
+def _check_cat_unique(conn, company_id, parent_id, name, code, exclude_id=None):
+    if conn.execute("SELECT 1 FROM item_categories WHERE company_id=? AND COALESCE(parent_id,0)=? "
+                    "AND name=? COLLATE NOCASE AND id<>?", (company_id, parent_id or 0, name, exclude_id or 0)).fetchone():
+        raise AccountingError("يوجد تصنيف بنفس الاسم تحت نفس التصنيف الأب")
+    if code and conn.execute("SELECT 1 FROM item_categories WHERE company_id=? AND code=? COLLATE NOCASE AND id<>?",
+                             (company_id, code, exclude_id or 0)).fetchone():
+        raise AccountingError("يوجد تصنيف بنفس الكود")
+
+
+def sync_items_text(conn, company_id, cat_ids):
+    """يحدّث العمود النصي items.category لأصناف التصنيفات المذكورة بمسارها الحالي."""
+    cats = _all_cats(conn, company_id)
+    for cid in cat_ids:
+        conn.execute("UPDATE items SET category=? WHERE company_id=? AND category_id=?",
+                     (_path(cats, cid), company_id, cid))
+
+
+def list_categories(conn, actor_id, company_id, include_inactive=True, branch_id=None):
+    """قائمة مسطّحة مرتبة كشجرة: id, parent_id, code, name, path, depth, is_active, direct_items, total_items, children."""
+    _req(conn, actor_id, company_id, "inventory.view")
+    cats = _all_cats(conn, company_id)
+    if branch_id is not None:
+        f, fa = branch_scope.master_clause(conn, company_id, branch_id)
+        vis = {r[0] for r in conn.execute("SELECT id FROM item_categories WHERE company_id=?" + f, [company_id, *fa])}
+        cats = {k: v for k, v in cats.items() if k in vis}
+    direct = {r[0]: r[1] for r in conn.execute(
+        "SELECT category_id, COUNT(*) FROM items WHERE company_id=? AND category_id IS NOT NULL GROUP BY category_id",
+        (company_id,))}
+    kids = {}
+    for c in cats.values():
+        kids.setdefault(c["parent_id"] if c["parent_id"] in cats else None, []).append(c["id"])
+    for k in kids:
+        kids[k].sort(key=lambda i: (cats[i]["code"], cats[i]["name"]))
+    out = []
+
+    def total(cid):
+        return direct.get(cid, 0) + sum(total(k) for k in kids.get(cid, []))
+
+    def walk(pid, depth):
+        for cid in kids.get(pid, []):
+            c = cats[cid]
+            if include_inactive or c["is_active"]:
+                out.append({"id": cid, "parent_id": c["parent_id"], "code": c["code"], "name": c["name"],
+                            "path": _path(cats, cid), "depth": depth, "is_active": c["is_active"], "notes": c["notes"],
+                            "direct_items": direct.get(cid, 0), "total_items": total(cid),
+                            "cost_method": c["cost_method"], "cost_method_effective": category_cost_method(conn, cid),
+                            "children": len(kids.get(cid, []))})
+                walk(cid, depth + 1)
+    walk(None, 0)
+    return out
+
+
+def create_category(conn, actor_id, company_id, name, *, parent_id=None, code=None, notes="", cost_method="", branch_id=None):
+    _req(conn, actor_id, company_id)
+    branch_id = branch_scope.default_master_branch(conn, company_id, branch_id)
+    name = _clean(name)
+    if not name:
+        raise AccountingError("اسم التصنيف مطلوب")
+    if SEP.strip() in name:
+        raise AccountingError("اسم التصنيف لا يحتوي على «/»؛ أنشئ تصنيفًا فرعيًا بدلًا من ذلك")
+    if parent_id:
+        p = _cat(conn, parent_id, company_id)
+        if not p["is_active"]:
+            raise AccountingError("التصنيف الأب معطّل")
+    code = _clean(code) or _next_cat_code(conn, company_id)
+    cost_method = clean_cost_method(cost_method)
+    _check_cat_unique(conn, company_id, parent_id, name, code)
+    with transaction(conn):
+        cid = conn.execute("INSERT INTO item_categories(company_id,code,name,parent_id,notes,cost_method,branch_id) VALUES(?,?,?,?,?,?,?)",
+                           (company_id, code, name, parent_id or None, (notes or "").strip(), cost_method, branch_id)).lastrowid
+        audit.log(conn, actor_id, "create_item_category", "item_categories", cid,
+                  after={"code": code, "name": name, "parent_id": parent_id, "cost_method": cost_method})
+    return cid
+
+
+def ensure_category_path(conn, actor_id, company_id, path_text):
+    """يُرجع معرّف التصنيف الأخير للمسار «أ / ب / ج» وينشئ الناقص (للاستيراد والإدخال الحر). فارغ ← None."""
+    parts = [_clean(p) for p in re.split(r"\s*[/>\\]\s*", path_text or "") if _clean(p)]
+    parent = None
+    for name in parts:
+        r = conn.execute("SELECT id,is_active FROM item_categories WHERE company_id=? AND COALESCE(parent_id,0)=? "
+                         "AND name=? COLLATE NOCASE", (company_id, parent or 0, name)).fetchone()
+        if r:
+            parent = r[0]
+        else:
+            parent = create_category(conn, actor_id, company_id, name, parent_id=parent)
+    return parent
+
+
+def edit_category(conn, actor_id, company_id, cat_id, *, name=None, code=None, notes=None, cost_method=None):
+    _req(conn, actor_id, company_id)
+    c = _cat(conn, cat_id, company_id)
+    new = {"name": c["name"] if name is None else _clean(name),
+           "code": c["code"] if code is None else _clean(code),
+           "notes": c["notes"] if notes is None else (notes or "").strip(),
+           "cost_method": c["cost_method"] if cost_method is None else clean_cost_method(cost_method)}
+    if not new["name"]:
+        raise AccountingError("اسم التصنيف مطلوب")
+    if SEP.strip() in new["name"]:
+        raise AccountingError("اسم التصنيف لا يحتوي على «/»")
+    if not new["code"]:
+        new["code"] = c["code"] or _next_cat_code(conn, company_id)
+    _check_cat_unique(conn, company_id, c["parent_id"], new["name"], new["code"], exclude_id=c["id"])
+    old = {k: c[k] for k in new}
+    if old == new:
+        return c["id"]
+    with transaction(conn):
+        before = moved_methods(conn, _items_under(conn, descendants_ids(conn, c["id"])))
+        conn.execute("UPDATE item_categories SET name=?,code=?,notes=?,cost_method=? WHERE id=?",
+                     (new["name"], new["code"], new["notes"], new["cost_method"], c["id"]))
+        assert_methods_unchanged(conn, before)          # يُلغي المعاملة كاملة إن مسّ أصنافًا لها حركات
+        sync_items_text(conn, company_id, descendants_ids(conn, c["id"]))
+        audit.log(conn, actor_id, "edit_item_category", "item_categories", c["id"], old, new)
+    return c["id"]
+
+
+def move_category(conn, actor_id, company_id, cat_id, new_parent_id):
+    _req(conn, actor_id, company_id)
+    c = _cat(conn, cat_id, company_id)
+    new_parent_id = int(new_parent_id) if new_parent_id else None
+    if new_parent_id == c["parent_id"]:
+        return c["id"]
+    if new_parent_id:
+        p = _cat(conn, new_parent_id, company_id)
+        if new_parent_id in descendants_ids(conn, c["id"]):
+            raise AccountingError("لا يمكن نقل التصنيف إلى نفسه أو إلى أحد فروعه")
+        if not p["is_active"]:
+            raise AccountingError("التصنيف الأب الجديد معطّل")
+    _check_cat_unique(conn, company_id, new_parent_id, c["name"], "", exclude_id=c["id"])
+    with transaction(conn):
+        before = moved_methods(conn, _items_under(conn, descendants_ids(conn, c["id"])))
+        conn.execute("UPDATE item_categories SET parent_id=? WHERE id=?", (new_parent_id, c["id"]))
+        assert_methods_unchanged(conn, before)
+        sync_items_text(conn, company_id, descendants_ids(conn, c["id"]))
+        audit.log(conn, actor_id, "move_item_category", "item_categories", c["id"],
+                  before={"parent_id": c["parent_id"]}, after={"parent_id": new_parent_id})
+    return c["id"]
+
+
+def set_category_active(conn, actor_id, company_id, cat_id, active):
+    _req(conn, actor_id, company_id)
+    c = _cat(conn, cat_id, company_id)
+    active = bool(active)
+    if bool(c["is_active"]) == active:
+        return
+    if active and c["parent_id"] and not _cat(conn, c["parent_id"], company_id)["is_active"]:
+        raise AccountingError("فعّل التصنيف الأب أولًا")
+    if not active and conn.execute("SELECT 1 FROM item_categories WHERE parent_id=? AND is_active=1", (c["id"],)).fetchone():
+        raise AccountingError("عطّل التصنيفات الفرعية أولًا")
+    with transaction(conn):
+        conn.execute("UPDATE item_categories SET is_active=? WHERE id=?", (int(active), c["id"]))
+        audit.log(conn, actor_id, "item_category_active", "item_categories", c["id"], after={"active": active})
+
+
+def delete_category(conn, actor_id, company_id, cat_id):
+    _req(conn, actor_id, company_id)
+    c = _cat(conn, cat_id, company_id)
+    if conn.execute("SELECT 1 FROM item_categories WHERE parent_id=?", (c["id"],)).fetchone():
+        raise AccountingError("التصنيف له تصنيفات فرعية؛ احذفها أو انقلها أولًا")
+    if conn.execute("SELECT 1 FROM items WHERE category_id=? LIMIT 1", (c["id"],)).fetchone():
+        raise AccountingError("التصنيف مرتبط بأصناف؛ انقل الأصناف إلى تصنيف آخر أو عطّل التصنيف")
+    with transaction(conn):
+        conn.execute("DELETE FROM item_categories WHERE id=?", (c["id"],))
+        audit.log(conn, actor_id, "delete_item_category", "item_categories", c["id"],
+                  before={"code": c["code"], "name": c["name"]})
+
+
+def assign_items(conn, actor_id, company_id, item_ids, category_id):
+    """يربط مجموعة أصناف بتصنيف (أو يفك الارتباط عند category_id=None)."""
+    _req(conn, actor_id, company_id)
+    ids = [int(i) for i in item_ids]
+    if not ids:
+        raise AccountingError("لم يتم تحديد أصناف")
+    text = ""
+    if category_id:
+        c = _cat(conn, category_id, company_id)
+        if not c["is_active"]:
+            raise AccountingError("التصنيف معطّل")
+        text = category_path(conn, c["id"])
+    with transaction(conn):
+        for iid in ids:
+            if not conn.execute("SELECT 1 FROM items WHERE id=? AND company_id=?", (iid, company_id)).fetchone():
+                raise AccountingError("صنف غير موجود في هذه الشركة")
+        before = moved_methods(conn, ids)
+        for iid in ids:
+            conn.execute("UPDATE items SET category_id=?, category=? WHERE id=?", (category_id or None, text, iid))
+        assert_methods_unchanged(conn, before)
+        audit.log(conn, actor_id, "assign_items_category", "item_categories", category_id or 0,
+                  after={"items": ids, "category_id": category_id})
+    return len(ids)
+
+
+def resolve_category(conn, actor_id, company_id, category_id=None, category_text=""):
+    """يحسم (category_id, category_text) لصنف: بالمعرّف أولًا، وإلا بالمسار النصي (ينشئ الناقص)."""
+    if category_id:
+        c = _cat(conn, category_id, company_id)
+        if not c["is_active"]:
+            raise AccountingError("التصنيف معطّل")
+        return c["id"], category_path(conn, c["id"])
+    if _clean(category_text):
+        cid = ensure_category_path(conn, actor_id, company_id, category_text)
+        return cid, category_path(conn, cid)
+    return None, ""
+
+
+# =============================================================== الوحدات
+def _unit(conn, unit_id, company_id):
+    r = conn.execute("SELECT * FROM units WHERE id=? AND company_id=?", (int(unit_id), company_id)).fetchone()
+    if not r:
+        raise AccountingError("الوحدة غير موجودة في هذه الشركة")
+    return r
+
+
+def _next_unit_code(conn, company_id):
+    n = conn.execute("SELECT COALESCE(MAX(CAST(substr(code,2) AS INTEGER)),0)+1 FROM units "
+                     "WHERE company_id=? AND code GLOB 'U[0-9]*'", (company_id,)).fetchone()[0]
+    return "U%02d" % n
+
+
+def _check_unit_unique(conn, company_id, name, code, exclude_id=None):
+    if conn.execute("SELECT 1 FROM units WHERE company_id=? AND name=? COLLATE NOCASE AND id<>?",
+                    (company_id, name, exclude_id or 0)).fetchone():
+        raise AccountingError("يوجد وحدة بنفس الاسم")
+    if code and conn.execute("SELECT 1 FROM units WHERE company_id=? AND code=? COLLATE NOCASE AND id<>?",
+                             (company_id, code, exclude_id or 0)).fetchone():
+        raise AccountingError("يوجد وحدة بنفس الكود")
+
+
+def unit_usage(conn, unit_id):
+    """{جدول: عدد} لكل ارتباط بالوحدة عبر المفاتيح الأجنبية (يغطي الأصناف وحركات المخزون والفواتير...)."""
+    detail = {}
+    for (t,) in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchall():
+        if t == "units":
+            continue
+        for fk in conn.execute(f"PRAGMA foreign_key_list({t})").fetchall():
+            if fk["table"] == "units":
+                n = conn.execute(f"SELECT COUNT(*) FROM {t} WHERE {fk['from']}=?", (int(unit_id),)).fetchone()[0]
+                if n:
+                    detail[t] = detail.get(t, 0) + n
+    return detail
+
+
+def list_units(conn, actor_id, company_id, include_inactive=True, branch_id=None):
+    _req(conn, actor_id, company_id, "inventory.view")
+    q, a = "SELECT id,code,name,notes,is_active,branch_id FROM units WHERE company_id=?", [company_id]
+    if not include_inactive:
+        q += " AND is_active=1"
+    f, fa = branch_scope.master_clause(conn, company_id, branch_id)
+    q += f; a += fa
+    rows = [dict(r) for r in conn.execute(q + " ORDER BY name", a)]
+    for r in rows:
+        u = unit_usage(conn, r["id"])
+        r["as_base"] = conn.execute("SELECT COUNT(*) FROM items WHERE base_unit_id=?", (r["id"],)).fetchone()[0]
+        r["usage"] = sum(u.values())
+    return rows
+
+
+def create_unit(conn, actor_id, company_id, name, *, code=None, notes="", branch_id=None):
+    _req(conn, actor_id, company_id)
+    branch_id = branch_scope.default_master_branch(conn, company_id, branch_id)
+    name = _clean(name)
+    if not name:
+        raise AccountingError("اسم الوحدة مطلوب")
+    code = _clean(code) or _next_unit_code(conn, company_id)
+    _check_unit_unique(conn, company_id, name, code)
+    with transaction(conn):
+        uid = conn.execute("INSERT INTO units(company_id,name,code,notes,branch_id) VALUES(?,?,?,?,?)",
+                           (company_id, name, code, (notes or "").strip(), branch_id)).lastrowid
+        audit.log(conn, actor_id, "create_unit", "units", uid, after={"code": code, "name": name})
+    return uid
+
+
+def edit_unit(conn, actor_id, company_id, unit_id, *, name=None, code=None, notes=None):
+    _req(conn, actor_id, company_id)
+    u = _unit(conn, unit_id, company_id)
+    new = {"name": u["name"] if name is None else _clean(name),
+           "code": u["code"] if code is None else _clean(code),
+           "notes": u["notes"] if notes is None else (notes or "").strip()}
+    if not new["name"]:
+        raise AccountingError("اسم الوحدة مطلوب")
+    if not new["code"]:
+        new["code"] = u["code"] or _next_unit_code(conn, company_id)
+    _check_unit_unique(conn, company_id, new["name"], new["code"], exclude_id=u["id"])
+    old = {k: u[k] for k in new}
+    if old == new:
+        return u["id"]
+    with transaction(conn):
+        conn.execute("UPDATE units SET name=?,code=?,notes=? WHERE id=?", (new["name"], new["code"], new["notes"], u["id"]))
+        audit.log(conn, actor_id, "edit_unit", "units", u["id"], old, new)
+    return u["id"]
+
+
+def set_unit_active(conn, actor_id, company_id, unit_id, active):
+    _req(conn, actor_id, company_id)
+    u = _unit(conn, unit_id, company_id)
+    if bool(u["is_active"]) == bool(active):
+        return
+    with transaction(conn):
+        conn.execute("UPDATE units SET is_active=? WHERE id=?", (int(bool(active)), u["id"]))
+        audit.log(conn, actor_id, "unit_active", "units", u["id"], after={"active": bool(active)})
+
+
+def delete_unit(conn, actor_id, company_id, unit_id):
+    _req(conn, actor_id, company_id)
+    u = _unit(conn, unit_id, company_id)
+    if unit_usage(conn, u["id"]):
+        raise AccountingError("الوحدة مستخدمة (أصناف أو حركات أو مستندات) ولا يمكن حذفها؛ عطّلها بدلًا من ذلك")
+    with transaction(conn):
+        conn.execute("DELETE FROM units WHERE id=?", (u["id"],))
+        audit.log(conn, actor_id, "delete_unit", "units", u["id"], before={"code": u["code"], "name": u["name"]})
+
+
+# ---- وحدات التحويل للصنف
+def _item_unit_in_use(conn, item_id, unit_id):
+    """هل استُخدمت وحدة التحويل هذه لهذا الصنف في أي جدول فيه item_id وunit_id (حركات/بنود)؟"""
+    for (t,) in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchall():
+        if t == "item_units":
+            continue
+        cols = [r[1] for r in conn.execute(f"PRAGMA table_info({t})")]
+        if "item_id" in cols and "unit_id" in cols:
+            if conn.execute(f"SELECT 1 FROM {t} WHERE item_id=? AND unit_id=? LIMIT 1", (item_id, unit_id)).fetchone():
+                return True
+    return False
+
+
+def _item_row(conn, item_id, company_id):
+    it = conn.execute("SELECT * FROM items WHERE id=? AND company_id=?", (int(item_id), company_id)).fetchone()
+    if not it:
+        raise AccountingError("الصنف غير موجود في هذه الشركة")
+    return it
+
+
+def update_item_unit(conn, actor_id, company_id, item_id, unit_id, factor):
+    from decimal import Decimal, ROUND_HALF_UP
+    _req(conn, actor_id, company_id)
+    it = _item_row(conn, item_id, company_id)
+    if int(unit_id) == it["base_unit_id"]:
+        raise AccountingError("معامل الوحدة الأساسية ثابت (1)")
+    if not conn.execute("SELECT 1 FROM item_units WHERE item_id=? AND unit_id=?", (it["id"], int(unit_id))).fetchone():
+        raise AccountingError("الوحدة غير مضافة لهذا الصنف")
+    f = int((Decimal(str(factor)) * 1000).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    if f <= 0:
+        raise AccountingError("معامل التحويل يجب أن يكون أكبر من صفر")
+    if _item_unit_in_use(conn, it["id"], int(unit_id)):
+        raise AccountingError("لا يمكن تغيير معامل وحدة استُخدمت في حركات أو مستندات")
+    with transaction(conn):
+        conn.execute("UPDATE item_units SET factor_milli=? WHERE item_id=? AND unit_id=?", (f, it["id"], int(unit_id)))
+        audit.log(conn, actor_id, "update_item_unit", "items", it["id"], after={"unit": int(unit_id), "factor": str(factor)})
+
+
+def remove_item_unit(conn, actor_id, company_id, item_id, unit_id):
+    _req(conn, actor_id, company_id)
+    it = _item_row(conn, item_id, company_id)
+    if int(unit_id) == it["base_unit_id"]:
+        raise AccountingError("لا يمكن إزالة الوحدة الأساسية للصنف")
+    if _item_unit_in_use(conn, it["id"], int(unit_id)):
+        raise AccountingError("لا يمكن إزالة وحدة استُخدمت في حركات أو مستندات")
+    with transaction(conn):
+        conn.execute("DELETE FROM item_units WHERE item_id=? AND unit_id=?", (it["id"], int(unit_id)))
+        audit.log(conn, actor_id, "remove_item_unit", "items", it["id"], after={"unit": int(unit_id)})

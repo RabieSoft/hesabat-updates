@@ -1,0 +1,313 @@
+"""الأصول الثابتة: كل أصل له حساب تكلفة تفصيلي (تحت فئة الأصل، مثل السيارات) وحساب مجمع إهلاك تفصيلي (تحت الحساب
+الرقابي «مجمع الإهلاك» المربوط)، تماما كنمط العملاء والموردين. القسط الثابت فقط حاليا. الإهلاك يُحسب شهريا من تاريخ
+الاقتناء، بحد أقصى (التكلفة − القيمة المتبقية)، ولا يُحتسب لأصل مستبعد أو لشهر سابق على الاقتناء أو لاحق للاستبعاد."""
+from datetime import date as _date
+from decimal import Decimal, ROUND_HALF_UP
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.accounting import balance_engine as be, journal_engine as je, period_engine
+from alhisabat.audit import audit
+from alhisabat.business import chart_of_accounts as coa
+from alhisabat.database.tx import transaction
+from alhisabat.security import permissions
+
+
+def _r(x):
+    return int(Decimal(x).quantize(Decimal(1), ROUND_HALF_UP))
+
+
+def _u(minor):
+    return Decimal(int(minor)) / 100
+
+
+def _mapping(conn, company_id, key):
+    r = conn.execute("SELECT account_id FROM account_mappings WHERE company_id=? AND map_key=?", (company_id, key)).fetchone()
+    return r[0] if r else None
+
+
+def _months_between(d1, d2):
+    return (d2.year - d1.year) * 12 + (d2.month - d1.month)
+
+
+def register_asset(conn, actor_id, company_id, name, category_account_id, acquisition_date, cost, useful_life_months, *,
+                   salvage_value=0, code=None, category=""):
+    """يُنشئ حسابي التكلفة والإهلاك المتراكم التفصيليين، ويُنشئ الأصل (بلا قيد اقتناء بعد)."""
+    permissions.require(conn, actor_id, company_id, "asset.manage", check_branch=False)
+    cat = coa._acc(conn, category_account_id)
+    if cat["company_id"] != company_id or cat["account_type"] != "asset" or not cat["is_group"] or not cat["is_active"]:
+        raise AccountingError("فئة الأصل يجب أن تكون حسابا تجميعيا نشطا من نوع أصل")
+    accum_ctl = _mapping(conn, company_id, "accum_depreciation")
+    if not accum_ctl:
+        raise AccountingError("اربط الحساب الرقابي لمجمع الإهلاك (Account Mapping: accum_depreciation)")
+    cost_m, salv_m = je._minor(cost), je._minor(salvage_value)
+    if cost_m <= 0:
+        raise AccountingError("التكلفة يجب أن تكون أكبر من صفر")
+    if salv_m >= cost_m:
+        raise AccountingError("القيمة المتبقية يجب أن تكون أقل من التكلفة")
+    if useful_life_months <= 0:
+        raise AccountingError("العمر الإنتاجي يجب أن يكون أكبر من صفر")
+    try:
+        _date.fromisoformat(acquisition_date)
+    except Exception:
+        raise AccountingError("تاريخ اقتناء غير صالح")
+    with transaction(conn):
+        if not code:
+            code = "FA%04d" % (conn.execute("SELECT COUNT(*)+1 FROM fixed_assets WHERE company_id=?", (company_id,)).fetchone()[0])
+        cost_acc = coa.add_account(conn, actor_id, company_id, name, "asset", category_account_id)
+        depr_acc = coa.add_account(conn, actor_id, company_id, f"مجمع إهلاك: {name}", "asset", accum_ctl)
+        conn.execute("UPDATE accounts SET nature='credit',nature_override=1 WHERE id=?", (depr_acc,))
+        aid = conn.execute(
+            "INSERT INTO fixed_assets(company_id,code,name,category,cost_account_id,accum_depr_account_id,acquisition_date,cost_minor,"
+            "salvage_value_minor,useful_life_months,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (company_id, code, name.strip(), category, cost_acc, depr_acc, acquisition_date, cost_m, salv_m, int(useful_life_months), actor_id)).lastrowid
+        audit.log(conn, actor_id, "register_asset", "fixed_assets", aid, after={"code": code, "cost": cost_m})
+    return aid
+
+
+def _asset(conn, asset_id, company_id=None):
+    r = conn.execute("SELECT * FROM fixed_assets WHERE id=?", (asset_id,)).fetchone()
+    if not r or (company_id is not None and r["company_id"] != company_id):
+        raise AccountingError("الأصل غير موجود في هذه الشركة")
+    return r
+
+
+def record_acquisition(conn, actor_id, asset_id, counter_account_id, description=""):
+    """قيد الاقتناء: مدين حساب تكلفة الأصل مقابل حساب مصدر التمويل (مورد/صندوق/بنك...). مرة واحدة لكل أصل."""
+    a = _asset(conn, asset_id)
+    permissions.require(conn, actor_id, a["company_id"], "asset.manage", check_branch=False)
+    if a["acquisition_entry_id"] is not None:
+        raise AccountingError("قيد الاقتناء مسجَّل بالفعل لهذا الأصل")
+    ca = coa._acc(conn, counter_account_id)
+    if ca["company_id"] != a["company_id"] or ca["is_group"] or not ca["is_active"]:
+        raise AccountingError("حساب مصدر التمويل غير صالح")
+    per = period_engine.find_period(conn, a["company_id"], a["acquisition_date"])
+    je._assert_open(per)
+    with transaction(conn):
+        eid = je.create_draft(conn, a["company_id"], actor_id, a["acquisition_date"],
+                              [{"account_id": a["cost_account_id"], "debit": _u(a["cost_minor"]), "credit": 0},
+                               {"account_id": counter_account_id, "debit": 0, "credit": _u(a["cost_minor"])}],
+                              description or f"اقتناء أصل: {a['name']}", entry_type="auto", source_type="fixed_asset", source_id=asset_id)
+        je.post(conn, eid, actor_id)
+        conn.execute("UPDATE fixed_assets SET acquisition_entry_id=? WHERE id=?", (eid, asset_id))
+        audit.log(conn, actor_id, "record_acquisition", "fixed_assets", asset_id, after={"entry": eid})
+    return eid
+
+
+def accumulated_depreciation(conn, asset_id, as_of=None):
+    a = _asset(conn, asset_id)
+    as_of = as_of or a["disposal_date"] or _date.today().isoformat()
+    return _accum_via_engine(conn, a, as_of)
+
+
+def _accum_via_engine(conn, a, as_of):
+    ys = be.year_start(conn, a["company_id"], as_of)
+    mov = be.movements(conn, a["company_id"], ys, as_of, ys, None, None, [a["accum_depr_account_id"]])
+    o, pd, pc = mov.get(a["accum_depr_account_id"], [0, 0, 0])
+    return -(o + pd - pc)   # حساب دائن الطبيعة: الرصيد الموجب = -(مدين-دائن)
+
+
+def net_book_value(conn, asset_id, as_of=None):
+    a = _asset(conn, asset_id)
+    as_of = as_of or _date.today().isoformat()
+    ys = be.year_start(conn, a["company_id"], as_of)
+    mov = be.movements(conn, a["company_id"], ys, as_of, ys, None, None, [a["cost_account_id"]])
+    o, pd, pc = mov.get(a["cost_account_id"], [0, 0, 0])
+    cost_bal = o + pd - pc
+    return cost_bal - _accum_via_engine(conn, a, as_of)
+
+
+def monthly_depreciation(a):
+    return _r(Decimal(a["cost_minor"] - a["salvage_value_minor"]) / a["useful_life_months"])
+
+
+def _eligible_months(conn, a, run_date):
+    """أشهر الإهلاك المستحقة حتى نهاية شهر run_date، ولم تُهلَك بعد، بحد أقصى العمر الإنتاجي."""
+    acq = _date.fromisoformat(a["acquisition_date"])
+    elapsed = _months_between(acq, _date.fromisoformat(run_date)) + 1
+    elapsed = max(0, min(elapsed, a["useful_life_months"]))
+    already = conn.execute("SELECT COALESCE(SUM(l.amount_minor),0) FROM asset_depreciation_lines l JOIN asset_depreciation_runs r ON r.id=l.run_id "
+                           "WHERE l.asset_id=? AND r.status='posted'", (a["id"],)).fetchone()[0]
+    months_done = _r(Decimal(already) / monthly_depreciation(a)) if monthly_depreciation(a) else 0
+    return max(0, elapsed - months_done), already
+
+
+def depreciation_preview(conn, user_id, company_id, run_date):
+    permissions.require(conn, user_id, company_id, "asset.view", check_branch=False)
+    out = []
+    for a in conn.execute("SELECT * FROM fixed_assets WHERE company_id=? AND status='active' AND acquisition_entry_id IS NOT NULL "
+                          "AND acquisition_date<=? ORDER BY code", (company_id, run_date)).fetchall():
+        months, already = _eligible_months(conn, a, run_date)
+        amt = min(monthly_depreciation(a) * months, a["cost_minor"] - a["salvage_value_minor"] - already)
+        if amt > 0:
+            out.append({"asset_id": a["id"], "code": a["code"], "name": a["name"], "months": months, "amount_minor": amt,
+                       "accumulated_before": already, "nbv_after": a["cost_minor"] - already - amt})
+    return out
+
+
+def run_depreciation(conn, actor_id, company_id, run_date, *, post=False):
+    permissions.require(conn, actor_id, company_id, "asset.depreciate", check_branch=False)
+    per = period_engine.find_period(conn, company_id, run_date)
+    je._assert_open(per)
+    if conn.execute("SELECT 1 FROM asset_depreciation_runs WHERE company_id=? AND run_date=? AND status<>'cancelled'", (company_id, run_date)).fetchone():
+        raise AccountingError("يوجد تشغيل إهلاك بهذا التاريخ لهذه الشركة")
+    prev = conn.execute("SELECT MAX(run_date) FROM asset_depreciation_runs WHERE company_id=? AND status='posted'", (company_id,)).fetchone()[0]
+    if prev and run_date <= prev:
+        raise AccountingError(f"تاريخ التشغيل يجب أن يكون بعد آخر تشغيل مرحّل ({prev})")
+    lines = depreciation_preview(conn, actor_id, company_id, run_date)
+    if not lines:
+        raise AccountingError("لا يوجد إهلاك مستحق بهذا التاريخ")
+    exp_default = _mapping(conn, company_id, "depreciation_expense")
+    with transaction(conn):
+        rid = conn.execute("INSERT INTO asset_depreciation_runs(company_id,run_date,created_by) VALUES(?,?,?)", (company_id, run_date, actor_id)).lastrowid
+        for l in lines:
+            conn.execute("INSERT INTO asset_depreciation_lines(run_id,asset_id,amount_minor) VALUES(?,?,?)", (rid, l["asset_id"], l["amount_minor"]))
+        eid = None
+        if post:
+            eid = _post_depreciation(conn, actor_id, rid, exp_default)
+        audit.log(conn, actor_id, "run_depreciation", "asset_depreciation_runs", rid, after={"assets": len(lines), "entry": eid})
+    return {"run_id": rid, "lines": lines, "entry_id": eid}
+
+
+def _post_depreciation(conn, actor_id, run_id, exp_default=None):
+    r = conn.execute("SELECT * FROM asset_depreciation_runs WHERE id=?", (run_id,)).fetchone()
+    lines = conn.execute("SELECT * FROM asset_depreciation_lines WHERE run_id=?", (run_id,)).fetchall()
+    exp = exp_default or _mapping(conn, r["company_id"], "depreciation_expense")
+    if not exp:
+        raise AccountingError("اربط حساب مصروف الإهلاك (Account Mapping: depreciation_expense)")
+    total = sum(l["amount_minor"] for l in lines)
+    jl = [{"account_id": exp, "debit": _u(total), "credit": 0}]
+    for l in lines:
+        acc = conn.execute("SELECT accum_depr_account_id FROM fixed_assets WHERE id=?", (l["asset_id"],)).fetchone()[0]
+        jl.append({"account_id": acc, "debit": 0, "credit": _u(l["amount_minor"])})
+    eid = je.create_draft(conn, r["company_id"], actor_id, r["run_date"], jl, f"إهلاك دوري بتاريخ {r['run_date']}",
+                          entry_type="auto", source_type="asset_depreciation", source_id=run_id)
+    je.post(conn, eid, actor_id)
+    conn.execute("UPDATE asset_depreciation_runs SET status='posted',journal_entry_id=?,posted_by=?,posted_at=CURRENT_TIMESTAMP WHERE id=?", (eid, actor_id, run_id))
+    return eid
+
+
+def post_depreciation_run(conn, actor_id, run_id):
+    r = conn.execute("SELECT * FROM asset_depreciation_runs WHERE id=?", (run_id,)).fetchone()
+    if not r:
+        raise AccountingError("التشغيل غير موجود")
+    permissions.require(conn, actor_id, r["company_id"], "asset.depreciate", check_branch=False)
+    permissions.require(conn, actor_id, r["company_id"], "journal.create", check_branch=False)
+    permissions.require(conn, actor_id, r["company_id"], "journal.post", check_branch=False)
+    if r["status"] != "draft":
+        raise AccountingError("التشغيل ليس مسودة")
+    with transaction(conn):
+        eid = _post_depreciation(conn, actor_id, run_id)
+        audit.log(conn, actor_id, "post_depreciation_run", "asset_depreciation_runs", run_id, after={"entry": eid})
+    return eid
+
+
+def cancel_depreciation_run(conn, actor_id, run_id, cancel_date, reason):
+    r = conn.execute("SELECT * FROM asset_depreciation_runs WHERE id=?", (run_id,)).fetchone()
+    if not r:
+        raise AccountingError("التشغيل غير موجود")
+    permissions.require(conn, actor_id, r["company_id"], "asset.depreciate", check_branch=False)
+    permissions.require(conn, actor_id, r["company_id"], "journal.reverse", check_branch=False)
+    if not reason or not reason.strip():
+        raise AccountingError("الإلغاء يتطلب ذكر السبب")
+    if r["status"] != "posted":
+        raise AccountingError("يُلغى التشغيل المرحّل فقط")
+    if cancel_date < r["run_date"]:
+        raise AccountingError("تاريخ الإلغاء أقدم من تاريخ التشغيل")
+    if conn.execute("SELECT 1 FROM asset_depreciation_runs WHERE company_id=? AND run_date>? AND status='posted'", (r["company_id"], r["run_date"])).fetchone():
+        raise AccountingError("توجد تشغيلات إهلاك لاحقة مرحّلة: ألغِها بالترتيب العكسي أولا")
+    with transaction(conn):
+        rid = je.reverse(conn, r["journal_entry_id"], actor_id, cancel_date, reason)
+        conn.execute("UPDATE asset_depreciation_runs SET status='cancelled',cancelled_by=?,cancelled_at=CURRENT_TIMESTAMP,cancel_reason=?,cancel_entry_id=? WHERE id=?",
+                     (actor_id, reason, rid, run_id))
+        audit.log(conn, actor_id, "cancel_depreciation_run", "asset_depreciation_runs", run_id, {"status": "posted"}, {"status": "cancelled", "reversal": rid}, reason)
+    return {"run_id": run_id, "reversal_entry_id": rid}
+
+
+def dispose_asset(conn, actor_id, asset_id, disposal_date, proceeds, counter_account_id, reason=""):
+    """استبعاد أصل: يصفّر تكلفته ومجمع إهلاكه، يثبت العائد (إن وُجد) في حساب مصدره، والفرق (عائد − القيمة الدفترية)
+    مكسب/خسارة استبعاد في حساب واحد."""
+    a = _asset(conn, asset_id)
+    permissions.require(conn, actor_id, a["company_id"], "asset.dispose", check_branch=False)
+    permissions.require(conn, actor_id, a["company_id"], "journal.create", check_branch=False)
+    permissions.require(conn, actor_id, a["company_id"], "journal.post", check_branch=False)
+    if a["status"] != "active":
+        raise AccountingError("الأصل مستبعد بالفعل")
+    if a["acquisition_entry_id"] is None:
+        raise AccountingError("لم يُسجَّل قيد اقتناء لهذا الأصل بعد")
+    if not reason or not reason.strip():
+        raise AccountingError("الاستبعاد يتطلب ذكر السبب")
+    if disposal_date < a["acquisition_date"]:
+        raise AccountingError("تاريخ الاستبعاد أقدم من تاريخ الاقتناء")
+    per = period_engine.find_period(conn, a["company_id"], disposal_date)
+    je._assert_open(per)
+    proceeds_m = je._minor(proceeds)
+    if proceeds_m < 0:
+        raise AccountingError("العائد لا يقبل قيمة سالبة")
+    gl_acc = _mapping(conn, a["company_id"], "disposal_gain_loss")
+    if not gl_acc:
+        raise AccountingError("اربط حساب مكسب/خسارة الاستبعاد (Account Mapping: disposal_gain_loss)")
+    accum = accumulated_depreciation(conn, asset_id, disposal_date)
+    nbv = a["cost_minor"] - accum
+    gain = proceeds_m - nbv
+    jl = [{"account_id": a["accum_depr_account_id"], "debit": _u(accum), "credit": 0},
+          {"account_id": a["cost_account_id"], "debit": 0, "credit": _u(a["cost_minor"])}]
+    if proceeds_m:
+        jl.append({"account_id": counter_account_id, "debit": _u(proceeds_m), "credit": 0})
+    if gain:
+        jl.append({"account_id": gl_acc, "debit": _u(-gain) if gain < 0 else 0, "credit": _u(gain) if gain > 0 else 0})
+    with transaction(conn):
+        eid = je.create_draft(conn, a["company_id"], actor_id, disposal_date, jl, f"استبعاد أصل: {a['name']} — {reason}",
+                              entry_type="auto", source_type="fixed_asset_disposal", source_id=asset_id)
+        je.post(conn, eid, actor_id)
+        conn.execute("UPDATE fixed_assets SET status='disposed',disposal_date=?,disposal_proceeds_minor=?,disposal_entry_id=? WHERE id=?",
+                     (disposal_date, proceeds_m, eid, asset_id))
+        audit.log(conn, actor_id, "dispose_asset", "fixed_assets", asset_id, after={"entry": eid, "gain": gain}, reason=reason)
+    return {"asset_id": asset_id, "entry_id": eid, "nbv": nbv, "gain": gain}
+
+
+def get_asset(conn, user_id, asset_id, as_of=None):
+    a = _asset(conn, asset_id)
+    permissions.require(conn, user_id, a["company_id"], "asset.view", check_branch=False)
+    as_of = as_of or a["disposal_date"] or _date.today().isoformat()
+    accum = accumulated_depreciation(conn, asset_id, as_of)
+    return {**dict(a), "as_of": as_of, "accumulated_depreciation": accum, "net_book_value": a["cost_minor"] - accum,
+           "monthly_depreciation": monthly_depreciation(a)}
+
+
+def list_assets(conn, user_id, company_id, *, status=None, category=None):
+    permissions.require(conn, user_id, company_id, "asset.view", check_branch=False)
+    q, a = "SELECT * FROM fixed_assets WHERE company_id=?", [company_id]
+    if status:
+        q += " AND status=?"; a.append(status)
+    if category:
+        q += " AND category=?"; a.append(category)
+    return [get_asset(conn, user_id, r["id"]) for r in conn.execute(q + " ORDER BY code", a)]
+
+
+def register_reconcile(conn, company_id, as_of):
+    """سجل الأصول: مجموع الإهلاك المُعلَن في تشغيلات الإهلاك المرحّلة (سجل الأصول) حتى as_of، لكل أصل لم يُستبعد بعد،
+    مقابل رصيد الحساب الرقابي «مجمع الإهلاك» الفعلي في دفتر الأستاذ (بالتجميع عبر الشجرة). الفرق يكشف أي تعديل مباشر
+    على حسابات مجمع الإهلاك خارج آلية تشغيل الإهلاك (مثل قيد تسوية أو تلاعب). حد معروف: أصل مُستبعد يُستثنى من الجانبين
+    (الاستبعاد يصفّر مجمع إهلاكه في الأستاذ ولا يُسجَّل في asset_depreciation_lines)."""
+    ctl = _mapping(conn, company_id, "accum_depreciation")
+    assets = conn.execute("SELECT * FROM fixed_assets WHERE company_id=?", (company_id,)).fetchall()
+    if not assets:
+        return None
+    active_ids = tuple(a["id"] for a in assets if a["status"] == "active")
+    reg_accum = 0
+    if active_ids:
+        q = ",".join("?" * len(active_ids))
+        reg_accum = conn.execute(
+            f"SELECT COALESCE(SUM(l.amount_minor),0) FROM asset_depreciation_lines l JOIN asset_depreciation_runs r ON r.id=l.run_id "
+            f"WHERE r.status='posted' AND r.run_date<=? AND l.asset_id IN ({q})", (as_of, *active_ids)).fetchone()[0]
+    ctl_accum = 0
+    if ctl:
+        ys = be.year_start(conn, company_id, as_of)
+        accs = be.load_accounts(conn, company_id)
+        tot = be.aggregate(accs, be.movements(conn, company_id, ys, as_of, ys))
+        disposed_ids = [a["accum_depr_account_id"] for a in assets if a["status"] == "disposed"]
+        disp_net = 0
+        for did in disposed_ids:
+            v = tot.get(did, [0, 0, 0])
+            disp_net += v[0] + v[1] - v[2]
+        ctl_accum = -((tot[ctl][0] + tot[ctl][1] - tot[ctl][2]) - disp_net)
+    return {"register_accum": reg_accum, "control_accum": ctl_accum, "matches": reg_accum == ctl_accum}

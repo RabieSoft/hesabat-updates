@@ -1,0 +1,657 @@
+"""المبيعات: الفاتورة مصدر تشغيلي، وترحيلها ينتج في معاملة واحدة: القيد المحاسبي (المبيعات/الخصم/الضريبة/الذمة أو الصندوق)،
+الأثر المخزني (حركات بيع بتكلفتها)، وتكلفة المبيعات. المرتجع مرتبط بالفاتورة الأصلية بمبالغها وتكلفتها. الإلغاء بعكس كامل بسبب موثّق.
+المبالغ بالوحدة الصغرى لعملة المستند؛ الكميات بالألف بوحدة البند؛ التكلفة دائما بالعملة الأساسية."""
+from datetime import date as _date, timedelta
+from decimal import Decimal, ROUND_HALF_UP
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.accounting import balance_engine as be, journal_engine as je, period_engine, rates as fxr
+from alhisabat.audit import audit
+from alhisabat.business import branch_scope
+from alhisabat.business import inventory as inv, parties as pt
+from alhisabat.database.tx import transaction
+from alhisabat.security import permissions
+
+PREFIX = {"invoice": "INV", "return": "SRT", "purchase": "PUR", "purchase_return": "PRT", "receipt": "RCV", "payment": "PAY", "transfer": "TRF"}
+
+
+def _r(x):
+    return int(Decimal(x).quantize(Decimal(1), ROUND_HALF_UP))
+
+
+def _u(minor):
+    return Decimal(int(minor)) / 100
+
+
+def _mapping(conn, company_id, key):
+    r = conn.execute("SELECT account_id FROM account_mappings WHERE company_id=? AND map_key=?", (company_id, key)).fetchone()
+    return r[0] if r else None
+
+
+# ---------------- الإعدادات ----------------
+def get_settings(conn, company_id):
+    r = conn.execute("SELECT credit_limit_mode,allow_edit_posted_invoice,allow_negative_stock FROM sales_settings WHERE company_id=?", (company_id,)).fetchone()
+    return {"credit_limit_mode": r[0] if r else "block", "allow_edit_posted_invoice": int(r[1]) if r else 0,
+            "allow_negative_stock": int(r[2]) if r else 0}
+
+
+def set_settings(conn, actor_id, company_id, *, credit_limit_mode=None, allow_edit_posted_invoice=None, allow_negative_stock=None):
+    """None = بلا تغيير. حد الائتمان بصلاحية settings.manage؛ تفعيل/إلغاء تعديل الفاتورة المرحّلة بصلاحية sales.edit_posted؛
+    وتفعيل/إلغاء البيع بالسالب بصلاحية stock.allow_negative (مدير النظام افتراضيًا)."""
+    permissions.require(conn, actor_id, company_id, "settings.manage")
+    old = get_settings(conn, company_id)
+    new = dict(old)
+    if credit_limit_mode is not None:
+        if credit_limit_mode not in ("block", "warn", "off"):
+            raise AccountingError("وضع الحد الائتماني غير معروف")
+        new["credit_limit_mode"] = credit_limit_mode
+    if allow_edit_posted_invoice is not None and int(bool(allow_edit_posted_invoice)) != old["allow_edit_posted_invoice"]:
+        permissions.require(conn, actor_id, company_id, "sales.edit_posted", check_branch=False)
+        new["allow_edit_posted_invoice"] = int(bool(allow_edit_posted_invoice))
+    if allow_negative_stock is not None and int(bool(allow_negative_stock)) != old["allow_negative_stock"]:
+        permissions.require(conn, actor_id, company_id, "stock.allow_negative", check_branch=False)
+        new["allow_negative_stock"] = int(bool(allow_negative_stock))
+    with transaction(conn):
+        conn.execute("INSERT INTO sales_settings(company_id,credit_limit_mode,allow_edit_posted_invoice,allow_negative_stock) VALUES(?,?,?,?) "
+                     "ON CONFLICT(company_id) DO UPDATE SET credit_limit_mode=excluded.credit_limit_mode,"
+                     "allow_edit_posted_invoice=excluded.allow_edit_posted_invoice,allow_negative_stock=excluded.allow_negative_stock",
+                     (company_id, new["credit_limit_mode"], new["allow_edit_posted_invoice"], new["allow_negative_stock"]))
+        audit.log(conn, actor_id, "set_sales_settings", "sales_settings", company_id, old, new)
+
+
+def _fixed_line_amount(ln, qty_milli, price):
+    """إجمالي البند كما أدخله المستخدم (قبل الخصم والضريبة) بالوحدة الصغرى، أو None إن لم يُدخل.
+    السعر يُحفظ بخانتين فقط، فقسمة الإجمالي على الكمية تُقرَّب وقد يختلف qty×price عن الإجمالي المكتوب بقرش أو أكثر.
+    لذلك يُعتمد الإجمالي المُدخل نفسه، بشرط أن يتوافق مع qty×price ضمن أثر تقريب السعر فقط (نصف قرش للوحدة) وإلا يُرفض."""
+    raw = ln.get("line_total")
+    if raw is None or str(raw).strip() == "":
+        return None
+    amt = je._minor(raw)
+    if amt < 0:
+        raise AccountingError("إجمالي البند لا يقبل قيمة سالبة")
+    calc = _r(Decimal(qty_milli) * price / 1000)
+    if abs(amt - calc) > Decimal(qty_milli) / 2000 + 1:
+        raise AccountingError("إجمالي البند لا يتوافق مع الكمية × السعر؛ صحّح السعر أو الإجمالي")
+    return amt
+
+
+# ---------------- الحساب ----------------
+def compute_lines(prepped, inv_disc_type="none", inv_disc_value=0):
+    """prepped: [{qty_milli, price, ldt, ldv, bps, incl}] → يضيف الحقول المحسوبة لكل بند ويرجع إجماليات المستند.
+    ترتيب العمليات: مبلغ البند ← خصم البند ← توزيع خصم الفاتورة نسبيا ← الضريبة (شاملة/غير شاملة) على البند."""
+    for l in prepped:
+        amt = l["fixed_amount"] if l.get("fixed_amount") is not None else _r(Decimal(l["qty_milli"]) * l["price"] / 1000)
+        ld = _r(Decimal(amt) * l["ldv"] / 10000) if l["ldt"] == "percent" else (l["ldv"] if l["ldt"] == "amount" else 0)
+        if ld > amt:
+            raise AccountingError("خصم البند يتجاوز مبلغه")
+        l["amount"], l["ld"], l["base"] = amt, ld, amt - ld
+    tot = sum(l["base"] for l in prepped)
+    idisc = _r(Decimal(tot) * inv_disc_value / 10000) if inv_disc_type == "percent" else (inv_disc_value if inv_disc_type == "amount" else 0)
+    if idisc > tot:
+        raise AccountingError("خصم الفاتورة يتجاوز إجمالي البنود")
+    shares = [(idisc * l["base"] // tot) if tot else 0 for l in prepped]
+    rem = idisc - sum(shares)
+    for i in sorted(range(len(prepped)), key=lambda k: (-prepped[k]["base"], k)):
+        if rem <= 0:
+            break
+        shares[i] += 1; rem -= 1
+    T = {"gross_ex": 0, "discount_ex": 0, "net_ex": 0, "tax": 0, "total": 0}
+    for l, sh in zip(prepped, shares):
+        after = l["base"] - sh
+        bps = l["bps"]
+        if l["incl"] and bps:
+            total = after; tax = _r(Decimal(after) * bps / (10000 + bps)); net = total - tax
+            disc_ex = _r(Decimal(l["ld"] + sh) * 10000 / (10000 + bps)); gross = net + disc_ex
+        else:
+            net = after; tax = _r(Decimal(after) * bps / 10000); total = net + tax; disc_ex = l["ld"] + sh; gross = l["amount"]
+        l.update({"share": sh, "gross_ex": gross, "discount_ex": disc_ex, "net_ex": net, "tax": tax, "total": total})
+        for k, v in (("gross_ex", gross), ("discount_ex", disc_ex), ("net_ex", net), ("tax", tax), ("total", total)):
+            T[k] += v
+    return T
+
+
+def _pay_accounts_ok(conn, company_id, account_id):
+    a = conn.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+    if not a or a["company_id"] != company_id or a["is_group"] or not a["is_active"] or a["account_type"] != "asset":
+        return False
+    if conn.execute("SELECT 1 FROM cash_accounts WHERE account_id=? AND is_active=1", (account_id,)).fetchone():
+        return True                                                    # صندوق/بنك مسجَّل
+    for key in ("cash", "bank"):
+        m = _mapping(conn, company_id, key)
+        if m and account_id in be.subtree_ids(conn, m, include_merged=False):
+            return True
+    return False
+
+
+def _prep_payments(conn, company_id, payments):
+    out = []
+    for p in payments or []:
+        amt = je._minor(p["amount"])
+        if amt <= 0:
+            raise AccountingError("مبلغ الدفعة يجب أن يكون أكبر من صفر")
+        if not _pay_accounts_ok(conn, company_id, p["account_id"]):
+            raise AccountingError("حساب الدفع/الاسترداد يجب أن يكون صندوقا أو بنكا نشطا")
+        out.append({"account_id": p["account_id"], "amount": amt, "note": p.get("note", "")})
+    return out
+
+
+def _prep_lines(conn, company_id, lines):
+    if not lines:
+        raise AccountingError("المستند يجب أن يحتوي بندا واحدا على الأقل")
+    out = []
+    for i, ln in enumerate(lines, 1):
+        it = inv._item(conn, ln["item_id"], company_id)
+        if not it["is_active"]:
+            raise AccountingError(f"الصنف {it['code']} غير نشط")
+        unit_id = ln.get("unit_id") or it["base_unit_id"]
+        f = conn.execute("SELECT factor_milli FROM item_units WHERE item_id=? AND unit_id=?", (it["id"], unit_id)).fetchone()
+        if not f:
+            raise AccountingError("الوحدة غير معرّفة لهذا الصنف")
+        try:
+            q = _r(Decimal(str(ln["qty"])) * 1000)
+        except Exception:
+            raise AccountingError("كمية غير صالحة")
+        if q <= 0:
+            raise AccountingError("الكمية يجب أن تكون أكبر من صفر")
+        price = je._minor(ln["unit_price"])
+        if price < 0:
+            raise AccountingError("السعر لا يقبل قيمة سالبة")
+        dp, da = ln.get("discount_percent"), ln.get("discount_amount")
+        if dp is not None and da is not None:
+            raise AccountingError("خصم البند نسبة أو مبلغ وليس الاثنين")
+        ldt, ldv = "none", 0
+        if dp is not None:
+            ldv = _r(Decimal(str(dp)) * 100); ldt = "percent"
+            if not 0 <= ldv <= 10000:
+                raise AccountingError("نسبة الخصم بين 0 و100")
+        elif da is not None:
+            ldv = je._minor(da); ldt = "amount"
+            if ldv < 0:
+                raise AccountingError("الخصم لا يقبل قيمة سالبة")
+        tid, bps = ln.get("tax_rate_id"), 0
+        if tid is not None:
+            t = conn.execute("SELECT * FROM tax_rates WHERE id=?", (tid,)).fetchone()
+            if not t or t["company_id"] != company_id or not t["is_active"] or t["kind"] != "output":
+                raise AccountingError("نسبة الضريبة غير صالحة")
+            bps = t["rate_bps"]
+        rev = inv.item_accounts(conn, it["id"])["revenue"]
+        if not rev:
+            raise AccountingError("حساب الإيراد غير مربوط للصنف (Account Mapping)")
+        out.append({"idx": i, "item": it, "unit_id": unit_id, "factor": f[0], "qty_milli": q, "price": price, "ldt": ldt, "ldv": ldv,
+                    "fixed_amount": _fixed_line_amount(ln, q, price),
+                    "tid": tid, "bps": bps, "incl": bool(ln.get("tax_inclusive")), "desc": ln.get("description", ""), "rev": rev})
+    return out
+
+
+def _disc(discount_percent, discount_amount):
+    if discount_percent is not None and discount_amount is not None:
+        raise AccountingError("خصم الفاتورة نسبة أو مبلغ وليس الاثنين")
+    if discount_percent is not None:
+        v = _r(Decimal(str(discount_percent)) * 100)
+        if not 0 <= v <= 10000:
+            raise AccountingError("نسبة الخصم بين 0 و100")
+        return "percent", v
+    if discount_amount is not None:
+        v = je._minor(discount_amount)
+        if v < 0:
+            raise AccountingError("الخصم لا يقبل قيمة سالبة")
+        return "amount", v
+    return "none", 0
+
+
+# ---------------- مسودة الفاتورة ----------------
+def _write(conn, actor_id, company_id, invoice_id, invoice_date, lines, customer_id, warehouse_id, currency, dp, da, payments, notes, branch_id):
+    try:
+        _date.fromisoformat(invoice_date)
+    except Exception:
+        raise AccountingError("تاريخ غير صالح")
+    base = fxr.base_currency(conn, company_id)
+    currency = currency or base
+    if currency != base and not fxr.currency_enabled(conn, company_id, currency):
+        raise AccountingError(f"العملة {currency} غير مفعّلة")
+    branch_id = branch_scope.resolve(conn, company_id, branch_id)
+    branch_scope.check_party(conn, company_id, branch_id, customer_id)
+    branch_scope.check_warehouse(conn, company_id, branch_id, warehouse_id)
+    cust = None
+    if customer_id is not None:
+        cust = conn.execute("SELECT * FROM parties WHERE id=? AND company_id=? AND kind='customer'", (customer_id, company_id)).fetchone()
+        if not cust:
+            raise AccountingError("العميل غير موجود في هذه الشركة")
+    prepped = _prep_lines(conn, company_id, lines)
+    branch_scope.check_items(conn, company_id, branch_id, [l["item"]["id"] for l in prepped])
+    if any(l["item"]["item_type"] == "stock" for l in prepped):
+        if warehouse_id is None:
+            raise AccountingError("المستودع مطلوب لبنود مخزنية")
+        inv._wh(conn, warehouse_id, company_id)
+    dt, dv = _disc(dp, da)
+    T = compute_lines(prepped, dt, dv)
+    pays = _prep_payments(conn, company_id, payments)
+    paid = sum(p["amount"] for p in pays)
+    if paid > T["total"]:
+        raise AccountingError("مجموع الدفعات يتجاوز إجمالي المستند")
+    due = T["total"] - paid
+    if due > 0 and cust is None:
+        raise AccountingError("البيع الآجل (المتبقي غير مدفوع) يتطلب عميلا")
+    due_date = (_date.fromisoformat(invoice_date) + timedelta(days=cust["payment_terms_days"])).isoformat() if due > 0 and cust else None
+    with transaction(conn):
+        if invoice_id is None:
+            invoice_id = conn.execute(
+                "INSERT INTO sales_invoices(company_id,branch_id,warehouse_id,invoice_date,due_date,customer_id,currency,discount_type,discount_value,"
+                "gross_ex_total,discount_ex_total,net_ex_total,tax_total,grand_total,paid_total,due_total,notes,created_by) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (company_id, branch_id, warehouse_id, invoice_date, due_date, customer_id, currency, dt, dv, T["gross_ex"], T["discount_ex"],
+                 T["net_ex"], T["tax"], T["total"], paid, due, notes or "", actor_id)).lastrowid
+            audit.log(conn, actor_id, "create_invoice", "sales_invoices", invoice_id, after={"total": T["total"]})
+        else:
+            conn.execute("DELETE FROM sales_invoice_lines WHERE invoice_id=?", (invoice_id,))
+            conn.execute("DELETE FROM invoice_payments WHERE invoice_id=?", (invoice_id,))
+            conn.execute("UPDATE sales_invoices SET branch_id=?,warehouse_id=?,invoice_date=?,due_date=?,customer_id=?,currency=?,discount_type=?,"
+                         "discount_value=?,gross_ex_total=?,discount_ex_total=?,net_ex_total=?,tax_total=?,grand_total=?,paid_total=?,due_total=?,notes=? "
+                         "WHERE id=?", (branch_id, warehouse_id, invoice_date, due_date, customer_id, currency, dt, dv, T["gross_ex"], T["discount_ex"],
+                                        T["net_ex"], T["tax"], T["total"], paid, due, notes or "", invoice_id))
+            audit.log(conn, actor_id, "update_invoice", "sales_invoices", invoice_id, after={"total": T["total"]})
+        for l in prepped:
+            conn.execute(
+                "INSERT INTO sales_invoice_lines(invoice_id,line_no,item_id,description,qty_milli,unit_id,factor_milli,unit_price_minor,line_discount_type,"
+                "line_discount_value,tax_rate_id,tax_bps,tax_inclusive,amount_minor,line_discount_minor,invoice_discount_share,gross_ex,discount_ex,"
+                "net_ex,tax_minor,total_minor,revenue_account_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (invoice_id, l["idx"], l["item"]["id"], l["desc"], l["qty_milli"], l["unit_id"], l["factor"], l["price"], l["ldt"], l["ldv"], l["tid"],
+                 l["bps"], int(l["incl"]), l["amount"], l["ld"], l["share"], l["gross_ex"], l["discount_ex"], l["net_ex"], l["tax"], l["total"], l["rev"]))
+        for p in pays:
+            conn.execute("INSERT INTO invoice_payments(invoice_id,account_id,amount_minor,note) VALUES(?,?,?,?)", (invoice_id, p["account_id"], p["amount"], p["note"]))
+    return invoice_id
+
+
+def create_invoice(conn, actor_id, company_id, invoice_date, lines, *, customer_id=None, warehouse_id=None, currency=None,
+                   discount_percent=None, discount_amount=None, payments=None, notes="", branch_id=None):
+    branch_id = branch_scope.resolve_for_user(conn, company_id, actor_id, branch_id)
+    permissions.require(conn, actor_id, company_id, "sales.create", branch_id)
+    return _write(conn, actor_id, company_id, None, invoice_date, lines, customer_id, warehouse_id, currency, discount_percent,
+                  discount_amount, payments, notes, branch_id)
+
+
+def _load(conn, invoice_id):
+    i = conn.execute("SELECT * FROM sales_invoices WHERE id=?", (invoice_id,)).fetchone()
+    if not i:
+        raise AccountingError("المستند غير موجود")
+    return i
+
+
+def update_invoice(conn, actor_id, invoice_id, invoice_date, lines, *, customer_id=None, warehouse_id=None, currency=None,
+                   discount_percent=None, discount_amount=None, payments=None, notes="", branch_id=None):
+    i = _load(conn, invoice_id)
+    permissions.require(conn, actor_id, i["company_id"], "sales.create", i["branch_id"])
+    if i["status"] != "draft" or i["doc_type"] != "invoice":
+        raise AccountingError("يُعدَّل مسودة فاتورة فقط")
+    if i["created_by"] != actor_id and not permissions.has(conn, actor_id, i["company_id"], "sales.cancel"):
+        raise permissions.PermissionDenied("لا يمكنك تعديل مسودة مستخدم آخر")
+    return _write(conn, actor_id, i["company_id"], invoice_id, invoice_date, lines, customer_id, warehouse_id, currency, discount_percent,
+                  discount_amount, payments, notes, branch_id)
+
+
+def delete_draft(conn, actor_id, invoice_id):
+    i = _load(conn, invoice_id)
+    permissions.require(conn, actor_id, i["company_id"], "sales.create", i["branch_id"])
+    if i["status"] != "draft":
+        raise AccountingError("لا يُحذف إلا المسودة")
+    with transaction(conn):
+        conn.execute("DELETE FROM sales_invoice_lines WHERE invoice_id=?", (invoice_id,))
+        conn.execute("DELETE FROM invoice_payments WHERE invoice_id=?", (invoice_id,))
+        conn.execute("DELETE FROM sales_invoices WHERE id=?", (invoice_id,))
+        audit.log(conn, actor_id, "delete_invoice_draft", "sales_invoices", invoice_id, before={"total": i["grand_total"]})
+
+
+# ---------------- المرتجع ----------------
+def _returned_sums(conn, orig_line_id):
+    r = conn.execute("SELECT COALESCE(SUM(l.qty_milli),0),COALESCE(SUM(l.gross_ex),0),COALESCE(SUM(l.discount_ex),0),COALESCE(SUM(l.tax_minor),0),"
+                     "COALESCE(SUM(l.amount_minor),0),COALESCE(SUM(l.line_discount_minor),0),COALESCE(SUM(l.invoice_discount_share),0) "
+                     "FROM sales_invoice_lines l JOIN sales_invoices h ON h.id=l.invoice_id WHERE l.orig_line_id=? AND h.status='posted' AND h.doc_type='return'",
+                     (orig_line_id,)).fetchone()
+    return tuple(r)
+
+
+def create_return(conn, actor_id, original_invoice_id, return_date, lines, *, payments=None, notes="", dry_run=False):
+    """مرتجع مرتبط بالفاتورة الأصلية: lines=[{orig_line_id, qty}]. المبالغ والضريبة والخصم نسبية من الأصل والباقي بلا بقايا تقريب.
+    dry_run=True: يتحقق ويعيد إجمالي المرتجع (وحدة صغرى) دون كتابة شيء (لمعاينة النافذة)."""
+    o = _load(conn, original_invoice_id)
+    permissions.require(conn, actor_id, o["company_id"], "sales.create", o["branch_id"])
+    if o["doc_type"] != "invoice" or o["status"] != "posted":
+        raise AccountingError("المرتجع يرتبط بفاتورة مرحّلة وغير ملغاة")
+    try:
+        _date.fromisoformat(return_date)
+    except Exception:
+        raise AccountingError("تاريخ غير صالح")
+    if return_date < o["invoice_date"]:
+        raise AccountingError("تاريخ المرتجع أقدم من تاريخ الفاتورة")
+    if not lines:
+        raise AccountingError("المرتجع يحتاج بندا واحدا على الأقل")
+    rows, T = [], {"gross": 0, "disc": 0, "tax": 0}
+    seen = set()
+    for i, ln in enumerate(lines, 1):
+        ol = conn.execute("SELECT * FROM sales_invoice_lines WHERE id=? AND invoice_id=?", (ln["orig_line_id"], original_invoice_id)).fetchone()
+        if not ol or ol["id"] in seen:
+            raise AccountingError("بند أصلي غير صالح")
+        seen.add(ol["id"])
+        q = _r(Decimal(str(ln["qty"])) * 1000)
+        if q <= 0:
+            raise AccountingError("الكمية يجب أن تكون أكبر من صفر")
+        rq, rg, rd, rt, ra, rld, rsh = _returned_sums(conn, ol["id"])
+        if rq + q > ol["qty_milli"]:
+            raise AccountingError("كمية المرتجع تتجاوز المتبقي من البند الأصلي")
+        last = rq + q == ol["qty_milli"]
+
+        def part(orig, done):
+            return orig - done if last else _r(Decimal(orig) * q / ol["qty_milli"])
+        g, d, t = part(ol["gross_ex"], rg), part(ol["discount_ex"], rd), part(ol["tax_minor"], rt)
+        amt, ld, sh = part(ol["amount_minor"], ra), part(ol["line_discount_minor"], rld), part(ol["invoice_discount_share"], rsh)
+        rows.append((i, ol, q, g, d, g - d, t, g - d + t, amt, ld, sh))
+        T["gross"] += g; T["disc"] += d; T["tax"] += t
+    total = T["gross"] - T["disc"] + T["tax"]
+    if dry_run:
+        return total
+    pays = _prep_payments(conn, o["company_id"], payments)
+    paid = sum(p["amount"] for p in pays)
+    if paid > total:
+        raise AccountingError("مجموع المبالغ المستردة يتجاوز إجمالي المرتجع")
+    if o["customer_id"] is None and paid != total:
+        raise AccountingError("مرتجع فاتورة نقدية بلا عميل يجب أن يُسترد كاملا (حدد حساب الصندوق/البنك)")
+    with transaction(conn):
+        rid = conn.execute(
+            "INSERT INTO sales_invoices(company_id,branch_id,warehouse_id,doc_type,invoice_date,customer_id,currency,exchange_rate,gross_ex_total,"
+            "discount_ex_total,net_ex_total,tax_total,grand_total,paid_total,due_total,original_invoice_id,notes,created_by) "
+            "VALUES(?,?,?,'return',?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (o["company_id"], o["branch_id"], o["warehouse_id"], return_date, o["customer_id"], o["currency"], o["exchange_rate"], T["gross"], T["disc"],
+             T["gross"] - T["disc"], T["tax"], total, paid, total - paid, original_invoice_id, notes or "", actor_id)).lastrowid
+        for (i, ol, q, g, d, n, t, tot, amt, ld, sh) in rows:
+            conn.execute(
+                "INSERT INTO sales_invoice_lines(invoice_id,line_no,item_id,description,qty_milli,unit_id,factor_milli,unit_price_minor,line_discount_type,"
+                "line_discount_value,tax_rate_id,tax_bps,tax_inclusive,amount_minor,line_discount_minor,invoice_discount_share,gross_ex,discount_ex,net_ex,"
+                "tax_minor,total_minor,revenue_account_id,orig_line_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (rid, i, ol["item_id"], ol["description"], q, ol["unit_id"], ol["factor_milli"], ol["unit_price_minor"], ol["line_discount_type"],
+                 ol["line_discount_value"], ol["tax_rate_id"], ol["tax_bps"], ol["tax_inclusive"], amt, ld, sh, g, d, n, t, tot, ol["revenue_account_id"], ol["id"]))
+        for p in pays:
+            conn.execute("INSERT INTO invoice_payments(invoice_id,account_id,amount_minor,note) VALUES(?,?,?,?)", (rid, p["account_id"], p["amount"], p["note"]))
+        audit.log(conn, actor_id, "create_return", "sales_invoices", rid, after={"original": original_invoice_id, "total": total})
+    return rid
+
+
+# ---------------- الترحيل ----------------
+def _next_number(conn, company_id, doc_type, fiscal_year_id):
+    conn.execute("INSERT OR IGNORE INTO doc_sequences(company_id,doc_type,fiscal_year_id,last_no) VALUES(?,?,?,0)", (company_id, doc_type, fiscal_year_id))
+    conn.execute("UPDATE doc_sequences SET last_no=last_no+1 WHERE company_id=? AND doc_type=? AND fiscal_year_id=?", (company_id, doc_type, fiscal_year_id))
+    n = conn.execute("SELECT last_no FROM doc_sequences WHERE company_id=? AND doc_type=? AND fiscal_year_id=?", (company_id, doc_type, fiscal_year_id)).fetchone()[0]
+    y = conn.execute("SELECT name FROM fiscal_years WHERE id=?", (fiscal_year_id,)).fetchone()[0]
+    return f"{PREFIX[doc_type]}-{y}-{n:06d}"
+
+
+def _je_line(account, cur, rate, debit=0, credit=0, cost_center_id=None):
+    ln = {"account_id": account, "debit": _u(debit) if debit else 0, "credit": _u(credit) if credit else 0, "currency": cur}
+    if rate is not None:
+        ln["rate"] = rate
+    if cost_center_id is not None:
+        ln["cost_center_id"] = cost_center_id
+    return ln
+
+
+def _agg(d, k, v):
+    d[k] = d.get(k, 0) + v
+
+
+def post_invoice(conn, actor_id, invoice_id, *, _keep_no=None, _mv_date=None):
+    """يرحّل فاتورة أو مرتجعا: كل الآثار في معاملة واحدة، وأي فشل = Rollback كامل (لا رقم مستهلك، لا حركة، لا قيد)."""
+    h = _load(conn, invoice_id)
+    cid = h["company_id"]
+    permissions.require(conn, actor_id, cid, "sales.post", h["branch_id"])
+    permissions.require(conn, actor_id, cid, "journal.create", h["branch_id"])
+    permissions.require(conn, actor_id, cid, "journal.post", h["branch_id"])
+    if h["status"] != "draft":
+        raise AccountingError("المستند ليس مسودة")
+    is_ret = h["doc_type"] == "return"
+    base = fxr.base_currency(conn, cid)
+    lines = conn.execute("SELECT * FROM sales_invoice_lines WHERE invoice_id=? ORDER BY line_no", (invoice_id,)).fetchall()
+    pays = conn.execute("SELECT * FROM invoice_payments WHERE invoice_id=?", (invoice_id,)).fetchall()
+    if not lines:
+        raise AccountingError("المستند بلا بنود")
+    per = period_engine.find_period(conn, cid, h["invoice_date"])
+    je._assert_open(per)
+    if is_ret:
+        rate = Decimal(h["exchange_rate"])
+    else:
+        rate = fxr.get_rate(conn, cid, h["currency"], h["invoice_date"])
+    cur, jrate = h["currency"], (None if h["currency"] == base else rate)
+    cust = None
+    if h["customer_id"] is not None:
+        cust = conn.execute("SELECT * FROM parties WHERE id=?", (h["customer_id"],)).fetchone()
+        if not cust["is_active"]:
+            raise AccountingError("العميل غير نشط")
+    for p in pays:
+        if not _pay_accounts_ok(conn, cid, p["account_id"]):
+            raise AccountingError("حساب دفع/استرداد غير صالح")
+    disc_acc, ret_acc = _mapping(conn, cid, "sales_discount"), _mapping(conn, cid, "sales_returns")
+    if h["discount_ex_total"] and not disc_acc:
+        raise AccountingError("اربط حساب خصم المبيعات (Account Mapping: sales_discount)")
+    if is_ret and not ret_acc:
+        raise AccountingError("اربط حساب مردودات المبيعات (Account Mapping: sales_returns)")
+    stock_lines = [l for l in lines if inv._item(conn, l["item_id"])["item_type"] == "stock"]
+    if stock_lines:
+        permissions.require(conn, actor_id, cid, "inventory.move", check_branch=False)
+    from alhisabat.business import cost_centers as cc
+    default_cc = cc.for_branch(conn, cid, h["branch_id"])
+    mode = get_settings(conn, cid)["credit_limit_mode"]
+    with transaction(conn):
+        # ---- الأصول التشغيلية: الائتمان (للبيع فقط) والمخزون
+        if not is_ret and h["due_total"] > 0 and mode != "off" and cust["credit_limit"] > 0:
+            bal = pt.balances(conn, cid, [cust], pt.latest_day(conn, cid))[cust["id"]]
+            due_base = _r(Decimal(h["due_total"]) * rate)
+            if bal + due_base > cust["credit_limit"]:
+                if mode == "block":
+                    raise AccountingError(f"تجاوز الحد الائتماني للعميل: الرصيد {bal} + المستحق {due_base} > الحد {cust['credit_limit']} (بالوحدة الصغرى)")
+                audit.log(conn, actor_id, "credit_limit_exceeded", "sales_invoices", invoice_id, after={"balance": bal, "due": due_base, "limit": cust["credit_limit"]})
+        mids = []
+        for l in stock_lines:
+            if is_ret:
+                ol = conn.execute("SELECT * FROM sales_invoice_lines WHERE id=?", (l["orig_line_id"],)).fetchone()
+                om = conn.execute("SELECT * FROM stock_movements WHERE id=?", (ol["movement_id"],)).fetchone()
+                _rq, *_ = _returned_sums(conn, ol["id"])
+                if _rq + l["qty_milli"] > ol["qty_milli"]:
+                    raise AccountingError("كمية المرتجع تتجاوز المتبقي (مرتجعات أخرى رُحّلت)")
+                mv = inv.record_movement(conn, actor_id, cid, l["item_id"], om["warehouse_id"], h["invoice_date"], "sale_return",
+                                         Decimal(l["qty_milli"]) / 1000, unit_id=l["unit_id"], ref_movement_id=om["id"],
+                                         source_type="sales_invoice", source_id=invoice_id)
+            else:
+                mv = inv.record_movement(conn, actor_id, cid, l["item_id"], h["warehouse_id"], _mv_date or h["invoice_date"], "sale",
+                                         Decimal(l["qty_milli"]) / 1000, unit_id=l["unit_id"], source_type="sales_invoice", source_id=invoice_id)
+            conn.execute("UPDATE sales_invoice_lines SET cost_base_minor=?,movement_id=? WHERE id=?", (mv["value_base"], mv["movement_id"], l["id"]))
+            mids.append(mv["movement_id"])
+        # ---- قيد المستند (بعملة المستند) + قيد التكلفة (أساسي)
+        rev, tax = {}, {}
+        for l in lines:
+            if is_ret:
+                pass
+            else:
+                _agg(rev, l["revenue_account_id"], l["gross_ex"])
+            # ملاحظة: التجميع أعلاه بالحساب فقط؛ مركز التكلفة يُطبَّق أدناه لكل حساب فرعا من الفرع (الحد: مركز واحد لكل حساب إيراد)
+            if l["tax_minor"]:
+                t = conn.execute("SELECT account_id FROM tax_rates WHERE id=?", (l["tax_rate_id"],)).fetchone()
+                if not t:
+                    raise AccountingError("ضريبة بلا نسبة")
+                _agg(tax, t[0], l["tax_minor"])
+        jl = []
+        if not is_ret:
+            for p in pays:
+                jl.append(_je_line(p["account_id"], cur, jrate, debit=p["amount_minor"]))
+            if h["due_total"] > 0:
+                jl.append(_je_line(cust["account_id"], cur, jrate, debit=h["due_total"]))
+            if h["discount_ex_total"]:
+                jl.append(_je_line(disc_acc, cur, jrate, debit=h["discount_ex_total"]))
+            for a, v in rev.items():
+                jl.append(_je_line(a, cur, jrate, credit=v, cost_center_id=default_cc))
+            for a, v in tax.items():
+                jl.append(_je_line(a, cur, jrate, credit=v))
+            jl += inv.sale_cost_lines(conn, cid, mids) if mids else []
+        else:
+            jl.append(_je_line(ret_acc, cur, jrate, debit=h["gross_ex_total"], cost_center_id=default_cc))
+            if h["discount_ex_total"]:
+                jl.append(_je_line(disc_acc, cur, jrate, credit=h["discount_ex_total"]))
+            for a, v in tax.items():
+                jl.append(_je_line(a, cur, jrate, debit=v))
+            for p in pays:
+                jl.append(_je_line(p["account_id"], cur, jrate, credit=p["amount_minor"]))
+            if h["due_total"] > 0:
+                jl.append(_je_line(cust["account_id"], cur, jrate, credit=h["due_total"]))
+            jl += inv.sale_return_cost_lines(conn, cid, mids) if mids else []
+        eid = je.create_draft(conn, cid, actor_id, h["invoice_date"], jl,
+                              ("مرتجع مبيعات" if is_ret else "فاتورة مبيعات") + f" رقم {invoice_id}", branch_id=h["branch_id"], entry_type="auto",
+                              source_type="sales_invoice", source_id=invoice_id, trusted_rates=True)
+        je.post(conn, eid, actor_id)
+        if mids:
+            inv.link_movements(conn, actor_id, cid, eid, mids)
+        no = _keep_no or _next_number(conn, cid, h["doc_type"], per["yid"])
+        conn.execute("UPDATE sales_invoices SET status='posted',invoice_no=?,journal_entry_id=?,exchange_rate=?,posted_by=?,posted_at=CURRENT_TIMESTAMP WHERE id=?",
+                     (no, eid, str(rate), actor_id, invoice_id))
+        audit.log(conn, actor_id, "post_invoice", "sales_invoices", invoice_id, after={"no": no, "entry": eid, "total": h["grand_total"]})
+    return {"invoice_id": invoice_id, "invoice_no": no, "entry_id": eid, "movements": mids}
+
+
+# ---------------- تعديل فاتورة مرحّلة ----------------
+def edit_posted_invoice(conn, actor_id, invoice_id, invoice_date, lines, *, reason, customer_id=None, warehouse_id=None, currency=None,
+                        discount_percent=None, discount_amount=None, payments=None, notes="", branch_id=None):
+    """تعديل أصناف/كميات/أسعار/دفعات فاتورة مبيعات مرحّلة (خيار يفعّله مدير النظام من الإعدادات).
+    في معاملة واحدة: عكس الحركات المخزنية القديمة + عكس القيد القديم بقيد عكسي، ثم إعادة الترحيل بالقيم الجديدة بنفس رقم الفاتورة.
+    تبقى الآثار القديمة ظاهرة في الأستاذ (قيد عكسي) ويُسجَّل التعديل في sales_invoice_edits والتدقيق. أي فشل = Rollback كامل."""
+    h = _load(conn, invoice_id)
+    cid = h["company_id"]
+    if not get_settings(conn, cid)["allow_edit_posted_invoice"]:
+        raise AccountingError("تعديل الفاتورة المرحّلة غير مفعّل: يفعّله مدير النظام من الإعدادات")
+    permissions.require(conn, actor_id, cid, "sales.edit_posted", h["branch_id"])
+    for code in ("sales.create", "sales.post", "journal.reverse"):
+        permissions.require(conn, actor_id, cid, code, h["branch_id"])
+    if not reason or not reason.strip():
+        raise AccountingError("تعديل فاتورة مرحّلة يتطلب ذكر السبب")
+    if h["status"] != "posted" or h["doc_type"] != "invoice":
+        raise AccountingError("تُعدَّل الفاتورة المرحّلة فقط (لا المرتجعات ولا الملغاة)")
+    if conn.execute("SELECT 1 FROM sales_invoices WHERE original_invoice_id=? AND status='posted'", (invoice_id,)).fetchone():
+        raise AccountingError("توجد مرتجعات فعّالة على هذه الفاتورة: ألغِها أولا ثم عدّل الفاتورة")
+    if conn.execute("SELECT 1 FROM voucher_allocations va JOIN cash_vouchers cv ON cv.id=va.voucher_id WHERE va.doc_type='sales_invoice' "
+                    "AND va.doc_id=? AND cv.status='posted'", (invoice_id,)).fetchone():
+        raise AccountingError("الفاتورة مسدَّدة (كليا أو جزئيا) بسندات قبض مرحّلة: ألغِ السندات أولا ثم عدّل الفاتورة")
+    old_lines = conn.execute("SELECT * FROM sales_invoice_lines WHERE invoice_id=? ORDER BY line_no", (invoice_id,)).fetchall()
+    # تاريخ الحركات المخزنية: لا يسبق آخر حركة للصنف (المحرك لا يعيد احتساب التاريخ)؛ قيد الفاتورة يبقى بتاريخها
+    mv_date = h["invoice_date"]
+    for l in old_lines:
+        if l["movement_id"]:
+            m = conn.execute("SELECT item_id,warehouse_id FROM stock_movements WHERE id=?", (l["movement_id"],)).fetchone()
+            last = conn.execute("SELECT MAX(movement_date) FROM stock_movements WHERE item_id=? AND warehouse_id=?", (m[0], m[1])).fetchone()[0]
+            mv_date = max(mv_date, last or mv_date)
+    for l in (lines or []):                     # أصناف جديدة قد تكون لها حركات لاحقة أيضا
+        wid = warehouse_id if warehouse_id is not None else h["warehouse_id"]
+        last = conn.execute("SELECT MAX(movement_date) FROM stock_movements WHERE item_id=? AND warehouse_id=?", (l.get("item_id"), wid)).fetchone()[0]
+        mv_date = max(mv_date, last or mv_date)
+    new_date = invoice_date or h["invoice_date"]
+    with transaction(conn):
+        old_entry = h["journal_entry_id"]
+        for l in old_lines:
+            if l["movement_id"]:
+                permissions.require(conn, actor_id, cid, "inventory.adjust", check_branch=False)
+                inv.void_movement(conn, actor_id, l["movement_id"], "تعديل فاتورة مرحّلة: " + reason, movement_date=mv_date, reverse_entry=False)
+        rid = je.reverse(conn, old_entry, actor_id, max(h["invoice_date"], new_date), "تعديل فاتورة مرحّلة: " + reason)
+        conn.execute("UPDATE doc_edit_guard SET active=1")
+        try:
+            conn.execute("UPDATE sales_invoices SET status='draft',journal_entry_id=NULL WHERE id=?", (invoice_id,))
+            _write(conn, actor_id, cid, invoice_id, new_date, lines, customer_id if customer_id is not None else h["customer_id"],
+                   warehouse_id if warehouse_id is not None else h["warehouse_id"], currency or h["currency"], discount_percent, discount_amount,
+                   payments, notes if notes != "" else h["notes"], branch_id if branch_id is not None else h["branch_id"])
+            res = post_invoice(conn, actor_id, invoice_id, _keep_no=h["invoice_no"], _mv_date=mv_date)
+        finally:
+            conn.execute("UPDATE doc_edit_guard SET active=0")
+        new_total = conn.execute("SELECT grand_total FROM sales_invoices WHERE id=?", (invoice_id,)).fetchone()[0]
+        conn.execute("INSERT INTO sales_invoice_edits(invoice_id,old_entry_id,reversal_entry_id,new_entry_id,old_total,new_total,reason,edited_by) VALUES(?,?,?,?,?,?,?,?)",
+                     (invoice_id, old_entry, rid, res["entry_id"], h["grand_total"], new_total, reason, actor_id))
+        audit.log(conn, actor_id, "edit_posted_invoice", "sales_invoices", invoice_id, {"total": h["grand_total"], "entry": old_entry},
+                  {"total": new_total, "entry": res["entry_id"], "reversal": rid}, reason)
+    return {"invoice_id": invoice_id, "invoice_no": h["invoice_no"], "old_entry_id": old_entry, "reversal_entry_id": rid,
+            "entry_id": res["entry_id"], "movements": res["movements"]}
+
+
+# ---------------- الإلغاء ----------------
+def cancel_invoice(conn, actor_id, invoice_id, cancel_date, reason):
+    h = _load(conn, invoice_id)
+    cid = h["company_id"]
+    permissions.require(conn, actor_id, cid, "sales.cancel", h["branch_id"])
+    permissions.require(conn, actor_id, cid, "journal.reverse", h["branch_id"])
+    if not reason or not reason.strip():
+        raise AccountingError("الإلغاء يتطلب ذكر السبب")
+    if h["status"] != "posted":
+        raise AccountingError("يُلغى المستند المرحّل فقط")
+    if h["doc_type"] == "invoice" and conn.execute(
+            "SELECT 1 FROM sales_invoices WHERE original_invoice_id=? AND status='posted'", (invoice_id,)).fetchone():
+        raise AccountingError("توجد مرتجعات فعّالة على هذه الفاتورة: ألغِها أولا")
+    if cancel_date < h["invoice_date"]:
+        raise AccountingError("تاريخ الإلغاء أقدم من تاريخ المستند")
+    if conn.execute("SELECT 1 FROM sales_invoice_lines WHERE invoice_id=? AND movement_id IS NOT NULL", (invoice_id,)).fetchone():
+        permissions.require(conn, actor_id, cid, "inventory.adjust", check_branch=False)      # عكس الحركات المخزنية
+    with transaction(conn):
+        for l in conn.execute("SELECT * FROM sales_invoice_lines WHERE invoice_id=? AND movement_id IS NOT NULL", (invoice_id,)).fetchall():
+            inv.void_movement(conn, actor_id, l["movement_id"], reason, movement_date=cancel_date, reverse_entry=False)
+        rid = je.reverse(conn, h["journal_entry_id"], actor_id, cancel_date, reason)
+        conn.execute("UPDATE sales_invoices SET status='cancelled',cancelled_by=?,cancelled_at=CURRENT_TIMESTAMP,cancel_reason=?,cancel_entry_id=? WHERE id=?",
+                     (actor_id, reason, rid, invoice_id))
+        audit.log(conn, actor_id, "cancel_invoice", "sales_invoices", invoice_id, {"status": "posted"}, {"status": "cancelled", "reversal": rid}, reason)
+    return {"invoice_id": invoice_id, "reversal_entry_id": rid}
+
+
+# ---------------- الاستعلام والتقارير ----------------
+def get_invoice(conn, user_id, invoice_id):
+    h = _load(conn, invoice_id)
+    permissions.require(conn, user_id, h["company_id"], "sales.view", h["branch_id"])
+    lines = [dict(r) for r in conn.execute("SELECT l.*,i.code item_code,i.name item_name FROM sales_invoice_lines l JOIN items i ON i.id=l.item_id "
+                                           "WHERE l.invoice_id=? ORDER BY l.line_no", (invoice_id,))]
+    pays = [dict(r) for r in conn.execute("SELECT * FROM invoice_payments WHERE invoice_id=?", (invoice_id,))]
+    if h["doc_type"] == "invoice":
+        for ln in lines:                       # الكمية المرتجعة سابقًا لكل بند (لنافذة المرتجع)
+            ln["returned_milli"] = _returned_sums(conn, ln["id"])[0]
+    return {**dict(h), "lines": lines, "payments": pays}
+
+
+def list_invoices(conn, user_id, company_id, *, doc_type=None, status=None, customer_id=None, date_from=None, date_to=None, limit=50, offset=0, branch_id=None):
+    permissions.require(conn, user_id, company_id, "sales.view", check_branch=False)
+    q, a = "SELECT * FROM sales_invoices WHERE company_id=?", [company_id]
+    for col, v, op in (("doc_type", doc_type, "="), ("status", status, "="), ("customer_id", customer_id, "="),
+                       ("invoice_date", date_from, ">="), ("invoice_date", date_to, "<=")):
+        if v is not None:
+            q += f" AND {col}{op}?"; a.append(v)
+    restricted = [r[0] for r in conn.execute("SELECT branch_id FROM user_branch_access WHERE user_id=?", (user_id,))]
+    if restricted:
+        q += " AND branch_id IN (%s)" % ",".join("?" * len(restricted)); a += restricted
+    f, fa = branch_scope.txn_clause(conn, company_id, branch_id)
+    q += f; a += fa
+    return [dict(r) for r in conn.execute(q + " ORDER BY invoice_date DESC,id DESC LIMIT ? OFFSET ?", (*a, min(int(limit), 500), int(offset)))]
+
+
+def sales_summary(conn, user_id, company_id, date_from, date_to, group_by="customer"):
+    """المبيعات الصافية (فواتير مرحّلة − مرتجعات مرحّلة، غير الملغاة) مجمّعة حسب العميل/الصنف/اليوم وحسب عملة المستند (لا جمع بين العملات).
+    الربح = الصافي بدون ضريبة − تكلفة البنود المخزنية (بالعملة الأساسية) — يُقارَن بعملة المستند فقط للمستندات بالعملة الأساسية.
+    تقرير تشغيلي؛ التقرير المحاسبي الرسمي من الأستاذ."""
+    permissions.require(conn, user_id, company_id, "sales.view", check_branch=False)
+    permissions.require(conn, user_id, company_id, "report.view", check_branch=False)
+    key = {"customer": "COALESCE(h.customer_id,0)", "item": "l.item_id", "day": "h.invoice_date"}.get(group_by)
+    if not key:
+        raise AccountingError("تجميع غير معروف")
+    sgn = "CASE h.doc_type WHEN 'invoice' THEN 1 ELSE -1 END"
+    rows = conn.execute(
+        f"SELECT {key} k,h.currency cur,SUM({sgn}*l.gross_ex) gross_ex,SUM({sgn}*l.discount_ex) discount_ex,SUM({sgn}*l.net_ex) net_ex,"
+        f"SUM({sgn}*l.tax_minor) tax,SUM({sgn}*l.total_minor) total,SUM({sgn}*l.cost_base_minor) cost "
+        f"FROM sales_invoice_lines l JOIN sales_invoices h ON h.id=l.invoice_id WHERE h.company_id=? AND h.status='posted' "
+        f"AND h.invoice_date BETWEEN ? AND ? GROUP BY k,h.currency ORDER BY k,h.currency", (company_id, date_from, date_to)).fetchall()
+    base = fxr.base_currency(conn, company_id)
+    return [{**dict(r), "profit": (r["net_ex"] - r["cost"]) if r["cur"] == base else None} for r in rows]
+
+
+def preview_totals(conn, company_id, lines, *, discount_percent=None, discount_amount=None):
+    """معاينة إجماليات مستند دون أي كتابة (v1.6): نفس مسار الحفظ تمامًا (_prep_lines ← compute_lines)،
+    فلا يختلف رقم المعاينة عن رقم الحفظ. يرفع AccountingError بنفس رسائل الحفظ. القيم بالوحدة الصغرى."""
+    prepped = _prep_lines(conn, company_id, lines)
+    dt, dv = _disc(discount_percent, discount_amount)
+    T = compute_lines(prepped, dt, dv)
+    T = dict(T)
+    T["lines"] = [{"idx": l["idx"], "amount": l["amount"], "line_discount": l["ld"], "tax": l["tax"], "total": l["total"]} for l in prepped]
+    return T

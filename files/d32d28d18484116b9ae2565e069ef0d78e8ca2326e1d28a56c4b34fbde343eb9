@@ -1,0 +1,135 @@
+"""منتقيات البحث الفوري: حساب/طرف/صنف/مستودع/صندوق. تعتمد على lookup_* في الجلسة (قوائم (id، نص)) ولا SQL هنا. يتطلب PySide6."""
+from PySide6.QtCore import Qt, QStringListModel, Signal
+from PySide6.QtWidgets import QComboBox, QCompleter
+
+from alhisabat.ui.core.logic import matches
+
+
+def cached_loader(loader):
+    """يغلّف دالة تحميل القوائم بذاكرة مؤقتة: تُستدعى الدالة (استعلام قاعدة البيانات) مرة واحدة لا مرة لكل سطر فاتورة.
+    الدالة المرجعة لها `.invalidate()` لإعادة التحميل عند تغيّر البيانات (صنف/حساب جديد)."""
+    box = {}
+
+    def _load():
+        if 'rows' not in box:
+            box['rows'] = list(loader())
+        return box['rows']
+
+    _load.invalidate = lambda: box.clear()
+    return _load
+
+
+def make_searchable(combo):
+    """يحوّل QComboBox عادية إلى قابلة للكتابة مع إكمال بالاحتواء (تجاهل حالة الأحرف). عند انتهاء الكتابة: إن طابق النص عنصرًا
+    اختير، وإلا يُعاد نص الاختيار الحالي (فلا يبقى نص حر لا يطابق القيمة المستخدمة فعلًا). تُرجع نفس القائمة."""
+    combo.setEditable(True)
+    combo.setInsertPolicy(QComboBox.NoInsert)
+    combo.setLayoutDirection(Qt.RightToLeft)
+    comp = combo.completer()
+    comp.setFilterMode(Qt.MatchContains)
+    comp.setCaseSensitivity(Qt.CaseInsensitive)
+
+    def _snap():
+        i = combo.findText(combo.currentText().strip(), Qt.MatchFixedString)
+        if i >= 0:
+            combo.setCurrentIndex(i)
+        else:
+            combo.setEditText(combo.itemText(combo.currentIndex()) if combo.currentIndex() >= 0 else '')
+    combo.lineEdit().editingFinished.connect(_snap)
+    return combo
+
+
+class SearchPicker(QComboBox):
+    """قائمة قابلة للبحث بالكود/الاسم (تجاهل التشكيل والهمزات). selected(id) عند الاختيار. المعرّف None = بلا اختيار."""
+    selected = Signal(object)
+
+    def __init__(self, loader=None, allow_empty=True, placeholder='اختر…', parent=None):
+        super().__init__(parent)
+        self.setEditable(True)
+        self.setInsertPolicy(QComboBox.NoInsert)
+        self.setLayoutDirection(Qt.RightToLeft)
+        self._loader, self._allow_empty, self._rows = loader, allow_empty, []
+        self.lineEdit().setPlaceholderText(placeholder)
+        self.setMaxVisibleItems(14)
+        self._last_emitted = None
+        self.activated.connect(lambda _i: self._emit_selected())
+        self.lineEdit().editingFinished.connect(self._emit_selected)   # كتابة اسم كامل ثم Tab/Enter تُحتسب اختيارًا أيضًا
+        if loader:
+            self.reload()
+
+    def _emit_selected(self):
+        cur = self.current_id()
+        if cur != self._last_emitted:
+            self._last_emitted = cur
+            self.selected.emit(cur)
+
+    def reload(self):
+        keep = self.current_id()
+        try:
+            self._rows = list(self._loader())
+        except Exception:  # noqa: BLE001 — الصلاحية قد تمنع القائمة؛ تظهر فارغة ولا تنهار الواجهة
+            self._rows = []
+        self.set_rows(self._rows)
+        if keep is not None:
+            self.set_id(keep)
+
+    def set_rows(self, rows):
+        self._rows = list(rows)
+        self.blockSignals(True)
+        self.clear()
+        if self._allow_empty:
+            self.addItem('', None)
+        for rid, text in self._rows:
+            self.addItem(text, rid)
+        # نموذج نصوص واحد للمكمِّل: لا نعيد بناء QCompleter مع كل تعبئة (كان يبطئ فتح الفاتورة بعشرات السطور)
+        if getattr(self, '_comp_model', None) is None:
+            self._comp_model = QStringListModel(self)
+            comp = QCompleter(self._comp_model, self)
+            comp.setFilterMode(Qt.MatchContains)
+            comp.setCaseSensitivity(Qt.CaseInsensitive)
+            self.setCompleter(comp)
+        self._comp_model.setStringList([t for _i, t in self._rows])
+        self.setCurrentIndex(0 if self._allow_empty else (0 if self._rows else -1))
+        self.blockSignals(False)
+
+    def current_id(self):
+        t = self.currentText().strip()
+        i = self.currentIndex()
+        if i >= 0 and self.itemText(i) == t:
+            return self.itemData(i)
+        for rid, text in self._rows:         # مكتوب يدويًا ويطابق تمامًا
+            if text == t:
+                return rid
+        hits = [rid for rid, text in self._rows if matches(t, text)] if t else []
+        return hits[0] if len(hits) == 1 else None
+
+    def set_id(self, rid):
+        i = self.findData(rid)
+        if i >= 0:
+            self.setCurrentIndex(i)
+        self._last_emitted = self.current_id()
+
+
+class AccountPicker(SearchPicker):
+    def __init__(self, session, types=None, groups=False, **kw):
+        super().__init__(lambda: session.lookup_accounts(types, groups), placeholder='ابحث بالرقم أو الاسم…', **kw)
+
+
+class PartyPicker(SearchPicker):
+    def __init__(self, session, kind, **kw):
+        super().__init__(lambda: session.lookup_parties(kind), placeholder='ابحث عن عميل/مورد…', **kw)
+
+
+class ItemPicker(SearchPicker):
+    def __init__(self, session, **kw):
+        super().__init__(session.lookup_items, placeholder='ابحث بالكود أو الاسم…', **kw)
+
+
+class WarehousePicker(SearchPicker):
+    def __init__(self, session, **kw):
+        super().__init__(session.lookup_warehouses, placeholder='اختر المستودع…', **kw)
+
+
+class CashPicker(SearchPicker):
+    def __init__(self, session, kind=None, **kw):
+        super().__init__(lambda: session.lookup_cash(kind), placeholder='اختر الصندوق/البنك…', **kw)

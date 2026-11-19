@@ -1,0 +1,83 @@
+ALTER TABLE journal_entries ADD COLUMN workflow_state TEXT NOT NULL DEFAULT 'draft' CHECK(workflow_state IN ('draft','reviewed','approved'));
+ALTER TABLE journal_entries ADD COLUMN reviewed_by INTEGER REFERENCES users(id);
+ALTER TABLE journal_entries ADD COLUMN reviewed_at TEXT;
+ALTER TABLE journal_entries ADD COLUMN approved_by INTEGER REFERENCES users(id);
+ALTER TABLE journal_entries ADD COLUMN approved_at TEXT;
+ALTER TABLE journal_entries ADD COLUMN return_reason TEXT;
+-- الرقم الرسمي المتسلسل بلا فجوات: يُمنح عند الترحيل فقط (entry_no يبقى رقم المسودة)
+ALTER TABLE journal_entries ADD COLUMN posted_no INTEGER;
+CREATE UNIQUE INDEX ux_je_posted_no ON journal_entries(company_id,fiscal_year_id,posted_no) WHERE posted_no IS NOT NULL;
+
+CREATE TABLE journal_settings(
+  company_id INTEGER PRIMARY KEY REFERENCES companies(id),
+  require_review INTEGER NOT NULL DEFAULT 0 CHECK(require_review IN (0,1)),
+  require_approval INTEGER NOT NULL DEFAULT 0 CHECK(require_approval IN (0,1)),
+  enforce_separation INTEGER NOT NULL DEFAULT 0 CHECK(enforce_separation IN (0,1)));
+
+INSERT INTO permissions(code,name_ar,is_sensitive) VALUES
+ ('journal.review','مراجعة قيد',0),('journal.approve','اعتماد قيد',1),
+ ('journal.post_direct','ترحيل مباشر دون استكمال دورة المراجعة',1),('settings.manage','إدارة إعدادات الشركة',1);
+INSERT INTO role_permissions SELECT 1,code FROM permissions WHERE code IN ('journal.review','journal.approve','journal.post_direct','settings.manage');
+INSERT INTO role_permissions SELECT 2,code FROM permissions WHERE code IN ('journal.review','journal.approve','journal.post_direct');
+INSERT INTO role_permissions SELECT 4,code FROM permissions WHERE code IN ('journal.review');
+
+DROP TRIGGER jl_ins_rules; DROP TRIGGER jl_no_update; DROP TRIGGER jl_no_delete;
+DROP TRIGGER je_ins_draft; DROP TRIGGER je_upd_rules;
+
+CREATE TRIGGER jl_ins_rules BEFORE INSERT ON journal_lines BEGIN
+  SELECT RAISE(ABORT,'لا يمكن إضافة سطر إلى قيد غير مسودة')
+   WHERE (SELECT status FROM journal_entries WHERE id=NEW.entry_id)<>'draft';
+  SELECT RAISE(ABORT,'القيد تحت المراجعة أو معتمد: أعده إلى المسودة قبل التعديل')
+   WHERE (SELECT workflow_state FROM journal_entries WHERE id=NEW.entry_id)<>'draft';
+  SELECT RAISE(ABORT,'الحساب غير موجود أو غير نشط أو تجميعي: لا تقبل الحركة')
+   WHERE NOT EXISTS(SELECT 1 FROM accounts a JOIN journal_entries e ON e.id=NEW.entry_id
+      WHERE a.id=NEW.account_id AND a.is_active=1 AND a.is_group=0 AND a.company_id=e.company_id);
+END;
+CREATE TRIGGER jl_no_update BEFORE UPDATE ON journal_lines BEGIN
+  SELECT RAISE(ABORT,'لا يمكن تعديل سطر في قيد مرحّل')
+   WHERE (SELECT status FROM journal_entries WHERE id=OLD.entry_id)<>'draft';
+  SELECT RAISE(ABORT,'القيد تحت المراجعة أو معتمد: أعده إلى المسودة قبل التعديل')
+   WHERE (SELECT workflow_state FROM journal_entries WHERE id=OLD.entry_id)<>'draft';
+END;
+CREATE TRIGGER jl_no_delete BEFORE DELETE ON journal_lines BEGIN
+  SELECT RAISE(ABORT,'لا يمكن حذف سطر من قيد مرحّل')
+   WHERE (SELECT status FROM journal_entries WHERE id=OLD.entry_id)<>'draft';
+  SELECT RAISE(ABORT,'القيد تحت المراجعة أو معتمد: أعده إلى المسودة قبل التعديل')
+   WHERE (SELECT workflow_state FROM journal_entries WHERE id=OLD.entry_id)<>'draft';
+END;
+CREATE TRIGGER je_ins_draft BEFORE INSERT ON journal_entries WHEN NEW.status<>'draft' OR NEW.workflow_state<>'draft' OR NEW.posted_no IS NOT NULL BEGIN
+  SELECT RAISE(ABORT,'يجب إنشاء القيد كمسودة ثم ترحيله');
+END;
+CREATE TRIGGER je_upd_rules BEFORE UPDATE ON journal_entries BEGIN
+  SELECT RAISE(ABORT,'لا يمكن تعديل قيد مرحّل: التصحيح بالعكس وقيد تصحيح')
+   WHERE OLD.status<>'draft' AND NOT (OLD.status='posted' AND NEW.status='reversed'
+     AND NEW.entry_date=OLD.entry_date AND NEW.description=OLD.description AND NEW.company_id=OLD.company_id
+     AND NEW.posted_no IS OLD.posted_no AND NEW.entry_type=OLD.entry_type AND NEW.workflow_state=OLD.workflow_state);
+  SELECT RAISE(ABORT,'لا يمكن نقل المسودة مباشرة إلى حالة معكوس')
+   WHERE OLD.status='draft' AND NEW.status='reversed';
+  SELECT RAISE(ABORT,'لا يمكن مراجعة أو اعتماد قيد غير متوازن أو بأقل من سطرين')
+   WHERE OLD.status='draft' AND NEW.status='draft' AND NEW.workflow_state<>'draft' AND OLD.workflow_state='draft' AND (
+     (SELECT COUNT(*) FROM journal_lines WHERE entry_id=OLD.id)<2 OR
+     (SELECT SUM(debit_base) FROM journal_lines WHERE entry_id=OLD.id)<>(SELECT SUM(credit_base) FROM journal_lines WHERE entry_id=OLD.id));
+  SELECT RAISE(ABORT,'السنة المالية أو الفترة مغلقة: يُمنع الترحيل')
+   WHERE OLD.status='draft' AND NEW.status='posted' AND NOT EXISTS(
+     SELECT 1 FROM fiscal_periods p JOIN fiscal_years y ON y.id=p.fiscal_year_id
+     WHERE p.id=NEW.period_id AND p.status='open' AND y.status='open' AND y.id=NEW.fiscal_year_id
+       AND NEW.entry_date BETWEEN p.start_date AND p.end_date AND y.company_id=NEW.company_id);
+  SELECT RAISE(ABORT,'القيد يجب أن يحتوي سطرين على الأقل')
+   WHERE OLD.status='draft' AND NEW.status='posted' AND (SELECT COUNT(*) FROM journal_lines WHERE entry_id=OLD.id)<2;
+  SELECT RAISE(ABORT,'القيد غير متوازن: إجمالي المدين لا يساوي إجمالي الدائن')
+   WHERE OLD.status='draft' AND NEW.status='posted' AND
+     (SELECT SUM(debit_base) FROM journal_lines WHERE entry_id=OLD.id)
+     <> (SELECT SUM(credit_base) FROM journal_lines WHERE entry_id=OLD.id);
+  SELECT RAISE(ABORT,'القيد لم تتم مراجعته: الشركة تشترط المراجعة قبل الترحيل')
+   WHERE OLD.status='draft' AND NEW.status='posted' AND NEW.entry_type NOT IN ('auto','reversal','closing')
+     AND (SELECT require_review FROM journal_settings WHERE company_id=NEW.company_id)=1
+     AND NEW.workflow_state NOT IN ('reviewed','approved');
+  SELECT RAISE(ABORT,'القيد لم يُعتمد: الشركة تشترط الاعتماد قبل الترحيل')
+   WHERE OLD.status='draft' AND NEW.status='posted' AND NEW.entry_type NOT IN ('auto','reversal','closing')
+     AND (SELECT require_approval FROM journal_settings WHERE company_id=NEW.company_id)=1
+     AND NEW.workflow_state<>'approved';
+  SELECT RAISE(ABORT,'الرقم الرسمي للقيد مطلوب عند الترحيل')
+   WHERE OLD.status='draft' AND NEW.status='posted' AND NEW.posted_no IS NULL;
+END;

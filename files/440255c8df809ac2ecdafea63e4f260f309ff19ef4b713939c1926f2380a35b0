@@ -1,0 +1,667 @@
+"""النظام: ضرائب، تقارير، نسخ احتياطي، استيراد، تدقيق، مستخدمون، إعدادات.
+
+كل صفحة خفيفة وتعتمد على SystemService/HRService. الطباعة/التصدير عبر printing.render_*.
+"""
+import os, tempfile
+from datetime import date
+from decimal import Decimal
+
+from PySide6.QtCore import Qt, QDate, QUrl
+from PySide6.QtGui import QDesktopServices
+from PySide6.QtWidgets import (
+    QComboBox, QDateEdit, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QVBoxLayout, QWidget, QTabWidget
+)
+
+from alhisabat.ui.components.datagrid import DataGrid
+from alhisabat.ui.components.document_sheet import DocumentSheet
+from alhisabat.ui.components.grid_logic import Column
+from alhisabat.ui.components import document_model as DM
+from alhisabat.ui.core.actions import Action, ActionGroup
+from alhisabat.ui.core.base_page import BasePage
+from alhisabat.ui.core.system_service import SystemService, REPORTS
+from alhisabat.ui.core.permissions import ActionState
+from alhisabat.ui.core.hr_service import HrService
+
+class TaxesPage(BasePage):
+    key='taxes'; title='الضرائب'; icon='percent'; required_permission='sales.view'
+    def build(self):
+        self.svc=SystemService(self.session); self._sel=None
+        lay=QVBoxLayout(self); lay.setContentsMargins(6,6,6,6)
+        self.grid=DataGrid([Column('code','الكود',width=80), Column('name','الاسم',width=200), Column('rate_bps','النسبة %',width=90), Column('account_id','الحساب',width=120), Column('is_active','نشط','status',70)], grid_id='taxes')
+        self.grid.selectionChangedRows.connect(lambda rows: (setattr(self,'_sel', rows[0] if len(rows)==1 else None), self.actions_changed.emit()))
+        lay.addWidget(self.grid,1)
+    def refresh(self):
+        if not getattr(self,'_built',False): return
+        keep=self._sel['id'] if self._sel else None
+        try: rows=self.svc.tax_rates()
+        except Exception as e: self.show_error(e); rows=[]
+        # تحويل rate_bps → نسبة
+        for r in rows:
+            try: r['rate_bps']=f"{Decimal(r.get('rate_bps') or 0)/100:.2f}"
+            except Exception: pass
+        self.grid.set_rows(rows)
+        if keep is not None: self.grid.select_where(lambda r: r['id']==keep)
+        self.actions_changed.emit()
+    def _state(self,k):
+        if k=='add': return self.access.state('tax.manage')
+        if not self._sel: return ActionState(False,'حدد سطرًا')
+        if k=='toggle': return self.access.state('tax.manage')
+        return ActionState(True)
+    def ribbon_groups(self):
+        def a(k,lab,icon,**kw): return Action(k,lab,icon,state_fn=lambda kk=k: self._state(kk), handler=lambda kk=k: self.do(kk), **kw)
+        return [ActionGroup('ضريبة',[a('add','+ نسبة ضريبة','new',primary=True), a('toggle','تفعيل/تعطيل','refresh')]), ActionGroup('عرض',[Action('refresh','تحديث','refresh',handler=self.refresh)])]
+    def do(self,k):
+        st=self._state(k)
+        if not st.enabled: return QMessageBox.information(self,self.title,st.reason)
+        if k=='add':
+            from alhisabat.ui.app_dialogs.system import TaxDialog
+            d=TaxDialog(self)
+            if self.exec_form(d):
+                ok,_=self.guarded(self.svc.create_tax, d.values(), reload=False)
+                if ok: self.refresh(); self.window_.data_changed(self.key)
+        if k=='toggle':
+            ok,_=self.guarded(self.svc.set_tax_active, self._sel['id'], not bool(self._sel.get('is_active')), reload=False)
+            if ok: self.refresh(); self.window_.data_changed(self.key)
+
+from alhisabat.ui.pages.reports import ReportsPage
+
+_BK_FILTER = 'نسخة احتياطية (*.zip *.db);;الكل (*.*)'
+
+
+class BackupPage(BasePage):
+    key='backup'; title='النسخ الاحتياطي'; icon='backup'; required_permission='backup.manage'
+    def build(self):
+        self.svc=SystemService(self.session); self._sel=None
+        lay=QVBoxLayout(self); lay.setContentsMargins(6,6,6,6)
+        from alhisabat.ui.components.backup_settings import BackupSettingsPanel
+        self.settings_panel=None
+        ab=getattr(self.window_,'auto_backup',None)
+        if ab is not None:                                     # لا تنهار الصفحة إن غابت اللوحة؛ بقية الصفحة (القائمة والاستعادة) تعمل
+            try:
+                self.settings_panel=BackupSettingsPanel(ab, self.window_.prefs); lay.addWidget(self.settings_panel)
+            except Exception as e: self.window_.log_error(str(e),'backup_panel')
+        self.grid=DataGrid([Column('created_at','التاريخ',width=140), Column('reason','السبب',width=200), Column('size_bytes','الحجم (بايت)','int',110), Column('path','المسار',width=300)], grid_id='backups')
+        self.grid.selectionChangedRows.connect(lambda rows: (setattr(self,'_sel', rows[0] if len(rows)==1 else None), self.actions_changed.emit()))
+        lay.addWidget(self.grid,1)
+    def _dir(self):
+        from alhisabat.ui.core import backup_logic as BL
+        return BL.load(self.window_.prefs)['dir']
+    def refresh(self):
+        if not getattr(self,'_built',False): return
+        keep=self._sel['id'] if self._sel and 'id' in self._sel else None
+        try: rows=self.svc.backups()
+        except Exception as e: self.show_error(e); rows=[]
+        self.grid.set_rows(rows)
+        if self.settings_panel is not None: self.settings_panel.reload()
+        if keep is not None: self.grid.select_where(lambda r: r.get('id')==keep)
+        self.actions_changed.emit()
+    def _state(self,k):
+        if k in ('create','verify','now'): return self.access.state('backup.manage')
+        if k=='restore': return self.access.state('backup.restore')
+        return ActionState(True)
+    def ribbon_groups(self):
+        def a(k,lab,icon,**kw): return Action(k,lab,icon,state_fn=lambda kk=k: self._state(kk), handler=lambda kk=k: self.do(kk), **kw)
+        return [ActionGroup('نسخ',[a('now','نسخ الآن إلى المجلد','new',primary=True), a('create','نسخة إلى مجلد آخر','new'), a('verify','التحقق من ملف','refresh'), a('restore','استعادة نسخة','delete',danger=True)]), ActionGroup('عرض',[Action('refresh','تحديث','refresh',handler=self.refresh)])]
+    def do(self,k):
+        st=self._state(k)
+        if not st.enabled: return QMessageBox.information(self,self.title,st.reason)
+        if k=='now':
+            ab=getattr(self.window_,'auto_backup',None)
+            if ab is None: return QMessageBox.information(self,self.title,'النسخ التلقائي غير متاح حاليًا.')
+            if not self._dir():
+                if not ab.choose_folder(self): return
+                if self.settings_panel is not None: self.settings_panel.reload()
+            return ab.run('manual', on_done=lambda _r: self.refresh(), on_error=self.show_error)
+        if k=='create':
+            d=QFileDialog.getExistingDirectory(self,'اختر مجلد حفظ النسخة (ملف مضغوط)', self._dir())
+            if not d: return
+            self.notify('جارٍ إنشاء النسخة الاحتياطية المضغوطة في الخلفية...')
+            def _bg(s, ctx):
+                from alhisabat.ui.core.system_service import SystemService
+                return SystemService(s).create_zip_backup(d)
+            def _done(r):
+                self.refresh()
+                self.notify('تم إنشاء النسخة الاحتياطية بنجاح: '+os.path.basename(r['path']))
+                self.window_.data_changed(self.key)
+            self.run_task(_bg, on_done=_done)
+        if k=='verify':
+            p,_=QFileDialog.getOpenFileName(self,'اختيار النسخة',self._dir(),_BK_FILTER)
+            if not p: return
+            try:
+                v=self.svc.verify_backup(p)
+                QMessageBox.information(self,'نتيجة التحقق','النسخة سليمة.' if v.get('integrity_ok') else 'النسخة غير سليمة — لا تعتمد عليها.')
+            except Exception as e: self.show_error(e)
+        if k=='restore':
+            p,_=QFileDialog.getOpenFileName(self,'اختيار النسخة للاستعادة',self._dir(),_BK_FILTER)
+            if not p: return
+            if QMessageBox.question(self,'تأكيد الاستعادة','سيتم استبدال قاعدة البيانات الحالية بالنسخة المختارة (تُحفظ نسخة أمان قبل ذلك). هل أنت متأكد؟', QMessageBox.Yes|QMessageBox.No)!=QMessageBox.Yes: return
+            try: self.svc.restore(p)
+            except Exception as e: return self.show_error(e)
+            r=QMessageBox.question(self,'تمت الاستعادة','تمت استعادة النسخة بنجاح. يلزم إعادة تشغيل البرنامج لتحميل البيانات المستعادة. هل تريد إعادة التشغيل الآن؟', QMessageBox.Yes|QMessageBox.No)
+            if r==QMessageBox.Yes:
+                self.window_.restart_requested=True
+                if not self.window_.close(): self.window_.restart_requested=False
+
+IMPORT_TARGETS_ITEM = 'أصناف'
+
+class ImportPage(BasePage):
+    key='import'; title='الاستيراد'; icon='import'; required_permission='data.import'
+    def build(self):
+        self.svc=SystemService(self.session); self._rows=None; self._details={}; self._doc_path=None
+        lay=QVBoxLayout(self); lay.setContentsMargins(6,6,6,6)
+        from PySide6.QtWidgets import QFrame, QComboBox as CB, QLineEdit as LE, QPushButton as PB, QGroupBox
+
+        # معالج الاستيراد (3 خطوات)
+        wizard_gb = QGroupBox("معالج استيراد البيانات (3 خطوات)")
+        w_lay = QVBoxLayout(wizard_gb)
+
+        step1_box = QHBoxLayout()
+        step1_box.addWidget(QLabel("<b>الخطوة 1:</b> نوع البيانات:"))
+        self.kind = CB()
+        from alhisabat.ui.core.system_service import IMPORT_TARGETS
+        for k in IMPORT_TARGETS.keys():
+            self.kind.addItem(k)
+        self.kind.currentIndexChanged.connect(lambda _i: self._on_kind_change())
+        step1_box.addWidget(self.kind)
+
+        self.fy_label = QLabel("السنة المالية للافتتاحي:")
+        self.fy_cb = CB()
+        try:
+            from alhisabat.ui.core import readmodel
+            for fy in readmodel.fiscal_years_list(self.session.conn, self.session.company_id):
+                self.fy_cb.addItem(fy['name'], fy['id'])
+        except Exception: pass
+        step1_box.addWidget(self.fy_label)
+        step1_box.addWidget(self.fy_cb)
+        self.fy_label.hide(); self.fy_cb.hide()
+
+        # فصل الفروع: الفرع الذي تُسجَّل عليه السجلات والأرصدة المستوردة
+        step1_box.addWidget(QLabel('الفرع:'))
+        self.branch_cb = CB()
+        self.branch_cb.addItem('الفرع الافتراضي (حسب الإعداد)', None)
+        try:
+            for b_ in self.svc.branches(): self.branch_cb.addItem(b_['name'], b_['id'])
+        except Exception: pass
+        step1_box.addWidget(self.branch_cb)
+        step1_box.addStretch(1)
+        w_lay.addLayout(step1_box)
+        file_box = QHBoxLayout()
+
+        self.path = LE(); self.path.setReadOnly(True); self.path.setPlaceholderText('لم يُختر ملف بعد (Excel أو CSV أو PDF أو صورة أو VCF جهات اتصال)')
+        pick = PB('اختيار ملف (Excel / CSV / PDF / صورة / VCF)...'); pick.setProperty('primary', True); pick.clicked.connect(self.choose)
+        file_box.addWidget(self.path, 1)
+        file_box.addWidget(pick)
+        rec_btn = PB('مطابقة أرصدة العملاء والموردين...'); rec_btn.clicked.connect(self._open_reconcile)
+        file_box.addWidget(rec_btn)
+        w_lay.addLayout(file_box)
+
+        # عملة الأرصدة الافتتاحية (عملاء/موردون): تُملأ بها الصفوف بلا عملة أو تُفرض على الكل؛ سعر الصرف اختياري (فارغ = سعر الجدول)
+        cur_box = QHBoxLayout()
+        self.cur_lbl = QLabel('العملة:')
+        self.cur_cb = CB(); self.cur_cb.setMinimumWidth(240)
+        self.cur_cb.addItem('حسب الملف (الأساسية إن لم تُذكر)', None)
+        self._base_cur = ''
+        try:
+            for c_ in self.svc.import_currencies():
+                self.cur_cb.addItem(f"{c_['name_ar']} ({c_['code']})", c_['code'])
+                if c_['is_base']: self._base_cur = c_['code']
+        except Exception: pass
+        self.rate_lbl = QLabel('سعر الصرف:')
+        self.rate_edit = LE(); self.rate_edit.setPlaceholderText('اتركه فارغًا لسعر الجدول'); self.rate_edit.setMaximumWidth(190)
+        from PySide6.QtWidgets import QCheckBox as _FC
+        self.force_chk = _FC('فرض العملة على كل الصفوف (تجاهل عمود العملة في الملف)')
+        for w_ in (self.cur_lbl, self.cur_cb, self.rate_lbl, self.rate_edit, self.force_chk): cur_box.addWidget(w_)
+        cur_box.addStretch(1)
+        w_lay.addLayout(cur_box)
+        self._cur_widgets = (self.cur_lbl, self.cur_cb, self.rate_lbl, self.rate_edit, self.force_chk)
+        self.cur_cb.currentIndexChanged.connect(lambda _i: (self._sync_cur_widgets(), self.preview()))
+        self.rate_edit.editingFinished.connect(self.preview)
+        self.force_chk.toggled.connect(lambda _c: self.preview())
+
+        # وحدة افتراضية للأصناف المقروءة من مستند لا يذكر الوحدة
+        unit_box = QHBoxLayout()
+        self.unit_lbl = QLabel('الوحدة الافتراضية للأصناف غير المحددة الوحدة:')
+        self.unit_cb = CB()
+        try:
+            for n in self.svc.unit_names(): self.unit_cb.addItem(n)
+        except Exception: pass
+        unit_box.addWidget(self.unit_lbl); unit_box.addWidget(self.unit_cb)
+        from PySide6.QtWidgets import QCheckBox as QCheckBox_
+        self.auto_parties = QCheckBox_('إنشاء العملاء/الموردين غير الموجودين تلقائيًا (مطابقة بالاسم)'); self.auto_parties.setChecked(True)
+        self.auto_parties.toggled.connect(lambda _c: self.preview())
+        unit_box.addWidget(self.auto_parties); self.auto_parties.hide()
+        from PySide6.QtWidgets import QCheckBox
+        self.auto_units = QCheckBox('إنشاء الوحدات غير الموجودة تلقائيًا عند الاعتماد'); self.auto_units.setChecked(True)
+        self.auto_units.toggled.connect(lambda _c: self.preview())
+        unit_box.addWidget(self.auto_units); unit_box.addStretch(1)
+        self.btn_drop = PB('حذف الأسطر المحددة من المعاينة')
+        self.btn_drop.clicked.connect(self.drop_selected)
+        self.btn_drop.setEnabled(False)
+        unit_box.addWidget(self.btn_drop)
+        w_lay.addLayout(unit_box)
+        stock_box = QHBoxLayout()
+        from PySide6.QtWidgets import QCheckBox as _CB, QDateEdit
+        self.stock_chk = _CB('حفظ الكميات كرصيد افتتاحي في المستودع:'); self.stock_chk.setChecked(False)
+        self.stock_wh = CB()
+        try:
+            for wid, wname in self.svc.warehouse_choices(): self.stock_wh.addItem(wname, wid)
+        except Exception: pass
+        self.stock_date = QDateEdit(QDate.currentDate()); self.stock_date.setCalendarPopup(True); self.stock_date.setDisplayFormat('yyyy-MM-dd')
+        self.stock_lbl = QLabel('بتاريخ:')
+        for w_ in (self.stock_chk, self.stock_wh, self.stock_lbl, self.stock_date): stock_box.addWidget(w_)
+        stock_box.addStretch(1)
+        w_lay.addLayout(stock_box)
+        # خيارات تنظيف الهواتف من جهات الاتصال (VCF)
+        vcf_box = QHBoxLayout()
+        from PySide6.QtWidgets import QCheckBox as _VC
+        self.vcf_cc_lbl = QLabel('مفتاح الدولة للأرقام المحلية:')
+        self.vcf_cc = LE('+967'); self.vcf_cc.setMaximumWidth(80); self.vcf_cc.setLayoutDirection(Qt.LeftToRight)
+        self.vcf_norm = _VC('تنسيق أرقام الأطراف التي لا جهة مطابقة لها'); self.vcf_norm.setChecked(True)
+        self.vcf_new = _VC('إنشاء الجهات غير الموجودة كأطراف جديدة'); self.vcf_new.setChecked(False)
+        self._vcf_widgets = (self.vcf_cc_lbl, self.vcf_cc, self.vcf_norm, self.vcf_new)
+        for w_ in self._vcf_widgets: vcf_box.addWidget(w_)
+        vcf_box.addStretch(1)
+        w_lay.addLayout(vcf_box)
+        self.vcf_cc.editingFinished.connect(self.preview)
+        self.vcf_norm.toggled.connect(lambda _c: self.preview())
+        self.vcf_new.toggled.connect(lambda _c: self.preview())
+        self._vcf_excl_ids, self._vcf_excl_names, self._vcf_pid = set(), set(), {}
+        self.doc_note = QLabel(''); self.doc_note.setWordWrap(True); self.doc_note.hide()
+        w_lay.addWidget(self.doc_note)
+
+        self.step2_lbl = QLabel("<b>الخطوة 2:</b> المعاينة والتحقق من صحة الصفوف")
+        w_lay.addWidget(self.step2_lbl)
+
+        self.grid = DataGrid([
+            Column('row_no', 'السطر', 'int', 70),
+            Column('status', 'الحالة', 'status', 90),
+            Column('code', 'الكود', width=100),
+            Column('name', 'الاسم', width=240),
+            Column('unit', 'الوحدة', width=110),
+            Column('side', 'النوع', width=70),
+            Column('currency', 'العملة', width=70),
+            Column('amount', 'الرصيد', 'money', 100),
+            Column('qty', 'الكمية', 'money', 80),
+            Column('purchase_price', 'سعر الشراء', 'money', 90),
+            Column('sale_price', 'سعر البيع', 'money', 90),
+            Column('total_value', 'الإجمالي', 'money', 90),
+            Column('phone_old', 'الهاتف الحالي', width=130),
+            Column('phone_new', 'الهاتف بعد التنظيف', width=140),
+            Column('contact', 'جهة الاتصال', width=170),
+            Column('match', 'طريقة المطابقة', width=130),
+            Column('review', 'المراجعة', width=100),
+            Column('raw', 'النص المقروء من المستند', width=260),
+            Column('errors', 'الأخطاء والملاحظات', width=320)
+        ], grid_id='import_preview_v2')
+        w_lay.addWidget(self.grid, 1)
+
+        bottom = QHBoxLayout()
+        self.info = QLabel('اختر نوع البيانات وملف CSV أو PDF أو صورة للبدء بالمعاينة.')
+        self.info.setObjectName('ctxKey')
+        bottom.addWidget(self.info, 1)
+
+        self.btn_commit = PB('الخطوة 3: اعتماد واستيراد الصفوف الصالحة')
+        self.btn_commit.setProperty('primary', True)
+        self.btn_commit.clicked.connect(lambda: self.do('commit'))
+        self.btn_commit.setEnabled(False)
+        bottom.addWidget(self.btn_commit)
+        w_lay.addLayout(bottom)
+
+        lay.addWidget(wizard_gb, 1)
+        self._on_kind_change()
+
+    def _is_vcf(self):
+        return '(VCF)' in self.kind.currentText()
+
+    def _apply_vcf_layout(self):
+        """يُظهر أعمدة وخيارات تنظيف الهواتف فقط عند اختيار هدف VCF، ويخفي أعمدة الأصناف والأرصدة."""
+        v = self._is_vcf()
+        for w_ in self._vcf_widgets: w_.setVisible(v)
+        self.btn_drop.setText('استبعاد الأسطر المحددة من التنظيف' if v else 'حذف الأسطر المحددة من المعاينة')
+        vcf_cols = {'phone_old', 'phone_new', 'contact', 'match'}
+        other_cols = {'code', 'unit', 'side', 'currency', 'amount', 'qty', 'purchase_price', 'sale_price', 'total_value', 'review', 'raw'}
+        for i, c in enumerate(self.grid.columns):
+            if c.key in vcf_cols: self.grid.table.setColumnHidden(i, not v)
+            elif c.key in other_cols and v: self.grid.table.setColumnHidden(i, True)
+            elif c.key in other_cols and not v: self.grid.table.setColumnHidden(i, False)
+
+    def _vcf_opts(self):
+        return {'default_cc': self.vcf_cc.text().strip() or '+967', 'normalize_existing': self.vcf_norm.isChecked(),
+                'create_new': self.vcf_new.isChecked(), 'preview_branch_id': self.branch_cb.currentData(),
+                'exclude_party_ids': sorted(self._vcf_excl_ids), 'exclude_new_names': sorted(self._vcf_excl_names)}
+
+    def _on_kind_change(self):
+        was_vcf_rows = getattr(self, '_rows_are_vcf', False)
+        if self._rows and was_vcf_rows != self._is_vcf():      # صفوف جهات الاتصال لا تصلح لبقية الأهداف والعكس
+            self._rows = None; self._details = {}; self.grid.set_rows([]); self.btn_commit.setEnabled(False)
+            self._vcf_excl_ids.clear(); self._vcf_excl_names.clear()
+            self.info.setText('اختر ملفًا مناسبًا لنوع البيانات المحدد.')
+        self._apply_vcf_layout()
+        if self._is_vcf(): self._doc_path = None            # هدف VCF لا يقرأ PDF/صور: لا نعيد قراءة مستند قديم
+        is_opening = 'افتتاحية' in self.kind.currentText()
+        self.fy_label.setVisible(is_opening)
+        self.auto_parties.setVisible(is_opening)
+        for w_ in self._cur_widgets: w_.setVisible(is_opening)
+        self._sync_cur_widgets()
+        self.fy_cb.setVisible(is_opening)
+        is_item = IMPORT_TARGETS_ITEM == self.kind.currentText()
+        self.unit_lbl.setVisible(is_item); self.unit_cb.setVisible(is_item); self.auto_units.setVisible(is_item)
+        for w_ in (self.stock_chk, self.stock_wh, self.stock_lbl, self.stock_date): w_.setVisible(is_item)
+        if self._doc_path and is_opening:
+            self._rows = None; self._details = {}; self.grid.set_rows([]); self.btn_commit.setEnabled(False)
+            self.doc_note.setText('قراءة PDF والصور لا تدعم الأرصدة الافتتاحية: استخدم ملف Excel أو CSV لها.'); self.doc_note.show()
+        elif self._doc_path:
+            self._read_doc(self._doc_path)        # نوع البيانات يغيّر قواعد التعرف: أعد القراءة
+        elif self._rows:
+            self.preview()
+
+    def _sync_cur_widgets(self):
+        """سعر الصرف يظهر فقط عند اختيار عملة أجنبية (غير الأساسية) لصفوف الأرصدة الافتتاحية."""
+        code = self.cur_cb.currentData()
+        show = (not self.cur_cb.isHidden()) and bool(code) and code != self._base_cur
+        self.rate_lbl.setVisible(show); self.rate_edit.setVisible(show)
+        if not show: self.rate_edit.clear()
+
+    def _cur_args(self):
+        """وسائط العملة للمحرك: لا شيء لغير الأرصدة الافتتاحية."""
+        if self.cur_cb.isHidden(): return {}
+        code = self.cur_cb.currentData()
+        return {'currency': code, 'rate': (self.rate_edit.text().strip() or None) if code else None, 'force_currency': bool(code) and self.force_chk.isChecked()}
+
+    def refresh(self): pass
+
+    def _open_reconcile(self):
+        from alhisabat.ui.app_dialogs.party_reconcile import PartyReconcileDialog
+        PartyReconcileDialog(self).exec()
+
+    def choose(self):
+        p, _ = QFileDialog.getOpenFileName(self, 'اختيار ملف الاستيراد', '', 'ملفات الاستيراد (*.csv *.xlsx *.xlsm *.vcf *.pdf *.png *.jpg *.jpeg *.tif *.tiff *.bmp *.webp);;جهات اتصال أندرويد (*.vcf);;Excel (*.xlsx *.xlsm);;CSV (*.csv);;PDF (*.pdf);;صور (*.png *.jpg *.jpeg *.tif *.tiff *.bmp *.webp)')
+        if not p: return
+        p = p.strip().strip('"')
+        self.path.setText(p)
+        self._details = {}; self._doc_path = None; self.doc_note.hide()
+        self._vcf_excl_ids.clear(); self._vcf_excl_names.clear()
+        if self.svc.is_vcf(p):                           # بالامتداد أو بمحتوى BEGIN:VCARD (ملفات الهاتف المؤقتة قد تأتي باسم غريب)
+            if not self._is_vcf():                       # ملف جهات اتصال: انتقل تلقائيًا إلى هدف تنظيف الهواتف (عملاء افتراضيًا)
+                self.kind.blockSignals(True); self.kind.setCurrentText('تنظيف هواتف العملاء (VCF)'); self.kind.blockSignals(False)
+                self._apply_vcf_layout()
+            try:
+                self._rows = self.svc.read_vcf(p); self._rows_are_vcf = True
+                self.doc_note.setText(f'تمت قراءة {len(self._rows)} جهة اتصال من الملف. تُطابَق بأسماء أطراف النظام وتُقترح أرقام نظيفة بصيغة دولية (+967…). لا يُكتب شيء قبل «اعتماد».'); self.doc_note.show()
+                self.preview()
+            except Exception as e:
+                self._rows = None; self.show_error(e)
+            return
+        if self._is_vcf():
+            return QMessageBox.warning(self, self.title, f'هذا الهدف يقرأ ملفات جهات الاتصال (.vcf) فقط، وهذا الملف ليس منها (الامتداد: «{os.path.splitext(p)[1] or "بلا امتداد"}»). اختر نوع بيانات آخر لهذا الملف.')
+        self._rows_are_vcf = False
+        if p.lower().endswith(('.csv', '.xlsx', '.xlsm', '.xls')):
+            try:
+                self._rows = self.svc.read_csv(p)
+                self.preview()
+            except Exception as e:
+                self.show_error(e)
+        else:
+            self._doc_path = p
+            self._read_doc(p)
+
+    def _read_doc(self, p):
+        """قراءة PDF/صورة في الخلفية (OCR قد يستغرق ثوانيَ)، ثم المعاينة عبر محرك الاستيراد نفسه."""
+        kind_txt, unit = self.kind.currentText(), self.unit_cb.currentText()
+        self.notify('جارٍ قراءة المستند والتعرف على الأسطر...')
+        def _bg(s, ctx):
+            from alhisabat.ui.core.system_service import SystemService
+            return SystemService(s).read_document(p, kind_txt, unit)
+        def _done(res):
+            self._rows = res['rows']
+            self._details = {i: d for i, d in enumerate(res['details'], 1)}
+            notes = [f"المصدر: {res['source']} — تم التعرف على {len(res['rows'])} سطر. راجع الأسطر المعلَّمة «يحتاج مراجعة» واحذف ما لا يصلح قبل الاعتماد."]
+            notes += res['warnings']
+            self.doc_note.setText('\n'.join(notes)); self.doc_note.show()
+            self.preview()
+        def _err(e):
+            self._rows = None; self.grid.set_rows([]); self.btn_commit.setEnabled(False); self.show_error(e)
+        self.run_task(_bg, on_done=_done, on_error=_err)
+
+    def drop_selected(self):
+        """يحذف الأسطر المحددة (ضجيج أو قراءة خاطئة) من الصفوف قبل الاعتماد؛ لا شيء يُكتب في قاعدة البيانات هنا."""
+        sel = {r['row_no'] for r in self.grid.selected_rows()}
+        if not sel or not self._rows: return
+        if self._is_vcf():                            # استبعاد صفوف من التنظيف (مطابقة خاطئة مثلًا) دون المساس بجهات الاتصال المقروءة
+            for rn in sel:
+                kind_, key_ = self._vcf_pid.get(rn, (None, None))
+                if kind_ == 'party': self._vcf_excl_ids.add(key_)
+                elif kind_ == 'new': self._vcf_excl_names.add(key_)
+            return self.preview()
+        keep = [(r, self._details.get(i)) for i, r in enumerate(self._rows, 1) if i not in sel]
+        self._rows = [r for r, _d in keep]
+        self._details = {i: d for i, (_r, d) in enumerate(keep, 1) if d}
+        if not self._rows:
+            self.grid.set_rows([]); self.btn_commit.setEnabled(False); self.info.setText('حُذفت كل الأسطر.')
+            self.actions_changed.emit(); return
+        self.preview()
+
+    def preview(self):
+        if not self._rows: return
+        try:
+            res = self.svc.import_preview(self._rows, self.kind.currentText(), auto_create_units=self.auto_units.isChecked(), auto_create_parties=self.auto_parties.isChecked(),
+                                          fiscal_year_id=(self.fy_cb.currentData() if self.fy_cb.isVisible() else None), vcf_opts=(self._vcf_opts() if self._is_vcf() else None), **(self._cur_args() if not self._is_vcf() else {}))
+        except Exception as e:
+            return self.show_error(e)
+        rows = []
+        self._vcf_pid = {}
+        for r in res.get('rows', []):
+            d = r.get('data') or {}
+            if self._is_vcf():
+                self._vcf_pid[r['row_no']] = ('party', d['party_id']) if d.get('party_id') else ('new', d.get('name'))
+                rows.append({'id': r['row_no'], 'row_no': r['row_no'], 'status': r['status'], 'name': d.get('name') or '',
+                             'phone_old': d.get('phone_old') or '', 'phone_new': d.get('phone_new') or '', 'contact': d.get('contact') or '',
+                             'match': d.get('match') or '', 'errors': '، '.join((r.get('errors') or []) + (r.get('notes') or []))})
+                continue
+            label = d.get('name') or d.get('code') or ''
+            rows.append({
+                'id': r['row_no'],
+                'row_no': r['row_no'],
+                'status': r['status'],
+                'name': label,
+                'code': d.get('code') or '',
+                'unit': d.get('new_unit') or d.get('unit') or '',
+                'side': {'credit': 'دائن', 'debit': 'مدين'}.get(d.get('side') or '', ''), 'currency': d.get('currency') or '', 'amount': d.get('amount'),
+                'qty': d.get('qty'), 'purchase_price': d.get('purchase_price'), 'sale_price': d.get('sale_price') or d.get('price'),
+                'total_value': d.get('total_value'),
+                'review': ('يحتاج مراجعة' if (self._details.get(r['row_no']) or {}).get('review') else ('' if not self._details else 'مطمئن')),
+                'raw': (self._details.get(r['row_no']) or {}).get('raw', ''),
+                'errors': '، '.join((r.get('errors') or []) + (r.get('notes') or []) + list((self._details.get(r['row_no']) or {}).get('notes') or []))
+            })
+        self.grid.set_rows(rows)
+        counts = {}
+        for r in res.get('rows', []):
+            st = r['status']
+            counts[st] = counts.get(st, 0) + 1
+        valid_cnt = counts.get('valid', 0)
+        names = {'valid': 'صالح', 'invalid': 'غير صالح', 'duplicate_in_file': 'مكرر في الملف', 'duplicate': 'مكرر', 'exists': 'موجود مسبقًا', 'duplicate_existing': 'له رصيد افتتاحي قائم',
+                 'unchanged': 'بلا تغيير', 'not_found': 'لا جهة مطابقة', 'review': 'يحتاج مراجعة'}
+        self._valid_rows = [r for r in res.get('rows', []) if r['status'] == 'valid']
+        self.info.setText(' | '.join(f"{names.get(k, k)}: {v}" for k, v in counts.items()))
+        self.btn_commit.setEnabled(valid_cnt > 0)
+        self.btn_drop.setEnabled(bool(res.get('rows')))
+        self.actions_changed.emit()
+
+    def _state(self, k):
+        if k == 'commit': return ActionState(bool(self._rows and self.btn_commit.isEnabled()), 'تحقق من الملف أولاً')
+        return ActionState(True)
+
+    def ribbon_groups(self):
+        def a(k, lab, icon, **kw): return Action(k, lab, icon, state_fn=lambda kk=k: self._state(kk), handler=lambda kk=k: self.do(kk), **kw)
+        return [ActionGroup('استيراد', [Action('choose', 'اختيار ملف (Excel/CSV/PDF/صورة/VCF)', 'new', handler=self.choose), a('commit', 'اعتماد الصفوف الصالحة', 'post', primary=True)])]
+
+    def do(self, k):
+        if k == 'commit':
+            if not self._rows: return QMessageBox.information(self, self.title, 'اختر ملفًا أولًا.')
+            msg = 'ستُدخل الصفوف الصالحة فقط. هل تريد المتابعة؟'
+            if (not self.cur_cb.isHidden()) and getattr(self, '_valid_rows', None):
+                tot = {}
+                for r_ in self._valid_rows:
+                    d_ = r_.get('data') or {}
+                    try: tot[d_.get('currency') or ''] = tot.get(d_.get('currency') or '', Decimal(0)) + Decimal(d_.get('amount') or 0)
+                    except Exception: pass
+                msg = f"سيُستورد {len(self._valid_rows)} رصيدًا افتتاحيًا:\n" + '\n'.join(f"  {c}: {v:,.2f}" for c, v in sorted(tot.items())) + "\n\nهل تريد المتابعة؟"
+            if self._is_vcf() and getattr(self, '_valid_rows', None) is not None:
+                n_new = sum(1 for r_ in self._valid_rows if (r_.get('data') or {}).get('action') == 'create')
+                msg = f"سيُحدَّث هاتف {len(self._valid_rows) - n_new} طرفًا" + (f" وسيُنشأ {n_new} طرفًا جديدًا" if n_new else '') + " بالأرقام النظيفة المعروضة.\nالصفوف غير الصالحة أو «بلا تغيير» أو «يحتاج مراجعة» لا تُمَس.\n\nهل تريد المتابعة؟"
+            if QMessageBox.question(self, 'اعتماد الاستيراد', msg, QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes: return
+            cur_args = self._cur_args()
+            rows_to_import = list(self._rows); auto_units = self.auto_units.isChecked()
+            opening = None
+            if self.stock_chk.isChecked() and self.stock_chk.isVisible():
+                if self.stock_wh.currentData() is None: return QMessageBox.warning(self, self.title, 'اختر المستودع أولًا (أو ألغِ حفظ الكميات).')
+                opening = {'warehouse_id': self.stock_wh.currentData(), 'date': self.stock_date.date().toString('yyyy-MM-dd')}
+            kind_txt = self.kind.currentText()
+            fy_id = self.fy_cb.currentData() if self.fy_cb.isVisible() else None
+            branch_id = self.branch_cb.currentData(); auto_parties = self.auto_parties.isChecked()
+            vcf_opts = self._vcf_opts() if self._is_vcf() else None
+            if self._is_vcf(): cur_args = {}
+            self.notify('جارٍ استيراد البيانات في الخلفية...')
+            def _bg(s, ctx):
+                from alhisabat.ui.core.system_service import SystemService
+                return SystemService(s).import_commit(rows_to_import, kind_txt, fiscal_year_id=fy_id, auto_create_units=auto_units, opening_stock=opening, branch_id=branch_id, auto_create_parties=auto_parties, vcf_opts=vcf_opts, **cur_args)
+            def _done(r):
+                self._rows = None; self._details = {}; self._doc_path = None; self._rows_are_vcf = False
+                self._vcf_excl_ids.clear(); self._vcf_excl_names.clear()
+                self.btn_commit.setEnabled(False); self.btn_drop.setEnabled(False)
+                self.notify(f"تم استيراد {r.get('imported', 0)} سجل بنجاح، وتخطي {r.get('skipped', 0)}" + (f"، وأُنشئ {r['parties_created']} طرف جديد" if r.get('parties_created') else "") + (f"، وأُدخل رصيد افتتاحي لـ {len(r['stock_in'])} صنف" + (f" (بلا رصيد لعدم توفر تكلفة/كمية موجبة: {len(r.get('stock_skipped') or [])})" if r.get('stock_skipped') else "") if r.get('stock_in') is not None and (r.get('stock_in') or r.get('stock_skipped')) else ""))
+                self.grid.set_rows([])
+                self.info.setText('اكتمل الاستيراد بنجاح.')
+                self.actions_changed.emit()
+                self.window_.data_changed(self.key)
+            self.run_task(_bg, on_done=_done)
+
+
+class AuditPage(BasePage):
+    key='audit'; title='سجل التدقيق'; icon='history'; required_permission='audit.view'
+    def build(self):
+        self.svc=SystemService(self.session)
+        lay=QVBoxLayout(self); lay.setContentsMargins(6,6,6,6)
+        self.grid=DataGrid([Column('at','التاريخ',width=140), Column('user','المستخدم',width=120), Column('action','الإجراء',width=150), Column('table_name','الجدول',width=130), Column('reason','السبب',width=200)], grid_id='audit')
+        lay.addWidget(self.grid,1)
+    def refresh(self):
+        if not getattr(self,'_built',False): return
+        try: rows=self.svc.audit(limit=300)
+        except Exception as e: self.show_error(e); rows=[]
+        # توحيد أعمدة العرض
+        for r in rows:
+            r['at']=r.get('created_at') or r.get('at') or ''
+            r['table_name']=r.get('table_name') or r.get('table') or ''
+        self.grid.set_rows(rows)
+    def ribbon_groups(self): return [ActionGroup('عرض',[Action('refresh','تحديث','refresh',handler=self.refresh)])]
+
+
+class UsersPage(BasePage):
+    key='users'; title='المستخدمون والصلاحيات'; icon='shield'; required_permission='user.manage'
+    def build(self):
+        self.svc=SystemService(self.session); self._sel=None
+        lay=QVBoxLayout(self); lay.setContentsMargins(6,6,6,6)
+        self.grid=DataGrid([Column('username','المستخدم',width=120), Column('full_name','الاسم الكامل',width=160), Column('roles','الأدوار',width=200), Column('is_active','نشط','status',70)], grid_id='users')
+        self.grid.selectionChangedRows.connect(lambda rows: (setattr(self,'_sel', rows[0] if len(rows)==1 else None), self.actions_changed.emit()))
+        lay.addWidget(self.grid,1)
+
+    def refresh(self):
+        if not getattr(self,'_built',False): return
+        keep=self._sel['id'] if self._sel else None
+        try: rows=self.svc.users()
+        except Exception as e: self.show_error(e); rows=[]
+        self.grid.set_rows(rows)
+        if keep is not None: self.grid.select_where(lambda r: r['id']==keep)
+        self.actions_changed.emit()
+
+    def _state(self,k):
+        if k in ('add','roles'): return self.access.state('user.manage')
+        if not self._sel: return ActionState(False,'حدد مستخدمًا')
+        return self.access.state('user.manage')
+
+    def ribbon_groups(self):
+        def a(k,lab,icon,**kw): return Action(k,lab,icon,state_fn=lambda kk=k: self._state(kk), handler=lambda kk=k: self.do(kk), **kw)
+        return [
+            ActionGroup('مستخدم',[
+                a('add','+ مستخدم','new',primary=True),
+                a('toggle','تفعيل/تعطيل','refresh'),
+                a('edit_user','تعديل بيانات المستخدم','edit'),
+                a('role','مجموعات صلاحيات المستخدم','edit'),
+                a('restrict','تقييد النطاق','lock')
+            ]),
+            ActionGroup('الصلاحيات',[a('roles','إدارة مجموعات الصلاحيات','shield',primary=True)]),
+            ActionGroup('عرض',[Action('refresh','تحديث','refresh',handler=self.refresh)])
+        ]
+
+    def do(self,k):
+        st=self._state(k)
+        if not st.enabled: return QMessageBox.information(self,self.title,st.reason)
+        if k=='roles':
+            from alhisabat.ui.app_dialogs.system import RolesManagerDialog
+            self.exec_form(RolesManagerDialog(self))
+            self.access.invalidate(); self.refresh(); self.window_.data_changed(self.key); return
+        if k=='add':
+            from alhisabat.ui.app_dialogs.system import UserDialog
+            d=UserDialog(self)
+            if self.exec_form(d):
+                ok,_=self.guarded(self.svc.create_user, d.values(), reload=False)
+                if ok: self.refresh(); self.window_.data_changed(self.key)
+        if k=='toggle':
+            ok,_=self.guarded(self.svc.set_user_active, self._sel['id'], not bool(self._sel.get('is_active')), reload=False)
+            if ok: self.refresh(); self.window_.data_changed(self.key)
+        if k=='edit_user':
+            from alhisabat.ui.app_dialogs.system import UserEditDialog
+            d=UserEditDialog(self, self._sel)
+            if self.exec_form(d):
+                uid=self._sel['id']
+                ok,_=self.guarded(self.svc.update_user, uid, d.values(), reload=False)
+                if ok:
+                    self.notify('تم تعديل بيانات المستخدم'); self.refresh(); self.window_.data_changed(self.key)
+        if k=='role':
+            from alhisabat.ui.app_dialogs.system import RoleDialog
+            try: cur=self.svc.user_role_ids(self._sel['id'])
+            except Exception as exc: return self.show_error(exc)
+            d=RoleDialog(self, cur)
+            if self.exec_form(d):
+                ok,_=self.guarded(self.svc.set_user_roles, self._sel['id'], d.values()['role_ids'], reload=False)
+                if ok: self.notify('تم تحديث مجموعات المستخدم'); self.access.invalidate(); self.refresh(); self.window_.data_changed(self.key)
+        if k=='restrict':
+            from alhisabat.ui.app_dialogs.system import UserRestrictionDialog
+            d=UserRestrictionDialog(self, self._sel)
+            self.exec_form(d)
+
+class SettingsPage(BasePage):
+    key='settings'; title='الإعدادات'; icon='settings'; required_permission='settings.manage'
+    def build(self):
+        self.svc=SystemService(self.session)
+        lay=QVBoxLayout(self); lay.setContentsMargins(6,6,6,6)
+        self.grid=DataGrid([Column('group','المجموعة',width=130), Column('key','البند',width=200), Column('value','القيمة',width=200)], grid_id='settings')
+        lay.addWidget(self.grid,1)
+        self.info=QLabel('تعديل الإعدادات الحرجة عبر الأزرار أعلاه؛ يتطلب صلاحية «إدارة إعدادات الشركة».'); self.info.setWordWrap(True); lay.addWidget(self.info)
+    def refresh(self):
+        if not getattr(self,'_built',False): return
+        try: rows=self.svc.settings()
+        except Exception as e: self.show_error(e); rows=[]
+        # إعطاء id للشبكة
+        for i,r in enumerate(rows): r['id']=i+1
+        self.grid.set_rows(rows)
+        self.actions_changed.emit()
+    def ribbon_groups(self):
+        return [ActionGroup('إعدادات',[Action('edit','تعديل الإعدادات (القيود والمبيعات والمخزون)','edit',state_fn=lambda: self.access.state('settings.manage'), handler=self._edit), Action('branches','الفروع','branch',state_fn=lambda: self.access.state('settings.manage'), handler=lambda: self.open_page_requested.emit('branches', None)), Action('my_profile','بيانات المستخدم','edit',handler=self._my_profile), Action('mobile_link','ربط الهاتف','settings',state_fn=lambda: self.access.state('settings.manage'), handler=lambda: self.open_page_requested.emit('mobile_link', None)), Action('print_guide','دليل الطباعة','print',handler=lambda: self.open_page_requested.emit('print_guide', None))]), ActionGroup('عرض',[Action('refresh','تحديث','refresh',handler=self.refresh)])]
+    def _my_profile(self):
+        """تعديل المستخدم الحالي لاسمه وكلمة مروره (يتطلب كلمة المرور الحالية)."""
+        from alhisabat.ui.app_dialogs.system import MyProfileDialog
+        ok,me=self.guarded(self.svc.my_profile, reload=False)
+        if not ok: return
+        d=MyProfileDialog(self, me['full_name'], me['username'])
+        if self.exec_form(d):
+            ok,_=self.guarded(self.svc.update_my_profile, d.values(), reload=False)
+            if ok:
+                self.notify('تم حفظ بيانات المستخدم')
+
+    def _edit(self):
+        from alhisabat.ui.app_dialogs.system import SettingsDialog
+        d=SettingsDialog(self)
+        if self.exec_form(d):
+            ok,_=self.guarded(self.svc.update_settings, d.values(), reload=False)
+            if ok: self.refresh(); self.window_.data_changed(self.key)

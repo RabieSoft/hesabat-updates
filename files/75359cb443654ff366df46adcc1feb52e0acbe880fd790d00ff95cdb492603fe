@@ -1,0 +1,436 @@
+"""مطابقة أرصدة العملاء والموردين مع ملف خارجي (نظام قديم).
+
+التدفق: read_reconcile_file → preview (يقارن ولا يكتب) → export_xlsx (اختياري: يعدّل المستخدم عمود «الرصيد المعتمد» ويعيد رفعه)
+→ commit (قيد تسوية واحد لكل طرف: أسطر على حساب الطرف بعملاته + سطر موازنة واحد بالعملة الأساسية على «فروقات مطابقة الأرصدة»).
+
+الاصطلاح: كل الأرصدة هنا «بطبيعة الطرف» (الموجب = مدين للعميل / دائن للمورد). الفرق = الرصيد المعتمد − رصيد النظام.
+المطابقة بالعملة الأصلية لكل عملة على حدة، ولا تمر بحساب الصندوق أو الأرباح؛ حسابها حقوق ملكية مؤقت (مفتاح الربط reconcile_diff).
+"""
+import csv
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+
+from alhisabat.accounting import balance_engine as be, journal_engine as je, rates as fxr
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.audit import audit
+from alhisabat.business import chart_of_accounts as coa, importer as imp
+from alhisabat.database.tx import transaction
+from alhisabat.security import permissions
+
+SOURCE = "party_reconcile"
+LABEL = "مطابقة"
+_KINDS = ("customer", "supplier")
+
+
+# ---------------- قراءة الملف ----------------
+def _field(h):
+    """عنوان العمود ← حقل. يميّز مدين/دائن كعمودين منفصلين، ويتجاهل أعمدة ملف سبق تصديره (رصيد النظام/الفرق)."""
+    k = imp._nk(h)
+    if not k:
+        return None
+    if "معتمد" in k:
+        return "approved"
+    if "النظام" in k or "فرق" in k or "الحاله" in k or "اقتراح" in k:
+        return None
+    if k in ("مدين", "debit", "dr", "عليه"):
+        return "debit"
+    if k in ("دائن", "credit", "cr", "له"):
+        return "credit"
+    f = imp._field_of_header(h)
+    return f if f in ("name", "code", "amount", "side", "currency") else None
+
+
+def _grid_rows(grid):
+    grid = [list(r) for r in grid]
+    hdr, cmap = None, {}
+    for i, r in enumerate(grid[:15]):
+        m = {}
+        for c, v in enumerate(r):
+            f = _field(v) if isinstance(v, str) else None
+            if f and f not in m.values():
+                m[c] = f
+        vals = set(m.values())
+        if ("name" in vals or "code" in vals) and vals & {"amount", "debit", "credit", "approved"}:
+            hdr, cmap = i, m
+            break
+    if hdr is None:
+        raise AccountingError("تعذّر التعرف على الأعمدة: يلزم عمود اسم (أو كود) وعمود رصيد أو مدين/دائن")
+    out, cur_side = [], None
+    totals = {imp._nk(w) for w in imp._TOTAL_WORDS}
+    for n, r in enumerate(grid[hdr + 1:], hdr + 2):
+        cells = [(c, v) for c, v in enumerate(r) if v is not None and str(v).strip() != ""]
+        if not cells:
+            continue
+        if len(cells) == 1 and imp._side_of(cells[0][1]):
+            cur_side = imp._side_of(cells[0][1])
+            continue
+        row = {"line": n, "name": "", "code": "", "amount": "", "debit": "", "credit": "", "approved": "", "side": "", "currency": ""}
+        for c, f in cmap.items():
+            v = r[c] if c < len(r) else None
+            row[f] = imp._clean_amount(v) if f in ("amount", "debit", "credit", "approved") else (str(v).strip() if v is not None else "")
+        row["name"] = " ".join(row["name"].split())
+        if imp._nk(row["name"]) in totals or not (row["name"] or row["code"]):
+            continue
+        if not row["side"] and cur_side:
+            row["side"] = cur_side
+        out.append(row)
+    if not out:
+        raise AccountingError("الملف بلا صفوف بيانات")
+    return out
+
+
+def read_reconcile_file(path):
+    """CSV أو xlsx ← صفوف {line,name,code,amount,debit,credit,approved,side,currency}. القراءة متدفقة (ملفات كبيرة)."""
+    pl = str(path or "").lower()
+    if not pl:
+        raise AccountingError("اختر ملفًا")
+    if pl.endswith((".xlsx", ".xlsm")):
+        try:
+            import openpyxl
+        except ImportError as e:
+            raise AccountingError("قراءة Excel تحتاج مكتبة openpyxl") from e
+        wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+        try:
+            ws = next((w for w in wb.worksheets if w.max_row and w.max_row > 1), wb.worksheets[0])
+            return _grid_rows(ws.iter_rows(values_only=True))
+        finally:
+            wb.close()
+    if pl.endswith(".xls"):
+        raise AccountingError("صيغة xls القديمة غير مدعومة: احفظ الملف بصيغة xlsx أو CSV")
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        return _grid_rows(csv.reader(f))
+
+
+# ---------------- أدوات ----------------
+def _num(v, label, errs):
+    t = str(v or "").strip()
+    if not t:
+        return None
+    try:
+        return Decimal(t)
+    except (InvalidOperation, ValueError):
+        errs.append(f"{label} ليس رقمًا")
+        return None
+
+
+def parse_amount(text):
+    """نص أدخله المستخدم (أرقام عربية/هندية وفواصل مقبولة) ← Decimal، أو AccountingError."""
+    errs = []
+    v = _num(imp._clean_amount(text), "المبلغ", errs)
+    if v is None or errs:
+        raise AccountingError("أدخل رقمًا صحيحًا")
+    return v
+
+
+def _minor(d):
+    return int((Decimal(d) * 100).quantize(Decimal(1), ROUND_HALF_UP))
+
+
+def _major(m):
+    return Decimal(m) / 100
+
+
+def file_natural(kind, row, errs):
+    """رصيد الملف بطبيعة الطرف (Decimal) أو None. الأولوية: المعتمد ← مدين/دائن ← الرصيد (+ نوعه)."""
+    nat_debit = kind == "customer"
+    ap = _num(row.get("approved"), "الرصيد المعتمد", errs)
+    if ap is not None:
+        return ap
+    d, c = _num(row.get("debit"), "المدين", errs), _num(row.get("credit"), "الدائن", errs)
+    if d is not None or c is not None:
+        net = (d or 0) - (c or 0)                                  # مدين − دائن
+        return net if nat_debit else -net
+    a = _num(row.get("amount"), "الرصيد", errs)
+    if a is None:
+        return None
+    side_raw = str(row.get("side") or "").strip()
+    side = imp._side_of(side_raw)
+    if side_raw and not side:
+        errs.append("نوع الرصيد غير مفهوم (المقبول: دائن / مدين)")
+        return None
+    if side:
+        return abs(a) if (side == "debit") == nat_debit else -abs(a)
+    return a                                                       # بلا نوع: الموجب = الرصيد الطبيعي
+
+
+def system_balances(conn, company_id, kind, as_of):
+    """{(party_id, currency): صافي مدين−دائن بالعملة الأصلية (وحدة صغرى)} للأرصدة المرحّلة، باستعلام واحد."""
+    ys = be.year_start(conn, company_id, as_of)
+    eff, counted, _ = be.frag("x")
+    args = {"c": company_id, "t": as_of, "ys": ys, "fl": be.perm_floor(conn, company_id, ys), "k": kind}
+    q = (f"SELECT p.id pid, l.currency cur, SUM(l.debit_orig-l.credit_orig) net "
+         f"FROM journal_lines l JOIN journal_entries e ON e.id=l.entry_id JOIN accounts x ON x.id=l.account_id "
+         f"JOIN parties p ON p.account_id=l.account_id "
+         f"WHERE e.company_id=:c AND p.kind=:k AND e.status IN {be.POSTED} AND e.entry_date<=:t AND {counted} "
+         f"GROUP BY p.id, l.currency")
+    return {(r["pid"], r["cur"]): r["net"] for r in conn.execute(q, args)}
+
+
+def _pending_drafts(conn, company_id):
+    return {(r[0]) for r in conn.execute(
+        "SELECT DISTINCT source_id FROM journal_entries WHERE company_id=? AND source_type=? AND status='draft'", (company_id, SOURCE))}
+
+
+# ---------------- مطابقة الأسماء التقريبية ----------------
+def _fold(s):
+    """طيّ إضافي للمقارنة التقريبية فقط: ؤ/ئ، وإسقاط «ال» التعريف من أول كل كلمة."""
+    k = imp._nk(s).translate(str.maketrans("ؤئ", "وي"))
+    return " ".join(t[2:] if t.startswith("ال") and len(t) > 3 else t for t in k.split())
+
+
+def _score(q, qc, f, fc):
+    from difflib import SequenceMatcher
+    r = SequenceMatcher(None, qc, fc, autojunk=False).ratio()                          # حرف زائد/ناقص/خاطئ، ومسافات زائدة أو ناقصة
+    r = max(r, SequenceMatcher(None, " ".join(sorted(q.split())), " ".join(sorted(f.split())), autojunk=False).ratio())  # اختلاف ترتيب الكلمات
+    lo, hi = sorted((len(qc), len(fc)))
+    if lo >= 4 and (qc in fc or fc in qc):                                             # اسم مختصر/مطوّل (لا يتجاوز 0.9 فلا يغلب تطابقًا حقيقيًا)
+        r = max(r, 0.6 + 0.3 * lo / hi)
+    return r
+
+
+class NameIndex:
+    """فهرس ثنائيات الحروف لاقتراح أقرب الأسماء بسرعة على آلاف الأطراف: اختيار مرشحين بالثنائيات ثم ترتيبهم بالتشابه الفعلي."""
+
+    def __init__(self, recs):
+        self.recs = list(recs)
+        self.fold = [_fold(r["name"]) for r in self.recs]
+        self.compact = [f.replace(" ", "") for f in self.fold]
+        self.post = {}
+        for i, c in enumerate(self.compact):
+            for g in {c[j:j + 2] for j in range(len(c) - 1)}:
+                self.post.setdefault(g, []).append(i)
+
+    def suggest(self, name, limit=5, min_score=0.5, pool=40):
+        q = _fold(name); qc = q.replace(" ", "")
+        if len(qc) < 2:
+            return []
+        grams = {qc[j:j + 2] for j in range(len(qc) - 1)}
+        cnt = {}
+        for g in grams:
+            for i in self.post.get(g, ()):
+                cnt[i] = cnt.get(i, 0) + 1
+        if not cnt:
+            return []
+        jac = lambda i: cnt[i] / (len(grams) + max(len(self.compact[i]) - 1, 1) - cnt[i])
+        out = []
+        for i in sorted(cnt, key=jac, reverse=True)[:pool]:
+            sc = _score(q, qc, self.fold[i], self.compact[i])
+            if sc >= min_score:
+                r = self.recs[i]
+                out.append({"party_id": r["id"], "code": r["code"], "name": r["name"], "score": round(sc, 3)})
+        out.sort(key=lambda x: -x["score"])
+        return out[:limit]
+
+
+# ---------------- المعاينة ----------------
+def preview(conn, user_id, company_id, kind, rows, *, as_of, currency=None, force_currency=False, dup_mode="skip"):
+    """يقارن رصيد الملف برصيد النظام (المرحَّل حتى as_of) لكل طرف وعملة. لا يكتب شيئًا.
+    الحالات: match | diff | unknown_party | ambiguous_party | invalid | duplicate_in_file | merged | pending_draft.
+    ambiguous_party: الاسم مطابق لأكثر من طرف في النظام ← suggestions = الأطراف المتطابقة ليختار المستخدم (لا اختيار تلقائي).
+    dup_mode: "skip" (الافتراضي) يتجاهل تكرار نفس الطرف/العملة في الملف ويُبقي الأول، "sum" يجمع أرصدة الصفوف المكررة (merged).
+    تحديد الطرف بالأولوية: party_id يختاره المستخدم ← الكود ← الاسم المطابق تمامًا؛ وإلا unknown_party مع اقتراحات الأسماء الأقرب (suggestions).
+    «الرصيد المعتمد» (approved) إن وُجد في الصف يطغى على رصيد الملف (إدخال يدوي).
+    الصف الواحد: file / system / diff / approved (بطبيعة الطرف، Decimal) + party_id/code/name/currency/matched_by/suggestions."""
+    permissions.require(conn, user_id, company_id, "data.import", check_branch=False)
+    permissions.require(conn, user_id, company_id, "party.view", check_branch=False)
+    if kind not in _KINDS:
+        raise AccountingError("نوع غير معروف")
+    base = fxr.base_currency(conn, company_id)
+    cur_default = imp._cur_of(currency) or base
+    recs = conn.execute("SELECT id,code,name FROM parties WHERE company_id=? AND kind=?", (company_id, kind)).fetchall()
+    by_id = {r["id"]: r for r in recs}
+    by_code = {r["code"]: r for r in recs}
+    by_name = {}
+    for r in recs:
+        by_name.setdefault(imp._nk(r["name"]), []).append(r)
+    index = None
+    sysb = system_balances(conn, company_id, kind, as_of)
+    pend = _pending_drafts(conn, company_id)
+    nat = 1 if kind == "customer" else -1
+    seen, out = set(), []
+    summary = {"match": 0, "diff": 0, "unknown_party": 0, "ambiguous_party": 0, "invalid": 0, "duplicate_in_file": 0, "merged": 0, "pending_draft": 0}
+    first = {}
+    for row in rows:
+        errs, rec, how, sugg, cands = [], None, "", [], []
+        code = (row.get("code") or "").strip()
+        name = " ".join(str(row.get("name") or "").split())
+        if row.get("party_id") is not None:
+            rec, how = by_id.get(row["party_id"]), "manual"
+            if rec is None:
+                errs.append("الطرف المختار غير صالح")
+        else:
+            if code:
+                rec, how = by_code.get(code), "code"
+            if rec is None and name:
+                m = by_name.get(imp._nk(name), [])
+                if len(m) > 1:
+                    cands = m                                      # اسم مكرر في النظام: يختار المستخدم الطرف (لا تخمين)
+                elif m:
+                    rec, how = m[0], "name"
+            if rec is None and not errs and not cands:
+                if not (code or name):
+                    errs.append("اسم الطرف أو كوده مطلوب")
+                elif name:
+                    index = index or NameIndex(recs)
+                    sugg = index.suggest(name)
+        cur = cur_default if force_currency else (imp._cur_of(row.get("currency")) or cur_default)
+        if cur != base and not fxr.currency_enabled(conn, company_id, cur):
+            errs.append(f"العملة {cur} غير معروفة أو غير مفعّلة")
+        f = file_natural(kind, row, errs)
+        if f is None and not errs:
+            errs.append("لا يوجد رصيد في هذا الصف")
+        status, diff, sysv = "invalid", None, None
+        if errs:
+            pass
+        elif rec is None and cands:
+            status = "ambiguous_party"
+            errs.append(f"الاسم مطابق لـ {len(cands)} أطراف في النظام: اختر الطرف الصحيح من القائمة (أو اكتب الكود في الملف)")
+            sugg = [{"party_id": c["id"], "code": c["code"], "name": c["name"], "score": 1.0,
+                     "system": _major(nat * sysb.get((c["id"], cur), 0))} for c in cands]
+        elif rec is None:
+            status = "unknown_party"
+            errs.append("الطرف غير موجود: اختر من الاقتراحات، أو أنشئه أولًا (أو استورده من تبويب الاستيراد)")
+        else:
+            key = (rec["id"], cur)
+            if key in seen and dup_mode == "sum" and key in first:
+                o = first[key]
+                summary[o["status"]] -= 1
+                o["file"] = o["file"] + f
+                o["approved"] = o["file"]
+                o["diff"] = o["file"] - o["system"]
+                o["status"] = "match" if o["diff"] == 0 else ("pending_draft" if rec["id"] in pend else "diff")
+                summary[o["status"]] += 1
+                o["merged_rows"] = o.get("merged_rows", 1) + 1
+                status, errs, sysv = "merged", [f"جُمع رصيده مع صف سابق لنفس الطرف ({cur}) — الإجمالي بعد الدمج {o['file']:,.2f}"], o["system"]
+            elif key in seen:
+                status, errs = "duplicate_in_file", [f"الطرف مكرر بنفس العملة ({cur}) داخل الملف: غير محتسب (اختر «جمع المكرر» لجمع الأرصدة)"]
+            else:
+                seen.add(key)
+                sysv = _major(nat * sysb.get(key, 0))
+                diff = f - sysv
+                status = "match" if diff == 0 else ("pending_draft" if rec["id"] in pend else "diff")
+                if status == "pending_draft":
+                    errs.append("له قيد مطابقة مسودة غير مرحَّل: رحّله أو احذفه ثم أعد المعاينة")
+        summary[status] += 1
+        out.append({"line": row.get("line"), "status": status, "errors": errs,
+                    "party_id": rec["id"] if rec else None, "code": rec["code"] if rec else code,
+                    "name": rec["name"] if rec else name, "file_name": name, "matched_by": how, "suggestions": sugg,
+                    "currency": cur, "file": f, "system": sysv, "diff": diff, "approved": f})
+        if status in ("match", "diff", "pending_draft") and rec is not None:
+            first.setdefault((rec["id"], cur), out[-1])
+    return {"as_of": as_of, "kind": kind, "base": base, "summary": summary, "rows": out}
+
+
+def confident_matches(prev, min_score=0.9, min_gap=0.05):
+    """{line: party_id} للصفوف غير المعروفة التي لأفضل اقتراح لها تشابه ≥ min_score ويتقدّم على الثاني بفارق min_gap على الأقل.
+    للاستعمال بعد تأكيد المستخدم (قبول الاقتراحات الواثقة دفعة واحدة)؛ المحرك لا يقبل اقتراحًا من تلقاء نفسه."""
+    out = {}
+    for r in prev["rows"]:
+        sg = r["suggestions"]
+        if r["status"] == "unknown_party" and sg and sg[0]["score"] >= min_score and (len(sg) == 1 or sg[0]["score"] - sg[1]["score"] >= min_gap):
+            out[r["line"]] = sg[0]["party_id"]
+    return out
+
+
+# ---------------- التصدير إلى Excel ----------------
+def export_xlsx(preview_result, path):
+    """يكتب نتيجة المعاينة إلى Excel: الكود، الاسم، العملة، رصيد الملف، رصيد النظام، الفرق، الرصيد المعتمد، الحالة.
+    «الرصيد المعتمد» عمود يعدّله المستخدم (افتراضيًا = رصيد الملف) ثم يعيد رفع الملف؛ الفرق عمود محسوب بمعادلة."""
+    try:
+        import openpyxl
+        from openpyxl.styles import Alignment, Font, PatternFill
+    except ImportError as e:
+        raise AccountingError("التصدير إلى Excel يحتاج مكتبة openpyxl") from e
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "المطابقة"
+    ws.sheet_view.rightToLeft = True
+    ws.append(["الكود", "الاسم", "العملة", "رصيد الملف", "رصيد النظام", "الفرق", "الرصيد المعتمد", "الحالة", "أقرب اقتراح"])
+    names = {"match": "متطابق", "diff": "فرق", "unknown_party": "طرف غير موجود", "invalid": "خطأ",
+             "duplicate_in_file": "مكرر في الملف", "pending_draft": "مسودة مطابقة قائمة",
+             "ambiguous_party": "اسم مكرر في النظام", "merged": "مدموج مع صف سابق"}
+    head = PatternFill("solid", fgColor="DDE7F3")
+    for c in ws[1]:
+        c.font, c.fill = Font(bold=True), head
+    for r in preview_result["rows"]:
+        i = ws.max_row + 1
+        f = float(r["file"]) if r["file"] is not None else None
+        s = float(r["system"]) if r["system"] is not None else None
+        ws.append([r["code"], r["name"], r["currency"], f, s, None, f, names[r["status"]] + (": " + "؛ ".join(r["errors"]) if r["errors"] else ""),
+                   "؛ ".join(f"{x['code']} — {x['name']} ({x['score']:.0%})" for x in r["suggestions"][:3])])
+        if f is not None and s is not None:
+            ws.cell(i, 6).value = f"=G{i}-E{i}"                    # الفرق = المعتمد − النظام (يتحدّث إن عدّل المستخدم المعتمد)
+        for col in (4, 5, 6, 7):
+            ws.cell(i, col).number_format = "#,##0.00;[Red]-#,##0.00"
+        if r["status"] == "diff":
+            ws.cell(i, 6).font = Font(bold=True, color="C00000")
+        ws.cell(i, 7).fill = PatternFill("solid", fgColor="FFF6D6")
+    for col, w in zip("ABCDEFGHI", (12, 34, 9, 16, 16, 16, 18, 40, 60)):
+        ws.column_dimensions[col].width = w
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    for row in ws.iter_rows(min_row=1, max_row=1):
+        for c in row:
+            c.alignment = Alignment(horizontal="center")
+    wb.save(path)
+    return path
+
+
+# ---------------- الاعتماد ----------------
+def _suspense_account(conn, actor_id, company_id):
+    try:
+        return coa.get_mapping(conn, company_id, "reconcile_diff")
+    except AccountingError:
+        try:
+            coa.complete_default_mappings(conn, actor_id, company_id)       # شركة قديمة: يربط المفتاح الناقص من القالب إن أمكن
+            return coa.get_mapping(conn, company_id, "reconcile_diff")
+        except AccountingError as e:
+            raise AccountingError("حساب «فروقات مطابقة الأرصدة» غير مربوط: أنشئ حسابًا تحت حقوق الملكية واربطه بالمفتاح "
+                                  "reconcile_diff من إعدادات ربط الحسابات ثم أعد المحاولة") from e
+
+
+def commit(conn, user_id, company_id, kind, rows, *, as_of, currency=None, force_currency=False, post=False, note="", dup_mode="skip"):
+    """يعيد المعاينة بنفسه (لا يثق بمعاينة سابقة) ثم يُنشئ قيد مطابقة لكل طرف له فرق: مسودة افتراضيًا، أو مرحّلًا مباشرة (post=True).
+    فشل طرف واحد (فترة مغلقة مثلًا) لا يوقف الباقي: يُعاد في failed. الأرصدة المتطابقة لا تُنتج قيدًا."""
+    prev = preview(conn, user_id, company_id, kind, rows, as_of=as_of, currency=currency, force_currency=force_currency, dup_mode=dup_mode)
+    permissions.require(conn, user_id, company_id, "journal.create", check_branch=False)
+    if post:
+        permissions.require(conn, user_id, company_id, "journal.post", check_branch=False)
+    todo = [r for r in prev["rows"] if r["status"] == "diff"]
+    if not todo:
+        return {"created": 0, "posted": 0, "matched": prev["summary"]["match"], "entries": [], "failed": [], "skipped": prev["summary"]}
+    suspense = _suspense_account(conn, user_id, company_id)
+    base, nat = prev["base"], (1 if kind == "customer" else -1)
+    by_party = {}
+    for r in todo:
+        by_party.setdefault(r["party_id"], []).append(r)
+    entries, failed, posted = [], [], 0
+    for pid, items in by_party.items():
+        acc = conn.execute("SELECT account_id,name FROM parties WHERE id=?", (pid,)).fetchone()
+        lines, net_base, parts = [], 0, []
+        try:
+            for r in items:
+                delta = nat * r["diff"]                                    # تغيّر (مدين − دائن) على حساب الطرف
+                cur = r["currency"]
+                rate = Decimal(1) if cur == base else fxr.get_rate(conn, company_id, cur, as_of)
+                lines.append({"account_id": acc["account_id"], "debit": delta if delta > 0 else 0, "credit": -delta if delta < 0 else 0,
+                              "currency": cur, "rate": None if cur == base else rate,
+                              "memo": f"{LABEL}: ملف {r['file']:,.2f} / نظام {r['system']:,.2f} / فرق {r['diff']:,.2f}"})
+                net_base += int((Decimal(_minor(delta)) * rate).quantize(Decimal(1), ROUND_HALF_UP))
+                parts.append(f"{cur} {r['diff']:+,.2f}")
+            if net_base:
+                m = Decimal(abs(net_base)) / 100
+                lines.append({"account_id": suspense, "debit": 0 if net_base > 0 else m, "credit": m if net_base > 0 else 0, "currency": base})
+            desc = f"{LABEL} — {acc['name']} — الفرق: " + "، ".join(parts) + (f" — {note.strip()}" if note and note.strip() else "")
+            with transaction(conn):
+                eid = je.create_draft(conn, company_id, user_id, as_of, lines, desc, entry_type="adjustment",
+                                      source_type=SOURCE, source_id=pid)
+                if post:
+                    je.post(conn, eid, user_id)
+                audit.log(conn, user_id, "party_reconcile", "parties", pid,
+                          after={"entry_id": eid, "as_of": as_of, "posted": bool(post), "items": parts})
+            entries.append({"party_id": pid, "entry_id": eid})
+            posted += 1 if post else 0
+        except Exception as e:                                             # طرف واحد لا يوقف الدفعة
+            failed.append({"party_id": pid, "name": acc["name"] if acc else "", "error": str(e)})
+    return {"created": len(entries), "posted": posted, "matched": prev["summary"]["match"], "entries": entries,
+            "failed": failed, "skipped": prev["summary"]}

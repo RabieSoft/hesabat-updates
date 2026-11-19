@@ -1,0 +1,58 @@
+from alhisabat.accounting.errors import AccountingError
+
+
+def get_settings(conn, company_id):
+    r = conn.execute("SELECT * FROM numbering_settings WHERE company_id=?", (company_id,)).fetchone()
+    if r is None:
+        conn.execute("INSERT INTO numbering_settings(company_id, segment_lengths) VALUES(?, '1,1,2,3,4')", (company_id,))
+        r = conn.execute("SELECT * FROM numbering_settings WHERE company_id=?", (company_id,)).fetchone()
+    return r
+
+
+def _segments(s):
+    return [int(x) for x in s["segment_lengths"].split(",")]
+
+
+def code_length_for_level(s, level):
+    seg = _segments(s)
+    total = len(s["prefix"])
+    for i in range(level):
+        total += seg[i] if i < len(seg) else seg[-1]   # العمق غير محدود: يُكرَّر آخر مقطع
+    return total
+
+
+def validate_code(conn, company_id, code, parent_id):
+    s = get_settings(conn, company_id)
+    if not code or not code.isdigit():
+        raise AccountingError("رقم الحساب يجب أن يتكون من أرقام فقط")
+    if not code.startswith(s["prefix"]):
+        raise AccountingError(f"رقم الحساب يجب أن يبدأ بالبادئة {s['prefix']}")
+    level = 1
+    if parent_id is not None:
+        p = conn.execute("SELECT code,level FROM accounts WHERE id=?", (parent_id,)).fetchone()
+        if not p:
+            raise AccountingError("الحساب الأب غير موجود")
+        level = p["level"] + 1
+        if not code.startswith(p["code"]):
+            raise AccountingError("رقم الحساب غير متوافق مع رقم الحساب الأب")
+    want = code_length_for_level(s, level)
+    if len(code) != want:
+        raise AccountingError(f"طول رقم الحساب في هذا المستوى يجب أن يكون {want} أرقام")
+    return level
+
+
+def next_code(conn, company_id, parent_id):
+    s = get_settings(conn, company_id)
+    if parent_id is None:
+        level, pcode = 1, s["prefix"]
+        rows = conn.execute("SELECT code FROM accounts WHERE company_id=? AND parent_id IS NULL", (company_id,)).fetchall()
+    else:
+        p = conn.execute("SELECT code,level FROM accounts WHERE id=?", (parent_id,)).fetchone()
+        level, pcode = p["level"] + 1, p["code"]
+        rows = conn.execute("SELECT code FROM accounts WHERE parent_id=?", (parent_id,)).fetchall()
+    width = code_length_for_level(s, level) - len(pcode)
+    used = [int(r["code"][len(pcode):]) for r in rows if r["code"][len(pcode):].isdigit()]
+    n = (max(used) if used else 0) + 1
+    if n >= 10 ** width:
+        raise AccountingError("لا توجد أرقام متاحة في هذا المستوى: زد طول المقطع في إعدادات الترقيم")
+    return pcode + str(n).zfill(width)

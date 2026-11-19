@@ -1,0 +1,133 @@
+"""أسعار الصرف والعملات. السعر = عدد وحدات العملة الأساسية لوحدة أجنبية واحدة، بدقة 8 خانات. السعر المستخدم يُنسخ إلى سطر القيد فلا يتغير التاريخ بتغيّر الجدول."""
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.audit import audit
+from alhisabat.database.tx import transaction
+from alhisabat.security import permissions
+
+DEVIATION_LIMIT = Decimal("0.30")     # تغير أكبر من 30% عن آخر سعر يحتاج force + سبب
+Q = Decimal("0.00000001")
+
+
+def _dec(rate):
+    try:
+        d = Decimal(str(rate)).quantize(Q, ROUND_HALF_UP)
+    except (InvalidOperation, ValueError):
+        raise AccountingError("سعر الصرف غير صالح")
+    if d <= 0 or d > Decimal("1000000"):
+        raise AccountingError("سعر الصرف يجب أن يكون أكبر من صفر وأقل من مليون")
+    return d
+
+
+def base_currency(conn, company_id):
+    r = conn.execute("SELECT base_currency FROM companies WHERE id=?", (company_id,)).fetchone()
+    if not r:
+        raise AccountingError("الشركة غير موجودة")
+    return r[0]
+
+
+def default_currency(conn, company_id):
+    """عملة الإدخال الافتراضية للشركة (المسبقة الاختيار في المستندات الجديدة). تعود للأساسية إن لم تُحدَّد أو عُطّلت."""
+    r = conn.execute("SELECT base_currency, default_currency FROM companies WHERE id=?", (company_id,)).fetchone()
+    if not r:
+        raise AccountingError("الشركة غير موجودة")
+    d = r[1]
+    if d and d != r[0] and currency_enabled(conn, company_id, d):
+        return d
+    return r[0]
+
+
+def set_default_currency(conn, actor_id, company_id, code):
+    permissions.require(conn, actor_id, company_id, "currency.manage", check_branch=False)
+    code = (code or "").strip().upper()
+    base = base_currency(conn, company_id)
+    if code != base and not currency_enabled(conn, company_id, code):
+        raise AccountingError("العملة غير موجودة أو غير مفعّلة للشركة")
+    with transaction(conn):
+        conn.execute("UPDATE companies SET default_currency=? WHERE id=?", (code, company_id))
+        audit.log(conn, actor_id, "set_default_currency", "companies", company_id, after={"default_currency": code})
+
+
+def currency_enabled(conn, company_id, code):
+    r = conn.execute("SELECT is_active FROM currencies WHERE code=?", (code,)).fetchone()
+    if not r or not r[0]:
+        return False
+    c = conn.execute("SELECT is_enabled FROM company_currencies WHERE company_id=? AND currency=?", (company_id, code)).fetchone()
+    return c is None or bool(c[0])
+
+
+def get_rate(conn, company_id, currency, on_date):
+    """آخر سعر بتاريخ ≤ on_date. العملة الأساسية = 1. لا سعر = خطأ صريح (لا افتراض 1 أبدا)."""
+    if currency == base_currency(conn, company_id):
+        return Decimal(1)
+    r = conn.execute("SELECT rate FROM exchange_rates WHERE company_id=? AND currency=? AND rate_date<=? "
+                     "ORDER BY rate_date DESC LIMIT 1", (company_id, currency, on_date)).fetchone()
+    if not r:
+        raise AccountingError(f"لا يوجد سعر صرف للعملة {currency} في تاريخ {on_date} أو قبله")
+    return Decimal(r[0])
+
+
+def set_rate(conn, actor_id, company_id, currency, rate_date, rate, *, reason="", force=False):
+    permissions.require(conn, actor_id, company_id, "currency.rates", check_branch=False)
+    if currency == base_currency(conn, company_id):
+        raise AccountingError("لا يوجد سعر صرف للعملة الأساسية")
+    if not conn.execute("SELECT 1 FROM currencies WHERE code=?", (currency,)).fetchone():
+        raise AccountingError("عملة غير معروفة")
+    r = _dec(rate)
+    old = conn.execute("SELECT id,rate FROM exchange_rates WHERE company_id=? AND currency=? AND rate_date=?",
+                       (company_id, currency, rate_date)).fetchone()
+    prev = conn.execute("SELECT rate FROM exchange_rates WHERE company_id=? AND currency=? AND rate_date<? "
+                        "ORDER BY rate_date DESC LIMIT 1", (company_id, currency, rate_date)).fetchone()
+    if prev and abs(r - Decimal(prev[0])) / Decimal(prev[0]) > DEVIATION_LIMIT and not (force and reason.strip()):
+        raise AccountingError("تغير السعر يتجاوز 30% عن آخر سعر: أكّد بـ force مع ذكر السبب")
+    if old and Decimal(old[1]) != r and not reason.strip():
+        raise AccountingError("تعديل سعر مسجّل لهذا التاريخ يتطلب ذكر السبب")
+    with transaction(conn):
+        if old:
+            conn.execute("UPDATE exchange_rates SET rate=? WHERE id=?", (str(r), old[0]))
+            audit.log(conn, actor_id, "update_rate", "exchange_rates", old[0], {"rate": old[1]}, {"rate": str(r)}, reason)
+            return old[0]
+        rid = conn.execute("INSERT INTO exchange_rates(company_id,currency,rate_date,rate,created_by) VALUES(?,?,?,?,?)",
+                           (company_id, currency, rate_date, str(r), actor_id)).lastrowid
+        audit.log(conn, actor_id, "set_rate", "exchange_rates", rid, after={"currency": currency, "date": rate_date, "rate": str(r)}, reason=reason or None)
+        return rid
+
+
+def list_rates(conn, user_id, company_id, currency=None, date_from=None, date_to=None, limit=100, offset=0):
+    permissions.require(conn, user_id, company_id, "report.view", check_branch=False)
+    q, a = "SELECT * FROM exchange_rates WHERE company_id=?", [company_id]
+    for col, v, op in (("currency", currency, "="), ("rate_date", date_from, ">="), ("rate_date", date_to, "<=")):
+        if v is not None:
+            q += f" AND {col}{op}?"; a.append(v)
+    return [dict(r) for r in conn.execute(q + " ORDER BY rate_date DESC,currency LIMIT ? OFFSET ?", (*a, min(int(limit), 1000), int(offset)))]
+
+
+def convert(conn, company_id, amount_minor, from_cur, to_cur, on_date):
+    """تحويل مبلغ (وحدات صغرى) عبر العملة الأساسية بسعر التاريخ."""
+    if from_cur == to_cur:
+        return int(amount_minor)
+    base = Decimal(int(amount_minor)) * get_rate(conn, company_id, from_cur, on_date)
+    return int((base / get_rate(conn, company_id, to_cur, on_date)).quantize(Decimal(1), ROUND_HALF_UP))
+
+
+def add_currency(conn, actor_id, company_id, code, name_ar, symbol, minor_digits=2):
+    permissions.require(conn, actor_id, company_id, "currency.manage", check_branch=False)
+    if minor_digits != 2:
+        raise AccountingError("العملات بغير خانتين عشريتين غير مدعومة حاليا (المبالغ تُخزَّن بوحدة 1/100)")
+    if not (code.isalpha() and code.isupper() and len(code) == 3):
+        raise AccountingError("رمز العملة يجب أن يكون 3 أحرف لاتينية كبيرة")
+    with transaction(conn):
+        conn.execute("INSERT INTO currencies(code,name_ar,symbol,minor_digits) VALUES(?,?,?,2)", (code, name_ar, symbol))
+        audit.log(conn, actor_id, "add_currency", "currencies", None, after={"code": code})
+
+
+def set_currency_enabled(conn, actor_id, company_id, code, enabled: bool):
+    permissions.require(conn, actor_id, company_id, "currency.manage", check_branch=False)
+    if code == base_currency(conn, company_id) and not enabled:
+        raise AccountingError("لا يمكن تعطيل العملة الأساسية")
+    if not conn.execute("SELECT 1 FROM currencies WHERE code=?", (code,)).fetchone():
+        raise AccountingError("عملة غير معروفة")
+    with transaction(conn):
+        conn.execute("INSERT INTO company_currencies VALUES(?,?,?) ON CONFLICT(company_id,currency) DO UPDATE SET is_enabled=excluded.is_enabled",
+                     (company_id, code, int(enabled)))
+        audit.log(conn, actor_id, "set_currency_enabled", "company_currencies", None, after={"currency": code, "enabled": enabled})

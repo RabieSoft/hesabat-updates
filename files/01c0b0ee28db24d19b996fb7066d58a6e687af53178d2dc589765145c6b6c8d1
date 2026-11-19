@@ -1,0 +1,518 @@
+"""LinesEditor: محرر بنود بلوحة المفاتيح (Tab/Enter/إضافة/حذف/نسخ) لخطوط القيود والفواتير.
+
+أعمدة معرَّفة بـ ColSpec (picker|money|qty|text). Enter ينتقل للخلية التالية وفي آخر خلية يضيف سطرًا، Del يحذف السطر،
+Ctrl+D ينسخه. المجاميع/التوازن/الضريبة تُحسب بدالة `totals_fn(rows)->dict` يمررها الاستدعاء (المنطق المحاسبي من المحرك).
+القيم Decimal دائمًا. يتطلب PySide6.
+"""
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Callable, Optional
+
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal
+from PySide6.QtGui import QBrush, QColor, QIcon
+from PySide6.QtWidgets import (
+    QAbstractItemView, QComboBox, QHBoxLayout, QHeaderView, QLabel, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget
+)
+
+from alhisabat.ui.core import calc_logic as CL, format as fmt
+from alhisabat.ui.design import tokens as T
+
+from .basic import MoneyEdit
+from .pickers import SearchPicker, cached_loader
+
+
+@dataclass
+class ColSpec:
+    key: str
+    label: str
+    kind: str = 'text'                      # picker | money | qty | date | unit | label(عرض فقط، لا يُدخَل ولا يدخل rows()) | text  (unit: قائمة تتبع صنف السطر، تُملأ بـ set_unit_options)
+    loader: Optional[Callable] = None       # لـ picker: دالة ترجع [(id، نص)]
+    width: int = 0
+    places: int = 2
+    required: bool = False
+    hidden: bool = False                    # عمود يحمل قيمه (مسودات قديمة) دون عرضه ولا التنقل إليه
+    stretch: bool = False                   # يتمدد ليملأ العرض المتبقي
+
+
+class LinesEditor(QWidget):
+    linesChanged = Signal()
+    unitChanged = Signal(int, str, object)  # (رقم السطر من 0، مفتاح العمود، معرّف الوحدة) — عند تغيير الوحدة بيد المستخدم أو برمجيًا
+    cellPicked = Signal(int, str, object)   # (رقم السطر من 0، مفتاح العمود، المعرّف المختار) — لربط معلومات مساعدة (آخر سعر، رصيد مخزون...)
+
+    def __init__(self, columns, totals_fn=None, min_rows=2, new_row_fn=None, parent=None, calc=None, row_h=28, object_name=None):
+        """new_row_fn(rows)->dict|None: قيم مبدئية للسطر الجديد المضاف بـEnter (مثال: مبلغ موازنة القيد).
+        calc=(مفتاح_الكمية، مفتاح_السعر، مفتاح_الإجمالي): ربط تفاعلي: الكمية×السعر=الإجمالي وعكسه (الإجمالي÷الكمية=السعر)."""
+        super().__init__(parent)
+        self.cols, self.totals_fn, self.min_rows = columns, totals_fn, min_rows
+        self._row_h = row_h
+        self.calc, self._calc_busy = calc, False
+        self._new_row_fn = new_row_fn
+        self._batch = 0                                # >0 أثناء التعبئة الجماعية: لا حساب مجاميع لكل سطر
+        self._timer = QTimer(self)                     # حساب المجاميع مؤجَّل ~60ms ومدموج: كتابة سريعة لا تُعيد قراءة كل الجدول بكل ضغطة
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(60)
+        self._timer.timeout.connect(self._recalc)
+        for c in self.cols:                            # قوائم الاختيار تُحمَّل مرة واحدة لكل المحرر
+            if c.kind == 'picker' and c.loader is not None and not hasattr(c.loader, 'invalidate'):
+                c.loader = cached_loader(c.loader)
+        self.setLayoutDirection(Qt.RightToLeft)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.table = QTableWidget(0, len(columns))
+        if object_name:
+            self.table.setObjectName(object_name)
+        self.table.setHorizontalHeaderLabels([c.label for c in columns])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)      # أعمدة قابلة للسحب
+        self.table.verticalHeader().setDefaultSectionSize(row_h)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        for i, c in enumerate(columns):
+            if c.width:
+                self.table.setColumnWidth(i, c.width)
+            if c.stretch:
+                self.table.horizontalHeader().setSectionResizeMode(i, QHeaderView.Stretch)
+            if c.hidden:
+                self.table.setColumnHidden(i, True)
+        self.table.installEventFilter(self)
+        self.table.itemChanged.connect(self._text_item_changed)
+        lay.addWidget(self.table, 1)
+        bar = QHBoxLayout()
+        self.btn_add = QPushButton('إضافة سطر')
+        self.btn_del = QPushButton('حذف السطر')
+        self.btn_dup = QPushButton('نسخ السطر')
+        self.btn_add.clicked.connect(lambda: self.add_row(focus=True))
+        self.btn_del.clicked.connect(self.remove_current)
+        self.btn_dup.clicked.connect(self.duplicate_current)
+        for b in (self.btn_add, self.btn_del, self.btn_dup):
+            bar.addWidget(b)
+        bar.addStretch(1)
+        self.totals_lbl = QLabel('')
+        self.totals_lbl.setObjectName('totInline'); self.totals_lbl.setVisible(False)
+        bar.addWidget(self.totals_lbl)
+        lay.addLayout(bar)
+        self._readonly = False
+        self.commit_fn = None                          # شريط إدخال: Enter في آخر حقل يستدعيها بدل إضافة سطر
+        self.variant_api = None                        # (variants_of(parent_id)->[(id,label,hex)], parent_of(child_id)->parent_id|None)
+        for _ in range(min_rows):
+            self.add_row()
+
+    def hide_toolbar(self):
+        """إخفاء أزرار إضافة/حذف/نسخ السطر وملصق المجاميع (الاختصارات Ctrl+Delete/Ctrl+D تبقى تعمل)."""
+        for w in (self.btn_add, self.btn_del, self.btn_dup, self.totals_lbl):
+            w.setVisible(False)
+
+    # ---------------------------------------------------------------- بناء الصفوف
+    def _make_cell(self, r, c, spec, value=None):
+        if spec.kind == 'picker':
+            w = SearchPicker(spec.loader, placeholder='ابحث…')
+            if value is not None:
+                w.set_id(value)
+            w.selected.connect(lambda _i, k=spec.key, ww=w: self._on_pick(k, ww))
+            self.table.setCellWidget(r, c, w)
+        elif spec.kind == 'variant':                       # معاينة ألوان الصنف المختار؛ يختفي العمود إن لم يكن لأي سطر ألوان
+            w = QComboBox(); w.setLayoutDirection(Qt.RightToLeft); w.setEnabled(False)
+            w.currentIndexChanged.connect(lambda _i, ww=w: self._variant_edited(ww))
+            self.table.setCellWidget(r, c, w)
+        elif spec.kind == 'unit':
+            w = QComboBox()
+            w.setLayoutDirection(Qt.RightToLeft)
+            w.setProperty('pending', value)                # قيمة محفوظة (مسودة) تُطبَّق حين تُحمَّل خيارات الوحدات
+            w.setEnabled(False)
+            w.currentIndexChanged.connect(lambda _i, k=spec.key, ww=w: self._unit_edited(k, ww))
+            self.table.setCellWidget(r, c, w)
+        elif spec.kind in ('money', 'qty'):
+            w = MoneyEdit(places=spec.places)
+            w.set_value(value)
+            w.valueChanged.connect(lambda _v, k=spec.key, ww=w: self._cell_edited(k, ww))
+            self.table.setCellWidget(r, c, w)
+        else:
+            it = QTableWidgetItem('' if value is None else str(value))
+            if spec.kind == 'label':
+                it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+            if spec.kind == 'date':
+                it.setTextAlignment(Qt.AlignCenter)
+                it.setToolTip('اكتب بأي ترتيب (يُصحَّح تلقائيًا): 31/05/2027 أو 05/2027')
+            self.table.setItem(r, c, it)
+
+    def add_row(self, values=None, focus=False, at=None):
+        r = self.table.rowCount() if at is None else at
+        self.table.insertRow(r)
+        values = values or {}
+        pick_color = None
+        if self.variant_api and values.get('item_id'):      # مسودة محفوظة: الصنف المخزَّن هو اللون؛ نعرض الأم + اللون
+            par = self.variant_api[1](values['item_id'])
+            if par:
+                pick_color = values['item_id']; values = {**values, 'item_id': par}
+        for c, spec in enumerate(self.cols):
+            self._make_cell(r, c, spec, values.get(spec.key))
+        self.table.setRowHeight(r, self._row_h)
+        if self.variant_api:
+            self._fill_variants(r, pick_color)
+        if self._readonly:
+            self._apply_readonly()
+        if focus:
+            self._focus(r, next((i for i, s in enumerate(self.cols) if not s.hidden), 0))
+        if not self._batch:
+            self._changed()
+        return r
+
+    def remove_current(self):
+        r = self.table.currentRow()
+        if r >= 0 and self.table.rowCount() > self.min_rows:
+            self.table.removeRow(r)
+            self._changed()
+        elif r >= 0:                                    # لا ننزل تحت الحد الأدنى: نفرّغ السطر
+            for c, spec in enumerate(self.cols):
+                self._clear_cell(r, c, spec)
+            self._changed()
+
+    def duplicate_current(self):
+        r = self.table.currentRow()
+        if r >= 0:
+            self.add_row(self.rows()[r], focus=True, at=r + 1)
+
+    def _clear_cell(self, r, c, spec):
+        w = self.table.cellWidget(r, c)
+        if isinstance(w, SearchPicker):
+            w.setCurrentIndex(0)
+        elif isinstance(w, QComboBox):
+            w.setProperty('pending', None)
+            w.blockSignals(True); w.clear(); w.setEnabled(False); w.blockSignals(False)
+        elif isinstance(w, MoneyEdit):
+            w.clear()
+        elif self.table.item(r, c):
+            self.table.item(r, c).setText('')
+
+    def clear(self):
+        self.set_rows([])
+
+    def set_rows(self, rows):
+        """تعبئة جماعية: نوقف إعادة الرسم والمجاميع أثناء الإضافة ثم نحسب مرة واحدة (كان الحساب يتكرر لكل سطر)."""
+        self._batch += 1
+        self.table.setUpdatesEnabled(False)
+        try:
+            self.table.setRowCount(0)
+            for r in rows:
+                self.add_row(r)
+            while self.table.rowCount() < self.min_rows:
+                self.add_row()
+        finally:
+            self.table.setUpdatesEnabled(True)
+            self._batch -= 1
+        self._recalc()
+
+    def set_issues(self, issues):
+        """تلوين الخلايا الخاطئة: issues = [(رقم_السطر_من_1، مفتاح_العمود، رسالة)]؛ يمسح التلوين السابق."""
+        keys = {c.key: i for i, c in enumerate(self.cols)}
+        for r in range(self.table.rowCount()):
+            for ci in range(len(self.cols)):
+                w = self.table.cellWidget(r, ci)
+                if w is not None and w.property('invalid'):
+                    w.setProperty('invalid', False)
+                    w.setToolTip('')
+                    w.style().unpolish(w)
+                    w.style().polish(w)
+        for n, key, msg in issues:
+            ci = keys.get(key)
+            w = self.table.cellWidget(n - 1, ci) if ci is not None and 0 < n <= self.table.rowCount() else None
+            if w is not None:
+                w.setProperty('invalid', True)
+                w.setToolTip(msg)
+                w.style().unpolish(w)
+                w.style().polish(w)
+
+    def _on_pick(self, key, widget):
+        """اختيار من عمود picker (مثلاً الصنف): يُصدر cellPicked(row, key, id) قبل إعادة الحساب، ليستطيع المستدعي
+        جلب معلومات مساعدة (آخر سعر، رصيد مخزون) دون أن يفقد السطر إن أُضيف/حُذف لاحقًا (نبحث عن رقم السطر وقت الحدث لا وقت الإنشاء)."""
+        row = next((r for r in range(self.table.rowCount())
+                    if self.table.cellWidget(r, next(i for i, c in enumerate(self.cols) if c.key == key)) is widget), -1)
+        if row >= 0 and self.variant_api and key == 'item_id':
+            self._fill_variants(row, None)
+        self._changed()
+        if row >= 0:
+            self.cellPicked.emit(row, key, widget.current_id())
+
+    # ---------------------------------------------------------------- عمود اللون (variant)
+    def _vcol(self):
+        return next((i for i, c in enumerate(self.cols) if c.kind == 'variant'), None), next((i for i, c in enumerate(self.cols) if c.key == 'item_id'), None)
+
+    def _fill_variants(self, row, select_id):
+        vc, ic = self._vcol()
+        if vc is None or ic is None: return
+        combo, pk = self.table.cellWidget(row, vc), self.table.cellWidget(row, ic)
+        if not isinstance(combo, QComboBox) or pk is None: return
+        from alhisabat.ui.design.color_swatch import swatch_icon
+        pid = pk.current_id(); opts = self.variant_api[0](pid) if pid else []
+        combo.blockSignals(True); combo.clear()
+        if opts:
+            combo.addItem('— اختر اللون —', None)
+            for cid, label, hx in opts:
+                combo.addItem(swatch_icon(hx) if hx else QIcon(), label, cid)
+            i = combo.findData(select_id) if select_id else 0
+            combo.setCurrentIndex(max(i, 0))
+        combo.setEnabled(bool(opts) and not self._readonly); combo.blockSignals(False)
+        self._sync_variant_col()
+
+    def _sync_variant_col(self):
+        vc, _ic = self._vcol()
+        if vc is None: return
+        has = any(isinstance(self.table.cellWidget(r, vc), QComboBox) and self.table.cellWidget(r, vc).count() > 0 for r in range(self.table.rowCount()))
+        self.table.setColumnHidden(vc, not has)
+
+    def _variant_edited(self, combo):
+        vc, _ic = self._vcol()
+        row = next((r for r in range(self.table.rowCount()) if self.table.cellWidget(r, vc) is combo), -1)
+        self._changed()
+        if row >= 0 and combo.currentData():
+            self.cellPicked.emit(row, 'item_id', combo.currentData())     # يحدّث آخر سعر ورصيد اللون المختار
+
+    def set_cell_value(self, row, key, value):
+        """تعبئة خلية برمجيًا (مثلًا تعبئة السعر تلقائيًا من آخر سعر) دون المرور بالمستخدم. يُشعِر linesChanged كبقية التعديلات."""
+        ci = next((i for i, c in enumerate(self.cols) if c.key == key), None)
+        if ci is None or not (0 <= row < self.table.rowCount()):
+            return
+        w = self.table.cellWidget(row, ci)
+        if isinstance(w, SearchPicker):
+            w.set_id(value)
+        elif isinstance(w, QComboBox):
+            i = w.findData(value)
+            if i >= 0:
+                w.setCurrentIndex(i)
+        elif isinstance(w, MoneyEdit):
+            w.set_value(value)
+        elif self.table.item(row, ci):
+            self.table.item(row, ci).setText('' if value is None else str(value))
+        self._changed()
+
+    def cell_widget(self, row, key):
+        ci = next((i for i, c in enumerate(self.cols) if c.key == key), None)
+        return self.table.cellWidget(row, ci) if ci is not None and 0 <= row < self.table.rowCount() else None
+
+    def set_unit_options(self, row, key, options, select=None):
+        """تعبئة قائمة الوحدات لسطر: options=[(id، نص)] والأساسية أولًا. الاختيار: select ثم القيمة المحفوظة (مسودة) ثم الأولى.
+        لا تُصدر unitChanged (تعبئة لا تعديل). قائمة فارغة = تعطيل الخلية مع إبقاء القيمة المحفوظة."""
+        w = self.cell_widget(row, key)
+        if not isinstance(w, QComboBox):
+            return
+        want = select if select is not None else w.property('pending')
+        w.blockSignals(True)
+        try:
+            w.clear()
+            for uid, text in options:
+                w.addItem(str(text), uid)
+            i = w.findData(want) if want is not None else -1
+            if w.count():
+                w.setCurrentIndex(i if i >= 0 else 0)
+                w.setProperty('pending', None)
+            w.setEnabled(bool(options) and not self._readonly)
+        finally:
+            w.blockSignals(False)
+        self._changed()
+
+    def _unit_edited(self, key, widget):
+        ci = next((i for i, c in enumerate(self.cols) if c.key == key), None)
+        row = next((r for r in range(self.table.rowCount()) if ci is not None and self.table.cellWidget(r, ci) is widget), -1)
+        self._changed()
+        if row >= 0:
+            self.unitChanged.emit(row, key, widget.currentData())
+
+    def cell_text(self, row, key):
+        """النص الظاهر في خلية (اسم الصنف المختار مثلًا) أو ''."""
+        ci = next((i for i, c in enumerate(self.cols) if c.key == key), None)
+        if ci is None or not (0 <= row < self.table.rowCount()):
+            return ''
+        w = self.table.cellWidget(row, ci)
+        if isinstance(w, SearchPicker):
+            return (w.currentText() or '').strip()
+        it = self.table.item(row, ci)
+        return it.text().strip() if it else ''
+
+    def mark_cells(self, key, marks, prop='dup'):
+        """تلوين تحذيري (غير مانع) لخلايا عمود: marks = {رقم_السطر_من_1: رسالة}. يمسح التلوين السابق لنفس العمود."""
+        ci = next((i for i, c in enumerate(self.cols) if c.key == key), None)
+        if ci is None:
+            return
+        for r in range(self.table.rowCount()):
+            w = self.table.cellWidget(r, ci)
+            if w is None:
+                continue
+            msg = marks.get(r + 1)
+            if bool(w.property(prop)) == bool(msg):          # لا تغيير: لا نعيد الصقل (يُستدعى مع كل حساب)
+                continue
+            targets = [w] + ([w.lineEdit()] if isinstance(w, SearchPicker) and w.lineEdit() is not None else [])
+            for t in targets:
+                t.setProperty(prop, bool(msg))
+                t.style().unpolish(t)
+                t.style().polish(t)
+            w.setToolTip(msg or '')
+
+    def set_read_only(self, flag):
+        self._readonly = flag
+        self._apply_readonly()
+        for b in (self.btn_add, self.btn_del, self.btn_dup):
+            b.setEnabled(not flag)
+
+    def _apply_readonly(self):
+        for r in range(self.table.rowCount()):
+            for c in range(len(self.cols)):
+                w = self.table.cellWidget(r, c)
+                if w is not None:
+                    w.setEnabled(not self._readonly)
+                elif self.table.item(r, c) and self.cols[c].kind != 'label':
+                    it = self.table.item(r, c)
+                    it.setFlags(it.flags() & ~Qt.ItemIsEditable if self._readonly else it.flags() | Qt.ItemIsEditable)
+
+    # ---------------------------------------------------------------- قراءة
+    def rows(self):
+        out = []
+        for r in range(self.table.rowCount()):
+            row = {}
+            for c, spec in enumerate(self.cols):
+                if spec.kind == 'label':
+                    continue                               # أعمدة العرض فقط لا تُرسَل للمحرك
+                if spec.kind == 'variant':
+                    vw = self.table.cellWidget(r, c)
+                    if isinstance(vw, QComboBox) and vw.count() and vw.currentData():
+                        row['item_id'] = vw.currentData()    # الصنف الفعلي في السطر = لون الأم المختار
+                    continue
+                w = self.table.cellWidget(r, c)
+                if isinstance(w, SearchPicker):
+                    row[spec.key] = w.current_id()
+                elif isinstance(w, QComboBox):
+                    row[spec.key] = w.currentData() if w.count() else w.property('pending')     # بلا خيارات: تبقى القيمة المحفوظة ولا تضيع
+                elif isinstance(w, MoneyEdit):
+                    row[spec.key] = w.value()
+                else:
+                    it = self.table.item(r, c)
+                    row[spec.key] = (it.text().strip() if it else '')
+            out.append(row)
+        for r, row in enumerate(out):                       # لون مختار يغلب الأم (الترتيب بين الأعمدة لا يهم)
+            vc, _ic = self._vcol()
+            vw = self.table.cellWidget(r, vc) if vc is not None else None
+            if isinstance(vw, QComboBox) and vw.count() and vw.currentData(): row['item_id'] = vw.currentData()
+        return out
+
+    def non_empty_rows(self):
+        return [r for r in self.rows() if any(v not in (None, '') for v in r.values())]
+
+    def validate(self):
+        """[(رقم_السطر، رسالة)] للحقول الإلزامية الناقصة في السطور غير الفارغة. المحرك يبقى الحَكَم النهائي."""
+        errs = []
+        for i, r in enumerate(self.rows(), 1):
+            if not any(v not in (None, '') for v in r.values()):
+                continue
+            for spec in self.cols:
+                if spec.required and r.get(spec.key) in (None, ''):
+                    errs.append((i, f'السطر {i}: «{spec.label}» مطلوب'))
+            vc, _ic = self._vcol()
+            vw = self.table.cellWidget(i - 1, vc) if vc is not None else None
+            if isinstance(vw, QComboBox) and vw.count() and not vw.currentData():
+                errs.append((i, f'السطر {i}: اختر اللون'))
+        return errs
+
+    # ---------------------------------------------------------------- مفاتيح
+    def eventFilter(self, obj, ev):
+        if obj is self.table and ev.type() == QEvent.KeyPress:
+            k = ev.key()
+            if k in (Qt.Key_Return, Qt.Key_Enter):
+                self._advance()
+                return True
+            if k == Qt.Key_Delete and ev.modifiers() & Qt.ControlModifier:
+                self.remove_current()
+                return True
+            if k == Qt.Key_D and ev.modifiers() & Qt.ControlModifier:
+                self.duplicate_current()
+                return True
+        return super().eventFilter(obj, ev)
+
+    def _advance(self):
+        r, c = max(self.table.currentRow(), 0), max(self.table.currentColumn(), 0)
+        vis = [i for i, s in enumerate(self.cols) if not s.hidden] or [0]       # الأعمدة المخفية لا يُنتقل إليها
+        nxt = next((i for i in vis if i > c and self._focusable(r, i)), None)
+        if nxt is not None:
+            self._focus(r, nxt)
+        elif self.commit_fn is not None:
+            self.commit_fn()
+        elif r + 1 < self.table.rowCount():
+            self._focus(r + 1, vis[0])
+        else:
+            seed = None
+            if self._new_row_fn:
+                try:
+                    seed = self._new_row_fn(self.rows())
+                except Exception:  # noqa: BLE001 — الاقتراح اختياري ولا يعطّل الإدخال
+                    seed = None
+            self.add_row(seed, focus=True)
+
+    def _focusable(self, r, c):
+        w = self.table.cellWidget(r, c)
+        return self.cols[c].kind != 'label' and (w is None or w.isEnabled())                # وحدة بلا صنف بعد (معطّلة): يُقفز فوقها
+
+    def _focus(self, r, c):
+        self.table.setCurrentCell(r, c)
+        w = self.table.cellWidget(r, c)
+        if w is not None:
+            w.setFocus()
+        else:
+            self.table.editItem(self.table.item(r, c))
+
+    # ---------------------------------------------------------------- ربط الكمية × السعر = الإجمالي وتواريخ الانتهاء
+    def _cell_edited(self, key, widget):
+        if self.calc and not self._calc_busy and not self._batch and key in self.calc:
+            self._solve(key, widget)
+        self._changed()
+
+    def _solve(self, key, widget):
+        qk, pk, tk = self.calc
+        ci = {c.key: i for i, c in enumerate(self.cols)}
+        row = next((r for r in range(self.table.rowCount()) if self.table.cellWidget(r, ci[key]) is widget), -1)
+        if row < 0:
+            return
+        w = {k: self.table.cellWidget(row, ci[k]) for k in (qk, pk, tk)}
+        edited = {qk: 'qty', pk: 'unit', tk: 'total'}[key]
+        places = self.cols[ci[pk]].places
+        q, u, t, anchor = CL.solve_line(w[qk].value(), w[pk].value(), w[tk].value(), w[tk].property('anchor'), edited, unit_places=places)
+        w[tk].setProperty('anchor', anchor)
+        self._calc_busy = True
+        try:
+            for k, v, e in ((pk, u, 'unit'), (tk, t, 'total')):
+                if e != edited and v is not None:
+                    w[k].blockSignals(True); w[k].set_value(v); w[k].blockSignals(False)
+        finally:
+            self._calc_busy = False
+        real = (q * u) if (q and u is not None) else None                    # السعر يُحفظ بخانات محدودة: نُنبّه إن اختلف الإجمالي الفعلي
+        off = real is not None and t is not None and abs(real - t) >= Decimal('0.005')
+        w[tk].setToolTip(f'تنبيه: السعر يُحفظ بخانتين فيكون إجمالي البند الفعلي {real:,.2f}' if off else '')
+
+    def _text_item_changed(self, it):
+        spec = self.cols[it.column()] if it.column() < len(self.cols) else None
+        if spec is None or spec.kind != 'date' or self._batch:
+            return
+        self.table.blockSignals(True)
+        try:
+            try:
+                it.setText(CL.parse_expiry_input(it.text()))
+                it.setBackground(self.table.palette().base()); it.setToolTip('اكتب بأي ترتيب (يُصحَّح تلقائيًا): 31/05/2027 أو 05/2027')
+            except ValueError as exc:
+                it.setBackground(QBrush(QColor(T.active_palette()['danger_soft']))); it.setToolTip(str(exc))
+        finally:
+            self.table.blockSignals(False)
+        self._changed()
+
+    def _changed(self):
+        if self._batch:
+            return
+        self._timer.start()                            # يدمج الضغطات المتتالية في حساب واحد
+
+    def _recalc(self):
+        rows = self.rows()                             # قراءة واحدة للجدول تُستعمل في المجاميع والتحقق
+        if self.totals_fn:
+            try:
+                t = self.totals_fn(rows)
+                if isinstance(t, dict):
+                    txt = '   '.join(f'{k}: {fmt.fmt_money(v) if isinstance(v, Decimal) else v}' for k, v in t.items())
+                    self.totals_lbl.setText(txt); self.totals_lbl.setVisible(bool(txt))
+            except Exception as exc:  # noqa: BLE001 — لا تنهار الواجهة أثناء الكتابة
+                self.totals_lbl.setText(str(exc)); self.totals_lbl.setVisible(True)
+        self.linesChanged.emit()

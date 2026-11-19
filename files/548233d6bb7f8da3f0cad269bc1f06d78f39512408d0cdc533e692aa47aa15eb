@@ -1,0 +1,296 @@
+"""اتفاقية فتح حساب تعامل تجاري: قالب قابل للتعديل لكل شركة، يُملأ تلقائيا من بيانات العميل وتُحفظ منه لقطة ثابتة
+(نص HTML نهائي) لكل نسخة، ثم تُسجَّل الطباعة والتوقيع ويُرفق الأصل الممسوح في ملف العميل.
+
+دورة الحالة: draft (مولَّدة) ← printed (طُبعت) ← signed (موقّعة). void = ملغاة (لا تُحذف أبدا: سجل التوقيعات محفوظ).
+نص النسخة المولَّدة لا يتغير حتى لو عُدّل القالب بعدها (يمنعه تريجر في القاعدة).
+خالصة بلا PySide6؛ الواجهة تطبع/تعرض الـ HTML الناتج فقط.
+"""
+import json
+import re
+from datetime import date, datetime
+from html import escape
+
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.audit import audit
+from alhisabat.business import branch_scope
+from alhisabat.database.tx import transaction
+from alhisabat.security import permissions
+
+KIND = "commercial_account"
+MAX_FILE_BYTES = 10 * 1024 * 1024
+_FILE_TYPES = {".pdf": ("application/pdf", b"%PDF"), ".png": ("image/png", b"\x89PNG"),
+               ".jpg": ("image/jpeg", b"\xff\xd8"), ".jpeg": ("image/jpeg", b"\xff\xd8")}
+_WEEKDAYS = ["الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]   # date.weekday(): الاثنين = 0
+
+# المتغيرات المتاحة في القالب: {{key}}. الفارغ منها يظهر نقاطا ليُملأ بخط اليد عند الطباعة.
+FIELDS = [
+    ("day", "اليوم"), ("time", "الساعة"), ("hijri_date", "التاريخ الهجري"), ("gregorian_date", "التاريخ الميلادي"),
+    ("place", "المكان"), ("district", "المديرية"), ("governorate", "المحافظة"),
+    ("party_name", "اسم العميل"), ("party_code", "رقم العميل"), ("party_phone", "هاتف العميل"), ("party_address", "عنوان العميل"),
+    ("id_type", "نوع الهوية"), ("id_number", "رقم الهوية"), ("id_issuer", "جهة إصدار الهوية"), ("id_issue_date", "تاريخ إصدار الهوية"),
+    ("company_name", "اسم المنشأة"), ("company_address", "عنوان المنشأة"), ("company_phone", "هاتف المنشأة"),
+    ("rep_name", "اسم ممثل المنشأة"), ("rep_title", "صفة ممثل المنشأة"),
+    ("payment_mode", "صفة السداد"), ("delay_period", "مدة التأخر"),
+]
+FIELD_KEYS = {k for k, _ in FIELDS}
+_PH = re.compile(r"\{\{\s*(\w+)\s*\}\}")
+
+DEFAULT_TEMPLATE = """\
+<h1 class="t">اتفاقية فتح حساب تعامل تجاري</h1>
+<p>إنه في يوم: {{day}} الساعة: {{time}} بتاريخ: {{hijri_date}} هـ، الموافق: {{gregorian_date}} م، بـ: {{place}} مديرية: {{district}} محافظة: {{governorate}}، اتفق الطرفان الآتيان:</p>
+<p><b>الطرف الأول:</b> الأخ/ {{party_name}}، يحمل: {{id_type}}، صادرة من: {{id_issuer}} برقم: {{id_number}} وتاريخ: {{id_issue_date}} م، هاتف رقم: {{party_phone}}، وهو بكامل الأهلية المعتبرة شرعًا وقانونًا، وبرضاه واختياره، وبصفته عميلًا، تقدم بطلب فتح حساب تعامل تجاري لدى: {{company_name}}، بحيث يلتزم التزامًا نهائيًا وغير قابل للرجوع عنه بكل ما يرد في كشف الحساب من مديونية تجارية حالية أو مستقبلية، كما يلتزم بالسداد عند أول إشعار يوجه إليه دون حاجة إلى إنذار أو مطالبة قضائية.</p>
+<p><b>الطرف الثاني:</b> الأخ/ {{rep_name}}، لدى/اسم المنشأة: {{company_name}}، الكائن في: {{company_address}}، هاتف رقم: {{company_phone}}، وبصفته: {{rep_title}}.</p>
+<p>وافق الطرف الثاني على قبول طلب الطرف الأول وفق الآلية التالية:</p>
+<p><b>أولًا:</b> يلتزم العميل بسداد المبالغ المستحقة عليه بصفة: {{payment_mode}} وفقًا للمبلغ المتفق عليه والمبين في التعامل وكشف الحساب.</p>
+<p><b>ثانيًا:</b> في حال تخلف العميل عن السداد لمدة: {{delay_period}}، يلتزم بسداد كامل المتأخرات المترتبة عليه، ويتحمل جميع الغرامات والجزاءات المترتبة على ذلك دون أي اعتراض.</p>
+<p><b>ثالثًا:</b> في حال إخلال العميل أو عدم التزامه بأي شرط من شروط هذا الاتفاق، يحق للطرف الثاني سحب البضاعة كاملة، شريطة أن تكون البضاعة في حالتها الجيدة التي سلمت بها للعميل، دون أن يترتب على الطرف الثاني أي مسؤولية.</p>
+<p><b>رابعًا:</b> يلتزم العميل بالمحافظة على سلامة البضاعة وفقًا لحالتها عند الاستلام من الطرف الثاني، وعدم العبث بها أو الإضرار بها أو الإساءة إلى سمعتها أو التأثير سلبًا على سعرها بأي شكل من الأشكال.</p>
+<p><b>خامسًا:</b> يعد كشف الحساب المشار إليه دينًا ثابتًا ومستحقًا في ذمة العميل، ويلتزم بتصفيته كاملًا عند أول مطالبة به.</p>
+<p><b>سادسًا:</b> أقر الطرفان بأن البيانات الواردة أعلاه صحيحة، وأن أرقام هواتفهما تعد وسيلة قانونية معتمدة لأي إعلان أو إشعار مستقبلي.</p>
+<p>وتمت قراءة هذا المحرر على الطرفين، ثم تمت المصادقة والإبهام عليه من قبلهما، وتوقيعاتهما وإبهامهما أدناه حجة عليهما، والله خير الشاهدين.</p>
+<table class="sig" width="100%"><tr>
+<td width="50%"><b>إبهام الطرف الأول:</b><br><br>{{party_name}}<br><br>.......................................</td>
+<td width="50%"><b>توقيع الطرف الثاني:</b><br><br>{{rep_name}}<br><br>.......................................</td>
+</tr></table>
+"""
+
+_CSS = ("body{font-family:'Segoe UI',Tahoma,'Noto Naskh Arabic',sans-serif;direction:rtl;font-size:12pt;color:#111;}"
+        "h1.t{text-align:center;font-size:18pt;margin:4px 0 10px 0;}h2.co{text-align:center;font-size:14pt;margin:0;color:#8a6508;}"
+        "p{margin:5px 0;line-height:150%;text-align:right;}.f{font-weight:bold;}.blank{color:#555;}"
+        "table.sig{margin-top:22px;}table.sig td{text-align:center;vertical-align:top;padding:8px;}")
+
+
+# ----------------------------------------------------------------------------- القالب
+def get_template(conn, company_id):
+    r = conn.execute("SELECT body_html FROM agreement_templates WHERE company_id=? AND kind=?", (company_id, KIND)).fetchone()
+    return r[0] if r else DEFAULT_TEMPLATE
+
+
+def _validate_template(html):
+    if not html or not html.strip():
+        raise AccountingError("نص القالب فارغ")
+    low = html.lower()
+    if "<script" in low or "javascript:" in low or re.search(r"\son\w+\s*=", low):
+        raise AccountingError("القالب لا يقبل سكربتات")
+    unknown = sorted({m for m in _PH.findall(html) if m not in FIELD_KEYS})
+    if unknown:
+        raise AccountingError("متغيرات غير معروفة في القالب: " + "، ".join("{{%s}}" % u for u in unknown))
+
+
+def set_template(conn, actor_id, company_id, html):
+    permissions.require(conn, actor_id, company_id, "party.agreement_template", check_branch=False)
+    _validate_template(html)
+    with transaction(conn):
+        old = conn.execute("SELECT body_html FROM agreement_templates WHERE company_id=? AND kind=?", (company_id, KIND)).fetchone()
+        conn.execute("INSERT INTO agreement_templates(company_id,kind,body_html,updated_by) VALUES(?,?,?,?) "
+                     "ON CONFLICT(company_id,kind) DO UPDATE SET body_html=excluded.body_html,updated_by=excluded.updated_by,"
+                     "updated_at=CURRENT_TIMESTAMP", (company_id, KIND, html, actor_id))
+        audit.log(conn, actor_id, "agreement_template_set", "agreement_templates", company_id,
+                  before={"len": len(old[0])} if old else None, after={"len": len(html)})
+
+
+def reset_template(conn, actor_id, company_id):
+    """يعيد القالب الافتراضي (يحذف تخصيص الشركة). النسخ المولَّدة سابقا لا تتأثر."""
+    permissions.require(conn, actor_id, company_id, "party.agreement_template", check_branch=False)
+    with transaction(conn):
+        conn.execute("DELETE FROM agreement_templates WHERE company_id=? AND kind=?", (company_id, KIND))
+        audit.log(conn, actor_id, "agreement_template_reset", "agreement_templates", company_id)
+
+
+# ----------------------------------------------------------------------------- التوليد
+def _days_label(n):
+    n = int(n)
+    if n == 1:
+        return "يوم واحد"
+    if n == 2:
+        return "يومين"
+    return f"{n} أيام" if 3 <= n <= 10 else f"{n} يومًا"
+
+
+def _fill(template, values):
+    def sub(m):
+        v = str(values.get(m.group(1)) or "").strip()
+        return f"<span class='f'>{escape(v)}</span>" if v else "<span class='blank'>.......................</span>"
+    return _PH.sub(sub, template)
+
+
+def _wrap(company_name, body):
+    co = f"<h2 class='co'>{escape(company_name)}</h2>" if company_name else ""
+    return (f"<!DOCTYPE html><html dir='rtl' lang='ar'><head><meta charset='utf-8'><title>اتفاقية فتح حساب تعامل تجاري</title>"
+            f"<style>{_CSS}</style></head><body>{co}{body}</body></html>")
+
+
+def preview_template(html, company_name=""):
+    """معاينة قالب (غير محفوظ) بلا بيانات: كل المتغيرات تظهر نقاطا."""
+    _validate_template(html)
+    return _wrap(company_name, _fill(html, {}))
+
+
+def _party(conn, party_id, company_id):
+    p = conn.execute("SELECT * FROM parties WHERE id=?", (party_id,)).fetchone()
+    if not p or p["company_id"] != company_id:
+        raise AccountingError("العميل غير موجود في هذه الشركة")
+    if p["kind"] != "customer":
+        raise AccountingError("اتفاقية فتح الحساب خاصة بالعملاء")
+    return p
+
+
+def build_values(conn, party, company_name, *, company_info=None, options=None, on=None):
+    """قيم المتغيرات: من بطاقة العميل والشركة، ثم options (إدخال المستخدم) يتغلب على المحسوب. اللغات/الأرقام كما أُدخلت."""
+    on = on or date.today()
+    ci, op = company_info or {}, options or {}
+    terms = int(party["payment_terms_days"] or 0)
+    vals = {
+        "day": _WEEKDAYS[on.weekday()], "gregorian_date": on.strftime("%d/%m/%Y"),
+        "party_name": party["name"], "party_code": party["code"], "party_phone": party["phone"], "party_address": party["address"],
+        "id_type": party["id_type"], "id_number": party["id_number"], "id_issuer": party["id_issuer"], "id_issue_date": party["id_issue_date"],
+        "company_name": company_name, "company_address": ci.get("address", ""), "company_phone": ci.get("phone", ""),
+        "rep_name": ci.get("rep_name", ""), "rep_title": ci.get("rep_title", ""),
+        "delay_period": _days_label(terms) if terms > 0 else "",
+    }
+    for k, v in op.items():
+        if k in FIELD_KEYS and v not in (None, ""):
+            vals[k] = v
+    return vals
+
+
+def generate(conn, actor_id, company_id, party_id, *, company_info=None, options=None, on=None, force=False):
+    """ينشئ نسخة جديدة (لقطة نص) للعميل. النسخ غير الموقّعة السابقة تُلغى. إن وُجدت نسخة موقّعة فلا تُولَّد أخرى إلا بـ force=True."""
+    permissions.require(conn, actor_id, company_id, "party.edit", check_branch=False)
+    p = _party(conn, party_id, company_id)
+    if not force and conn.execute("SELECT 1 FROM party_agreements WHERE party_id=? AND status='signed'", (party_id,)).fetchone():
+        raise AccountingError("للعميل اتفاقية موقّعة بالفعل؛ لا حاجة لنسخة جديدة إلا عند تغيّر الشروط (استخدم التوليد القسري)")
+    cname = conn.execute("SELECT name FROM companies WHERE id=?", (company_id,)).fetchone()[0]
+    values = build_values(conn, p, cname, company_info=company_info, options=options, on=on)
+    html = _wrap(cname, _fill(get_template(conn, company_id), values))
+    with transaction(conn):
+        ver = conn.execute("SELECT COALESCE(MAX(version),0)+1 FROM party_agreements WHERE party_id=?", (party_id,)).fetchone()[0]
+        conn.execute("UPDATE party_agreements SET status='void' WHERE party_id=? AND status IN ('draft','printed')", (party_id,))
+        aid = conn.execute("INSERT INTO party_agreements(company_id,party_id,version,body_html,data_json,created_by) VALUES(?,?,?,?,?,?)",
+                           (company_id, party_id, ver, html, json.dumps(values, ensure_ascii=False), actor_id)).lastrowid
+        audit.log(conn, actor_id, "agreement_generate", "party_agreements", aid, after={"party": p["code"], "version": ver})
+    return aid
+
+
+# ----------------------------------------------------------------------------- الاستعلام
+_COLS = ("id,company_id,party_id,version,status,created_by,created_at,printed_at,signed_at,signed_by,signed_file_name,"
+         "signed_file_mime,(signed_file IS NOT NULL) AS has_file")
+
+
+def _agreement(conn, agreement_id, company_id):
+    a = conn.execute("SELECT * FROM party_agreements WHERE id=?", (agreement_id,)).fetchone()
+    if not a or a["company_id"] != company_id:
+        raise AccountingError("الاتفاقية غير موجودة في هذه الشركة")
+    return a
+
+
+def list_agreements(conn, user_id, company_id, party_id):
+    permissions.require(conn, user_id, company_id, "party.view", check_branch=False)
+    _party(conn, party_id, company_id)
+    return [dict(r) for r in conn.execute(f"SELECT {_COLS} FROM party_agreements WHERE party_id=? ORDER BY version DESC", (party_id,))]
+
+
+def get_html(conn, user_id, company_id, agreement_id):
+    permissions.require(conn, user_id, company_id, "party.view", check_branch=False)
+    return _agreement(conn, agreement_id, company_id)["body_html"]
+
+
+def status_of(conn, party_id):
+    """none | draft | printed | signed (الأعلى حالةً بين النسخ غير الملغاة)."""
+    s = {r[0] for r in conn.execute("SELECT status FROM party_agreements WHERE party_id=? AND status!='void'", (party_id,))}
+    for k in ("signed", "printed", "draft"):
+        if k in s:
+            return k
+    return "none"
+
+
+def parties_without_signed(conn, user_id, company_id, *, active_only=True, branch_id=None):
+    """عملاء بلا اتفاقية موقّعة (للمتابعة والطباعة الجماعية للعملاء المرحَّلين). كل صف فيه status الحالية: none/draft/printed."""
+    permissions.require(conn, user_id, company_id, "party.view", check_branch=False)
+    q = ("SELECT p.id,p.code,p.name,p.phone,p.is_active,"
+         "COALESCE((SELECT CASE MAX(CASE status WHEN 'printed' THEN 2 WHEN 'draft' THEN 1 ELSE 0 END) WHEN 2 THEN 'printed' WHEN 1 THEN 'draft' ELSE 'none' END "
+         "FROM party_agreements a WHERE a.party_id=p.id AND a.status IN ('draft','printed')),'none') AS status "
+         "FROM parties p WHERE p.company_id=? AND p.kind='customer' "
+         "AND NOT EXISTS(SELECT 1 FROM party_agreements s WHERE s.party_id=p.id AND s.status='signed')")
+    args = [company_id]
+    if active_only:
+        q += " AND p.is_active=1"
+    f, fa = branch_scope.master_clause(conn, company_id, branch_id, col="p.branch_id")
+    q += f
+    args += fa
+    return [dict(r) for r in conn.execute(q + " ORDER BY p.code", args)]
+
+
+# ----------------------------------------------------------------------------- الطباعة والتوقيع
+def mark_printed(conn, actor_id, company_id, agreement_id):
+    permissions.require(conn, actor_id, company_id, "party.edit", check_branch=False)
+    a = _agreement(conn, agreement_id, company_id)
+    if a["status"] != "draft":
+        if a["status"] == "void":
+            raise AccountingError("الاتفاقية ملغاة")
+        return
+    with transaction(conn):
+        conn.execute("UPDATE party_agreements SET status='printed',printed_at=CURRENT_TIMESTAMP WHERE id=?", (agreement_id,))
+        audit.log(conn, actor_id, "agreement_printed", "party_agreements", agreement_id)
+
+
+def record_signature(conn, actor_id, company_id, agreement_id, *, signed_date=None, file_name=None, data=None):
+    """يسجّل أن الاتفاقية وُقِّعت، مع إرفاق الأصل الممسوح (PDF/PNG/JPG حتى 10MB) إن وُجد. يجوز لاحقا استبدال المرفق."""
+    permissions.require(conn, actor_id, company_id, "party.edit", check_branch=False)
+    a = _agreement(conn, agreement_id, company_id)
+    if a["status"] == "void":
+        raise AccountingError("الاتفاقية ملغاة: لا يمكن تسجيل توقيعها")
+    mime = None
+    if data is not None:
+        ext = "." + (file_name or "").rsplit(".", 1)[-1].lower() if "." in (file_name or "") else ""
+        if ext not in _FILE_TYPES:
+            raise AccountingError("نوع الملف غير مدعوم: المسموح PDF أو PNG أو JPG")
+        mime, magic = _FILE_TYPES[ext]
+        if not data or len(data) > MAX_FILE_BYTES:
+            raise AccountingError("الملف فارغ أو أكبر من 10 ميجابايت")
+        if not bytes(data).startswith(magic):
+            raise AccountingError("محتوى الملف لا يطابق امتداده")
+    sd = signed_date or (a["signed_at"] if a["status"] == "signed" and a["signed_at"] else date.today().isoformat())
+    try:
+        datetime.strptime(sd, "%Y-%m-%d")
+    except ValueError:
+        raise AccountingError("تاريخ التوقيع غير صالح (YYYY-MM-DD)")
+    with transaction(conn):
+        if data is not None:
+            conn.execute("UPDATE party_agreements SET status='signed',signed_at=?,signed_by=COALESCE(signed_by,?),signed_file_name=?,"
+                         "signed_file_mime=?,signed_file=? WHERE id=?", (sd, actor_id, file_name, mime, bytes(data), agreement_id))
+        elif a["status"] != "signed":
+            conn.execute("UPDATE party_agreements SET status='signed',signed_at=?,signed_by=? WHERE id=?", (sd, actor_id, agreement_id))
+        audit.log(conn, actor_id, "agreement_signed" if a["status"] != "signed" else "agreement_file_replaced",
+                  "party_agreements", agreement_id, before={"status": a["status"]},
+                  after={"status": "signed", "file": file_name, "size": len(data) if data is not None else None})
+
+
+def get_signed_file(conn, user_id, company_id, agreement_id):
+    permissions.require(conn, user_id, company_id, "party.view", check_branch=False)
+    a = _agreement(conn, agreement_id, company_id)
+    if a["signed_file"] is None:
+        raise AccountingError("لا يوجد ملف مرفق لهذه الاتفاقية")
+    return a["signed_file_name"], a["signed_file_mime"], bytes(a["signed_file"])
+
+
+def void_agreement(conn, actor_id, company_id, agreement_id, reason):
+    permissions.require(conn, actor_id, company_id, "party.edit", check_branch=False)
+    if not (reason or "").strip():
+        raise AccountingError("سبب الإلغاء مطلوب")
+    a = _agreement(conn, agreement_id, company_id)
+    if a["status"] == "void":
+        return
+    with transaction(conn):
+        conn.execute("UPDATE party_agreements SET status='void' WHERE id=?", (agreement_id,))
+        audit.log(conn, actor_id, "agreement_void", "party_agreements", agreement_id, before={"status": a["status"]}, reason=reason.strip())
+
+
+# ----------------------------------------------------------------------------- طباعة جماعية
+_BODY = re.compile(r"<body>(.*)</body>", re.S)
+
+
+def combine(htmls):
+    """يدمج عدة اتفاقيات في مستند واحد، كل واحدة في صفحة مستقلة (للطباعة الجماعية للعملاء المرحَّلين)."""
+    parts = [(_BODY.search(h).group(1) if _BODY.search(h) else h) for h in htmls]
+    return _wrap("", "<p style='page-break-after:always;margin:0'>&nbsp;</p>".join(parts))

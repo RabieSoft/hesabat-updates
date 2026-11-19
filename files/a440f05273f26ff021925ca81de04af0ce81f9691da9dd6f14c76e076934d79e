@@ -1,0 +1,278 @@
+"""صفحة دفتر الأستاذ التفصيلي: كشف حساب حركة القيود مع رصيد جارٍ وDrill-down مباشر."""
+import os
+from datetime import date
+
+from PySide6.QtCore import Qt, QDate
+from PySide6.QtWidgets import (
+    QComboBox, QDateEdit, QFileDialog, QFrame, QHBoxLayout,
+    QLabel, QMessageBox, QPushButton, QTabWidget, QVBoxLayout, QWidget
+)
+
+from alhisabat.ui.app_dialogs.drilldown import JournalViewDialog, SOURCE_PAGES
+from alhisabat.ui.components import document_model as DM
+from alhisabat.ui.components.datagrid import DataGrid
+from alhisabat.ui.components.document_sheet import DocumentSheet
+from alhisabat.ui.components.grid_logic import Column
+from alhisabat.ui.components.pickers import SearchPicker, make_searchable
+from alhisabat.ui.core import format as fmt
+from alhisabat.ui.core.actions import Action, ActionGroup
+from alhisabat.ui.core.base_page import BasePage
+from alhisabat.ui.core.permissions import ActionState
+from alhisabat.ui.core.reports_service import ReportsService
+
+
+class LedgerPage(BasePage):
+    """صفحة دفتر الأستاذ التفصيلي: كشف حساب حركة القيود مع رصيد جارٍ وDrill-down مباشر."""
+    key = 'ledger'
+    title = 'دفتر الأستاذ'
+    icon = 'book'
+    required_permission = 'report.view'
+
+    def build(self):
+        self._built = True
+        self.svc = ReportsService(self.session)
+        self._sel = None
+        self._data = None
+        self.spec = None
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(6, 6, 6, 6)
+
+        # شريط الترشيح
+        bar = QHBoxLayout()
+        bar.addWidget(QLabel("الحساب:"))
+        # قائمة قابلة للكتابة والبحث (بالرقم أو الاسم، وتتجاهل الهمزات والتشكيل) مع إبقاء اختيارها من القائمة
+        # كل الحسابات (الفرعية + الرئيسية: كشف الرئيسي يشمل أبناءه)
+        self.account_combo = SearchPicker(lambda: self.session.lookup_accounts(None, None), allow_empty=True,
+                                          placeholder='اكتب رقم الحساب أو اسمه…')
+        self.account_combo.setMinimumWidth(280)
+        self.account_combo.selected.connect(lambda *_: self.refresh_ledger())
+        bar.addWidget(self.account_combo, 2)
+
+        bar.addWidget(QLabel("من:"))
+        self.frm = QDateEdit(QDate(date.today().year, 1, 1))
+        bar.addWidget(QLabel("إلى:"))
+        self.to = QDateEdit(QDate.currentDate())
+        for w in (self.frm, self.to):
+            w.setCalendarPopup(True)
+            w.setDisplayFormat('yyyy-MM-dd')
+            w.setMinimumWidth(135)
+            w.dateChanged.connect(lambda *_: self.refresh_ledger())
+            bar.addWidget(w)
+
+        bar.addStretch(0)
+        lay.addLayout(bar)
+        bar = QHBoxLayout()                                   # سطر ثانٍ كي لا تتراكب الحقول في العرض الضيق
+        bar.addWidget(QLabel("الفرع:"))
+        self.branch_combo = make_searchable(QComboBox())
+        self.branch_combo.addItem("الكل", None)
+        self.branch_combo.currentIndexChanged.connect(lambda *_: self.refresh_ledger())
+        self.branch_combo.setMinimumWidth(130)
+        bar.addWidget(self.branch_combo)
+
+        bar.addWidget(QLabel("العملة:"))
+        self.cur_combo = make_searchable(QComboBox())
+        self.cur_combo.addItem("العرض الافتراضي", None)
+        self.cur_combo.currentIndexChanged.connect(lambda *_: self.refresh_ledger())
+        self.cur_combo.setMinimumWidth(150)
+        bar.addWidget(self.cur_combo)
+
+        btn_go = QPushButton("عرض كشف الحساب")
+        btn_go.setProperty('primary', True)
+        btn_go.clicked.connect(self.refresh_ledger)
+        bar.addWidget(btn_go)
+        bar.addStretch(1)
+        lay.addLayout(bar)
+
+        # بطاقة الملخص المالي
+        self.summary_card = QFrame()
+        self.summary_card.setObjectName("summaryCard")
+        sl = QHBoxLayout(self.summary_card)
+        self.lbl_opening = QLabel("الافتتاحي: —")
+        self.lbl_debit = QLabel("مدين الفترة: —")
+        self.lbl_credit = QLabel("دائن الفترة: —")
+        self.lbl_closing = QLabel("الرصيد الختامي: —")
+        for lbl in (self.lbl_opening, self.lbl_debit, self.lbl_credit, self.lbl_closing):
+            lbl.setStyleSheet("font-weight: bold; font-size: 12px; margin-left: 12px;")
+            sl.addWidget(lbl)
+        sl.addStretch(1)
+        lay.addWidget(self.summary_card)
+
+        # التبويبات: جدول الحركات التفاعلي + معاينة الورقة
+        self.tabs = QTabWidget()
+
+        # جدول الحركات
+        grid_panel = QWidget()
+        gpl = QVBoxLayout(grid_panel)
+        gpl.setContentsMargins(0, 0, 0, 0)
+        cols = [
+            Column('entry_date', 'التاريخ', 'date', 95),
+            Column('posted_no', 'رقم القيد', 'int', 85, link=True),
+            Column('display_description', 'البيان', width=240),
+            Column('ref', 'رقم المرجع', width=120),
+            Column('debit_base', 'مدين', 'money', 110, minor=True),
+            Column('credit_base', 'دائن', 'money', 110, minor=True),
+            Column('running_balance', 'الرصيد الجاري', 'money', 120, minor=True),
+            Column('source_label', 'المصدر', width=120),
+            Column('memo', 'ملاحظة', width=130),
+        ]
+        self.grid = DataGrid(cols, grid_id='ledger_page_grid_v2')
+        self.grid.enable_cell_selection()
+        self.grid.set_print_context(lambda: self.spec)
+        self.grid.selectionChangedRows.connect(self._on_row_select)
+        self.grid.rowActivated.connect(self._on_row_activate)
+        self.grid.linkClicked.connect(lambda row, _k: self.open_source_doc(row))   # رقم القيد ← المستند الأصلي
+        gpl.addWidget(self.grid, 1)
+
+        btn_row = QHBoxLayout()
+        self.btn_entry = QPushButton("عرض القيد المحاسبي")
+        self.btn_entry.setEnabled(False)
+        self.btn_entry.clicked.connect(self._open_entry)
+        btn_row.addWidget(self.btn_entry)
+
+        self.btn_source = QPushButton("عرض المستند المصدر")
+        self.btn_source.setEnabled(False)
+        self.btn_source.clicked.connect(self._open_source)
+        btn_row.addWidget(self.btn_source)
+        btn_print_sel = QPushButton("طباعة المحدد")
+        btn_print_sel.setToolTip("حدّد أعمدة أو خلايا أو صفوفًا ثم اطبع المحدد فقط")
+        btn_print_sel.clicked.connect(lambda: self.grid.print_selected())
+        btn_row.addWidget(btn_print_sel)
+        btn_row.addStretch(1)
+        gpl.addLayout(btn_row)
+
+        self.tabs.addTab(grid_panel, "حركات الأستاذ (تفاعلي)")
+
+        # المعاينة على ورقة
+        paper = self.window_.prefs.get('paper') if hasattr(self, 'window_') else 'A4'
+        self.sheet = DocumentSheet(paper)
+        self.tabs.addTab(self.sheet, "معاينة على ورقة (طباعة)")
+        lay.addWidget(self.tabs, 1)
+
+    def refresh(self):
+        if not getattr(self, '_built', False):
+            return
+        if not getattr(self, '_accounts_loaded', False) and self.session.can('account.view'):
+            self.account_combo.reload()
+            self._accounts_loaded = True
+        if self.cur_combo.count() <= 1:
+            try:
+                self.cur_combo.setItemText(0, self.svc.default_view_label())
+                for code, lab in self.svc.lookup_currencies():
+                    self.cur_combo.addItem(lab, code)
+            except Exception:  # noqa: BLE001 — الترشيح بالعملة مساعد؛ يبقى «الكل»
+                pass
+        if self.branch_combo.count() <= 1:
+            for b in self.svc.lookup_branches():
+                self.branch_combo.addItem(b['name'], b['id'])
+
+        if getattr(self, 'params', None):
+            aid = self.params.get('account_id') if isinstance(self.params, dict) else self.params
+            if aid:
+                self.account_combo.set_id(int(aid))
+            if isinstance(self.params, dict):
+                if self.params.get('date_from'):
+                    self.frm.setDate(QDate.fromString(self.params['date_from'], Qt.ISODate))
+                if self.params.get('date_to'):
+                    self.to.setDate(QDate.fromString(self.params['date_to'], Qt.ISODate))
+            self.params = None
+            self.refresh_ledger()
+
+    def refresh_ledger(self):
+        aid = self.account_combo.current_id()
+        if not aid:
+            return
+        d_from = self.frm.date().toPython().isoformat()
+        d_to = self.to.date().toPython().isoformat()
+        br_id = self.branch_combo.currentData()
+        cur = self.cur_combo.currentData()
+
+        try:
+            self._data = self.svc.ledger(aid, d_from, d_to, branch_id=br_id, currency=cur, limit=1000)
+            self.spec = self.svc.report_spec('كشف حساب', d_from, d_to, account_id=aid, branch_id=br_id, currency=cur)
+        except Exception as exc:
+            self._data = None
+            self.spec = None
+            return self.show_error(exc)
+
+        # تحديث البطاقة
+        sx = '_orig' if cur else ''                          # عند اختيار عملة: الأرقام بالعملة الأصلية
+        op = fmt.fmt_money(self._data['opening_balance' + sx], minor=True)
+        dr = fmt.fmt_money(self._data['total_debit' + sx], minor=True)
+        cr = fmt.fmt_money(self._data['total_credit' + sx], minor=True)
+        cl = fmt.fmt_money(self._data['closing_balance' + sx], minor=True)
+        if cur:
+            op, dr, cr, cl = (f"{v} {cur}" for v in (op, dr, cr, cl))
+        self.lbl_opening.setText(f"الافتتاحي: {op}")
+        self.lbl_debit.setText(f"مدين الفترة: {dr}")
+        self.lbl_credit.setText(f"دائن الفترة: {cr}")
+        self.lbl_closing.setText(f"الرصيد الختامي: {cl}")
+
+        rows = self._data['rows']
+        for r in rows:
+            st = r.get('source_type')
+            sid = r.get('source_id')
+            r['source_label'] = f"{st} #{sid}" if st and sid else (st or 'يدوي')
+            if cur:                                          # الشبكة تعرض أعمدة *_base؛ نضع فيها الأصلية لهذه العملة
+                r['debit_base'], r['credit_base'], r['running_balance'] = r['debit_orig'], r['credit_orig'], r['running_balance_orig']
+        self.grid.set_rows(rows)
+
+        # تحديث الورقة
+        doc = DM.from_print_spec(self.spec, 'report')
+        self.sheet.set_document(doc)
+        self.actions_changed.emit()
+
+    def _on_row_select(self, rows):
+        self._sel = rows[0] if len(rows) == 1 else None
+        has_sel = self._sel is not None
+        self.btn_entry.setEnabled(has_sel)
+        has_src = has_sel and bool(self._sel.get('source_type')) and bool(self._sel.get('source_id'))
+        self.btn_source.setEnabled(has_src)
+
+    def _on_row_activate(self, row):
+        if row and row.get('entry_id'):
+            d = JournalViewDialog(self, self.session, row['entry_id'])
+            self.exec_form(d)
+
+    def _open_entry(self):
+        if self._sel and self._sel.get('entry_id'):
+            d = JournalViewDialog(self, self.session, self._sel['entry_id'])
+            self.exec_form(d)
+
+    def _open_source(self):
+        if not self._sel:
+            return
+        self.open_source_doc(self._sel)
+
+    def ribbon_groups(self):
+        has_spec = bool(self.spec)
+        return [
+            ActionGroup('تصدير', [
+                Action('xlsx', 'Excel', 'export', state_fn=lambda: ActionState(has_spec, 'اعرض كشف الحساب أولًا'),
+                       handler=lambda: self._export('xlsx')),
+                Action('csv', 'CSV', 'export', state_fn=lambda: ActionState(has_spec, 'اعرض كشف الحساب أولًا'),
+                       handler=lambda: self._export('csv')),
+                Action('html', 'HTML', 'export', state_fn=lambda: ActionState(has_spec, 'اعرض كشف الحساب أولًا'),
+                       handler=lambda: self._export('html')),
+            ]),
+            ActionGroup('طباعة', [
+                Action('print', 'طباعة', 'print', state_fn=lambda: ActionState(has_spec, 'اعرض كشف الحساب أولًا'),
+                       handler=lambda: self.sheet.print_()),
+                Action('pdf', 'معاينة وحفظ PDF', 'export', state_fn=lambda: ActionState(has_spec, 'اعرض كشف الحساب أولًا'),
+                       handler=lambda: self.sheet.save_pdf()),
+            ]),
+        ]
+
+    def _export(self, fmt_code):
+        if not self.spec:
+            return
+        title = f"كشف_حساب_{self.account_combo.currentText()}"
+        path, _ = QFileDialog.getSaveFileName(self, 'تصدير كشف الحساب', f"{title}.{fmt_code}", f"*.{fmt_code}")
+        if path:
+            if not path.lower().endswith('.' + fmt_code):
+                path += '.' + fmt_code
+            try:
+                self.svc.export_report(self.spec, fmt_code, path)
+                self.notify(f'تم التصدير: {os.path.basename(path)}')
+            except Exception as e:
+                self.show_error(e)

@@ -1,0 +1,224 @@
+"""تتبع الصلاحية بالدفعات: تاريخ الانتهاء، الصرف بنظام «الأقدم انتهاءً أولًا» (FEFO)، التنبيهات، وتقرير الصلاحية.
+
+مبادئ: (1) لا يمسّ التكلفة ولا القيود: التكلفة تبقى من طريقة التقييم في inventory (متوسط/FIFO/LIFO)،
+(2) الدفعات تُنشأ فقط للأصناف track_expiry=1، والرصيد القديم بلا دفعات يبقى «غير مؤرَّخ» ويمكن تأريخه عبر assign_untracked،
+(3) البيع والتحويل لا يصرفان دفعة منتهية؛ التسوية (الإتلاف) والمرتجع للمورد يصرفانها، (4) الدفعة تعكس بدقة مع الحركة (stock_lot_alloc).
+الكميات milli بوحدة الأساس. بلا PySide6.
+"""
+import re
+from datetime import date as _date
+from decimal import Decimal
+
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.audit import audit
+from alhisabat.database.tx import transaction
+
+_ISO = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+NO_EXPIRY_OUT_BLOCK = ("sale", "transfer_out")        # أنواع الصادر التي لا تصرف دفعة منتهية
+
+
+def _parse_expiry(text):
+    """'' → ''، وإلا يرجع YYYY-MM-DD صالحًا أو يرفع AccountingError."""
+    t = (text or "").strip()
+    if not t:
+        return ""
+    if not _ISO.match(t):
+        raise AccountingError("تاريخ الانتهاء يجب أن يكون بصيغة YYYY-MM-DD")
+    try:
+        _date.fromisoformat(t)
+    except ValueError:
+        raise AccountingError("تاريخ الانتهاء غير صالح")
+    return t
+
+
+def _tracked(conn, item_id):
+    r = conn.execute("SELECT track_expiry FROM items WHERE id=?", (item_id,)).fetchone()
+    return bool(r and r[0])
+
+
+def _lots_total(conn, item_id, warehouse_id):
+    return conn.execute("SELECT COALESCE(SUM(qty_milli),0) FROM stock_lots WHERE item_id=? AND warehouse_id=?", (item_id, warehouse_id)).fetchone()[0]
+
+
+def _add_lot(conn, company_id, item_id, warehouse_id, movement_id, qty_milli, expiry_date, lot_no=""):
+    lid = conn.execute("INSERT INTO stock_lots(company_id,item_id,warehouse_id,lot_no,expiry_date,qty_milli,received_qty_milli,source_movement_id) "
+                       "VALUES(?,?,?,?,?,?,?,?)", (company_id, item_id, warehouse_id, (lot_no or "").strip(), expiry_date, qty_milli, qty_milli, movement_id)).lastrowid
+    conn.execute("INSERT INTO stock_lot_alloc(movement_id,lot_id,qty_milli) VALUES(?,?,?)", (movement_id, lid, qty_milli))
+    return lid
+
+
+def _check_incoming(conn, item_id, movement_type, movement_date, expiry_date):
+    """يتحقق من تاريخ الانتهاء لوارد صنف متتبَّع؛ يرجع التاريخ المنظّف."""
+    exp = _parse_expiry(expiry_date)
+    if movement_type in ("purchase", "opening") and not exp:
+        name = conn.execute("SELECT name FROM items WHERE id=?", (item_id,)).fetchone()[0]
+        raise AccountingError(f"تاريخ الانتهاء مطلوب للصنف «{name}» (الصنف مفعَّل عليه تتبع الصلاحية)")
+    if movement_type == "purchase" and exp and exp < movement_date:
+        raise AccountingError(f"تاريخ الانتهاء ({exp}) أسبق من تاريخ الاستلام ({movement_date}): راجع التاريخ")
+    return exp
+
+
+def _plan_out(conn, item_id, warehouse_id, qty_milli, movement_date, movement_type, *, lot_id=None, allow_expired=False):
+    """يخطّط الصرف FEFO (الأقدم انتهاءً أولًا؛ بلا تاريخ آخرًا) ويرجع [(lot_id, qty)]. يرفع خطأ إن لم تكفِ الدفعات الصالحة.
+    الجزء غير المغطّى بدفعات (رصيد قديم بلا دفعات) يُصرف بلا توزيع."""
+    block_expired = movement_type in NO_EXPIRY_OUT_BLOCK and not allow_expired
+    rows = conn.execute("SELECT id,qty_milli,expiry_date,lot_no FROM stock_lots WHERE item_id=? AND warehouse_id=? AND qty_milli>0 "
+                        "ORDER BY (expiry_date=''), expiry_date, id", (item_id, warehouse_id)).fetchall()
+    if lot_id is not None:
+        rows = [r for r in rows if r["id"] == int(lot_id)]
+        if not rows:
+            raise AccountingError("الدفعة المحددة غير موجودة أو نفدت كميتها")
+        r = rows[0]
+        if r["qty_milli"] < qty_milli:
+            raise AccountingError(f"كمية الدفعة المتاحة {Decimal(r['qty_milli']) / 1000} أقل من المطلوب {Decimal(qty_milli) / 1000}")
+        if block_expired and r["expiry_date"] and r["expiry_date"] < movement_date:
+            raise AccountingError(f"الدفعة منتهية الصلاحية ({r['expiry_date']}): لا يجوز بيعها أو تحويلها")
+        return [(r["id"], qty_milli)]
+    usable = [r for r in rows if not (block_expired and r["expiry_date"] and r["expiry_date"] < movement_date)]
+    expired_qty = sum(r["qty_milli"] for r in rows) - sum(r["qty_milli"] for r in usable)
+    plan, need = [], qty_milli
+    for r in usable:
+        if need <= 0:
+            break
+        n = min(need, r["qty_milli"])
+        plan.append((r["id"], n)); need -= n
+    if need > 0:
+        bal = conn.execute("SELECT COALESCE(qty_milli,0) FROM stock_balances WHERE item_id=? AND warehouse_id=?", (item_id, warehouse_id)).fetchone()
+        untracked = (bal[0] if bal else 0) - _lots_total(conn, item_id, warehouse_id)
+        if need > max(untracked, 0):
+            if expired_qty:
+                raise AccountingError(f"الكمية الصالحة غير كافية: يوجد {Decimal(expired_qty) / 1000} منتهي الصلاحية لا يجوز صرفه "
+                                      f"(أتلفه من «تسوية مخزنية» أولًا)")
+            raise AccountingError("الرصيد غير كافٍ")
+    return plan
+
+
+def _apply_plan(conn, movement_id, plan):
+    for lot_id, n in plan:
+        conn.execute("UPDATE stock_lots SET qty_milli=qty_milli-? WHERE id=?", (n, lot_id))
+        conn.execute("INSERT INTO stock_lot_alloc(movement_id,lot_id,qty_milli) VALUES(?,?,?)", (movement_id, lot_id, n))
+
+
+def _follow(conn, movement_id, ref_id, direction, qty_milli):
+    """حركة مرتبطة بأصل (مرتجع بيع/شراء أو عكس): تعيد أو تخصم من نفس دفعات الأصل بالترتيب."""
+    allocs = conn.execute("SELECT lot_id,qty_milli FROM stock_lot_alloc WHERE movement_id=? ORDER BY rowid", (ref_id,)).fetchall()
+    if not allocs:
+        return
+    used = {r[0]: r[1] for r in conn.execute(
+        "SELECT a.lot_id,SUM(a.qty_milli) FROM stock_lot_alloc a JOIN stock_movements m ON m.id=a.movement_id "
+        "WHERE m.ref_movement_id=? AND m.movement_type IN ('sale_return','purchase_return') AND m.id<>? "
+        "AND NOT EXISTS(SELECT 1 FROM stock_movements v WHERE v.ref_movement_id=m.id AND v.movement_type='reversal') GROUP BY a.lot_id", (ref_id, movement_id))}
+    need = qty_milli
+    for a in allocs:
+        if need <= 0:
+            break
+        avail = a["qty_milli"] - used.get(a["lot_id"], 0)
+        n = min(need, max(avail, 0))
+        if n <= 0:
+            continue
+        if direction == "out":
+            have = conn.execute("SELECT qty_milli FROM stock_lots WHERE id=?", (a["lot_id"],)).fetchone()[0]
+            n = min(n, have)
+            if n <= 0:
+                continue
+            conn.execute("UPDATE stock_lots SET qty_milli=qty_milli-? WHERE id=?", (n, a["lot_id"]))
+        else:
+            conn.execute("UPDATE stock_lots SET qty_milli=qty_milli+? WHERE id=?", (n, a["lot_id"]))
+        conn.execute("INSERT INTO stock_lot_alloc(movement_id,lot_id,qty_milli) VALUES(?,?,?)", (movement_id, a["lot_id"], n))
+        need -= n
+
+
+def _copy_for_transfer(conn, company_id, in_movement_id, dest_warehouse_id, out_movement_id):
+    """تحويل: الدفعات المصروفة من المصدر تُنشأ في الهدف بنفس الانتهاء ورقم الدفعة."""
+    for a in conn.execute("SELECT a.lot_id,a.qty_milli,l.item_id,l.expiry_date,l.lot_no FROM stock_lot_alloc a JOIN stock_lots l ON l.id=a.lot_id "
+                          "WHERE a.movement_id=?", (out_movement_id,)).fetchall():
+        _add_lot(conn, company_id, a["item_id"], dest_warehouse_id, in_movement_id, a["qty_milli"], a["expiry_date"], a["lot_no"])
+
+
+def assign_untracked(conn, actor_id, company_id, item_id, warehouse_id, expiry_date, lot_no="", qty=None):
+    """تأريخ رصيد قديم بلا دفعات (قبل تفعيل التتبع): ينشئ دفعة بالكمية (الافتراضي كل غير المؤرَّخ) دون أي حركة أو قيد."""
+    from alhisabat.business import inventory as inv
+    it = inv._item(conn, item_id, company_id)
+    inv._req(conn, actor_id, company_id, "inventory.manage", warehouse_id)
+    if not it["track_expiry"]:
+        raise AccountingError("فعّل تتبع الصلاحية للصنف أولًا")
+    exp = _parse_expiry(expiry_date)
+    if not exp:
+        raise AccountingError("أدخل تاريخ الانتهاء")
+    bal = conn.execute("SELECT COALESCE(qty_milli,0) FROM stock_balances WHERE item_id=? AND warehouse_id=?", (item_id, warehouse_id)).fetchone()
+    free = (bal[0] if bal else 0) - _lots_total(conn, item_id, warehouse_id)
+    q = free if qty is None else int(round(Decimal(str(qty)) * 1000))
+    if q <= 0 or q > free:
+        raise AccountingError(f"الكمية غير المؤرَّخة المتاحة: {Decimal(max(free, 0)) / 1000}")
+    with transaction(conn):
+        lid = conn.execute("INSERT INTO stock_lots(company_id,item_id,warehouse_id,lot_no,expiry_date,qty_milli,received_qty_milli) VALUES(?,?,?,?,?,?,?)",
+                           (company_id, item_id, warehouse_id, (lot_no or "").strip(), exp, q, q)).lastrowid
+        audit.log(conn, actor_id, "assign_lot_expiry", "stock_lots", lid, after={"item": item_id, "wh": warehouse_id, "qty_milli": q, "expiry": exp})
+    return lid
+
+
+def untracked_qty_milli(conn, item_id, warehouse_id):
+    bal = conn.execute("SELECT COALESCE(qty_milli,0) FROM stock_balances WHERE item_id=? AND warehouse_id=?", (item_id, warehouse_id)).fetchone()
+    return max((bal[0] if bal else 0) - _lots_total(conn, item_id, warehouse_id), 0)
+
+
+def _status_of(expiry_date, today_iso, alert_days):
+    """('none'|'expired'|'near'|'ok', days_left|None)."""
+    if not expiry_date:
+        return "none", None
+    left = (_date.fromisoformat(expiry_date) - _date.fromisoformat(today_iso)).days
+    if left < 0:
+        return "expired", left
+    return ("near" if left <= alert_days else "ok"), left
+
+
+def lots_report(conn, user_id, company_id, *, warehouse_id=None, item_id=None, today=None, status=None, within_days=None):
+    """الدفعات القائمة (كمية > 0) مرتبة بالأقرب انتهاءً. status: expired|near|ok|none أو None للكل. within_days يضيّق على ما ينتهي خلال N يومًا."""
+    from alhisabat.business import inventory as inv
+    inv._req(conn, user_id, company_id, "inventory.view", warehouse_id)
+    today = today or _date.today().isoformat()
+    allowed = inv._allowed_warehouses(conn, user_id)
+    q = ("SELECT l.id lot_id,l.item_id,i.code item_code,i.name item_name,i.expiry_alert_days alert_days,l.warehouse_id,w.name warehouse_name,"
+         "l.lot_no,l.expiry_date,l.qty_milli,COALESCE(b.qty_milli,0) bal_qty,COALESCE(b.value_base,0) bal_val "
+         "FROM stock_lots l JOIN items i ON i.id=l.item_id JOIN warehouses w ON w.id=l.warehouse_id "
+         "LEFT JOIN stock_balances b ON b.item_id=l.item_id AND b.warehouse_id=l.warehouse_id WHERE l.company_id=? AND l.qty_milli>0")
+    a = [company_id]
+    if warehouse_id:
+        q += " AND l.warehouse_id=?"; a.append(warehouse_id)
+    if item_id:
+        q += " AND l.item_id=?"; a.append(item_id)
+    if allowed:
+        q += " AND l.warehouse_id IN (%s)" % ",".join("?" * len(allowed)); a += allowed
+    q += " ORDER BY (l.expiry_date=''), l.expiry_date, i.name, l.id"
+    out = []
+    for r in conn.execute(q, a):
+        st, left = _status_of(r["expiry_date"], today, r["alert_days"])
+        if status and st != status:
+            continue
+        if within_days is not None and (left is None or left > within_days):
+            continue
+        val = int(round(Decimal(r["bal_val"]) * r["qty_milli"] / r["bal_qty"])) if r["bal_qty"] else 0
+        out.append({"lot_id": r["lot_id"], "item_id": r["item_id"], "item_code": r["item_code"], "item_name": r["item_name"],
+                    "warehouse_id": r["warehouse_id"], "warehouse_name": r["warehouse_name"], "lot_no": r["lot_no"],
+                    "expiry_date": r["expiry_date"], "qty_milli": r["qty_milli"], "days_left": left, "status": st, "value_base": val})
+    return out
+
+
+def expiry_summary(conn, user_id, company_id, today=None):
+    """أعداد للتنبيهات: دفعات/أصناف منتهية وقريبة الانتهاء (حسب أيام التنبيه لكل صنف) مع قيمتها التقديرية."""
+    rows = lots_report(conn, user_id, company_id, today=today)
+    s = {"expired_lots": 0, "near_lots": 0, "expired_items": set(), "near_items": set(), "expired_value": 0, "near_value": 0}
+    for r in rows:
+        if r["status"] == "expired":
+            s["expired_lots"] += 1; s["expired_items"].add(r["item_id"]); s["expired_value"] += r["value_base"]
+        elif r["status"] == "near":
+            s["near_lots"] += 1; s["near_items"].add(r["item_id"]); s["near_value"] += r["value_base"]
+    s["expired_items"], s["near_items"] = len(s["expired_items"]), len(s["near_items"])
+    return s
+
+
+def item_lots(conn, item_id, warehouse_id=None):
+    q, a = "SELECT id,warehouse_id,lot_no,expiry_date,qty_milli FROM stock_lots WHERE item_id=? AND qty_milli>0", [item_id]
+    if warehouse_id:
+        q += " AND warehouse_id=?"; a.append(warehouse_id)
+    return [dict(r) for r in conn.execute(q + " ORDER BY (expiry_date=''),expiry_date,id", a)]

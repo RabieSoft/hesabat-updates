@@ -1,0 +1,41 @@
+"""ناقل وهمي (FakeTransport) لاختبارات الوحدات والنواة بلا متصفح وبلا إنترنت."""
+from typing import List, Optional
+
+from alhisabat.messaging.transports.base import ConnectionStatus, MessageTransport, SendResult
+
+
+class FakeTransport(MessageTransport):
+    def __init__(self, connected: bool = True, fail_next: bool = False, fail_code: str = "simulated_error"):
+        self.connected = connected
+        self.fail_next = fail_next
+        self.fail_code = fail_code
+        self.sent_messages: List[dict] = []
+        self.closed = False
+
+    def is_available(self) -> bool:
+        return True
+
+    def check_connection(self) -> ConnectionStatus:
+        if self.connected:
+            return ConnectionStatus(state="connected", message="متصل وجاهز للإرسال")
+        return ConnectionStatus(state="disconnected", message="غير متصل")
+
+    def send_message(
+        self,
+        phone: str,
+        text: str,
+        attachment_path: Optional[str] = None,
+    ) -> SendResult:
+        if not self.connected:
+            return SendResult(success=False, status="failed", error_code="disconnected", detail="الجلسة غير متصلة")
+
+        if self.fail_next:
+            self.fail_next = False
+            return SendResult(success=False, status="failed", error_code=self.fail_code, detail="فشل محاكى للاختبار")
+
+        msg = {"phone": phone, "text": text, "attachment_path": attachment_path}
+        self.sent_messages.append(msg)
+        return SendResult(success=True, status="sent", error_code="", detail="تم الإرسال بنجاح")
+
+    def close(self) -> None:
+        self.closed = True

@@ -1,0 +1,54 @@
+-- 0039_account_mapping_defaults.sql
+-- استكمال روابط الحسابات النظامية الناقصة لكل شركة دون استبدال أي ربط موجود.
+-- تُنشأ الحسابات المساندة فقط عند وجود الشجرة الافتراضية والحسابات الأب المناسبة.
+
+-- حساب رقابي للموظفين تحت الخصوم المتداولة.
+INSERT INTO accounts(company_id,code,name,parent_id,level,account_type,nature,is_group,is_control,is_system,is_active)
+SELECT c.id,'2107','حسابات الموظفين',p.id,p.level+1,'liability','credit',1,1,1,1
+FROM companies c JOIN accounts p ON p.company_id=c.id AND p.code='21' AND p.is_group=1
+WHERE NOT EXISTS (SELECT 1 FROM accounts a WHERE a.company_id=c.id AND a.code='2107')
+  AND NOT EXISTS (SELECT 1 FROM account_mappings m WHERE m.company_id=c.id AND m.map_key='employees');
+
+-- حساب استقطاعات الرواتب المستحقة.
+INSERT INTO accounts(company_id,code,name,parent_id,level,account_type,nature,is_group,is_control,is_system,is_active)
+SELECT c.id,'2108','استقطاعات الرواتب المستحقة',p.id,p.level+1,'liability','credit',0,0,1,1
+FROM companies c JOIN accounts p ON p.company_id=c.id AND p.code='21' AND p.is_group=1
+WHERE NOT EXISTS (SELECT 1 FROM accounts a WHERE a.company_id=c.id AND a.code='2108');
+
+-- حساب رقابي لمجمع الإهلاك تحت الأصول غير المتداولة.
+INSERT INTO accounts(company_id,code,name,parent_id,level,account_type,nature,nature_override,is_group,is_control,is_system,is_active)
+SELECT c.id,'1208','مجمع الإهلاك',p.id,p.level+1,'asset','credit',1,1,1,1,1
+FROM companies c JOIN accounts p ON p.company_id=c.id AND p.code='12' AND p.is_group=1
+WHERE NOT EXISTS (SELECT 1 FROM accounts a WHERE a.company_id=c.id AND a.code='1208')
+  AND NOT EXISTS (SELECT 1 FROM account_mappings m WHERE m.company_id=c.id AND m.map_key='accum_depreciation');
+
+-- حساب مصروف الإهلاك.
+INSERT INTO accounts(company_id,code,name,parent_id,level,account_type,nature,is_group,is_control,is_system,is_active)
+SELECT c.id,'6109','مصروف الإهلاك',p.id,p.level+1,'expense','debit',0,0,1,1
+FROM companies c JOIN accounts p ON p.company_id=c.id AND p.code='61' AND p.is_group=1
+WHERE NOT EXISTS (SELECT 1 FROM accounts a WHERE a.company_id=c.id AND a.code='6109');
+
+-- ربط الحسابات التي لها حساب افتراضي معروف في شجرة القالب.
+INSERT OR IGNORE INTO account_mappings(company_id,map_key,account_id)
+SELECT c.id,'employees',a.id FROM companies c JOIN accounts a ON a.company_id=c.id AND a.code='2107'
+WHERE a.is_group=1 AND a.is_control=1 AND a.is_active=1;
+INSERT OR IGNORE INTO account_mappings(company_id,map_key,account_id)
+SELECT c.id,'payroll_expense',a.id FROM companies c JOIN accounts a ON a.company_id=c.id AND a.code='6101'
+WHERE a.account_type='expense' AND a.is_group=0 AND a.is_active=1;
+INSERT OR IGNORE INTO account_mappings(company_id,map_key,account_id)
+SELECT c.id,'payroll_deductions',a.id FROM companies c JOIN accounts a ON a.company_id=c.id AND a.code='2108'
+WHERE a.account_type='liability' AND a.is_group=0 AND a.is_active=1;
+INSERT OR IGNORE INTO account_mappings(company_id,map_key,account_id)
+SELECT c.id,'accum_depreciation',a.id FROM companies c JOIN accounts a ON a.company_id=c.id AND a.code='1208'
+WHERE a.account_type='asset' AND a.is_group=1 AND a.is_control=1 AND a.is_active=1;
+INSERT OR IGNORE INTO account_mappings(company_id,map_key,account_id)
+SELECT c.id,'depreciation_expense',a.id FROM companies c JOIN accounts a ON a.company_id=c.id AND a.code='6109'
+WHERE a.account_type='expense' AND a.is_group=0 AND a.is_active=1;
+INSERT OR IGNORE INTO account_mappings(company_id,map_key,account_id)
+SELECT c.id,'disposal_gain_loss',a.id FROM companies c JOIN accounts a ON a.company_id=c.id AND a.code='6402'
+WHERE a.account_type='expense' AND a.is_group=0 AND a.is_active=1;
+INSERT OR IGNORE INTO account_mappings(company_id,map_key,account_id)
+SELECT c.id,'opening_suspense',a.id FROM companies c JOIN accounts a ON a.company_id=c.id AND a.code='37'
+WHERE a.is_active=1;
+
+-- لا يتم استبدال أي ربط سابق، وتظل الحسابات قابلة للتعديل من شاشة ربط الحسابات.

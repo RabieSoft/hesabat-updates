@@ -1,0 +1,395 @@
+import json
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.audit import audit
+from alhisabat.business import numbering
+from alhisabat.database.tx import transaction
+from alhisabat.repositories import accounts as repo
+from alhisabat.security import permissions
+
+TYPE_BY_DIGIT = {"1": "asset", "2": "liability", "3": "equity", "4": "revenue", "5": "cogs", "6": "expense"}
+
+# قالب الشجرة الافتراضي (قابل للتعديل بعد التحميل): (رقم, اسم, [أبناء])
+TEMPLATE = [
+ ("1", "الأصول", [("11", "الأصول المتداولة", [("1101", "الصناديق", []), ("1102", "البنوك", []),
+   ("1103", "العملاء والذمم المدينة", "control"), ("1104", "المخزون", []), ("1105", "السلف والعهد", []),
+   ("1106", "المصروفات المقدمة", []), ("1107", "الإيرادات المستحقة", []), ("1108", "أصول متداولة أخرى", [])]),
+  ("12", "الأصول غير المتداولة", [("1201", "الأراضي", []), ("1202", "المباني", []), ("1203", "السيارات", []),
+   ("1204", "المعدات", []), ("1205", "الأثاث", []), ("1206", "الأصول التقنية", []), ("1207", "أصول أخرى", []), ("1208", "مجمع الإهلاك", "control")])]),
+ ("2", "الخصوم", [("21", "الخصوم المتداولة", [("2101", "الموردون", "control"), ("2102", "المصروفات المستحقة", []),
+   ("2103", "الرواتب المستحقة", []), ("2104", "الضرائب والرسوم", []), ("2105", "دفعات مقدمة من العملاء", []),
+   ("2106", "خصوم أخرى", []), ("2107", "حسابات الموظفين", "control"), ("2108", "استقطاعات الرواتب المستحقة", [])]),
+  ("22", "الخصوم طويلة الأجل", [("2201", "القروض طويلة الأجل", []), ("2202", "خصوم طويلة الأجل أخرى", [])])]),
+ ("3", "حقوق الملكية", [("31", "رأس المال", []), ("32", "حسابات الشركاء", []), ("33", "المسحوبات", []),
+   ("34", "الأرباح المحتجزة", []), ("35", "الاحتياطيات", []), ("36", "نتيجة الفترة", []),
+   ("37", "الأرصدة الافتتاحية المعلقة", []),
+   ("38", "فروقات مطابقة الأرصدة", [])]),
+ ("4", "الإيرادات", [("41", "إيرادات النشاط", [("4101", "مبيعات السلع", []), ("4102", "إيرادات الخدمات", []),
+   ("4103", "إيرادات تشغيلية أخرى", [])]),
+  ("42", "مردودات وخصومات المبيعات", [("4201", "مردودات المبيعات", []), ("4202", "الخصم المسموح", [])]),
+  ("43", "إيرادات أخرى", [("4301", "إيرادات استثمارية", []), ("4302", "إيرادات متنوعة", [])])]),
+ ("5", "تكلفة النشاط", [("51", "تكلفة المبيعات", [("5101", "تكلفة البضاعة المباعة", []), ("5102", "تكاليف مباشرة", [])]),
+  ("52", "تكاليف الشراء المباشرة", [("5201", "نقل", []), ("5202", "تخليص", []), ("5203", "شحن", []),
+   ("5204", "تكاليف شراء أخرى", [])])]),
+ ("6", "المصروفات", [("61", "مصروفات إدارية", [("6101", "رواتب وأجور", []), ("6102", "إيجارات", []),
+   ("6103", "كهرباء ومياه", []), ("6104", "اتصالات وإنترنت", []), ("6105", "قرطاسية", []), ("6106", "صيانة", []),
+   ("6107", "تأمين", []), ("6108", "مصروفات تقنية", []), ("6109", "مصروف الإهلاك", [])]),
+  ("62", "مصروفات بيع وتسويق", [("6201", "إعلان", []), ("6202", "عمولات", []), ("6203", "نقل وتوصيل", []),
+   ("6204", "تسويق", [])]),
+  ("63", "مصروفات مالية", [("6301", "رسوم بنكية", []), ("6302", "فوائد وتمويل", []), ("6303", "فروقات عملة", [])]),
+  ("64", "مصروفات أخرى", [("6401", "مصروفات متنوعة", []), ("6402", "خسائر أخرى", [])])]),
+]
+DEFAULT_MAPPING = {"cash": "1101", "bank": "1102", "customers": "1103", "inventory": "1104", "suppliers": "2101",
+                   "sales": "4101", "cogs": "5101", "retained_earnings": "34", "period_result": "36",
+                   "fx_differences": "6303", "inventory_adjustment": "6402",
+                   "sales_discount": "4202", "sales_returns": "4201", "cash_difference": "6401",
+                   "employees": "2107", "payroll_expense": "6101", "payroll_deductions": "2108",
+                   "accum_depreciation": "1208", "depreciation_expense": "6109",
+                   "disposal_gain_loss": "6402", "opening_suspense": "37",
+                   "reconcile_diff": "38"}
+EXTRA_MAP_KEYS = ()
+MAP_KEYS = tuple(DEFAULT_MAPPING) + EXTRA_MAP_KEYS
+
+
+def _acc(conn, account_id):
+    r = conn.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+    if not r:
+        raise AccountingError("الحساب غير موجود")
+    return r
+
+
+def party_of_account(conn, account_id):
+    return conn.execute("SELECT id,kind FROM parties WHERE account_id=?", (account_id,)).fetchone()
+
+
+def _is_party_control(conn, company_id, account_id):
+    return (conn.execute("SELECT 1 FROM account_mappings WHERE company_id=? AND map_key IN ('customers','suppliers') AND account_id=?",
+                         (company_id, account_id)).fetchone() is not None or
+            conn.execute("SELECT 1 FROM party_groups WHERE account_id=? AND company_id=?",
+                         (account_id, company_id)).fetchone() is not None)
+
+
+def _no_party(conn, account_id, action):
+    if party_of_account(conn, account_id):
+        raise AccountingError(f"هذا حساب عميل/مورد: {action} من شاشة العملاء والموردين")
+    if conn.execute("SELECT 1 FROM party_groups WHERE account_id=?", (account_id,)).fetchone():
+        raise AccountingError(f"هذا حساب مجموعة أطراف: {action} من شاشة العملاء والموردين")
+
+
+def _has_movements(conn, account_id):
+    return conn.execute("SELECT 1 FROM journal_lines WHERE account_id=? LIMIT 1", (account_id,)).fetchone() is not None
+
+
+def _need_for(a, normal):
+    return "account.system_edit" if a["is_system"] else normal
+
+
+def _template_index():
+    """{كود: (اسم, كود الأب أو None)} لكل حسابات القالب."""
+    out = {}
+
+    def walk(nodes, parent):
+        for code, name, kids in nodes:
+            out[code] = (name, parent)
+            walk([] if kids == "control" else kids, code)
+    walk(TEMPLATE, None)
+    return out
+
+
+def _check_template_consistency():
+    """كل كود في DEFAULT_MAPPING يجب أن يكون موجودا في القالب (يُستدعى من الاختبارات ومن التحميل)."""
+    idx = _template_index()
+    missing = sorted({c for c in DEFAULT_MAPPING.values() if c not in idx})
+    if missing:
+        raise AccountingError("قالب الشجرة الافتراضي ناقص: حسابات مطلوبة للربط غير موجودة: " + "، ".join(missing))
+
+
+def load_default_template(conn, actor_id, company_id):
+    """يحمّل القالب في شركة ليس لها حسابات، ويضبط الحسابات النظامية وربطها (Account Mapping).
+    العملية كلها معاملة واحدة: إما شجرة كاملة مربوطة بالكامل أو لا شيء (لا شجرة ناقصة تمنع إعادة المحاولة)."""
+    permissions.require(conn, actor_id, company_id, "account.system_edit")
+    if conn.execute("SELECT 1 FROM accounts WHERE company_id=? LIMIT 1", (company_id,)).fetchone():
+        raise AccountingError("الشركة لديها حسابات بالفعل: لا يمكن تحميل القالب فوقها")
+    s = numbering.get_settings(conn, company_id)
+    if s["prefix"] or s["segment_lengths"].split(",")[:3] != ["1", "1", "2"]:
+        raise AccountingError("إعدادات الترقيم الحالية لا تناسب القالب الافتراضي")
+    _check_template_consistency()
+    ids = {}
+
+    def walk(nodes, parent):
+        for code, name, kids in nodes:
+            control = kids == "control"
+            kids = [] if control else kids
+            typ = TYPE_BY_DIGIT[code[0]]
+            aid = repo.create_account(conn, company_id, code, name, typ, parent, is_group=bool(kids) or control,
+                                      is_control=control, is_system=code in DEFAULT_MAPPING.values(), created_by=actor_id)
+            ids[code] = aid
+            walk(kids, aid)
+    with transaction(conn):
+        walk(TEMPLATE, None)
+        conn.execute("UPDATE accounts SET revalue_fx=1 WHERE id IN (?,?)", (ids["1101"], ids["1102"]))   # نقدية وبنوك: بنود نقدية تُعاد تقييمها
+        for key, code in DEFAULT_MAPPING.items():
+            conn.execute("INSERT INTO account_mappings VALUES(?,?,?)", (company_id, key, ids[code]))
+        audit.log(conn, actor_id, "load_template", "accounts", None, after={"count": len(ids)})
+    return ids
+
+
+def complete_default_mappings(conn, actor_id, company_id):
+    """إصلاح لشركة موجودة (حمّلت قالبا ناقصا سابقا أو فشل تحميلها): يربط كل مفتاح مفقود من DEFAULT_MAPPING
+    بالحساب ذي الكود المقابل، وينشئ الحساب من القالب إن كان مفقودا وأبوه موجودا. لا يغيّر أي ربط قائم.
+    يرجع قائمة المفاتيح التي رُبطت الآن."""
+    permissions.require(conn, actor_id, company_id, "account.system_edit")
+    idx = _template_index()
+    have = {r[0] for r in conn.execute("SELECT map_key FROM account_mappings WHERE company_id=?", (company_id,))}
+    added = []
+    with transaction(conn):
+        for key, code in DEFAULT_MAPPING.items():
+            if key in have:
+                continue
+            row = conn.execute("SELECT id,is_active FROM accounts WHERE company_id=? AND code=?", (company_id, code)).fetchone()
+            if row is None:
+                name, parent_code = idx[code]
+                parent = conn.execute("SELECT id,level FROM accounts WHERE company_id=? AND code=?",
+                                      (company_id, parent_code)).fetchone() if parent_code else None
+                if parent_code and parent is None:
+                    continue   # الشجرة الحالية لا تحوي الأب: يبقى المفتاح للربط اليدوي
+                aid = repo.create_account(conn, company_id, code, name, TYPE_BY_DIGIT[code[0]], parent["id"] if parent else None,
+                                          is_system=True, created_by=actor_id)
+            elif not row["is_active"]:
+                continue
+            else:
+                aid = row["id"]
+            conn.execute("INSERT INTO account_mappings VALUES(?,?,?)", (company_id, key, aid))
+            conn.execute("UPDATE accounts SET is_system=1 WHERE id=?", (aid,))
+            added.append(key)
+        if added:
+            audit.log(conn, actor_id, "complete_mappings", "account_mappings", None, after={"keys": added})
+    return added
+
+
+def add_account(conn, actor_id, company_id, name, account_type, parent_id=None, code=None,
+                is_group=False, is_control=False, description="", _via_party=False):
+    s = numbering.get_settings(conn, company_id)
+    if parent_id is not None:
+        p = _acc(conn, parent_id)
+        if p["company_id"] != company_id:
+            raise AccountingError("الحساب الأب من شركة أخرى")
+        if not _via_party and _is_party_control(conn, company_id, parent_id):
+            raise AccountingError("حسابات العملاء والموردين تُنشأ من شاشة العملاء والموردين فقط")
+        if p["account_type"] != account_type:
+            raise AccountingError("نوع الحساب يجب أن يطابق نوع الحساب الأب")
+        if not p["is_active"]:
+            raise AccountingError("الحساب الأب معطّل")
+        if _has_movements(conn, parent_id):
+            raise AccountingError("الحساب الأب عليه حركات: لا يمكن أن يصبح تجميعيا")
+        if not p["is_group"]:   # تحويل حساب حركة بلا حركات إلى تجميعي عند إضافة ابن له (موثّق في التدقيق)
+            permissions.require(conn, actor_id, company_id, _need_for(p, "account.edit"))
+            conn.execute("UPDATE accounts SET is_group=1 WHERE id=?", (parent_id,))
+            audit.log(conn, actor_id, "convert_to_group", "accounts", parent_id, {"is_group": 0}, {"is_group": 1})
+    if not name or not name.strip():
+        raise AccountingError("اسم الحساب مطلوب")
+    if code is None:
+        if s["mode"] != "auto":
+            raise AccountingError("رقم الحساب مطلوب (الترقيم اليدوي)")
+        code = numbering.next_code(conn, company_id, parent_id)
+    else:
+        numbering.validate_code(conn, company_id, code, parent_id)
+    aid = repo.create_account(conn, company_id, code, name.strip(), account_type, parent_id,
+                              is_group=is_group or is_control, is_control=is_control, created_by=actor_id)
+    if description:
+        conn.execute("UPDATE accounts SET description=? WHERE id=?", (description, aid))
+    return aid
+
+
+def edit_account(conn, actor_id, account_id, *, name=None, description=None, default_currency=None,
+                 is_control=None, branch_id=None, revalue_fx=None, _via_party=False):
+    a = _acc(conn, account_id)
+    if not _via_party:
+        _no_party(conn, account_id, "التعديل")
+    permissions.require(conn, actor_id, a["company_id"], _need_for(a, "account.edit"))
+    new = {"name": name if name is not None else a["name"],
+           "description": description if description is not None else a["description"],
+           "default_currency": default_currency if default_currency is not None else a["default_currency"],
+           "is_control": int(is_control) if is_control is not None else a["is_control"],
+           "branch_id": branch_id if branch_id is not None else a["branch_id"],
+           "revalue_fx": int(revalue_fx) if revalue_fx is not None else a["revalue_fx"]}
+    if not new["name"].strip():
+        raise AccountingError("اسم الحساب مطلوب")
+    if new["is_control"] and not a["is_group"]:
+        raise AccountingError("الحساب الرقابي يجب أن يكون تجميعيا")
+    old = {k: a[k] for k in new}
+    with transaction(conn):
+        conn.execute("UPDATE accounts SET name=?,description=?,default_currency=?,is_control=?,branch_id=?,revalue_fx=? WHERE id=?",
+                     (new["name"].strip(), new["description"], new["default_currency"], new["is_control"],
+                      new["branch_id"], new["revalue_fx"], account_id))
+        audit.log(conn, actor_id, "edit_account", "accounts", account_id, old, new)
+
+
+def set_active(conn, actor_id, account_id, active: bool, reason="", _via_party=False):
+    a = _acc(conn, account_id)
+    if not _via_party:
+        _no_party(conn, account_id, "التعطيل والتفعيل")
+    permissions.require(conn, actor_id, a["company_id"], _need_for(a, "account.deactivate"))
+    if not active and conn.execute("SELECT 1 FROM accounts WHERE parent_id=? AND is_active=1", (account_id,)).fetchone():
+        raise AccountingError("لا يمكن تعطيل حساب تجميعي وتحته حسابات نشطة")
+    if active and a["parent_id"] and not _acc(conn, a["parent_id"])["is_active"]:
+        raise AccountingError("الحساب الأب معطّل: فعّله أولا")
+    with transaction(conn):
+        conn.execute("UPDATE accounts SET is_active=? WHERE id=?", (int(active), account_id))
+        audit.log(conn, actor_id, "activate" if active else "deactivate", "accounts", account_id,
+                  {"is_active": a["is_active"]}, {"is_active": int(active)}, reason)
+
+
+def delete_account(conn, actor_id, account_id, _via_party=False):
+    a = _acc(conn, account_id)
+    if not _via_party:
+        _no_party(conn, account_id, "الحذف")
+    permissions.require(conn, actor_id, a["company_id"], "account.delete")
+    if conn.execute("SELECT 1 FROM account_mappings WHERE account_id=?", (account_id,)).fetchone():
+        raise AccountingError("الحساب مربوط بعملية نظامية (Account Mapping): لا يمكن حذفه")
+    if conn.execute("SELECT 1 FROM accounts WHERE merged_into_id=?", (account_id,)).fetchone():
+        raise AccountingError("الحساب هدف دمج سابق: لا يمكن حذفه")
+    with transaction(conn):
+        conn.execute("DELETE FROM accounts WHERE id=?", (account_id,))
+        audit.log(conn, actor_id, "delete_account", "accounts", account_id, {"code": a["code"], "name": a["name"]})
+
+
+def _subtree(conn, root_id):
+    return conn.execute(
+        "WITH RECURSIVE t(id,depth) AS (SELECT id,0 FROM accounts WHERE id=? UNION ALL "
+        "SELECT a.id,t.depth+1 FROM accounts a JOIN t ON a.parent_id=t.id) "
+        "SELECT a.*,t.depth FROM accounts a JOIN t ON a.id=t.id ORDER BY t.depth,a.code", (root_id,)).fetchall()
+
+
+def move_account(conn, actor_id, account_id, new_parent_id, preview=False):
+    """يرجع قائمة (id, كود قديم, كود جديد, مستوى جديد). preview=True لا ينفذ شيئا."""
+    a = _acc(conn, account_id)
+    permissions.require(conn, actor_id, a["company_id"], _need_for(a, "account.move"))
+    if new_parent_id == account_id:
+        raise AccountingError("لا يمكن نقل الحساب إلى نفسه")
+    if new_parent_id == a["parent_id"]:
+        raise AccountingError("الحساب موجود أصلا تحت هذا الأب")
+    sub = _subtree(conn, account_id)
+    if any(party_of_account(conn, r["id"]) for r in sub):
+        raise AccountingError("الشجرة الفرعية تحتوي حساب عميل/مورد: لا يمكن نقلها")
+    if new_parent_id is not None:
+        if _is_party_control(conn, a["company_id"], new_parent_id):
+            raise AccountingError("لا يمكن النقل تحت الحساب الرقابي للعملاء/الموردين")
+        p = _acc(conn, new_parent_id)
+        if p["id"] in {r["id"] for r in sub}:
+            raise AccountingError("لا يمكن نقل الحساب إلى أحد أبنائه")
+        if p["company_id"] != a["company_id"] or p["account_type"] != a["account_type"]:
+            raise AccountingError("الأب الجديد يجب أن يكون من نفس الشركة ونفس نوع الحساب")
+        if not p["is_group"] or not p["is_active"]:
+            raise AccountingError("الأب الجديد يجب أن يكون تجميعيا ونشطا")
+    new_root = numbering.next_code(conn, a["company_id"], new_parent_id)
+    base_level = 1 if new_parent_id is None else _acc(conn, new_parent_id)["level"] + 1
+    plan = []
+    for r in sub:
+        code = new_root + r["code"][len(a["code"]):]
+        plan.append((r["id"], r["code"], code, base_level + r["depth"], r["parent_id"]))
+    outside = {row[0] for row in conn.execute("SELECT code FROM accounts WHERE company_id=?", (a["company_id"],))} \
+        - {r["code"] for r in sub}
+    s = numbering.get_settings(conn, a["company_id"])
+    for (i, old, new, lvl, _) in plan:
+        if new in outside:
+            raise AccountingError(f"الرقم الجديد {new} مستخدم")
+        if len(new) != numbering.code_length_for_level(s, lvl):
+            raise AccountingError(f"الرقم الجديد {new} لا يوافق إعدادات الترقيم في المستوى {lvl}")
+    result = [(i, old, new, lvl) for (i, old, new, lvl, _) in plan]
+    if preview:
+        return result
+    with transaction(conn):
+        for (i, *_r) in plan:
+            conn.execute("UPDATE accounts SET code='tmp:'||id WHERE id=?", (i,))
+        for (i, old, new, lvl, oldparent) in plan:
+            parent = new_parent_id if i == account_id else oldparent
+            conn.execute("UPDATE accounts SET code=?,parent_id=?,level=? WHERE id=?", (new, parent, lvl, i))
+        audit.log(conn, actor_id, "move_account", "accounts", account_id,
+                  {"parent_id": a["parent_id"], "codes": {str(i): o for i, o, _n, _l in result}},
+                  {"parent_id": new_parent_id, "codes": {str(i): n for i, _o, n, _l in result}})
+    return result
+
+
+def merge_accounts(conn, actor_id, source_id, target_id, reason):
+    """دمج آمن: لا يُعاد كتابة القيود المرحّلة؛ المصدر يُعطَّل ويُسجَّل أنه مدموج في الهدف،
+    وتُنقل سطور المسودات فقط. التقارير تجمّع المدموج عبر balance_with_merged."""
+    if not reason or not reason.strip():
+        raise AccountingError("الدمج يتطلب ذكر السبب")
+    s, t = _acc(conn, source_id), _acc(conn, target_id)
+    permissions.require(conn, actor_id, s["company_id"], _need_for(s, "account.merge"))
+    if source_id == target_id:
+        raise AccountingError("لا يمكن دمج الحساب في نفسه")
+    if party_of_account(conn, source_id) or party_of_account(conn, target_id):
+        raise AccountingError("لا يمكن دمج حسابات العملاء والموردين")
+    if s["company_id"] != t["company_id"] or s["account_type"] != t["account_type"]:
+        raise AccountingError("الدمج يتطلب نفس الشركة ونفس نوع الحساب")
+    if s["is_group"] or t["is_group"]:
+        raise AccountingError("الدمج بين حسابات الحركة فقط")
+    if not t["is_active"] or s["merged_into_id"]:
+        raise AccountingError("الحساب الهدف يجب أن يكون نشطا والمصدر غير مدموج مسبقا")
+    if conn.execute("SELECT 1 FROM account_mappings WHERE account_id=?", (source_id,)).fetchone():
+        raise AccountingError("الحساب المصدر مربوط بعملية نظامية: غيّر الربط أولا")
+    with transaction(conn):
+        conn.execute("UPDATE journal_lines SET account_id=? WHERE account_id=? AND entry_id IN "
+                     "(SELECT id FROM journal_entries WHERE status='draft')", (target_id, source_id))
+        conn.execute("UPDATE accounts SET is_active=0,merged_into_id=? WHERE id=?", (target_id, source_id))
+        audit.log(conn, actor_id, "merge_accounts", "accounts", source_id,
+                  {"code": s["code"]}, {"merged_into": target_id, "code": t["code"]}, reason)
+
+
+def balance_with_merged(conn, account_id):
+    """مؤقت حتى Gate 05: رصيد الحساب + كل الحسابات المدموجة فيه (مدين - دائن، أساسي)."""
+    r = conn.execute(
+        "WITH RECURSIVE m(id) AS (SELECT ? UNION ALL SELECT a.id FROM accounts a JOIN m ON a.merged_into_id=m.id) "
+        "SELECT COALESCE(SUM(l.debit_base),0)-COALESCE(SUM(l.credit_base),0) FROM journal_lines l "
+        "JOIN journal_entries e ON e.id=l.entry_id WHERE l.account_id IN (SELECT id FROM m) "
+        "AND e.status IN ('posted','reversed')", (account_id,)).fetchone()
+    return r[0]
+
+
+def set_mapping(conn, actor_id, company_id, key, account_id):
+    permissions.require(conn, actor_id, company_id, "account.system_edit")
+    if key not in MAP_KEYS:
+        raise AccountingError("مفتاح ربط غير معروف")
+    a = _acc(conn, account_id)
+    if a["company_id"] != company_id or not a["is_active"]:
+        raise AccountingError("الحساب غير صالح للربط")
+    if key in ("customers", "suppliers") and conn.execute(
+            "SELECT 1 FROM parties WHERE company_id=? AND kind=?", (company_id, "customer" if key == "customers" else "supplier")).fetchone():
+        raise AccountingError("توجد أطراف مرتبطة بالحساب الرقابي الحالي: لا يمكن تغيير الربط")
+    if key in ("customers", "suppliers", "employees"):
+        # لكل نوع طرف حساب رقابي مستقل: لا يتداخل مع رقابي نوع آخر (وإلا ظهرت «حسابات بلا طرف» عند فحص الإقفال)
+        from alhisabat.accounting import balance_engine as be
+        label = {"customers": "العملاء", "suppliers": "الموردين", "employees": "الموظفين"}
+        mine = set(be.subtree_ids(conn, account_id, include_merged=False))
+        for other in ("customers", "suppliers", "employees"):
+            r = conn.execute("SELECT account_id FROM account_mappings WHERE company_id=? AND map_key=?", (company_id, other)).fetchone()
+            if other != key and r and r[0] in mine:
+                raise AccountingError(f"هذا الحساب هو (أو يحوي) الحساب الرقابي لـ{label[other]}: اختر حسابًا رقابيًا مستقلًا لـ{label[key]}")
+    with transaction(conn):
+        old = conn.execute("SELECT account_id FROM account_mappings WHERE company_id=? AND map_key=?", (company_id, key)).fetchone()
+        conn.execute("INSERT INTO account_mappings VALUES(?,?,?) ON CONFLICT(company_id,map_key) DO UPDATE SET account_id=excluded.account_id",
+                     (company_id, key, account_id))
+        conn.execute("UPDATE accounts SET is_system=1 WHERE id=?", (account_id,))
+        audit.log(conn, actor_id, "set_mapping", "account_mappings", account_id,
+                  {"account_id": old[0]} if old else None, {"key": key, "account_id": account_id})
+
+
+def get_mapping(conn, company_id, key):
+    r = conn.execute("SELECT account_id FROM account_mappings WHERE company_id=? AND map_key=?", (company_id, key)).fetchone()
+    if not r:
+        raise AccountingError(f"لم يتم ربط الحساب النظامي «{key}»: اضبط Account Mapping أولا")
+    return r[0]
+
+
+def get_tree(conn, company_id, include_inactive=True, branch_id=None):
+    """شجرة الحسابات. مع branch_id تُخفى حسابات العملاء/الموردين/الصناديق التابعة لفروع أخرى."""
+    from alhisabat.business import branch_scope
+    hide = branch_scope.foreign_account_ids(conn, company_id, branch_id)
+    rows = conn.execute("SELECT id,code,name,parent_id,level,account_type,is_group,is_control,is_system,is_active "
+                        "FROM accounts WHERE company_id=? ORDER BY code", (company_id,)).fetchall()
+    nodes = {r["id"]: {**dict(r), "children": []} for r in rows if (include_inactive or r["is_active"]) and r["id"] not in hide}
+    roots = []
+    for n in nodes.values():
+        (nodes[n["parent_id"]]["children"] if n["parent_id"] in nodes else roots).append(n)
+    return roots

@@ -1,0 +1,513 @@
+"""ناقل أتمتة WhatsApp Web عبر Playwright (sync) والمتصفح المثبت (Chrome افتراضيًا، أو Edge باختيار المستخدم).
+
+- استيراد Playwright يتم بشكل كسول لتفادي أي عطل إن لم تكن المكتبة مثبتة.
+- ملف تعريف دائم لكل فرع لحفظ الجلسة بعد مسح QR لمرة واحدة.
+- استخدام selectors.json خارجي قابل للتحديث.
+"""
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from alhisabat.messaging import browser_prefs
+from alhisabat.messaging.phone import to_wa_number
+from alhisabat.messaging.transports.base import ConnectionStatus, MessageTransport, SendResult
+
+_SELECTORS_PATH = Path(__file__).resolve().parent.parent / "selectors.json"
+
+
+def load_selectors() -> Dict[str, Any]:
+    try:
+        if _SELECTORS_PATH.is_file():
+            return json.loads(_SELECTORS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def get_profile_dir(branch_id: Optional[int]) -> Path:
+    b_id = str(branch_id or "default")
+    if sys.platform == "win32":
+        app_data = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        p = Path(app_data) / "AlhisabatPro" / "whatsapp" / "profile" / b_id
+    else:
+        p = Path.home() / ".alhisabat" / "whatsapp" / "profile" / b_id
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _cdp_alive(port: int) -> bool:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{int(port)}/json/version", timeout=1.5) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+# ---------------------------------------------------------------- تصنيف نوافذ واتساب المنبثقة (دوال صرفة قابلة للاختبار)
+# السبب القديم لـ«فشلت» الكاذبة: المحددات العامة [data-animate-modal-popup] تطابق أي نافذة منبثقة بما فيها
+# «جارٍ بدء المحادثة»، فكان يُعتبر الرقم غير مسجل والرسالة أُرسلت فعلًا.
+_INVALID_POPUP_RE = re.compile(
+    r"(غير صالح|غير صحيح|غير مسجل|ليس.{0,12}واتساب|not\s+on\s+whatsapp|invalid|isn['’]t\s+on\s+whatsapp|is\s+not\s+valid)",
+    re.IGNORECASE)
+_LOADING_POPUP_RE = re.compile(r"(جارٍ|جاري|يتم\s+|starting\s+chat|loading|opening|please\s+wait)", re.IGNORECASE)
+
+
+def classify_popup_text(text: str) -> str:
+    """'invalid' إن كان نص النافذة يفيد أن الرقم غير صالح/غير مسجل، 'loading' لنوافذ التحميل، وإلا 'other'."""
+    t = (text or "").strip()
+    if not t:
+        return "other"
+    if _INVALID_POPUP_RE.search(t) and not _LOADING_POPUP_RE.search(t):
+        return "invalid"
+    if _LOADING_POPUP_RE.search(t):
+        return "loading"
+    return "other"
+
+
+# ---------------------------------------------------------------- ناقل مشترك واحد لكل فرع
+# الواجهة (زر «ربط واتساب») والعامل (طابور الرسائل) كانا يُنشئان كلٌّ ناقله فيُفتح أكثر من نافذة واتساب.
+# الآن ناقل واحد لكل فرع في العملية، وقفل عام يمنع تزامن فتح النافذة.
+_SHARED: Dict[str, "WebTransport"] = {}
+_SHARED_LOCK = threading.Lock()
+_LAUNCH_LOCK = threading.RLock()
+
+
+def get_shared_transport(branch_id: Optional[int] = None) -> "WebTransport":
+    key = str(branch_id or "default")
+    with _SHARED_LOCK:
+        tr = _SHARED.get(key)
+        if tr is None or tr._closed:
+            tr = WebTransport(branch_id)
+            tr.shared = True
+            _SHARED[key] = tr
+        return tr
+
+
+def shutdown_shared_transports() -> None:
+    """عند إغلاق البرنامج: فصل Playwright فقط (نافذة واتساب تبقى مفتوحة بجلستها)."""
+    with _SHARED_LOCK:
+        items = list(_SHARED.values())
+        _SHARED.clear()
+    for tr in items:
+        try:
+            tr.close()
+        except Exception:
+            pass
+
+
+class WebTransport(MessageTransport):
+    """كل استدعاءات Playwright تجري في خيط واحد مخصص (Playwright sync مرتبط بخيطه)،
+    لذلك يمكن استدعاء check_connection من الواجهة وsend_message من العامل بأمان على نفس النافذة.
+
+    طريقة الفتح: نافذة تطبيق Chrome (--app) كما يفتحها اختصار واتساب، مع منفذ تحكم محلي،
+    ثم الاتصال بها عبر CDP؛ فتبقى النافذة مفتوحة وجلستها محفوظة حتى بعد إغلاق البرنامج.
+    """
+
+    def __init__(self, branch_id: Optional[int] = None):
+        self.branch_id = branch_id
+        self.profile_dir = get_profile_dir(branch_id)
+        self.selectors = load_selectors()
+        self._ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"wa-pw-{branch_id or 0}")
+        self._closed = False
+        self._lock = threading.Lock()
+        # كائنات Playwright (لا تُلمس إلا من خيط _ex)
+        self._pw = None
+        self._browser = None
+        self._context = None
+        self._page = None
+        self._note = ""
+        self.shared = False
+
+    # ---------------------------------------------------------------- واجهة عامة
+    def is_available(self) -> bool:
+        """التحقق من Playwright ومشغّله، بما في ذلك عند تشغيل البرنامج كملف تنفيذي."""
+        try:
+            from playwright.sync_api import sync_playwright  # noqa: F401
+            from playwright._impl._driver import compute_driver_executable
+            driver_executable, driver_cli = compute_driver_executable()
+            return Path(driver_executable).is_file() and Path(driver_cli).is_file()
+        except Exception:
+            return False
+
+    def _run(self, fn, *args):
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("الناقل مغلق")
+        return self._ex.submit(fn, *args).result()
+
+    def check_connection(self, wait_seconds: float = 25.0) -> ConnectionStatus:
+        if not self.is_available():
+            return ConnectionStatus(
+                state="error",
+                message=("مكوّن Playwright أو مشغّله غير موجود في حزمة البرنامج. أعد بناء النسخة بعد تضمين Playwright؛ "
+                         "ويجب أيضًا تثبيت Google Chrome (أو Edge) على هذا الجهاز."),
+            )
+        try:
+            return self._run(self._check_impl, wait_seconds)
+        except Exception as e:
+            return ConnectionStatus(state="error", message=str(e))
+
+    def send_message(self, phone: str, text: str, attachment_path: Optional[str] = None) -> SendResult:
+        try:
+            return self._run(self._send_impl, phone, text, attachment_path)
+        except Exception as e:
+            return SendResult(success=False, status="failed", error_code="execution_error", detail=str(e))
+
+    def reset(self) -> None:
+        """يفصل Playwright ويُبقي الناقل صالحًا لإعادة الاتصال لاحقًا (نافذة واتساب المفتوحة لا تُمَس)."""
+        with self._lock:
+            if self._closed:
+                return
+        try:
+            self._ex.submit(self._close_impl).result(timeout=10)
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        """يفصل Playwright فقط؛ تبقى نافذة Chrome مفتوحة بجلستها (إن فُتحت عبر CDP)."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        try:
+            self._ex.submit(self._close_impl).result(timeout=10)
+        except Exception:
+            pass
+        self._ex.shutdown(wait=False)
+
+    # ---------------------------------------------------------------- التشغيل والاتصال (خيط Playwright)
+    def _close_impl(self):
+        try:
+            if self._browser is not None:
+                self._browser.close()          # مع CDP: فصل فقط
+            elif self._context is not None:
+                self._context.close()          # مع الإطلاق المباشر: يغلق النافذة
+        except Exception:
+            pass
+        try:
+            if self._pw:
+                self._pw.stop()
+        except Exception:
+            pass
+        self._pw = self._browser = self._context = self._page = None
+
+    def _port_file(self) -> Path:
+        return self.profile_dir.parent / f"cdp_port_{self.branch_id or 'default'}.txt"
+
+    def _saved_port(self) -> int:
+        try:
+            return int(self._port_file().read_text().strip())
+        except Exception:
+            return 0
+
+    def _launch_chrome_window(self, plan: Dict[str, Any], port: int) -> None:
+        udd = plan.get("user_data_dir") or str(self.profile_dir)
+        cmd = [
+            str(plan["exe"]),
+            f"--user-data-dir={udd}",
+            f"--remote-debugging-port={port}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--window-size=1100,800",
+            f"--app={browser_prefs.WA_URL}",
+        ]
+        if plan.get("profile_directory"):
+            cmd.insert(2, f"--profile-directory={plan['profile_directory']}")
+        kwargs: Dict[str, Any] = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "stdin": subprocess.DEVNULL}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = 0x00000008 | 0x00000200   # DETACHED_PROCESS | NEW_PROCESS_GROUP
+        else:
+            kwargs["start_new_session"] = True
+        subprocess.Popen(cmd, **kwargs)
+
+    def _connect_cdp(self, plan: Dict[str, Any]) -> bool:
+        """يتصل بنافذة Chrome المفتوحة أو يفتحها. يعيد False إن لم يوجد ملف Chrome (للانتقال للإطلاق المباشر)."""
+        port = 0
+        for cand in (int(plan.get("port") or 0), self._saved_port()):
+            if cand and _cdp_alive(cand):
+                port = cand
+                break
+        if not port:
+            if not plan.get("exe"):
+                return False
+            port = int(plan.get("port") or 0) or _free_port()
+            self._launch_chrome_window(plan, port)
+            deadline = time.time() + 25
+            while time.time() < deadline and not _cdp_alive(port):
+                time.sleep(0.5)
+            if not _cdp_alive(port):
+                raise RuntimeError(
+                    "تعذر الاتصال بنافذة Chrome. إن كانت نافذة واتساب الخاصة بالبرنامج مفتوحة مسبقًا بدون منفذ التحكم "
+                    "فأغلقها ثم أعد المحاولة."
+                )
+            try:
+                self._port_file().write_text(str(port))
+            except Exception:
+                pass
+        self._browser = self._pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+        self._context = self._browser.contexts[0] if self._browser.contexts else self._browser.new_context()
+        return True
+
+    def _launch_direct(self, prefs: Dict[str, Any]) -> None:
+        """احتياطي: إطلاق Playwright المباشر بقناة المتصفح المختار (chrome أولًا؛ edge فقط إن اختير أو تلقائي)."""
+        kind = str(prefs.get("browser") or "chrome")
+        channels = ("chrome", "msedge") if kind == "auto" else (kind,)
+        last_err = None
+        for channel in channels:
+            try:
+                self._context = self._pw.chromium.launch_persistent_context(
+                    user_data_dir=str(self.profile_dir), channel=channel, headless=False, no_viewport=True,
+                    args=["--disable-blink-features=AutomationControlled", "--window-position=0,0", "--window-size=1100,800"],
+                )
+                return
+            except Exception as e:
+                last_err = e
+        name = "Google Chrome" if kind == "chrome" else ("Microsoft Edge" if kind == "msedge" else "Chrome أو Edge")
+        raise RuntimeError(f"تعذر تشغيل المتصفح ({name}). تأكد من تثبيته: {last_err}")
+
+    def _find_wa_page(self):
+        for pg in self._context.pages:
+            try:
+                if not pg.is_closed() and "web.whatsapp.com" in pg.url:
+                    return pg
+            except Exception:
+                continue
+        # صفحة ما زالت تُحمَّل (about:blank) داخل نافذة التطبيق: تُعتبر نافذة واتساب ولا تُفتح نافذة ثانية
+        for pg in self._context.pages:
+            try:
+                if not pg.is_closed() and pg.url in ("", "about:blank"):
+                    return pg
+            except Exception:
+                continue
+        return None
+
+    def _ensure_page(self):
+        if self._page is not None and not self._page.is_closed():
+            return self._page
+        prefs = browser_prefs.load_prefs()
+        if self._pw is None:
+            from playwright.sync_api import sync_playwright
+            self._pw = sync_playwright().start()
+        plan = browser_prefs.resolve_launch_plan(prefs)
+        self._note = str(plan.get("note") or "")
+
+        with _LAUNCH_LOCK:                               # عملية فتح/اتصال واحدة في كل مرة على مستوى البرنامج
+            if self._context is None:
+                if not self._connect_cdp(plan):
+                    self._launch_direct(prefs)
+
+            page = self._find_wa_page()
+            if page is None and self._browser is not None:
+                # المتصفح يعمل لكن لا نرى صفحة واتساب: ننتظر قليلًا (قد تكون قيد الفتح) ثم نستعمل نفس المتصفح
+                # بدل إطلاق نافذة تطبيق جديدة (كان هذا سبب ظهور نافذة واتساب ثانية).
+                deadline = time.time() + 6
+                while time.time() < deadline and page is None:
+                    time.sleep(0.5)
+                    page = self._find_wa_page()
+            if page is None:
+                page = self._context.pages[0] if self._context.pages else self._context.new_page()
+                if "web.whatsapp.com" not in (page.url or ""):
+                    page.goto(browser_prefs.WA_URL, wait_until="domcontentloaded")
+        page.on("dialog", lambda d: d.accept())      # «مغادرة الصفحة؟» عند التنقل بين المحادثات
+        self._page = page
+        return page
+
+    # ---------------------------------------------------------------- فحص الاتصال
+    def _visible(self, page, key: str) -> bool:
+        for sel in self.selectors.get(key, []):
+            try:
+                if page.locator(sel).first.is_visible():
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _check_impl(self, wait_seconds: float) -> ConnectionStatus:
+        page = self._ensure_page()
+        deadline = time.time() + max(1.0, wait_seconds)
+        while True:
+            if self._visible(page, "chat_list"):
+                return ConnectionStatus(state="connected", message="الجلسة متصلة وجاهزة للإرسال" + (f" — {self._note}" if self._note else ""))
+            if self._visible(page, "qr_canvas"):
+                try:
+                    page.bring_to_front()
+                except Exception:
+                    pass
+                return ConnectionStatus(state="qr_ready", message="بانتظار مسح رمز QR من الهاتف (نافذة واتساب ظاهرة الآن)" + (f" — {self._note}" if self._note else ""))
+            if time.time() >= deadline:
+                return ConnectionStatus(state="disconnected", message="صفحة واتساب ويب ما زالت تُحمَّل... أعد الفحص بعد لحظات")
+            time.sleep(1)
+
+    # ---------------------------------------------------------------- الإرسال
+    def _popup_texts(self, page) -> List[str]:
+        out: List[str] = []
+        for pop_sel in ("[data-animate-modal-popup='true']", "[data-testid='popup-contents']", "div[role='dialog']"):
+            try:
+                loc = page.locator(pop_sel)
+                n = min(loc.count(), 3)
+                for k in range(n):
+                    el = loc.nth(k)
+                    if el.is_visible():
+                        out.append(el.inner_text(timeout=800) or "")
+            except Exception:
+                continue
+        return out
+
+    def _invalid_phone_popup(self, page) -> bool:
+        """نافذة «الرقم غير صالح/غير مسجل» الفعلية فقط (بقراءة نصها)؛ نوافذ التحميل العامة لا تُعدّ خطأ."""
+        for txt in self._popup_texts(page):
+            if classify_popup_text(txt) == "invalid":
+                return True
+        for sel in self.selectors.get("invalid_phone_popup", []):
+            if not sel.startswith("text="):         # المحددات العامة أُهملت عمدًا؛ تبقى محددات النص الصريح فقط
+                continue
+            try:
+                if page.locator(sel).first.is_visible():
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _wait_for_input(self, page, timeout: float = 25.0, expect_text: Optional[str] = None):
+        """ينتظر صندوق الكتابة، أو يعيد SendResult عند الحظر/الرقم غير الصالح.
+
+        expect_text: عند التنقل داخل نفس الصفحة بلا إعادة تحميل نشترط ظهور النص المعبّأ مسبقًا في الصندوق،
+        فيثبت أن المحادثة تغيّرت فعلًا ولا نرسل إلى المحادثة السابقة بالخطأ.
+        """
+        start = time.time()
+        while time.time() - start < timeout:
+            if self._visible(page, "blocked_banner"):
+                return None, SendResult(False, "blocked", "account_blocked", "تم اكتشاف تنبيه حظر أو تقييد للحساب على واتساب")
+            if self._invalid_phone_popup(page):
+                for ok_sel in self.selectors.get("invalid_phone_ok_button", []):
+                    try:
+                        page.locator(ok_sel).first.click(timeout=1000)
+                        break
+                    except Exception:
+                        pass
+                return None, SendResult(False, "failed", "not_on_whatsapp", "رقم الهاتف غير مسجل في واتساب أو غير صالح")
+            for in_sel in self.selectors.get("message_input_box", []):
+                try:
+                    loc = page.locator(in_sel).first
+                    if loc.is_visible():
+                        if expect_text:
+                            have = (loc.inner_text() or "").strip()
+                            if not have or expect_text.strip()[:15] not in have:
+                                continue
+                        return loc, None
+                except Exception:
+                    pass
+            time.sleep(0.7)
+        return None, SendResult(False, "failed", "selector_failure",
+                                "تعذر الوصول لصندوق الإرسال — تأكد أن الجلسة متصلة (QR) أو حدّث التطبيق")
+
+    def _open_chat(self, page, wa_num: str, text: str, force_text: bool):
+        """يفتح المحادثة المطلوبة داخل نافذة واتساب المفتوحة نفسها بلا إعادة تحميل الصفحة (نقر رابط داخلي).
+        عند أي تعذر يرجع إلى التنقل الكامل. يعيد (صندوق_الكتابة، خطأ)."""
+        url = f"https://web.whatsapp.com/send?phone={wa_num}&text={urllib.parse.quote(text or '')}"
+        on_wa = False
+        try:
+            on_wa = "web.whatsapp.com" in (page.url or "") and self._visible(page, "chat_list")
+        except Exception:
+            on_wa = False
+        if on_wa and text:
+            try:
+                page.evaluate(
+                    """(u) => { const a = document.createElement('a'); a.href = u; a.style.display = 'none';
+                                 document.body.appendChild(a); a.click(); a.remove(); }""", url)
+                box, err = self._wait_for_input(page, timeout=14.0, expect_text=text)
+                if err is None:
+                    return box, None
+                if err.error_code in ("not_on_whatsapp", "account_blocked"):
+                    return None, err
+            except Exception:
+                pass
+        # احتياطي: تنقل كامل (أول رسالة، أو واتساب لم يستجب للتنقل الداخلي)
+        page.goto(url if text else f"https://web.whatsapp.com/send?phone={wa_num}", wait_until="domcontentloaded")
+        return self._wait_for_input(page)
+
+    def _click_first(self, page, key: str, timeout: int = 2500) -> bool:
+        for sel in self.selectors.get(key, []):
+            try:
+                page.locator(sel).first.click(timeout=timeout)
+                return True
+            except Exception:
+                continue
+        return False
+
+    def _send_impl(self, phone: str, text: str, attachment_path: Optional[str]) -> SendResult:
+        page = self._ensure_page()
+        wa_num = to_wa_number(phone)
+        has_att = bool(attachment_path and os.path.isfile(attachment_path))
+        # التنقل داخل النافذة المفتوحة نفسها (بلا نافذة ثانية وبلا إعادة تحميل)؛ مع المرفق يُعبَّأ النص للتحقق ثم يُمسح ليُكتب كتعليق
+        input_box, err = self._open_chat(page, wa_num, text or "", force_text=has_att)
+        if err:
+            return err
+        if has_att and text:
+            try:
+                input_box.click()
+                page.keyboard.press("Control+A")
+                page.keyboard.press("Delete")
+            except Exception:
+                pass
+
+        if has_att:
+            if not self._click_first(page, "attach_button"):
+                return SendResult(False, "failed", "attach_failure", "تعذر فتح قائمة المرفقات في واتساب ويب")
+            done = False
+            for file_sel in self.selectors.get("attach_document_input", []):
+                try:
+                    page.locator(file_sel).first.set_input_files(attachment_path, timeout=4000)
+                    done = True
+                    break
+                except Exception:
+                    continue
+            if not done:
+                return SendResult(False, "failed", "attach_failure", "تعذر رفع الملف المرفق")
+            time.sleep(1.5)
+            if text:
+                for cap in self.selectors.get("caption_input", []):
+                    try:
+                        c = page.locator(cap).first
+                        if c.is_visible():
+                            c.click()
+                            page.keyboard.insert_text(text)
+                            break
+                    except Exception:
+                        continue
+            if not self._click_first(page, "caption_send_button", timeout=4000):
+                page.keyboard.press("Enter")
+            time.sleep(3)
+            return SendResult(True, "sent", "", "تم إرسال الرسالة مع المرفق عبر WhatsApp Web")
+
+        # نص فقط: Enter ثم نتأكد أن الصندوق فرغ فعلًا
+        input_box.press("Enter")
+        for attempt in range(2):
+            t0 = time.time()
+            while time.time() - t0 < 8:
+                try:
+                    if not (input_box.inner_text() or "").strip():
+                        time.sleep(1)
+                        return SendResult(True, "sent", "", "تم إرسال الرسالة بنجاح عبر WhatsApp Web")
+                except Exception:
+                    return SendResult(True, "sent", "", "تم إرسال الرسالة (تغيّرت الصفحة بعد الإرسال)")
+                time.sleep(0.5)
+            if attempt == 0:
+                self._click_first(page, "send_button", timeout=1500)
+        return SendResult(False, "failed", "send_unconfirmed", "لم يتأكد الإرسال: بقي النص في صندوق الكتابة")

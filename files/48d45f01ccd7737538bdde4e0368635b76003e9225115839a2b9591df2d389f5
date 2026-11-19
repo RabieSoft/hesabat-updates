@@ -1,0 +1,47 @@
+"""وصف الإجراءات (Actions) التي تعرضها الصفحات في الـRibbon: عقد واحد بين الصفحة وشريط الأدوات. بلا PySide6."""
+from dataclasses import dataclass, field
+from typing import Callable, List, Optional
+
+from .permissions import ALLOWED, Access, ActionState
+
+
+@dataclass
+class Action:
+    key: str
+    label: str
+    icon: str = ''
+    tip: str = ''
+    shortcut: str = ''
+    perm: Optional[str] = None
+    danger: bool = False
+    primary: bool = False
+    handler: Optional[Callable] = None
+    state_fn: Optional[Callable[[], ActionState]] = None   # يُستدعى عند كل تحديث لحالة الأزرار
+
+    def resolve(self, access: Access, read_only_reason='') -> ActionState:
+        if self.state_fn is not None:
+            st = self.state_fn()
+            if st.enabled and self.perm and not access.has(self.perm):
+                return access.state(self.perm)
+            return st
+        return access.state(self.perm, read_only_reason=read_only_reason) if self.perm else ALLOWED
+
+    def state(self) -> ActionState:
+        """اختصار لاستدعاء state_fn مباشرة (للاختبار والـRibbon)."""
+        if self.state_fn is not None:
+            return self.state_fn()
+        return ALLOWED
+
+
+@dataclass
+class ActionGroup:
+    title: str
+    actions: List[Action] = field(default_factory=list)
+
+
+def find(groups, key):
+    for g in groups:
+        for a in g.actions:
+            if a.key == key:
+                return a
+    return None

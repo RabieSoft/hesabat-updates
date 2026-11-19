@@ -1,0 +1,534 @@
+"""المخزون: الأصناف (شجرة تصنيفات + DataGrid للرصيد)، المستودعات، عمليات المخزون.
+
+تستخدم InventoryService فقط. الصفحات خفيفة وتعرض ورقة مطبوعة لكارت الصنف/تقرير الأرصدة عبر DocumentSheet.
+"""
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtWidgets import (
+    QComboBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+    QSizePolicy, QSplitter, QTabWidget, QVBoxLayout, QWidget, QInputDialog
+)
+
+from alhisabat.ui.components import document_model as DM
+from alhisabat.ui.components.basic import ask_reason
+from alhisabat.ui.components.datagrid import DataGrid
+from alhisabat.ui.components.document_sheet import DocumentSheet
+from alhisabat.ui.components.grid_logic import Column
+from alhisabat.ui.core.actions import Action, ActionGroup
+from alhisabat.ui.core.base_page import BasePage
+from alhisabat.ui.core.inventory_service import InventoryService
+from alhisabat.ui.core.permissions import ActionState; from alhisabat.ui.pages.inventory_colors import with_colors, with_count_entry, COLOR_KEYS
+
+@with_colors
+class StockPage(BasePage):
+    key = 'stock'; title = 'الأصناف والأرصدة'; icon = 'box'; required_permission = 'inventory.view'
+
+    def build(self):
+        self.svc = InventoryService(self.session); self._items = []; self._sel = None
+        lay = QVBoxLayout(self); lay.setContentsMargins(6, 6, 6, 6)
+        bar = QHBoxLayout()
+        self.cat = QComboBox(); self.cat.addItem('الكل', None); self.cat.currentIndexChanged.connect(lambda _i: self._filter())
+        self.search = QLineEdit(); self.search.setPlaceholderText('بحث بالاسم أو الكود…'); self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(lambda _t: self._filter())
+        bar.addWidget(QLabel('التصنيف:')); bar.addWidget(self.cat); bar.addWidget(self.search, 1)
+        lay.addLayout(bar)
+        split = QSplitter(Qt.Horizontal)
+        self.grid = DataGrid([
+            Column('code', 'الكود', width=90),
+            Column('name', 'اسم الصنف', width=200),
+            Column('category', 'التصنيف', width=110),
+            Column('color_label', 'اللون', 'swatch', 150),
+            Column('unit', 'الوحدة', width=80),
+            Column('stock_milli', 'الرصيد', 'qty', 100, milli=True),
+            Column('next_expiry', 'أقرب انتهاء', 'date', 100),
+            Column('kind', 'النوع', width=70),
+            Column('is_active', 'نشط', 'status', 70)
+        ], grid_id='stock_items_v3')
+        self.grid.set_dense(22, 8.5); self.grid.set_free_resize()
+        self.grid.selectionChangedRows.connect(self._on_select)
+        self.grid.rowActivated.connect(lambda _r: self.do('edit'))
+        split.addWidget(self.grid)
+        right = QWidget(); rl = QVBoxLayout(right); rl.setContentsMargins(0, 0, 0, 0)
+        self.sheet = DocumentSheet(self.window_.prefs.get('paper')); rl.addWidget(self.sheet, 1)
+        split.addWidget(right); split.setStretchFactor(0, 3); split.setStretchFactor(1, 2)
+        right.setMinimumWidth(340); right.setMaximumWidth(780)
+        right.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        self.sheet.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        QTimer.singleShot(0, lambda: split.setSizes([max(480, int(split.width() * 0.56)), max(380, int(split.width() * 0.44))]))
+        lay.addWidget(split, 1)
+
+    def refresh(self):
+        if not getattr(self, '_built', False): return
+        keep = self._sel['id'] if self._sel else None
+        try:
+            self._items = self.svc.items(limit=2000)
+        except Exception as exc:
+            self.show_error(exc); self._items = []
+        try: cmap = self.svc.item_color_map()
+        except Exception: cmap = {}
+        for r in self._items:                              # معاينة ألوان الصنف: مربعات + أسماء (فارغ لغير الملوّن)
+            cl = cmap.get(r['id'], [])
+            r['color_label'] = '، '.join(n for n, _h in cl); r['color_label_hexes'] = [h for _n, h in cl]
+        try: cats = [c['path'] for c in self.svc.category_tree(False)]
+        except Exception: cats = sorted({(r.get('category') or '').strip() for r in self._items if (r.get('category') or '').strip()})
+        cur = self.cat.currentData(); self.cat.blockSignals(True); self.cat.clear(); self.cat.addItem('الكل', None)
+        for c in cats: self.cat.addItem(c, c)
+        idx = self.cat.findData(cur); self.cat.setCurrentIndex(max(idx, 0)); self.cat.blockSignals(False)
+        self._filter(keep)
+        self.actions_changed.emit()
+
+    def _filter(self, keep=None):
+        cat = self.cat.currentData(); q = (self.search.text() or '').strip()
+        from alhisabat.ui.core import logic as _logic
+        qn = _logic.normalize_ar(q) if q else ''
+        rows = self._items
+        if cat is not None: rows = [r for r in rows if (r.get('category') or '').strip() == cat or (r.get('category') or '').strip().startswith(cat + ' / ')]
+        if qn: rows = [r for r in rows if all(w in _logic.normalize_ar(f"{r.get('code','')} {r.get('name','')}") for w in qn.split())]
+        self.grid.set_rows(rows)
+        if keep is not None: self.grid.select_where(lambda r: r['id'] == keep)
+        else: self._on_select([])
+
+    def _on_select(self, rows):
+        self._sel = rows[0] if len(rows) == 1 else None
+        if self._sel:
+            try: self.sheet.set_document(DM.from_print_spec(self._card_spec(self._sel), 'report'))
+            except Exception as exc:
+                self.show_error(exc); self.sheet.set_document(None)
+        else: self.sheet.set_document(None)
+        self.actions_changed.emit()
+
+    def _card_spec(self, it):
+        """بطاقة الصنف: بيانات الصنف + آخر حركاته (كان يُمرَّر لها أعمدة وصفوف فارغة فتظهر «لا توجد بيانات»)."""
+        from decimal import Decimal
+        from alhisabat.ui.core import format as fmt
+        qty = lambda m: (fmt.fmt_money(Decimal(m or 0) / 1000, 3).rstrip('0').rstrip('.') or '0')
+        extra = [('الصنف', it['name']), ('الكود', it.get('code', '')), ('الوحدة', it.get('unit', '')),
+                 ('التصنيف', it.get('category') or '—'), ('الباركود', it.get('barcode') or '—'),
+                 ('الرصيد الحالي', qty(it.get('stock_milli'))), ('الحد الأدنى', qty(it.get('min_qty_milli'))),
+                 ('الحالة', 'نشط' if it.get('is_active') else 'معطّل')]
+        if it.get('color_label'): extra.append(('الألوان', it['color_label']))
+        moves = []
+        try: moves = self.svc.item_movements(it['id'], limit=40)
+        except Exception: pass
+        dirs = {'in': 'وارد', 'out': 'صادر'}
+        rows = [{'date': str(m.get('movement_date') or ''), 'type': str(m.get('movement_type') or ''), 'dir': dirs.get(m.get('direction'), m.get('direction') or ''),
+                 'wh': m.get('warehouse') or '', 'qty': qty(m.get('qty_milli')), 'val': fmt.fmt_money(Decimal(m.get('value_base') or 0) / 100, 2)} for m in moves]
+        return {'title': 'بطاقة الصنف', 'company': self.state.get('company', {}).get('name', ''), 'extra': extra,
+                'columns': [{'key': 'date', 'label': 'التاريخ'}, {'key': 'type', 'label': 'النوع'}, {'key': 'dir', 'label': 'الاتجاه'},
+                            {'key': 'wh', 'label': 'المستودع'}, {'key': 'qty', 'label': 'الكمية', 'numeric': True}, {'key': 'val', 'label': 'القيمة', 'numeric': True}],
+                'rows': rows, 'totals': []}
+
+    def _state(self, k):
+        if k in COLOR_KEYS: return self.color_state(k)
+        if k in ('add', 'cleanup_unused', 'cleanup_dups'): return self.access.state('inventory.manage')
+        if not self._sel: return ActionState(False, 'حدد صنفًا أولًا')
+        if k in ('edit', 'toggle', 'units'): return self.access.state('inventory.manage')
+        if k == 'movements': return ActionState(True)
+        return ActionState(True)
+
+    def ribbon_groups(self):
+        def a(k, lab, icon, **kw):
+            return Action(k, lab, icon, state_fn=lambda kk=k: self._state(kk), handler=lambda kk=k: self.do(kk), **kw)
+        return [
+            ActionGroup('صنف', [
+                a('add', '+ صنف', 'new', primary=True),
+                a('edit', 'تعديل', 'edit'),
+                a('info', 'معلومات الصنف', 'info'),
+                a('movements', 'كارت وحركات الصنف', 'history'),
+                a('toggle', 'تفعيل/تعطيل', 'refresh'),
+                a('units', 'وحدات التحويل', 'link')
+            ]),
+            self.color_group(),
+            ActionGroup('تنظيف الأصناف', [
+                a('cleanup_unused', 'حذف الأصناف بدون حركات', 'delete', danger=True, tip='يعرض الأصناف التي لا رصيد افتتاحي لها ولا حركات لتحذف ما تحدده'),
+                a('cleanup_dups', 'الأصناف المكررة', 'copy', tip='يعرض الأصناف المتشابهة الاسم لحذف النسخ التي ليس لها رصيد ولا حركة')
+            ]),
+            ActionGroup('عرض', [
+                Action('print', 'طباعة', 'print', state_fn=lambda: ActionState(bool(self._sel), 'حدد صنفًا'), handler=lambda: self.sheet.print_()),
+                Action('refresh', 'تحديث', 'refresh', handler=self.refresh)
+            ])
+        ]
+
+    def do(self, k):
+        st = self._state(k)
+        if not st.enabled: return QMessageBox.information(self, self.title, st.reason)
+        if k in COLOR_KEYS: return self.color_do(k)
+        if k in ('cleanup_unused', 'cleanup_dups'):
+            from alhisabat.ui.app_dialogs.item_cleanup import run_item_cleanup
+            return run_item_cleanup(self, 'unused' if k == 'cleanup_unused' else 'duplicates')
+        if k == 'add': return self._add()
+        if k == 'edit': return self._edit()
+        if k == 'movements': return self._movements()
+        if k == 'info': return self.open_page_requested.emit('item_info', {'item_id': self._sel['id']})
+        if k == 'toggle':
+            verb = 'تعطيل' if self._sel.get('is_active') else 'تفعيل'
+            if ask_reason(self, verb, [f"هل تريد {verb} «{self._sel.get('name')}»؟"], need_reason=False, confirm_text=verb) is None: return
+            ok, _ = self.guarded(self.svc.set_item_active, self._sel['id'], not bool(self._sel.get('is_active')), reload=False)
+            if ok: self.refresh(); self.window_.data_changed(self.key)
+        if k == 'units': return self._units()
+
+    def _add(self):
+        from alhisabat.ui.app_dialogs.inventory import ItemDialog
+        while True:                                   # «حفظ وإضافة آخر» يعيد فتح نموذج فارغ بعد كل حفظ ناجح
+            d = ItemDialog(self)
+            if not self.exec_form(d): return
+            vals = d.values()
+            ok, new_id = self.guarded(self.svc.create_item, vals, reload=False)
+            if not ok: return
+            self._apply_colors(new_id, vals)
+            self.refresh(); self.window_.data_changed(self.key)
+            if not d.add_another: return
+
+    def _edit(self):
+        from alhisabat.ui.app_dialogs.inventory import ItemDialog
+        d = ItemDialog(self, self._sel)
+        if self.exec_form(d):
+            vals = d.values()
+            ok, _ = self.guarded(self.svc.edit_item, self._sel['id'], vals, reload=False)
+            if ok: self._apply_colors(self._sel['id'], vals); self.refresh(); self.window_.data_changed(self.key)
+
+    def _apply_colors(self, item_id, vals):
+        """خطوة واحدة: تفعيل الألوان (إن لزم) ثم إنشاء الألوان المعلَّمة في نموذج الصنف."""
+        if not vals.get('has_colors') or not item_id: return
+        ok, _ = self.guarded(self.svc.enable_item_variants, item_id, reload=False)
+        if ok and vals.get('color_ids'): self.guarded(self.svc.add_item_colors, item_id, vals['color_ids'], reload=False)
+
+    def _movements(self):
+        if not self._sel: return
+        from alhisabat.ui.app_dialogs.inventory import ItemCardDialog
+        ItemCardDialog(self, self._sel).exec()
+
+    def _units(self):
+        from alhisabat.ui.app_dialogs.catalog import ItemUnitsDialog
+        ItemUnitsDialog(self, self._sel).exec()
+
+
+class WarehousesPage(BasePage):
+    key = 'warehouses'; title = 'المستودعات'; icon = 'building'; required_permission = 'inventory.view'
+
+    def build(self):
+        self.svc = InventoryService(self.session); self._sel = None
+        lay = QVBoxLayout(self); lay.setContentsMargins(6, 6, 6, 6)
+        self.grid = DataGrid([
+            Column('code', 'الكود', width=90),
+            Column('name', 'الاسم', width=200),
+            Column('is_active', 'نشط', 'status', 90)
+        ], grid_id='warehouses')
+        self.grid.selectionChangedRows.connect(lambda rows: (setattr(self, '_sel', rows[0] if len(rows) == 1 else None), self.actions_changed.emit()))
+        lay.addWidget(self.grid, 1)
+
+    def refresh(self):
+        if not getattr(self, '_built', False): return
+        keep = self._sel['id'] if self._sel else None
+        try: rows = self.svc.warehouses()
+        except Exception as e: self.show_error(e); rows = []
+        self.grid.set_rows(rows)
+        if keep is not None: self.grid.select_where(lambda r: r['id'] == keep)
+        self.actions_changed.emit()
+
+    def _state(self, k):
+        if k in ('add', 'cleanup_unused', 'cleanup_dups'): return self.access.state('inventory.manage')
+        if not self._sel: return ActionState(False, 'حدد مستودعًا')
+        return self.access.state('inventory.manage')
+
+    def ribbon_groups(self):
+        def a(k, lab, icon, **kw):
+            return Action(k, lab, icon, state_fn=lambda kk=k: self._state(kk), handler=lambda kk=k: self.do(kk), **kw)
+        return [
+            ActionGroup('مستودع', [a('add', '+ مستودع', 'new', primary=True), a('toggle', 'تفعيل/تعطيل', 'refresh')]),
+            ActionGroup('عرض', [Action('refresh', 'تحديث', 'refresh', handler=self.refresh)])
+        ]
+
+    def do(self, k):
+        st = self._state(k)
+        if not st.enabled: return QMessageBox.information(self, self.title, st.reason)
+        if k == 'add':
+            from alhisabat.ui.app_dialogs.inventory import WarehouseDialog
+            d = WarehouseDialog(self)
+            if self.exec_form(d):
+                ok, _ = self.guarded(self.svc.create_warehouse, d.values(), reload=False)
+                if ok: self.refresh(); self.window_.data_changed(self.key)
+        if k == 'toggle':
+            verb = 'تعطيل' if self._sel.get('is_active') else 'تفعيل'
+            ok, _ = self.guarded(self.svc.set_warehouse_active, self._sel['id'], not bool(self._sel.get('is_active')), reload=False)
+            if ok: self.refresh(); self.window_.data_changed(self.key)
+
+
+@with_count_entry
+class StockOpsPage(BasePage):
+    key = 'stock_ops'; title = 'عمليات المخزون'; icon = 'truck'; required_permission = 'inventory.view'
+    source_targets = {'stock_count': ('c_grid', 'tabs', 3)}
+
+    def build(self):
+        self.svc = InventoryService(self.session); self._count_sel = None; self._exp_sel = None
+        lay = QVBoxLayout(self); lay.setContentsMargins(6, 6, 6, 6)
+        self.tabs = QTabWidget(); self.tabs.setLayoutDirection(Qt.RightToLeft)
+        self.tabs.addTab(self._tab_report(), 'الأرصدة')
+        self.tabs.addTab(self._tab_low(), 'نقص المخزون')
+        self.tabs.addTab(self._tab_expiry(), 'الصلاحية')
+        self.tabs.addTab(self._tab_counts(), 'الجرد')
+        self.sheet = DocumentSheet(self.window_.prefs.get('paper'))
+        self.sheet.paperChanged.connect(lambda p: self.window_.prefs.set('paper', p))
+        self.sheet.set_compact(True)
+        right = QWidget(); rl = QVBoxLayout(right); rl.setContentsMargins(0, 0, 0, 0); rl.addWidget(self.sheet, 1)
+        right.setMinimumWidth(340); right.setMaximumWidth(780)
+        right.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        self.sheet.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        self.tabs.setMinimumWidth(320)
+        split = QSplitter(Qt.Horizontal); split.setChildrenCollapsible(True)
+        split.addWidget(self.tabs); split.addWidget(right)
+        split.setStretchFactor(0, 3); split.setStretchFactor(1, 2)
+        QTimer.singleShot(0, lambda: split.setSizes([max(480, int(split.width() * 0.56)), max(380, int(split.width() * 0.44))]))
+        lay.addWidget(split, 1)
+
+    def refresh(self):
+        if not getattr(self, '_built', False): return
+        self._load_report(); self._load_low(); self._load_expiry(); self._load_counts()
+        self.actions_changed.emit()
+
+    def _tab_report(self):
+        w = QWidget(); lay = QVBoxLayout(w)
+        bar = QHBoxLayout()
+        self.f_wh = QComboBox(); self.f_wh.addItem('كل المستودعات', None)
+        self.f_zero = QComboBox(); self.f_zero.addItems(['إخفاء الأصفار', 'إظهار الكل'])
+        self.f_wh.currentIndexChanged.connect(lambda _i: self._load_report())        # الفلتر يعيد التحميل والمعاينة
+        self.f_zero.currentIndexChanged.connect(lambda _i: self._load_report())
+        bar.addWidget(QLabel('المستودع:')); bar.addWidget(self.f_wh); bar.addWidget(self.f_zero); bar.addStretch(1)
+        lay.addLayout(bar)
+        self.r_grid = DataGrid([
+            Column('item_code', 'كود الصنف', width=90),
+            Column('item_name', 'الصنف', width=200),
+            Column('warehouse_name', 'المستودع', width=130),
+            Column('qty_milli', 'الكمية', 'qty', 100, milli=True),
+            Column('value_base', 'القيمة', 'money', 110, minor=True)
+        ], grid_id='stock_report_v2')
+        self.r_grid.set_dense(22, 8.5); self.r_grid.set_free_resize()
+        lay.addWidget(self.r_grid, 1)
+        return w
+
+    def _load_report(self):
+        try:
+            cur = self.f_wh.currentData(); self.f_wh.blockSignals(True); self.f_wh.clear(); self.f_wh.addItem('كل المستودعات', None)
+            for w in self.svc.warehouses():
+                if w.get('is_active'): self.f_wh.addItem(w['name'], w['id'])
+            idx = self.f_wh.findData(cur); self.f_wh.setCurrentIndex(max(idx, 0)); self.f_wh.blockSignals(False)
+            rows = self.svc.stock_report(warehouse_id=self.f_wh.currentData(), include_zero=bool(self.f_zero.currentIndex()))
+            self.r_grid.set_rows(rows)
+            self.sheet.set_document(self._report_doc(self.f_wh.currentData()))
+        except Exception as e: self.show_error(e)
+
+    def _report_doc(self, warehouse_id):
+        """مستند تقرير المخزون لمستودع واحد (أو الكل إن كان None) وفق خيار الأصفار."""
+        from alhisabat.reporting import printing as PR
+        spec = PR.stock_report_print(self.session.conn, self.session.user_id, self.session.company_id,
+                                     warehouse_id=warehouse_id, include_zero=bool(self.f_zero.currentIndex()))
+        return DM.from_print_spec(spec, 'report')
+
+    def _print_warehouses(self):
+        """طباعة كل مستودع بتقرير مستقل: نختار المستودعات (الكل مُحدَّد افتراضيًا إلا إن كان فلتر المستودع مضبوطًا) ثم تُطبع كلٌّ على حدة."""
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox, QListWidget, QListWidgetItem
+        from alhisabat.ui.components import print_service as PS
+        try: whs = [w for w in self.svc.warehouses() if w.get('is_active')]
+        except Exception as e: return self.show_error(e)
+        if not whs: return QMessageBox.information(self, self.title, 'لا توجد مستودعات نشطة.')
+        dlg = QDialog(self); dlg.setWindowTitle('طباعة المستودعات'); dlg.setLayoutDirection(Qt.RightToLeft); dlg.setMinimumWidth(380)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel('اختر المستودعات المراد طباعتها — يُطبع كل مستودع كتقرير مستقل:'))
+        lst = QListWidget(); lay.addWidget(lst, 1)
+        cur = self.f_wh.currentData()
+        for w in whs:
+            it = QListWidgetItem(w['name']); it.setData(Qt.UserRole, w['id'])
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+            it.setCheckState(Qt.Checked if (cur is None or cur == w['id']) else Qt.Unchecked)
+            lst.addItem(it)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setText('طباعة'); bb.button(QDialogButtonBox.Cancel).setText('إلغاء')
+        bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject); lay.addWidget(bb)
+        if self.exec_form(dlg) != QDialog.Accepted: return
+        ids = [lst.item(i).data(Qt.UserRole) for i in range(lst.count()) if lst.item(i).checkState() == Qt.Checked]
+        if not ids: return QMessageBox.information(self, self.title, 'لم تُحدَّد مستودعات.')
+        try: docs = [self._report_doc(i) for i in ids]
+        except Exception as e: return self.show_error(e)
+        n = PS.print_many(self, docs, self.window_.prefs.get('paper') or 'A4')
+        if n: self.notify(f'تمت طباعة {n} مستودع/مستودعات')
+
+    def _tab_low(self):
+        w = QWidget(); lay = QVBoxLayout(w)
+        self.l_grid = DataGrid([
+            Column('code', 'الكود', width=90),
+            Column('name', 'الصنف', width=200),
+            Column('qty', 'الرصيد الحالي', 'qty', 100),
+            Column('min_qty_milli', 'الحد الأدنى', 'qty', 100, milli=True)
+        ], grid_id='low_stock_v2')
+        self.l_grid.set_dense(22, 8.5); self.l_grid.set_free_resize()
+        lay.addWidget(self.l_grid, 1)
+        return w
+
+    def _load_low(self):
+        try:
+            rows = self.svc.low_stock(); self.l_grid.set_rows(rows)
+        except Exception as e: self.show_error(e)
+
+    # ---------------- الصلاحية
+    _EXP_FILTERS = [('الكل', None), ('منتهي الصلاحية', 'expired'), ('قريب الانتهاء', 'near'), ('سليم', 'ok'), ('بلا تاريخ', 'none')]
+
+    def _tab_expiry(self):
+        w = QWidget(); lay = QVBoxLayout(w)
+        bar = QHBoxLayout()
+        self.e_filter = QComboBox()
+        for lab, code in self._EXP_FILTERS: self.e_filter.addItem(lab, code)
+        self.e_filter.currentIndexChanged.connect(lambda _i: self._load_expiry())
+        self.e_summary = QLabel(''); self.e_summary.setObjectName('panelTitle')
+        bar.addWidget(QLabel('الحالة:')); bar.addWidget(self.e_filter); bar.addStretch(1); bar.addWidget(self.e_summary)
+        lay.addLayout(bar)
+        self.e_grid = DataGrid([
+            Column('status', 'الحالة', 'status', 110),
+            Column('item_code', 'الكود', width=80),
+            Column('item_name', 'الصنف', width=200),
+            Column('warehouse_name', 'المستودع', width=110),
+            Column('lot_no', 'الدفعة', width=90),
+            Column('expiry_date', 'تاريخ الانتهاء', 'date', 100),
+            Column('days_left', 'الأيام المتبقية', 'int', 90),
+            Column('qty_milli', 'الكمية', 'qty', 90, milli=True, total=True),
+            Column('value_base', 'القيمة التقديرية', 'money', 110, minor=True, total=True)
+        ], grid_id='stock_expiry_v2')
+        self.e_grid.selectionChangedRows.connect(self._on_exp_select)
+        self.e_grid.set_dense(22, 8.5); self.e_grid.set_free_resize()
+        lay.addWidget(self.e_grid, 1)
+        return w
+
+    def _on_exp_select(self, rows):
+        self._exp_sel = rows[0] if len(rows) == 1 else None
+        self.actions_changed.emit()
+
+    def _load_expiry(self):
+        try:
+            self.e_grid.set_rows(self.svc.expiry_report(status=self.e_filter.currentData()))
+            s = self.svc.expiry_summary()
+            self.e_summary.setText(f"منتهي: {s['expired_lots']} دفعة · قريب الانتهاء: {s['near_lots']} دفعة")
+        except Exception as e: self.show_error(e)
+
+    def _writeoff_state(self):
+        st = self.access.state('inventory.adjust')
+        if not st.enabled: return st
+        if not self._exp_sel or self._exp_sel.get('status') != 'expired': return ActionState(False, 'حدد دفعة منتهية من تبويب الصلاحية')
+        return ActionState(True)
+
+    def _writeoff(self):
+        from decimal import Decimal as _D
+        from alhisabat.ui.app_dialogs.inventory import AdjustDialog
+        r = self._exp_sel
+        d = AdjustDialog(self, preset={'item_id': r['item_id'], 'warehouse_id': r['warehouse_id'], 'lot_id': r['lot_id'],
+                                       'qty': f"{_D(r['qty_milli']) / 1000:f}".rstrip('0').rstrip('.'), 'reason': 'إتلاف — منتهي الصلاحية'})
+        if self.exec_form(d):
+            ok, _ = self.guarded(self.svc.adjust, d.values(), reload=False)
+            if ok: self.notify('تم إتلاف الدفعة المنتهية بنجاح'); self.refresh(); self.window_.data_changed(self.key)
+
+    def _assign_expiry(self):
+        from alhisabat.ui.app_dialogs.inventory import AssignExpiryDialog
+        d = AssignExpiryDialog(self)
+        if self.exec_form(d):
+            v = d.values()
+            ok, _ = self.guarded(self.svc.assign_untracked, v['item_id'], v['warehouse_id'], v['expiry_date'], v['lot_no'], v['qty'], reload=False)
+            if ok: self.notify('تم تحديد تاريخ الانتهاء للرصيد'); self.refresh(); self.window_.data_changed(self.key)
+
+    def _tab_counts(self):
+        w = QWidget(); lay = QVBoxLayout(w)
+        self.c_grid = DataGrid([
+            Column('id', 'المعرف', 'int', 70),
+            Column('warehouse', 'المستودع', width=130),
+            Column('count_date', 'التاريخ', 'date', 95),
+            Column('status', 'الحالة', 'status', 90),
+            Column('lines', 'البنود', 'int', 70)
+        ], grid_id='stock_counts_v2')
+        self.c_grid.selectionChangedRows.connect(self._on_count_select)
+        self.c_grid.set_dense(22, 8.5); self.c_grid.set_free_resize()
+        lay.addWidget(self.c_grid, 1)
+        return w
+
+    def _on_count_select(self, rows):
+        self._count_sel = rows[0] if len(rows) == 1 else None
+        self.actions_changed.emit()
+
+    def _load_counts(self):
+        try:
+            rows = self.svc.list_counts(); self.c_grid.set_rows(rows)
+        except Exception as e: self.show_error(e)
+
+    def _count_action_state(self, kind):
+        c_state = self.access.state('inventory.count')
+        if not c_state.enabled: return c_state
+        if not self._count_sel: return ActionState(False, 'حدد عملية جرد أولًا من تبويب الجرد')
+        st = self._count_sel.get('status')
+        if st != 'draft': return ActionState(False, f'العملية متاحة للجرد المسودة فقط (الحالة الحالية: {st})')
+        return ActionState(True)
+
+    def ribbon_groups(self):
+        return [
+            ActionGroup('عمليات', [
+                Action('transfer', 'تحويل مخزني', 'transfer', state_fn=lambda: self.access.state('inventory.transfer'), handler=self._transfer),
+                Action('adjust', 'تسوية مخزنية', 'edit', state_fn=lambda: self.access.state('inventory.adjust'), handler=self._adjust),
+                Action('opening_stock', 'أرصدة أول المدة', 'coins', state_fn=lambda: self.access.state('inventory.adjust'), handler=self._opening_stock),
+                Action('assign_expiry', 'تأريخ رصيد قديم', 'edit', state_fn=lambda: self.access.state('inventory.manage'), handler=self._assign_expiry),
+                Action('writeoff_expired', 'إتلاف دفعة منتهية', 'delete', danger=True, state_fn=self._writeoff_state, handler=self._writeoff),
+                Action('new_count', 'جرد جديد', 'new', state_fn=lambda: self.access.state('inventory.count'), handler=self._new_count),
+                Action('post_count', 'ترحيل الجرد', 'post', state_fn=lambda: self._count_action_state('post'), handler=self._post_count),
+                Action('cancel_count', 'إلغاء الجرد', 'delete', danger=True, state_fn=lambda: self._count_action_state('cancel'), handler=self._cancel_count)
+            ]),
+            ActionGroup('عرض', [
+                Action('print', 'طباعة', 'print', handler=lambda: self.sheet.print_()),
+                Action('print_wh', 'طباعة كل مستودع', 'print', handler=self._print_warehouses),
+                Action('refresh', 'تحديث', 'refresh', handler=self.refresh)
+            ])
+        ]
+
+    def _transfer(self):
+        from alhisabat.ui.app_dialogs.inventory import TransferDialog
+        d = TransferDialog(self)
+        if self.exec_form(d):
+            ok, _ = self.guarded(self.svc.transfer, d.values(), reload=False)
+            if ok: self.notify('تم تسجيل التحويل بنجاح'); self.refresh(); self.window_.data_changed(self.key)
+
+    def _adjust(self):
+        from alhisabat.ui.app_dialogs.inventory import AdjustDialog
+        d = AdjustDialog(self)
+        if self.exec_form(d):
+            ok, _ = self.guarded(self.svc.adjust, d.values(), reload=False)
+            if ok: self.notify('تمت التسوية المخزنية بنجاح'); self.refresh(); self.window_.data_changed(self.key)
+
+    def resume_draft(self, dialog_id):
+        """استئناف نافذة إدخال من مسودة محفوظة (يُستدعى من MainWindow بعد موافقة المستخدم)."""
+        if dialog_id == 'opening_stock':
+            self._opening_stock(resume=True)
+
+    def _opening_stock(self, resume=False):
+        from alhisabat.ui.app_dialogs.inventory import OpeningStockDialog
+        from alhisabat.ui.components.basic import show_singleton
+        # غير مقيِّدة: يمكن تصغيرها («–») والعمل في الشاشة ثم العودة إليها؛ الضغط على الزر مجددًا يُرجع نفس النافذة
+        show_singleton(self, '_opening_stock_dlg', lambda: OpeningStockDialog(self, resume=resume))
+
+    def _new_count(self):
+        from alhisabat.ui.app_dialogs.inventory import CountDialog
+        d = CountDialog(self)
+        if self.exec_form(d):
+            vals = d.values()
+            ok, _ = self.guarded(self.svc.create_count, vals['warehouse_id'], vals['date'], vals.get('is_full', False), vals.get('note', ''), reload=False)
+            if ok: self.notify('تم إنشاء مسودة الجرد'); self.refresh(); self.window_.data_changed(self.key)
+
+    def _post_count(self):
+        if not self._count_sel:
+            return QMessageBox.information(self, self.title, 'حدد جردًا مسودة لترحيله.')
+        cid = self._count_sel['id']
+        if ask_reason(self, 'ترحيل الجرد', [f"هل تريد ترحيل الجرد رقم {cid} وتوليد التسويات اللازمة؟"], need_reason=False, confirm_text='ترحيل الجرد') is None:
+            return
+        ok, _ = self.guarded(self.svc.post_count, cid, reload=False)
+        if ok: self.notify('تم ترحيل الجرد بنجاح'); self.refresh(); self.window_.data_changed(self.key)
+
+    def _cancel_count(self):
+        if not self._count_sel:
+            return QMessageBox.information(self, self.title, 'حدد جردًا مسودة لإلغائه.')
+        cid = self._count_sel['id']
+        reason = ask_reason(self, 'إلغاء الجرد', [f"هل تريد إلغاء الجرد رقم {cid}؟"], need_reason=True, confirm_text='إلغاء الجرد', danger=True)
+        if not reason:
+            return
+        ok, _ = self.guarded(self.svc.cancel_count, cid, reason=reason, reload=False)
+        if ok: self.notify('تم إلغاء الجرد'); self.refresh(); self.window_.data_changed(self.key)

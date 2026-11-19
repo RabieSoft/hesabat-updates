@@ -1,0 +1,104 @@
+"""نافذة معاينة وتأكيد إدراج رسالة واتساب في الطابور قبل الإرسال.
+
+تُستعمل كنقطة تكامل مشتركة من: الفواتير، السندات، كشف الحساب، وتقارير الديون.
+خالية من ألوان Hex الثابتة وSQL المباشر وfloat.
+"""
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QDialog, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+    QPushButton, QTextEdit, QVBoxLayout
+)
+
+from alhisabat.messaging.service import MessagingService
+
+
+class WhatsAppPreviewDialog(QDialog):
+    def __init__(
+        self,
+        parent,
+        db_path: str,
+        phone: str,
+        party_name: str,
+        message_text: str,
+        party_id=None,
+        attachment_path: str = "",
+        ref_type: str = "",
+        ref_id=None,
+        branch_id=None,
+        user_id=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("معاينة وإرسال رسالة واتساب")
+        self.setMinimumWidth(440)
+        self.svc = MessagingService(db_path, branch_id=branch_id, user_id=user_id)
+        self.phone = phone
+        self.party_name = party_name
+        self.party_id = party_id
+        self.attachment_path = attachment_path
+        self.ref_type = ref_type
+        self.ref_id = ref_id
+
+        lay = QVBoxLayout(self)
+        lay.setSpacing(10)
+
+        # الطرف والهاتف
+        lbl_info = QLabel(f"المستلم: {party_name}")
+        lbl_info.setStyleSheet("font-weight:bold;")
+        lay.addWidget(lbl_info)
+
+        row_p = QHBoxLayout()
+        row_p.addWidget(QLabel("رقم الهاتف:"))
+        self.txt_phone = QLineEdit(phone)
+        row_p.addWidget(self.txt_phone)
+        lay.addLayout(row_p)
+
+        if attachment_path:
+            lbl_att = QLabel(f"المرفق: {attachment_path}")
+            lbl_att.setWordWrap(True)
+            lay.addWidget(lbl_att)
+
+        lay.addWidget(QLabel("نص الرسالة:"))
+        self.txt_body = QTextEdit()
+        self.txt_body.setPlainText(message_text)
+        self.txt_body.setMinimumHeight(120)
+        lay.addWidget(self.txt_body)
+
+        row_b = QHBoxLayout()
+        row_b.addStretch(1)
+        btn_cancel = QPushButton("إلغاء")
+        btn_cancel.clicked.connect(self.reject)
+        row_b.addWidget(btn_cancel)
+
+        btn_send = QPushButton("تأكيد وإدراج في الطابور")
+        btn_send.setStyleSheet("font-weight:bold;")
+        btn_send.clicked.connect(self._confirm)
+        row_b.addWidget(btn_send)
+        lay.addLayout(row_b)
+
+    def _confirm(self):
+        ph = self.txt_phone.text().strip()
+        body = self.txt_body.toPlainText().strip()
+        if not ph or not body:
+            QMessageBox.warning(self, "تنبيه", "رقم الهاتف ونص الرسالة مطلوبان.")
+            return
+
+        try:
+            kind = "document" if self.attachment_path else "text"
+            mid = self.svc.enqueue(
+                phone=ph,
+                body=body,
+                party_id=self.party_id,
+                kind=kind,
+                ref_type=self.ref_type,
+                ref_id=self.ref_id,
+                attachment_path=self.attachment_path,
+                bypass_idempotency=False,
+            )
+            try:
+                self.svc.ensure_worker()      # تشغيل خدمة الطابور تلقائيًا كي لا تبقى الرسالة «في الانتظار»
+            except Exception:  # noqa: BLE001
+                pass
+            QMessageBox.information(self, "نجاح", f"تم إدراج الرسالة في طابور واتساب بنجاح (رقم: {mid}).")
+            self.accept()
+        except Exception as e:
+            QMessageBox.critical(self, "خطأ في الإدراج", str(e))

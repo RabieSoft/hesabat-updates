@@ -1,0 +1,231 @@
+"""مخططات خفيفة بـQPainter (بلا مكتبات): TrendChart (خط) وBarChart (أعمدة). ألوانها من Tokens. يتطلب PySide6."""
+from decimal import Decimal
+
+from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
+from PySide6.QtWidgets import QToolTip, QWidget
+
+from alhisabat.ui.core import format as fmt
+from alhisabat.ui.design import tokens as T
+
+
+class _Base(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.labels, self.series, self.mode = [], [], 'light'
+        self.setMinimumHeight(150)
+        self.setMouseTracking(True)
+        self.setLayoutDirection(Qt.LeftToRight)
+
+    def set_data(self, labels, series):
+        """series: [{'name': str, 'values': [Decimal...], 'tone': 'info'}]."""
+        self.labels, self.series = list(labels), list(series)
+        self.update()
+
+    def set_mode(self, mode):
+        self.mode = mode
+        self.update()
+
+    def _bounds(self):
+        vals = [Decimal(v) for s in self.series for v in s['values'] if v is not None]
+        if not vals:
+            return Decimal(0), Decimal(1)
+        lo, hi = min(min(vals), Decimal(0)), max(max(vals), Decimal(0))
+        return lo, (hi if hi != lo else lo + 1)
+
+    def _plot_rect(self):
+        return QRectF(52, 10, max(self.width() - 64, 10), max(self.height() - 34, 10))
+
+    def _grid(self, p, rect, lo, hi, pal):
+        p.setPen(QPen(QColor(pal['grid']), 1))
+        for i in range(5):
+            y = rect.bottom() - rect.height() * i / 4
+            p.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
+            v = lo + (hi - lo) * Decimal(i) / 4
+            p.setPen(QColor(pal['muted']))
+            p.drawText(QRectF(0, y - 8, 48, 16), int(Qt.AlignRight | Qt.AlignVCenter), fmt.fmt_money(v, 0))
+            p.setPen(QPen(QColor(pal['grid']), 1))
+        p.setPen(QColor(pal['muted']))
+        n = max(len(self.labels), 1)
+        for i, lb in enumerate(self.labels):
+            x = rect.left() + rect.width() * (i + 0.5) / n
+            p.drawText(QRectF(x - 30, rect.bottom() + 4, 60, 18), int(Qt.AlignCenter), str(lb))
+
+
+class TrendChart(_Base):
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        pal = T.palette(self.mode)
+        rect = self._plot_rect()
+        lo, hi = self._bounds()
+        self._grid(p, rect, lo, hi, pal)
+        n = max(len(self.labels), 1)
+        for s in self.series:
+            pts = []
+            for i, v in enumerate(s['values']):
+                if v is None:
+                    continue
+                x = rect.left() + rect.width() * (i + 0.5) / n
+                y = rect.bottom() - rect.height() * float((Decimal(v) - lo) / (hi - lo))
+                pts.append(QPointF(x, y))
+            col = QColor(pal[s.get('tone', 'info')])
+            p.setPen(QPen(col, 2))
+            if len(pts) > 1:
+                p.drawPolyline(QPolygonF(pts))
+            p.setBrush(col)
+            for pt in pts:
+                p.drawEllipse(pt, 3, 3)
+        p.end()
+
+
+class BarChart(_Base):
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        pal = T.palette(self.mode)
+        rect = self._plot_rect()
+        lo, hi = self._bounds()
+        self._grid(p, rect, lo, hi, pal)
+        n, k = max(len(self.labels), 1), max(len(self.series), 1)
+        slot = rect.width() / n
+        bw = max(slot * 0.7 / k, 2)
+        zero_y = rect.bottom() - rect.height() * float((Decimal(0) - lo) / (hi - lo))
+        for si, s in enumerate(self.series):
+            p.setBrush(QColor(pal[s.get('tone', 'info')]))
+            p.setPen(Qt.NoPen)
+            for i, v in enumerate(s['values']):
+                if v is None:
+                    continue
+                x = rect.left() + slot * i + slot * 0.15 + bw * si
+                y = rect.bottom() - rect.height() * float((Decimal(v) - lo) / (hi - lo))
+                p.drawRect(QRectF(x, min(y, zero_y), bw, abs(zero_y - y)))
+        p.end()
+
+    def mouseMoveEvent(self, e):
+        rect = self._plot_rect()
+        if self.labels and rect.contains(e.position()):
+            i = int((e.position().x() - rect.left()) / (rect.width() / len(self.labels)))
+            if 0 <= i < len(self.labels):
+                tip = self.labels[i] + '\n' + '\n'.join(f"{s['name']}: {fmt.fmt_money(s['values'][i])}" for s in self.series if i < len(s['values']))
+                QToolTip.showText(e.globalPosition().toPoint(), tip, self)
+        super().mouseMoveEvent(e)
+
+
+_MONTHS_AR = ('يناير', 'فبراير', 'مارس', 'أبريل', 'مايو', 'يونيو', 'يوليو', 'أغسطس', 'سبتمبر', 'أكتوبر', 'نوفمبر', 'ديسمبر')
+
+
+def _nice_max(v):
+    """أقرب سقف «جميل» (1/2/2.5/5 × 10^n) لمحور المبالغ."""
+    v = float(v)
+    if v <= 0:
+        return 1.0, 1.0
+    import math
+    exp = math.floor(math.log10(v))
+    for m in (1, 2, 2.5, 5, 10):
+        step = m * 10 ** exp / 4 if m != 10 else 10 ** (exp + 1) / 4
+        top = step * 4
+        if top >= v:
+            return top, step
+    return v, v / 4
+
+
+class CashFlowChart(QWidget):
+    """حركة التدفق النقدي: أعمدة (إيرادات/مصروفات) لكل شهر + خط صافي التدفق، مع وسيلة إيضاح وتلميح عند المرور.
+    القيم Decimal بوحدات رئيسية. الألوان من Tokens (chart_rev/chart_exp/chart_net)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.months, self.revenue, self.expense, self.net, self.mode = [], [], [], [], 'light'
+        self.setMinimumHeight(240)
+        self.setMouseTracking(True)
+        self.setLayoutDirection(Qt.LeftToRight)
+
+    def set_data(self, months, revenue, expense, net):
+        self.months = [int(m) for m in months]
+        self.revenue, self.expense, self.net = list(revenue), list(expense), list(net)
+        self.update()
+
+    def set_mode(self, mode):
+        self.mode = mode
+        self.update()
+
+    def _rect(self):
+        return QRectF(58, 34, max(self.width() - 72, 10), max(self.height() - 62, 10))
+
+    def _scale(self):
+        vals = [float(v) for v in (*self.revenue, *self.expense, *self.net)] or [0.0]
+        lo, hi = min(min(vals), 0.0), max(max(vals), 0.0)
+        top, step = _nice_max(hi) if hi > 0 else (1.0, 0.25)
+        bottom = 0.0
+        if lo < 0:
+            bottom = -(_nice_max(-lo)[0])
+        return bottom, top
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        pal = T.palette(self.mode)
+        rect = self._rect()
+        bottom, top = self._scale()
+        span = (top - bottom) or 1.0
+        yv = lambda v: rect.bottom() - rect.height() * (float(v) - bottom) / span
+
+        # الشبكة والمحور الرأسي
+        p.setPen(QPen(QColor(pal['grid']), 1))
+        for i in range(5):
+            val = bottom + span * i / 4
+            y = yv(val)
+            p.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
+            p.setPen(QColor(pal['muted']))
+            p.drawText(QRectF(0, y - 9, 52, 18), int(Qt.AlignRight | Qt.AlignVCenter), fmt.fmt_money(Decimal(str(round(val))), 0))
+            p.setPen(QPen(QColor(pal['grid']), 1))
+
+        n = max(len(self.months), 1)
+        slot = rect.width() / n
+        bw = max(min(slot * 0.30, 22), 3)
+        zero = yv(0)
+        for i, m in enumerate(self.months):
+            cx = rect.left() + slot * (i + 0.5)
+            for k, (vals, tone) in enumerate(((self.revenue, 'chart_rev'), (self.expense, 'chart_exp'))):
+                v = float(vals[i]) if i < len(vals) else 0.0
+                y = yv(v)
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(pal[tone]))
+                x = cx - bw - 1 if k == 0 else cx + 1
+                p.drawRect(QRectF(x, min(y, zero), bw, abs(zero - y)))
+            p.setPen(QColor(pal['muted']))
+            p.drawText(QRectF(cx - slot / 2, rect.bottom() + 6, slot, 18), int(Qt.AlignCenter), _MONTHS_AR[(m - 1) % 12])
+
+        # خط صافي التدفق
+        pts = [QPointF(rect.left() + slot * (i + 0.5), yv(v)) for i, v in enumerate(self.net)]
+        col = QColor(pal['chart_net'])
+        p.setPen(QPen(col, 2))
+        if len(pts) > 1:
+            p.drawPolyline(QPolygonF(pts))
+        p.setBrush(col)
+        for pt in pts:
+            p.drawEllipse(pt, 3.5, 3.5)
+
+        # وسيلة الإيضاح أعلى المخطط (يمين ← يسار كما في الواجهات العربية)
+        x = rect.right()
+        for label, tone in (('الإيرادات', 'chart_rev'), ('المصروفات', 'chart_exp'), ('صافي التدفق', 'chart_net')):
+            w = p.fontMetrics().horizontalAdvance(label)
+            p.setPen(QColor(pal['muted']))
+            p.drawText(QRectF(x - w - 16, 6, w + 4, 18), int(Qt.AlignRight | Qt.AlignVCenter), label)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(pal[tone]))
+            p.drawEllipse(QPointF(x - 6, 15), 4.5, 4.5)
+            x -= w + 34
+        p.end()
+
+    def mouseMoveEvent(self, e):
+        rect = self._rect()
+        if self.months and rect.contains(e.position()):
+            i = int((e.position().x() - rect.left()) / (rect.width() / len(self.months)))
+            if 0 <= i < len(self.months):
+                g = lambda arr: fmt.fmt_money(arr[i]) if i < len(arr) else '—'
+                tip = (f"{_MONTHS_AR[(self.months[i] - 1) % 12]}\nالإيرادات: {g(self.revenue)}\n"
+                       f"المصروفات: {g(self.expense)}\nصافي التدفق: {g(self.net)}")
+                QToolTip.showText(e.globalPosition().toPoint(), tip, self)
+        super().mouseMoveEvent(e)

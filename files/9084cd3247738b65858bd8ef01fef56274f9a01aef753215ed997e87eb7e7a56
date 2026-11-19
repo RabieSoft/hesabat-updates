@@ -1,0 +1,261 @@
+"""نوافذ التعمق المالي (Drill-down Dialogs): من أي رقم/حساب إلى القيد ثم إلى المستند المصدر.
+
+بلا منطق محاسبي في الواجهة (كل الأرقام من المحرك عبر ReportsService وJournalService).
+Decimal فقط للمبالغ ولا float.
+"""
+from decimal import Decimal
+from typing import Optional
+
+from PySide6.QtCore import QTimer, Qt, Signal
+from PySide6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame, QMessageBox, QTabWidget, QWidget
+)
+
+from alhisabat.ui.components import document_model as DM
+from alhisabat.ui.components.datagrid import DataGrid
+from alhisabat.ui.components.document_sheet import DocumentSheet
+from alhisabat.ui.components.grid_logic import Column
+from alhisabat.ui.core import format as fmt
+from alhisabat.ui.core.journal_service import JournalService
+from alhisabat.ui.core.reports_service import ReportsService
+from alhisabat.ui.core.source_nav import info_from_row, request_open
+
+
+from alhisabat.ui.core.source_nav import SOURCE_PAGES  # noqa: E402,F401 — مصدر واحد للتوافق مع الاستدعاءات القديمة
+
+
+class JournalViewDialog(QDialog):
+    """معاينة واقعية للقيد المحاسبي على DocumentSheet مع إمكانية الانتقال للمستند المصدر."""
+    open_page_requested = Signal(str, object)
+
+    def __init__(self, parent, session, entry_id: int):
+        super().__init__(parent)
+        self.session = session
+        self.entry_id = int(entry_id)
+        self.svc = JournalService(session)
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.resize(850, 750)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 10, 10, 10)
+
+        self._entry = None
+        try:
+            self._entry = self.svc.get(self.entry_id)
+            spec = self.svc.print_spec(self.entry_id)
+            doc = DM.from_print_spec(spec, 'journal', status=self._entry.get('status'))
+            self.setWindowTitle(f"قيد محاسبي رقم: {self._entry.get('posted_no') or self._entry.get('entry_no') or self.entry_id}")
+        except Exception as exc:
+            QMessageBox.critical(self, "خطأ", f"تعذر تحميل بيانات القيد: {exc}")
+            doc = None
+
+        self.sheet = DocumentSheet(parent.window_.prefs.get('paper') if hasattr(parent, 'window_') else 'A4')
+        if doc:
+            self.sheet.set_document(doc)
+        lay.addWidget(self.sheet, 1)
+
+        btn_bar = QHBoxLayout()
+        btn_full = QPushButton("الانتقال لصفحة القيود")
+        btn_full.clicked.connect(self._goto_journal_page)
+        btn_bar.addWidget(btn_full)
+
+        src_type = (self._entry or {}).get('source_type')
+        src_id = (self._entry or {}).get('source_id')
+        if src_type and src_id and src_type in SOURCE_PAGES:
+            btn_src = QPushButton(f"عرض المستند المصدر ({src_type} #{src_id})")
+            btn_src.setProperty('primary', True)
+            btn_src.clicked.connect(self._goto_source_doc)
+            btn_bar.addWidget(btn_src)
+
+        btn_bar.addStretch(1)
+        btn_close = QPushButton("إغلاق")
+        btn_close.clicked.connect(self.accept)
+        btn_bar.addWidget(btn_close)
+        lay.addLayout(btn_bar)
+
+    def _goto_journal_page(self):
+        self._navigate({'entry_id': self.entry_id, 'force_journal': True})
+
+    def _goto_source_doc(self):
+        self._navigate({'entry_id': self.entry_id, 'source_type': (self._entry or {}).get('source_type'),
+                        'source_id': (self._entry or {}).get('source_id')})
+
+    def _navigate(self, info):
+        """يغلق النافذة ثم يطلب من الصفحة الأم فتح المستند الأصلي (تتسلسل الأمهات: نافذة ← نافذة ← صفحة)."""
+        parent = self.parent()
+        self.accept()
+        QTimer.singleShot(0, lambda: request_open(parent, info))
+
+
+class AccountDrilldownDialog(QDialog):
+    """كشف حساب تفصيلي مع Drill-down لحركات الحساب والقيد والمستند المصدر."""
+    open_page_requested = Signal(str, object)
+
+    def __init__(self, parent, session, account_id: int, date_from: str, date_to: str, *,
+                 branch_id: Optional[int] = None, cost_center_id: Optional[int] = None):
+        super().__init__(parent)
+        self.session = session
+        self.account_id = int(account_id)
+        self.date_from = date_from
+        self.date_to = date_to
+        self.branch_id = branch_id
+        self.cost_center_id = cost_center_id
+        self.svc = ReportsService(session)
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.resize(1050, 700)
+
+        self._sel = None
+        self._data = None
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 12, 12, 12)
+
+        # بطاقة الترويسة والملخص المالي
+        self.header_card = QFrame()
+        self.header_card.setObjectName("summaryCard")
+        hl = QHBoxLayout(self.header_card)
+        hl.setContentsMargins(10, 8, 10, 8)
+        self.lbl_acc_title = QLabel("تحميل كشف الحساب...")
+        self.lbl_acc_title.setStyleSheet("font-weight: bold; font-size: 14px;")
+        hl.addWidget(self.lbl_acc_title)
+        hl.addStretch(1)
+
+        self.kpi_opening = QLabel("")
+        self.kpi_debit = QLabel("")
+        self.kpi_credit = QLabel("")
+        self.kpi_closing = QLabel("")
+        for lbl in (self.kpi_opening, self.kpi_debit, self.kpi_credit, self.kpi_closing):
+            lbl.setStyleSheet("font-size: 12px; margin-left: 14px;")
+            hl.addWidget(lbl)
+        lay.addWidget(self.header_card)
+
+        # التبويبات: جدول الحركات التفاعلي والمعاينة الواقعية
+        self.tabs = QTabWidget()
+        cols = [
+            Column('entry_date', 'التاريخ', 'date', 95),
+            Column('posted_no', 'رقم القيد', 'int', 90, link=True),
+            Column('display_description', 'البيان', width=220),
+            Column('ref', 'رقم المرجع', width=120),
+            Column('debit_base', 'مدين', 'money', 110, minor=True),
+            Column('credit_base', 'دائن', 'money', 110, minor=True),
+            Column('running_balance', 'الرصيد الجاري', 'money', 120, minor=True),
+            Column('source_label', 'المستند المصدر', width=130),
+            Column('memo', 'ملاحظة', width=140),
+        ]
+        self.grid = DataGrid(cols, grid_id='drilldown_ledger_grid_v2')
+        self.grid.enable_cell_selection()
+        self.grid.selectionChangedRows.connect(self._on_select_row)
+        self.grid.rowActivated.connect(self._on_activate_row)
+        self.grid.linkClicked.connect(lambda row, _k: self._navigate(info_from_row(row)))   # رقم القيد ← المستند الأصلي
+        self.tabs.addTab(self.grid, "حركات الحساب (تفاعلي)")
+
+        paper = parent.window_.prefs.get('paper') if hasattr(parent, 'window_') else 'A4'
+        self.sheet = DocumentSheet(paper)
+        self.tabs.addTab(self.sheet, "معاينة على ورقة (طباعة)")
+        lay.addWidget(self.tabs, 1)
+
+        # شريط أزرار الإجراءات
+        bar = QHBoxLayout()
+        self.btn_view_entry = QPushButton("عرض القيد المحاسبي")
+        self.btn_view_entry.setEnabled(False)
+        self.btn_view_entry.clicked.connect(self._open_selected_entry)
+        bar.addWidget(self.btn_view_entry)
+
+        self.btn_view_source = QPushButton("عرض المستند المصدر")
+        self.btn_view_source.setEnabled(False)
+        self.btn_view_source.clicked.connect(self._open_selected_source)
+        bar.addWidget(self.btn_view_source)
+
+        self.btn_goto_ledger_tab = QPushButton("فتح في صفحة دفتر الأستاذ")
+        self.btn_goto_ledger_tab.clicked.connect(self._goto_full_ledger_page)
+        bar.addWidget(self.btn_goto_ledger_tab)
+
+        self.btn_print_sel = QPushButton("طباعة المحدد")
+        self.btn_print_sel.clicked.connect(lambda: self.grid.print_selected())
+        bar.addWidget(self.btn_print_sel)
+
+        bar.addStretch(1)
+        btn_close = QPushButton("إغلاق")
+        btn_close.clicked.connect(self.accept)
+        bar.addWidget(btn_close)
+        lay.addLayout(bar)
+
+        self._load_data()
+
+    def _load_data(self):
+        try:
+            self._data = self.svc.ledger(
+                self.account_id, self.date_from, self.date_to,
+                branch_id=self.branch_id, limit=1000
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "خطأ", f"تعذر استخراج كشف الحساب: {exc}")
+            return
+
+        acc = self._data['account']
+        acc_name = f"{acc['code']} — {acc['name']}"
+        self.setWindowTitle(f"كشف حساب تفصيلي: {acc_name}")
+        self.lbl_acc_title.setText(f"الحساب: {acc_name} ({'مدين' if acc['nature'] == 'debit' else 'دائن'})")
+
+        op = fmt.fmt_money(self._data['opening_balance'], minor=True)
+        dr = fmt.fmt_money(self._data['total_debit'], minor=True)
+        cr = fmt.fmt_money(self._data['total_credit'], minor=True)
+        cl = fmt.fmt_money(self._data['closing_balance'], minor=True)
+
+        self.kpi_opening.setText(f"الافتتاحي: <b>{op}</b>")
+        self.kpi_debit.setText(f"مدين: <b>{dr}</b>")
+        self.kpi_credit.setText(f"دائن: <b>{cr}</b>")
+        self.kpi_closing.setText(f"الختامي: <b>{cl}</b>")
+
+        rows = self._data['rows']
+        for r in rows:
+            st = r.get('source_type')
+            sid = r.get('source_id')
+            r['source_label'] = f"{st} #{sid}" if st and sid else (st or 'يدوي')
+        self.grid.set_rows(rows)
+
+        # ورقة المستند
+        try:
+            spec = self.svc.report_spec('كشف حساب', self.date_from, self.date_to, account_id=self.account_id)
+            doc = DM.from_print_spec(spec, 'report')
+            self.sheet.set_document(doc)
+        except Exception:
+            pass
+
+    def _on_select_row(self, rows):
+        self._sel = rows[0] if len(rows) == 1 else None
+        has_sel = self._sel is not None
+        self.btn_view_entry.setEnabled(has_sel)
+        has_src = has_sel and bool(self._sel.get('source_type')) and bool(self._sel.get('source_id'))
+        self.btn_view_source.setEnabled(has_src)
+
+    def _on_activate_row(self, row):
+        if row and row.get('entry_id'):
+            self._show_entry_dialog(row['entry_id'])
+
+    def _open_selected_entry(self):
+        if self._sel and self._sel.get('entry_id'):
+            self._show_entry_dialog(self._sel['entry_id'])
+
+    def _show_entry_dialog(self, entry_id: int):
+        d = JournalViewDialog(self, self.session, entry_id)
+        d.exec()
+
+    def _open_selected_source(self):
+        if not self._sel:
+            return
+        self._navigate(info_from_row(self._sel))
+
+    def _navigate(self, info):
+        parent = self.parent()
+        self.accept()
+        QTimer.singleShot(0, lambda: request_open(parent, info))
+
+    def _goto_full_ledger_page(self):
+        self.accept()
+        if hasattr(self.parent(), 'open_page_requested'):
+            self.parent().open_page_requested.emit('ledger', {
+                'account_id': self.account_id,
+                'date_from': self.date_from,
+                'date_to': self.date_to,
+            })

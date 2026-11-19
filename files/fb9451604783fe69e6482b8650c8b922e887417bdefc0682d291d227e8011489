@@ -1,0 +1,46 @@
+DROP TRIGGER jl_ins_rules;
+CREATE TABLE account_mappings_new(
+  company_id INTEGER NOT NULL REFERENCES companies(id),
+  map_key TEXT NOT NULL CHECK(map_key IN ('customers','suppliers','inventory','sales','cogs','cash','bank',
+      'retained_earnings','period_result','fx_differences','inventory_adjustment','sales_discount','sales_returns',
+      'cash_difference','employees','payroll_expense','payroll_deductions','accum_depreciation','depreciation_expense',
+      'disposal_gain_loss','opening_suspense')),
+  account_id INTEGER NOT NULL REFERENCES accounts(id),
+  PRIMARY KEY(company_id,map_key));
+INSERT INTO account_mappings_new SELECT company_id,map_key,account_id FROM account_mappings;
+DROP TABLE account_mappings;
+ALTER TABLE account_mappings_new RENAME TO account_mappings;
+CREATE TRIGGER jl_ins_rules BEFORE INSERT ON journal_lines BEGIN
+  SELECT RAISE(ABORT,'لا يمكن إضافة سطر إلى قيد غير مسودة')
+   WHERE (SELECT status FROM journal_entries WHERE id=NEW.entry_id)<>'draft';
+  SELECT RAISE(ABORT,'القيد تحت المراجعة أو معتمد: أعده إلى المسودة قبل التعديل')
+   WHERE (SELECT workflow_state FROM journal_entries WHERE id=NEW.entry_id)<>'draft';
+  SELECT RAISE(ABORT,'الحساب غير موجود أو غير نشط أو تجميعي: لا تقبل الحركة')
+   WHERE NOT EXISTS(SELECT 1 FROM accounts a JOIN journal_entries e ON e.id=NEW.entry_id
+      WHERE a.id=NEW.account_id AND a.is_group=0 AND a.company_id=e.company_id
+        AND (a.is_active=1 OR e.entry_type IN ('reversal','closing','opening')));
+  SELECT RAISE(ABORT,'قيد الافتتاح يقبل حسابات الميزانية فقط (أصول/خصوم/حقوق ملكية)')
+   WHERE (SELECT entry_type FROM journal_entries WHERE id=NEW.entry_id)='opening'
+     AND (SELECT account_type FROM accounts WHERE id=NEW.account_id) NOT IN ('asset','liability','equity');
+  SELECT RAISE(ABORT,'حسابات العملاء والموردين والموظفين والمخزون لا تقبل قيدا يدويا عاديا: استخدم المستند المناسب أو قيد تسوية')
+   WHERE (SELECT entry_type FROM journal_entries WHERE id=NEW.entry_id)='general'
+     AND (EXISTS(SELECT 1 FROM parties WHERE account_id=NEW.account_id)
+          OR EXISTS(SELECT 1 FROM account_mappings m WHERE m.account_id=NEW.account_id AND m.map_key='inventory')
+          OR EXISTS(SELECT 1 FROM items WHERE inventory_account_id=NEW.account_id));
+  SELECT RAISE(ABORT,'مركز التكلفة غير صالح (غير موجود أو غير نشط أو تجميعي أو من شركة أخرى)')
+   WHERE NEW.cost_center_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM cost_centers cc JOIN journal_entries e ON e.id=NEW.entry_id
+      WHERE cc.id=NEW.cost_center_id AND cc.is_active=1 AND cc.is_group=0 AND cc.company_id=e.company_id);
+  SELECT RAISE(ABORT,'هذا الحساب يتطلب مركز تكلفة')
+   WHERE NEW.cost_center_id IS NULL AND EXISTS(SELECT 1 FROM accounts a WHERE a.id=NEW.account_id AND a.requires_cost_center=1);
+END;
+
+CREATE TABLE import_batches(
+  id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id),
+  target TEXT NOT NULL CHECK(target IN ('customers','suppliers','items','party_opening')),
+  status TEXT NOT NULL DEFAULT 'previewed' CHECK(status IN ('previewed','committed')),
+  total_rows INTEGER NOT NULL, valid_rows INTEGER NOT NULL, invalid_rows INTEGER NOT NULL, duplicate_rows INTEGER NOT NULL,
+  report_json TEXT NOT NULL, created_by INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  committed_by INTEGER REFERENCES users(id), committed_at TEXT, committed_report_json TEXT);
+
+INSERT INTO permissions(code,name_ar,is_sensitive) VALUES('data.import','استيراد بيانات (عملاء/موردون/أصناف/أرصدة)',1);
+INSERT INTO role_permissions SELECT r.id,'data.import' FROM roles r WHERE r.id IN (1,2);

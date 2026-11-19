@@ -1,0 +1,137 @@
+"""عزل بيانات الفروع — نقطة التطبيق الواحدة.
+
+* المعاملات (قيود/فواتير/سندات): الفرع الفعلي = COALESCE(branch_id, الفرع الرئيسي). كل مستند جديد يُختم بفرع.
+* البيانات الأساسية (أطراف/أصناف/تصنيفات/وحدات): branch_id=NULL يعني «مشترك».
+  - وضع isolated (الافتراضي): كل سجل يتبع فرعًا (القديم بلا فرع يتبع الرئيسي) ولا يظهر إلا فيه.
+  - وضع shared  : المشترك يظهر في كل الفروع، والمقيَّد بفرع يظهر في فرعه فقط.
+  - وضع isolated: كل سجل يتبع فرعًا (القديم بلا فرع يتبع الرئيسي) ولا يظهر إلا فيه.
+* branch_id=None في دوال القوائم = بلا تصفية (كل الفروع) — وتبقى قيود وصول المستخدم سارية في الدوال نفسها.
+"""
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.audit import audit
+from alhisabat.database.tx import transaction
+from alhisabat.security import permissions
+
+MODES = ("shared", "isolated")
+
+
+def main_branch_id(conn, company_id):
+    r = conn.execute("SELECT id FROM branches WHERE company_id=? ORDER BY is_active DESC,id LIMIT 1", (company_id,)).fetchone()
+    return r[0] if r else None
+
+
+def get_mode(conn, company_id):
+    r = conn.execute("SELECT isolation_mode FROM branch_settings WHERE company_id=?", (company_id,)).fetchone()
+    return r[0] if r else "isolated"   # الافتراضي: كل فرع مستقل كأنه نظام جديد
+
+
+def set_mode(conn, actor_id, company_id, mode):
+    permissions.require(conn, actor_id, company_id, "settings.manage", check_branch=False)
+    if mode not in MODES:
+        raise AccountingError("وضع عزل الفروع غير معروف")
+    old = get_mode(conn, company_id)
+    with transaction(conn):
+        conn.execute("INSERT INTO branch_settings(company_id,isolation_mode) VALUES(?,?) "
+                     "ON CONFLICT(company_id) DO UPDATE SET isolation_mode=excluded.isolation_mode", (company_id, mode))
+        audit.log(conn, actor_id, "branch_isolation_mode", "branch_settings", company_id, {"mode": old}, {"mode": mode})
+
+
+def resolve(conn, company_id, branch_id):
+    """يُرجع فرعًا صالحًا للمستند: المُمرَّر (بعد التحقق) أو الرئيسي. None فقط إن لم توجد فروع أصلًا."""
+    if branch_id is None:
+        return main_branch_id(conn, company_id)
+    r = conn.execute("SELECT is_active FROM branches WHERE id=? AND company_id=?", (int(branch_id), company_id)).fetchone()
+    if not r:
+        raise AccountingError("الفرع غير موجود في هذه الشركة")
+    if not r[0]:
+        raise AccountingError("الفرع معطّل؛ لا يمكن إنشاء مستندات عليه")
+    return int(branch_id)
+
+
+def resolve_for_user(conn, company_id, user_id, branch_id):
+    """مثل resolve، لكن المستخدم المقيَّد بفروع لا يُنسَب مستنده تلقائيًا للرئيسي: يبقى None فيُرفض بفحص الصلاحيات."""
+    if branch_id is None and conn.execute("SELECT 1 FROM user_branch_access WHERE user_id=? LIMIT 1", (user_id,)).fetchone():
+        return None
+    return resolve(conn, company_id, branch_id)
+
+
+def default_master_branch(conn, company_id, branch_id):
+    """فرع السجل الأساسي الجديد: المُمرَّر صراحةً، وإلا في وضع isolated الفرع الحالي/الرئيسي، وإلا NULL (مشترك)."""
+    if branch_id is not None:
+        return resolve(conn, company_id, branch_id)
+    return resolve(conn, company_id, None) if get_mode(conn, company_id) == "isolated" else None
+
+
+def txn_clause(conn, company_id, branch_id, col="branch_id"):
+    """شرط SQL للمعاملات: (sql, args). branch_id=None → لا تصفية."""
+    if branch_id is None:
+        return "", []
+    main = main_branch_id(conn, company_id)
+    return f" AND COALESCE({col},?)=?", [main, int(branch_id)]
+
+
+def master_clause(conn, company_id, branch_id, col="branch_id"):
+    """شرط SQL للبيانات الأساسية حسب وضع العزل."""
+    if branch_id is None:
+        return "", []
+    if get_mode(conn, company_id) == "isolated":
+        return f" AND COALESCE({col},?)=?", [main_branch_id(conn, company_id), int(branch_id)]
+    return f" AND ({col} IS NULL OR {col}=?)", [int(branch_id)]
+
+
+def _master_ok(conn, company_id, branch_id, rec_branch):
+    if branch_id is None:
+        return True
+    if rec_branch is None:
+        return get_mode(conn, company_id) != "isolated" or main_branch_id(conn, company_id) == int(branch_id)
+    return int(rec_branch) == int(branch_id)
+
+
+def foreign_account_ids(conn, company_id, branch_id):
+    """حسابات الأستاذ التفصيلية (عملاء/موردون/صناديق وبنوك) التي تتبع فرعًا آخر غير branch_id؛ تُخفى من شجرة الحسابات وقوائمها."""
+    if branch_id is None:
+        return set()
+    main, b = main_branch_id(conn, company_id), int(branch_id)
+    if get_mode(conn, company_id) == "isolated":
+        pq = "SELECT account_id FROM parties WHERE company_id=? AND COALESCE(branch_id,?)<>?"
+        pa = (company_id, main, b)
+    else:
+        pq = "SELECT account_id FROM parties WHERE company_id=? AND branch_id IS NOT NULL AND branch_id<>? AND ?=?"
+        pa = (company_id, b, b, b)
+    out = {r[0] for r in conn.execute(pq, pa)}
+    out |= {r[0] for r in conn.execute("SELECT account_id FROM cash_accounts WHERE company_id=? AND COALESCE(branch_id,?)<>?", (company_id, main, b))}
+    out.discard(None)
+    return out
+
+
+def check_party(conn, company_id, branch_id, party_id):
+    if party_id is None or branch_id is None:
+        return
+    r = conn.execute("SELECT name,branch_id FROM parties WHERE id=? AND company_id=?", (party_id, company_id)).fetchone()
+    if r and not _master_ok(conn, company_id, branch_id, r["branch_id"]):
+        raise AccountingError(f"الطرف «{r['name']}» يتبع فرعًا آخر ولا يمكن استخدامه في هذا الفرع")
+
+
+def check_items(conn, company_id, branch_id, item_ids):
+    if branch_id is None:
+        return
+    for iid in {i for i in item_ids if i is not None}:
+        r = conn.execute("SELECT name,branch_id FROM items WHERE id=? AND company_id=?", (iid, company_id)).fetchone()
+        if r and not _master_ok(conn, company_id, branch_id, r["branch_id"]):
+            raise AccountingError(f"الصنف «{r['name']}» يتبع فرعًا آخر ولا يمكن استخدامه في هذا الفرع")
+
+
+def check_warehouse(conn, company_id, branch_id, warehouse_id):
+    if branch_id is None or warehouse_id is None:
+        return
+    r = conn.execute("SELECT name,branch_id FROM warehouses WHERE id=? AND company_id=?", (warehouse_id, company_id)).fetchone()
+    if r and r["branch_id"] is not None and r["branch_id"] != int(branch_id):
+        raise AccountingError(f"المخزن «{r['name']}» يتبع فرعًا آخر غير فرع المستند")
+
+
+def check_cash(conn, company_id, branch_id, cash_id):
+    if branch_id is None or cash_id is None:
+        return
+    r = conn.execute("SELECT name,branch_id FROM cash_accounts WHERE id=? AND company_id=?", (cash_id, company_id)).fetchone()
+    if r and r["branch_id"] is not None and r["branch_id"] != int(branch_id):
+        raise AccountingError(f"الصندوق/البنك «{r['name']}» يتبع فرعًا آخر غير فرع السند")

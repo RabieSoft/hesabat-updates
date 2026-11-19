@@ -1,0 +1,154 @@
+"""حارس سلامة المخطط: يصلح قاعدة بيانات سُجّلت ترحيلاتها «منفَّذة» بينما أعمدتها غير موجودة فعلاً.
+
+السبب المعروف: نسخة تطويرية سابقة سجّلت الترحيل 0051 في schema_migrations بمحتوى مختلف (بلا أعمدة الألوان)،
+فلا يُعاد تنفيذه على قاعدة العميل ويفشل أي استعلام يذكر i.parent_item_id.
+
+الضمانات:
+- لا يلمس القاعدة إطلاقًا إن كانت كل الأعمدة التي تضيفها الترحيلات موجودة (الحالة الطبيعية: فحص قراءة فقط).
+- عند النقص: نسخة احتياطية أولًا، ثم تنفيذ جمل البنية فقط (CREATE/ALTER) المفقودة، ولا تُنفَّذ أي جملة بيانات
+  (INSERT/UPDATE/DELETE) فلا تتكرر بيانات ولا تتغير أرقام.
+- كل ترحيل يُصلَح داخل معاملة واحدة؛ فشله يتراجع كاملًا دون كسر بقية البرنامج.
+"""
+import re
+import shutil
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+
+from .connection import MIGRATIONS_DIR, _split_statements
+
+_ADD_COL = re.compile(r"ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(\w+)", re.I)
+_DDL_HEAD = ("CREATE", "ALTER")
+_BENIGN = ("already exists", "duplicate column name")
+
+
+_CREATE = re.compile(r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s*\(", re.I)
+_CONSTRAINT_HEAD = ("PRIMARY", "UNIQUE", "CHECK", "FOREIGN", "CONSTRAINT")
+HEAL_TABLES_FROM = "0051"   # الجداول المنشأة من هذا الترحيل فصاعدًا (ميزة الألوان) تُفحص أعمدتها؛ الأقدم قد تعدّله ترحيلات لاحقة عمدًا
+
+
+def _strip_comments(sql):
+    return "\n".join(l.split("--")[0] for l in sql.splitlines())
+
+
+def _create_table_columns(sql):
+    """[(جدول، عمود، تعريف العمود)] من جمل CREATE TABLE في نص الترحيل."""
+    sql = _strip_comments(sql)
+    out = []
+    for m in _CREATE.finditer(sql):
+        i, depth, parts, cur = m.end(), 1, [], ""
+        while i < len(sql) and depth:
+            ch = sql[i]
+            depth += (ch == "(") - (ch == ")")
+            if depth == 0:
+                break
+            if ch == "," and depth == 1:
+                parts.append(cur); cur = ""
+            else:
+                cur += ch
+            i += 1
+        parts.append(cur)
+        for part in parts:
+            part = part.strip()
+            if part and not part.upper().startswith(_CONSTRAINT_HEAD):
+                name, _, rest = part.partition(" ")
+                out.append((m.group(1), name.strip('"`[]'), rest.strip()))
+    return out
+
+
+def _add_column(conn, table, col, definition):
+    """ALTER TABLE ADD COLUMN بتعريف العمود؛ إن رفضه SQLite (NOT NULL بلا قيمة، CURRENT_TIMESTAMP...) يُبسَّط."""
+    d = re.sub(r"\bPRIMARY\s+KEY\b|\bUNIQUE\b", "", definition, flags=re.I)
+    tries = [d]
+    simple = re.sub(r"\bNOT\s+NULL\b", "", d, flags=re.I)
+    simple = re.sub(r"\bDEFAULT\s+CURRENT_\w+", "", simple, flags=re.I)
+    tries.append(simple)
+    tries.append(re.split(r"\b(?:CHECK|REFERENCES)\b", simple, flags=re.I)[0])
+    last = None
+    for t in tries:
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {t}")
+            return
+        except sqlite3.OperationalError as e:
+            if "duplicate column" in str(e).lower():
+                return
+            last = e
+    raise last
+
+
+def _columns(conn, table):
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _table_exists(conn, table):
+    return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is not None
+
+
+def find_missing(conn, migrations_dir=None):
+    """{اسم الترحيل: [(جدول، عمود)...]} للأعمدة التي يضيفها ترحيل مسجَّل ولا وجود لها في القاعدة."""
+    out = {}
+    cache = {}
+    for f in sorted(Path(migrations_dir or MIGRATIONS_DIR).glob("*.sql")):
+        miss = []
+        text = f.read_text(encoding="utf-8")
+        pairs = list(_ADD_COL.findall(text))
+        if f.stem >= HEAL_TABLES_FROM:
+            pairs += [(t, c) for t, c, _d in _create_table_columns(text)]
+        for tbl, col in pairs:
+            if tbl not in cache:
+                cache[tbl] = _columns(conn, tbl) if _table_exists(conn, tbl) else None
+            if cache[tbl] is not None and col not in cache[tbl]:
+                miss.append((tbl, col))
+        if miss:
+            out[f.stem] = miss
+    return out
+
+
+def _heal_one(conn, path):
+    """ينفّذ جمل البنية فقط من الترحيل، متجاوزًا الموجود منها. معاملة واحدة."""
+    conn.execute("BEGIN")
+    try:
+        if path.stem >= HEAL_TABLES_FROM:                  # جدول موجود بأعمدة ناقصة (نسخة تطويرية قديمة): أضف الناقص
+            for tbl, col, definition in _create_table_columns(path.read_text(encoding="utf-8")):
+                if _table_exists(conn, tbl) and col not in _columns(conn, tbl):
+                    _add_column(conn, tbl, col, definition)
+        for stmt in _split_statements(path.read_text(encoding="utf-8")):
+            body = "\n".join(l for l in stmt.splitlines() if not l.strip().startswith("--")).strip()
+            if not body.upper().startswith(_DDL_HEAD):
+                continue                                   # لا بيانات ولا PRAGMA ولا BEGIN/COMMIT
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError as e:
+                if not any(t in str(e).lower() for t in _BENIGN):
+                    raise
+        conn.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(?)", (path.stem,))
+        conn.execute("COMMIT")
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+
+
+def ensure_schema(conn, db_path=None, migrations_dir=None):
+    """يُستدعى بعد migrate(). يرجع قائمة الترحيلات التي أُصلحت (فارغة في الحالة الطبيعية)."""
+    mdir = Path(migrations_dir or MIGRATIONS_DIR)
+    missing = find_missing(conn, mdir)
+    if not missing:
+        return []
+    if db_path and str(db_path) != ":memory:" and Path(db_path).exists():
+        if conn.in_transaction:
+            conn.execute("COMMIT")
+        shutil.copy2(db_path, f"{db_path}.pre_heal_{datetime.now():%Y%m%d%H%M%S}.bak")
+    # الترحيلات التي تُصلَح: ما نقصت أعمدته + اللاحقة له التي تذكر هذه الأعمدة (مثل تريجرات 0052)، بالترتيب
+    cols = {c for v in missing.values() for _t, c in v}
+    first = min(missing)
+    names = list(missing)
+    for f in sorted(mdir.glob("*.sql")):
+        if f.stem > first and f.stem not in missing and any(
+                re.search(rf"\b{c}\b", f.read_text(encoding="utf-8")) for c in cols):
+            names.append(f.stem)
+    healed = []
+    for name in sorted(names):
+        _heal_one(conn, mdir / f"{name}.sql")
+        healed.append(name)
+    return healed

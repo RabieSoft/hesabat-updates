@@ -1,0 +1,121 @@
+"""نافذة «القوالب الجاهزة» للقيد المركّب: اختر الوصفة، حدد الطرف والصندوق والمبالغ، فتُبنى السطور تلقائيًا (alhisabat/ui/core/journal_recipes.py)."""
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMenu, QMessageBox,
+                               QVBoxLayout)
+
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.ui.components.basic import MoneyEdit
+from alhisabat.ui.components.pickers import SearchPicker
+from alhisabat.ui.core import journal_recipes as R
+
+
+class RecipeDialog(QDialog):
+    def __init__(self, parent, svc, recipe_key=None, favorites=None):
+        super().__init__(parent)
+        self.svc, self.result_rows, self.result_desc, self.result_key = svc, None, '', None
+        self.fav = favorites                     # FavoriteStore (اختياري): نجمة ★ وقائمة زر الفأرة الأيمن
+        self.setWindowTitle('قوالب القيود الجاهزة')
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.resize(720, 460)
+        root = QHBoxLayout(self)
+        self.lst = QListWidget()
+        self.lst.setMaximumWidth(340)
+        self._fill_list()
+        self.lst.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.lst.customContextMenuRequested.connect(self._list_menu)
+        self.lst.currentRowChanged.connect(self._select)
+        root.addWidget(self.lst)
+        right = QVBoxLayout()
+        self.hint = QLabel('')
+        self.hint.setWordWrap(True)
+        self.hint.setObjectName('ctxKey')
+        right.addWidget(self.hint)
+        self.card = QFrame()
+        self.card.setFrameShape(QFrame.StyledPanel)
+        self.form = QFormLayout(self.card)
+        self.form.setLabelAlignment(Qt.AlignRight)
+        right.addWidget(self.card)
+        self.preview = QLabel('')
+        self.preview.setWordWrap(True)
+        right.addWidget(self.preview)
+        right.addStretch(1)
+        bb = QDialogButtonBox()
+        ok = bb.addButton('إدراج في القيد', QDialogButtonBox.AcceptRole)
+        ok.setProperty('primary', True)
+        ok.setAutoDefault(False)
+        bb.addButton('إلغاء', QDialogButtonBox.RejectRole).setAutoDefault(False)
+        bb.accepted.connect(self._accept)
+        bb.rejected.connect(self.reject)
+        right.addWidget(bb)
+        root.addLayout(right, 1)
+        self._widgets = {}
+        idx = next((i for i, r in enumerate(R.RECIPES) if r.key == recipe_key), 0)
+        if recipe_key is not None:            # اختيار الحالة من القائمة المنسدلة في شاشة القيد: لا حاجة لقائمة الحالات هنا
+            self.lst.hide()
+            self.setWindowTitle(R.RECIPES[idx].title)
+            self.resize(480, 380)
+        self.lst.setCurrentRow(idx)
+
+    def _fill_list(self):
+        cur = self.lst.currentRow()
+        self.lst.blockSignals(True)
+        self.lst.clear()
+        for r in R.RECIPES:
+            self.lst.addItem(('★ ' if self.fav and self.fav.has(r.key) else '') + r.title)
+        self.lst.setCurrentRow(max(cur, 0))
+        self.lst.blockSignals(False)
+
+    def _list_menu(self, pos):
+        it = self.lst.itemAt(pos)
+        if it is None or self.fav is None:
+            return
+        row = self.lst.row(it)
+        key = R.RECIPES[row].key
+        m = QMenu(self)
+        act = m.addAction('إزالة من المفضلة' if self.fav.has(key) else 'إضافة إلى المفضلة')
+        if m.exec(self.lst.mapToGlobal(pos)) is act:
+            self.fav.toggle(key)
+            self._fill_list()
+
+    def _select(self, i):
+        if i < 0:
+            return
+        r = R.RECIPES[i]
+        while self.form.rowCount():
+            self.form.removeRow(0)
+        self._widgets = {}
+        self.hint.setText(r.hint + '\nيتطلب القيد على حساب عميل/مورد تفعيل «السماح بقيد يدوي على العملاء والموردين» (مدير النظام).'
+                          if any(f.kind in (R.CUSTOMER, R.SUPPLIER, R.EMPLOYEE) for f in r.fields) else r.hint)
+        for f in r.fields:
+            if f.kind == R.AMOUNT:
+                w = MoneyEdit()
+                w.setMaximumWidth(200)
+            else:
+                opts = self.svc.recipe_options(f.kind)
+                w = SearchPicker(lambda o=opts: o, placeholder='ابحث…')
+                dflt = self.svc.recipe_default(f.kind)
+                if dflt:
+                    w.set_id(dflt)
+            self._widgets[f.key] = w
+            self.form.addRow(f.label + ' *', w)
+        self.preview.setText('')
+
+    def _values(self):
+        out = {}
+        for k, w in self._widgets.items():
+            out[k] = w.value() if isinstance(w, MoneyEdit) else w.current_id()
+        return out
+
+    def _accept(self):
+        r = R.RECIPES[self.lst.currentRow()]
+        v = self._values()
+        try:
+            rows = R.build(r.key, v)
+        except AccountingError as exc:
+            return QMessageBox.warning(self, 'بيانات ناقصة', str(exc))
+        party = ''
+        for k in ('customer', 'supplier', 'employee'):
+            if k in self._widgets:
+                party = self._widgets[k].currentText().split('—')[-1].strip()
+        self.result_rows, self.result_desc, self.result_key = rows, R.suggested_description(r.key, party), r.key
+        self.accept()

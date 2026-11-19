@@ -1,0 +1,102 @@
+"""سجل الصفحات: مفتاح الصفحة (navigation.PAGE_KEYS) ← صنفها. ما لم يُسجَّل بعد يظهر بصفحة «قيد البناء» (PlaceholderPage)."""
+from alhisabat.ui.core.base_page import PlaceholderPage
+from alhisabat.ui.shell import navigation as N
+
+_CLASSES = {}
+
+
+def register(key, cls):
+    if key not in N.PAGE_KEYS:
+        raise KeyError(f'مفتاح صفحة غير معرّف في navigation: {key}')
+    _CLASSES[key] = cls
+
+
+def create(key, window, params=None):
+    spec = N.get(key)
+    if spec is None:
+        return None
+    cls = _CLASSES.get(key)
+    if cls is None:
+        return PlaceholderPage(window, spec)
+    page = cls(window)
+    page.params = params
+    return page
+
+
+def registered():
+    return dict(_CLASSES)
+
+
+_MODULES = ('journal', 'sales', 'parties', 'cash', 'inventory', 'item_info', 'stock_recon', 'catalog', 'branches',
+            'accounts', 'currencies', 'hr', 'period_end', 'reports', 'print_guide', 'system', 'dashboard', 'mobile_link', 'messaging', 'notebook')
+
+
+def load_builtin(progress=None):
+    """يسجّل الصفحات المبنية. تُستورد كسولًا حتى لا يلزم PySide6 عند استيراد السجل في الاختبارات.
+    progress(i, n, الاسم) اختياري: يُستدعى بعد استيراد كل وحدة صفحات (لشريط تقدم شاشة التحميل)."""
+    if progress is not None:
+        import importlib
+        for i, name in enumerate(_MODULES, 1):
+            importlib.import_module(f'{__package__}.{name}')
+            progress(i, len(_MODULES), '')
+    from .journal import JournalPage
+    from .sales import PurchasesPage, SalesPage
+    from .parties import PartiesPage
+    from .cash import BankReconPage, CashPage
+    from .inventory import StockOpsPage, StockPage, WarehousesPage
+    from .item_info import ItemInfoPage
+    from .stock_recon import StockReconPage
+    from .catalog import CategoriesPage, UnitsPage
+    from .branches import BranchesPage
+    from .accounts import AccountsPage, MappingsPage
+    from .currencies import CurrenciesPage
+    from .hr import AssetsPage, CostCentersPage, EmployeesPage, PayrollPage
+    from .period_end import PeriodEndPage
+    from .reports import AgingPage, LedgerPage, ReportsPage
+    from .print_guide import PrintGuidePage
+    from .mobile_link import MobileLinkPage
+    from .messaging import MessagingPage
+    from .notebook import NotebookPage
+    from .dashboard import DashboardPage
+    from .system import AuditPage, BackupPage, ImportPage, SettingsPage, TaxesPage, UsersPage
+
+    register('journal', JournalPage)
+    register('sales', SalesPage)
+    register('purchases', PurchasesPage)
+    register('parties', PartiesPage)
+    register('cash', CashPage)
+    register('bank_recon', BankReconPage)
+    register('stock', StockPage)
+    register('warehouses', WarehousesPage)
+    register('item_info', ItemInfoPage)
+    register('stock_ops', StockOpsPage)
+    register('stock_recon', StockReconPage)
+    register('item_categories', CategoriesPage)
+    register('units', UnitsPage)
+    register('branches', BranchesPage)
+    register('accounts', AccountsPage)
+    register('mappings', MappingsPage)
+    register('currencies', CurrenciesPage)
+    register('period_end', PeriodEndPage)
+
+
+    register('employees', EmployeesPage)
+    register('cost_centers', CostCentersPage)
+    register('payroll', PayrollPage)
+    register('assets', AssetsPage)
+    register('reports', ReportsPage)
+    register('ledger', LedgerPage)
+    register('aging', AgingPage)
+    register('import', ImportPage)
+    register('backup', BackupPage)
+    register('audit', AuditPage)
+    register('users', UsersPage)
+    register('settings', SettingsPage)
+    register('mobile_link', MobileLinkPage)
+    register('messages', MessagingPage)
+    register('notebook', NotebookPage)
+    register('taxes', TaxesPage)
+    register('print_guide', PrintGuidePage)
+    register('dashboard', DashboardPage)
+
+

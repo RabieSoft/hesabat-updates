@@ -1,0 +1,573 @@
+"""مركز التقارير والقوائم المالية (المرحلة 5 والقسم 6.8):
+- القوائم المالية الرسمية: ميزان المراجعة، قائمة الدخل، المركز المالي، قائمة التدفقات النقدية.
+- القوائم المقارنة: قائمة الدخل المقارنة، المركز المالي المقارن بفترات متعددة.
+- تقارير مراكز التكلفة: نتيجة مراكز التكلفة (الأرباح والخسائر)، دفتر أستاذ مركز التكلفة.
+- معاينة واقعية على ورقة (DocumentSheet)، طباعة، وتصدير (HTML, XLSX, CSV).
+"""
+import os
+import tempfile
+from datetime import date
+from typing import Optional
+
+from PySide6.QtCore import Qt, QDate, QUrl
+from PySide6.QtGui import QDesktopServices
+from PySide6.QtWidgets import (
+    QComboBox, QDateEdit, QFileDialog, QFrame, QHBoxLayout,
+    QLabel, QMessageBox, QPushButton, QTabWidget, QVBoxLayout, QWidget, QCheckBox, QGridLayout
+)
+
+from alhisabat.ui.app_dialogs.drilldown import AccountDrilldownDialog, JournalViewDialog
+from alhisabat.ui.components import document_model as DM
+from alhisabat.ui.components.datagrid import DataGrid
+from alhisabat.ui.components.document_sheet import DocumentSheet
+from alhisabat.ui.components.grid_logic import Column
+from alhisabat.ui.components.pickers import SearchPicker, make_searchable
+from alhisabat.ui.core.actions import Action, ActionGroup
+from alhisabat.ui.core.base_page import BasePage
+from alhisabat.ui.core.permissions import ActionState
+from alhisabat.ui.core import readmodel
+from alhisabat.ui.core.reports_service import ReportsService, REPORT_CATEGORIES
+
+
+class ReportsPage(BasePage):
+    """مركز التقارير المالي الشامل: فهرس مصنف، مرشحات ذكية، معاينة على الورقة، وجدول تفاعلي بـ Drill-down."""
+    key = 'reports'
+    title = 'القوائم والتقارير'
+    icon = 'chart'
+    required_permission = 'report.view'
+
+    def build(self):
+        self._built = True
+        self.svc = ReportsService(self.session)
+        self.spec = None
+        self._current_rows = []
+        self._sel_row = None
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(6)
+
+        # ---------------- شريط التحكم والمرشحات ----------------
+        filter_box = QFrame()
+        filter_box.setObjectName("panelFrame")
+        flay = QVBoxLayout(filter_box)
+        flay.setContentsMargins(8, 8, 8, 8)
+        flay.setSpacing(6)
+
+        # السطر الأول: اختيار نوع التقرير والفترة
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("التقرير:"))
+        self.kind = QComboBox()
+        for cat_name, rep_list in REPORT_CATEGORIES.items():
+            self.kind.addItem(f"── {cat_name} ──", None)
+            idx = self.kind.count() - 1
+            self.kind.model().item(idx).setEnabled(False)
+            for r in rep_list:
+                self.kind.addItem(f"   {r}", r)
+        self.kind.setCurrentIndex(1)                       # أول تقرير فعلي (لا عنوان التصنيف المعطّل)
+        self.kind.setMinimumWidth(260)
+        self.kind.currentIndexChanged.connect(self._on_kind_changed)
+        row1.addWidget(self.kind, 2)
+
+        # إعدادات مسبقة للتواريخ
+        row1.addWidget(QLabel("الفترة:"))
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItems(["السنة الحالية", "الربع الحالي", "الشهر الحالي", "السنة السابقة", "مخصص"])
+        self.preset_combo.setMinimumWidth(140)
+        self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
+        row1.addWidget(self.preset_combo)
+
+        self.lbl_from = QLabel("من:")
+        self.frm = QDateEdit(QDate(date.today().year, 1, 1))
+        self.lbl_to = QLabel("إلى:")
+        self.to = QDateEdit(QDate.currentDate())
+        for w in (self.frm, self.to):
+            w.setCalendarPopup(True)
+            w.setDisplayFormat('yyyy-MM-dd')
+            w.setMinimumWidth(135)
+            w.dateChanged.connect(lambda *_: self._mark_custom_preset())
+        row1.addWidget(self.lbl_from)
+        row1.addWidget(self.frm)
+        row1.addWidget(self.lbl_to)
+        row1.addWidget(self.to)
+
+        self.btn_run = QPushButton("عرض التقرير")
+        self.btn_run.setProperty('primary', True)
+        self.btn_run.clicked.connect(self.run)
+        row1.addWidget(self.btn_run)
+        row1.addStretch(1)
+        flay.addLayout(row1)
+
+        # السطر الثاني: مرشحات إضافية ديناميكية — شبكة تُعاد رصّ المرئي منها كل مرة (3 أزواج «عنوان+حقل» في السطر)
+        # فلا تتراكب الحقول ولا تنضغط مهما قلّ عرض النافذة، ويحتفظ كل حقل بحدّ أدنى مقروء.
+        self.row2_widget = QWidget()
+        self.grid2 = QGridLayout(self.row2_widget)
+        self.grid2.setContentsMargins(0, 0, 0, 0)
+        self.grid2.setHorizontalSpacing(8)
+        self.grid2.setVerticalSpacing(6)
+
+        self.lbl_branch = QLabel("الفرع:")
+        self.branch_combo = make_searchable(QComboBox())
+        self.branch_combo.addItem("الكل", None)
+
+        self.lbl_account = QLabel("الحساب:")
+        self.account_combo = SearchPicker(lambda: self.session.lookup_accounts(None, None), allow_empty=True,
+                                          placeholder='اكتب رقم الحساب أو اسمه…')
+
+        self.lbl_gkind = QLabel("النوع:")
+        self.gkind_combo = QComboBox()
+        for lab, k in (("عملاء", "customer"), ("موردين", "supplier"), ("أصناف", "item")):
+            self.gkind_combo.addItem(lab, k)
+        self.gkind_combo.currentIndexChanged.connect(self._fill_groups)
+        self.lbl_group = QLabel("المجموعة:")
+        self.group_combo = QComboBox()
+        make_searchable(self.group_combo)
+        self.lbl_cur = QLabel("العملة:")
+        self.cur_combo = make_searchable(QComboBox())      # يُملأ عند التحميل: العملة الأساسية (وحدها) ← «جميع العملات» ← بقية العملات
+
+        self.lbl_cost_center = QLabel("مركز التكلفة:")
+        self.cc_combo = QComboBox()
+        self.cc_combo.addItem("الكل", None)
+        make_searchable(self.cc_combo)
+
+        self.lbl_side = QLabel("الرصيد:")
+        self.side_combo = QComboBox()
+        for lab, v in (("دائن ومدين (الكل)", "all"), ("مدينون فقط", "debit"), ("دائنون فقط", "credit")):
+            self.side_combo.addItem(lab, v)
+
+        # تغيير المرشح من المستخدم يُعيد إعداد التقرير المعروض فورًا (كشاشة أعمار الديون) بدل انتظار «عرض التقرير»
+        for _cb in (self.side_combo, self.cur_combo, self.group_combo):
+            _cb.activated.connect(self._rerun_if_shown)
+
+        self.chk_hide_zero = QCheckBox("إخفاء الأصفار")
+        self.chk_hide_zero.setChecked(True)
+        self.chk_closing = QCheckBox("شامل الإقفال")
+        self.chk_closing.setChecked(True)
+
+        # (عنوان، حقل، حدّ أدنى للعرض بالبكسل)
+        self._filter_cells = [
+            (self.lbl_branch, self.branch_combo, 170), (self.lbl_account, self.account_combo, 300),
+            (self.lbl_gkind, self.gkind_combo, 120), (self.lbl_group, self.group_combo, 220),
+            (self.lbl_cur, self.cur_combo, 170), (self.lbl_side, self.side_combo, 170), (self.lbl_cost_center, self.cc_combo, 190),
+            (None, self.chk_hide_zero, 0), (None, self.chk_closing, 0),
+        ]
+        for lbl, w, mw in self._filter_cells:
+            if mw:
+                w.setMinimumWidth(mw)
+        self._relayout_filters()
+        flay.addWidget(self.row2_widget)
+        lay.addWidget(filter_box)
+
+        # ---------------- منطقة العرض ----------------
+        self.tabs = QTabWidget()
+
+        # التبويب 1: الورقة الواقعية DocumentSheet
+        paper = self.window_.prefs.get('paper') if hasattr(self, 'window_') else 'A4'
+        self.sheet = DocumentSheet(paper)
+        self.sheet.paperChanged.connect(lambda p: hasattr(self, 'window_') and self.window_.prefs.set('paper', p))
+        self.tabs.addTab(self.sheet, "معاينة على ورقة (طباعة)")
+
+        # التبويب 2: جدول تفاعلي للـ Drill-down
+        grid_container = QWidget()
+        gl = QVBoxLayout(grid_container)
+        gl.setContentsMargins(0, 0, 0, 0)
+
+        grid_bar = QHBoxLayout()
+        self.grid_hint = QLabel("نقر مزدوج على أي سطر للانتقال للحساب / القيد / المستند المصدر (Drill-down).")
+        self.grid_hint.setObjectName("ctxKey")
+        grid_bar.addWidget(self.grid_hint)
+        grid_bar.addStretch(1)
+
+        self.btn_drill = QPushButton("تفاصيل وحركات الحساب (Drill-down)")
+        self.btn_drill.setEnabled(False)
+        self.btn_drill.clicked.connect(self._drilldown_selected)
+        grid_bar.addWidget(self.btn_drill)
+        self.btn_print_sel = QPushButton("طباعة المحدد")
+        self.btn_print_sel.setToolTip("حدّد أعمدة أو خلايا أو صفوفًا من الجدول (نقر على رأس العمود أو رقم الصف، أو سحب، أو Ctrl) ثم اطبع المحدد فقط")
+        self.btn_print_sel.clicked.connect(lambda: self.grid.print_selected())
+        grid_bar.addWidget(self.btn_print_sel)
+        gl.addLayout(grid_bar)
+
+        self.grid = DataGrid([], grid_id='reports_dynamic_grid')
+        self.grid.selectionChangedRows.connect(self._on_grid_select)
+        self.grid.rowActivated.connect(self._on_grid_activate)
+        self.grid.linkClicked.connect(lambda row, _k: self.open_source_doc(row))   # رقم القيد/المستند ← الشاشة الأصلية
+        gl.addWidget(self.grid, 1)
+
+        self.tabs.addTab(grid_container, "جدول تفاعلي (Drill-down)")
+        lay.addWidget(self.tabs, 1)
+
+        self._on_kind_changed()
+
+    def refresh(self):
+        if not getattr(self, '_built', False):
+            return
+        try:
+            if not getattr(self, '_accounts_loaded', False) and self.session.can('account.view'):
+                self.account_combo.reload()
+                self._accounts_loaded = True
+        except Exception:
+            pass
+
+        try:
+            if self.cc_combo.count() <= 1 and self.session.can('costcenter.view'):
+                for c in self.svc.lookup_cost_centers():
+                    self.cc_combo.addItem(f"{c.get('code') or ''} {c['name']}".strip(), c['id'])
+        except Exception:
+            pass
+
+        try:
+            if self.cur_combo.count() == 0:
+                for i, (code, lab) in enumerate(self.svc.lookup_currencies()):
+                    self.cur_combo.addItem(lab, code)
+                    if i == 0:
+                        self.cur_combo.addItem("جميع العملات", None)
+        except Exception:
+            pass
+        if self.cur_combo.count() == 0:
+            self.cur_combo.addItem("جميع العملات", None)
+        if self.group_combo.count() == 0:
+            self._fill_groups()
+
+        try:
+            if self.branch_combo.count() <= 1:
+                for b in self.svc.lookup_branches():
+                    self.branch_combo.addItem(b['name'], b['id'])
+                # كل فرع مستقل: الافتراضي هو الفرع الحالي؛ «الكل» (تجميعي) لغير المقيَّد فقط
+                if self.session.is_branch_restricted():
+                    self.branch_combo.removeItem(0)
+                i = self.branch_combo.findData(self.session.branch_id)
+                if i >= 0:
+                    self.branch_combo.setCurrentIndex(i)
+        except Exception:
+            pass
+
+    def _fill_groups(self, *_):
+        """مجموعات النوع المختار (عملاء/موردين/أصناف). العملة لا تنطبق على الأصناف (قيمها بالأساسية)."""
+        kind = self.gkind_combo.currentData()
+        self.group_combo.clear()
+        try:
+            for gid, lab in self.svc.lookup_report_groups(kind):
+                self.group_combo.addItem(lab, gid)
+        except Exception as exc:  # noqa: BLE001 — صلاحية ناقصة أو لا مجموعات: تبقى القائمة فارغة
+            self.group_combo.addItem(f"تعذّر تحميل المجموعات", None)
+            self.notify(str(exc))
+        self.cur_combo.setEnabled(kind != 'item')
+        if kind == 'item':
+            self.cur_combo.setCurrentIndex(0)
+
+    def _mark_custom_preset(self):
+        if self.preset_combo.currentIndex() != 4:
+            self.preset_combo.blockSignals(True)
+            self.preset_combo.setCurrentIndex(4)
+            self.preset_combo.blockSignals(False)
+
+    def _on_preset_changed(self):
+        idx = self.preset_combo.currentIndex()
+        today = date.today()
+        y = today.year
+        self.frm.blockSignals(True)
+        self.to.blockSignals(True)
+        if idx == 0:
+            self.frm.setDate(QDate(y, 1, 1))
+            self.to.setDate(QDate(y, 12, 31))
+        elif idx == 1:
+            q = (today.month - 1) // 3
+            sm = q * 3 + 1
+            em = sm + 2
+            last_day = 31 if em in (3, 12) else 30
+            self.frm.setDate(QDate(y, sm, 1))
+            self.to.setDate(QDate(y, em, last_day))
+        elif idx == 2:
+            import calendar
+            _, last_day = calendar.monthrange(y, today.month)
+            self.frm.setDate(QDate(y, today.month, 1))
+            self.to.setDate(QDate(y, today.month, last_day))
+        elif idx == 3:
+            self.frm.setDate(QDate(y - 1, 1, 1))
+            self.to.setDate(QDate(y - 1, 12, 31))
+        self.frm.blockSignals(False)
+        self.to.blockSignals(False)
+
+    def _current_report_key(self) -> Optional[str]:
+        return self.kind.currentData()
+
+    def _relayout_filters(self, want=None):
+        """يعيد رصّ المرشحات المطلوبة فقط في الشبكة: 3 أزواج (عنوان+حقل) للسطر، والحقول تتمدد، بلا فجوات ولا تراكب.
+        want: مجموعة الحقول المطلوبة (الفرع دائمًا)؛ غير المطلوب يُخفى."""
+        want = set(want or ()) | {self.branch_combo}
+        g = self.grid2
+        while g.count():
+            g.takeAt(0)
+        for c in range(g.columnCount()):
+            g.setColumnStretch(c, 0)
+        per_row, col_i, row_i = 3, 0, 0
+        for lbl, w, _mw in self._filter_cells:
+            on = w in want
+            if lbl is not None:
+                lbl.setVisible(on)
+            w.setVisible(on)
+            if not on:
+                continue
+            c = col_i * 2
+            if lbl is not None:
+                g.addWidget(lbl, row_i, c)
+                g.addWidget(w, row_i, c + 1)
+                g.setColumnStretch(c + 1, 1)
+            else:
+                g.addWidget(w, row_i, c, 1, 2)
+            col_i += 1
+            if col_i == per_row:
+                col_i, row_i = 0, row_i + 1
+
+    def _on_kind_changed(self, *_):
+        k = self._current_report_key()
+        if not k:
+            return
+        self._relayout_filters(self._apply_kind_visibility(k))
+        # ملخص الأرصدة حسب العملة يخص كل العملات افتراضيًا؛ وغيره يبدأ بالعملة الأساسية وحدها
+        all_i = self.cur_combo.findData(None)
+        is_sum = k == 'ملخص الأرصدة ورأس المال حسب العملة'
+        if all_i >= 0 and self.cur_combo.count() > 1:
+            if is_sum:
+                self.cur_combo.setCurrentIndex(all_i)
+            elif getattr(self, '_was_cur_summary', False):
+                self.cur_combo.setCurrentIndex(0)
+        self._was_cur_summary = is_sum
+
+    def _apply_kind_visibility(self, k):
+        """يضبط ظهور حقول التواريخ ويُرجع مجموعة المرشحات الإضافية المطلوبة لهذا التقرير."""
+
+        is_point = k in ('المركز المالي', 'أعمار ديون العملاء', 'أعمار ديون الموردين', 'ملخص الأرصدة ورأس المال حسب العملة', 'مطابقة أرصدة العملاء والموردين')
+        is_stock = k == 'تقرير المخزون'
+        needs_acc = k in ('كشف حساب', 'ملخص الحساب', 'كشف حساب تفصيلي', 'مصادقة كشف حساب')
+        needs_cc = k in ('دفتر أستاذ مركز التكلفة', 'أرباح وخسائر مراكز التكلفة', 'ميزان المراجعة')
+        is_tb = k == 'ميزان المراجعة'
+
+        self.lbl_from.setVisible(not is_point and not is_stock)
+        self.frm.setVisible(not is_point and not is_stock)
+        self.lbl_to.setText('حتى تاريخ:' if is_point else 'إلى:')
+        self.to.setVisible(not is_stock)
+        self.lbl_to.setVisible(not is_stock)
+
+        is_grp = k == 'كشف حساب مجموعة'
+        want = set()
+        if is_grp:
+            want |= {self.gkind_combo, self.group_combo}
+        if k == 'مطابقة أرصدة العملاء والموردين':
+            want.add(self.gkind_combo)                         # عملاء / موردين (الأصناف غير صالحة هنا فيُرفض برسالة)
+        if is_grp or k in ('كشف حساب', 'ملخص الأرصدة ورأس المال حسب العملة', 'كشف حساب تفصيلي', 'مطابقة أرصدة العملاء والموردين', 'مصادقة كشف حساب'):
+            want.add(self.cur_combo)
+        if is_grp or k in ('كشف حساب', 'أعمار ديون العملاء', 'أعمار ديون الموردين'):
+            want.add(self.side_combo)
+        if needs_acc:
+            want.add(self.account_combo)
+        if needs_cc:
+            want.add(self.cc_combo)
+        if is_tb:
+            want.add(self.chk_hide_zero)
+        if is_tb or needs_acc:
+            want.add(self.chk_closing)
+        return want
+
+    def run(self):
+        k = self._current_report_key()
+        if not k:
+            return QMessageBox.information(self, self.title, "اختر نوع التقرير أولًا.")
+
+        d_from = self.frm.date().toPython().isoformat()
+        d_to = self.to.date().toPython().isoformat()
+        acc_id = self.account_combo.current_id()
+        cc_id = self.cc_combo.currentData()
+        br_id = self.branch_combo.currentData()
+        cur = self.cur_combo.currentData() if self.cur_combo.isVisibleTo(self) else None
+        g_kind = self.gkind_combo.currentData() if k in ('كشف حساب مجموعة', 'مطابقة أرصدة العملاء والموردين') else None
+        g_id = self.group_combo.currentData() if g_kind and k == 'كشف حساب مجموعة' else None
+        if g_kind and k == 'كشف حساب مجموعة' and g_id is None:      # (0 = «بلا مجموعة» صالح؛ None = لا مجموعات أو فشل التحميل)
+            return QMessageBox.information(self, self.title, "اختر المجموعة أولًا (لا توجد مجموعات لهذا النوع أو تعذّر تحميلها).")
+
+        periods = None
+        dates = None
+        if k == 'قائمة الدخل المقارنة':
+            y = self.frm.date().year()
+            periods = [
+                (f"{y}-01-01", f"{y}-12-31", f"السنة الحالية ({y})"),
+                (f"{y-1}-01-01", f"{y-1}-12-31", f"السنة السابقة ({y-1})"),
+            ]
+        elif k == 'المركز المالي المقارن':
+            y = self.to.date().year()
+            dates = [
+                (f"{y}-12-31", f"نهاية {y}"),
+                (f"{y-1}-12-31", f"نهاية {y-1}"),
+            ]
+
+        side = self.side_combo.currentData() if self.side_combo.isVisibleTo(self) else None
+        hide_z = self.chk_hide_zero.isChecked()
+        inc_cls = self.chk_closing.isChecked()
+        self.btn_run.setEnabled(False)
+        self.notify("جارٍ إعداد التقرير في الخلفية...")
+
+        def _bg(s, ctx):
+            from alhisabat.ui.core.reports_service import ReportsService
+            return ReportsService(s).report_spec(
+                k, d_from, d_to,
+                account_id=acc_id,
+                cost_center_id=cc_id,
+                branch_id=br_id,
+                hide_zero=hide_z,
+                include_closing=inc_cls,
+                periods=periods,
+                dates=dates,
+                currency=cur,
+                group_kind=g_kind,
+                group_id=g_id,
+                balance_side=side,
+            )
+
+        def _done(spec):
+            self.btn_run.setEnabled(True)
+            self.spec = spec
+            self._spec_kind = k
+            doc = DM.from_print_spec(self.spec, 'report')
+            self.sheet.set_document(doc)
+            self._setup_datagrid(self.spec)
+            self.actions_changed.emit()
+            self.notify(f"تم إعداد تقرير: {self.spec.get('title')}")
+
+        def _err(exc):
+            self.btn_run.setEnabled(True)
+            self.spec = None
+            self.show_error(exc)
+
+        self.run_task(_bg, on_done=_done, on_error=_err)
+
+    def _setup_datagrid(self, spec):
+        cols = []
+        has_entry = any(r.get('entry_id') for r in spec.get('rows', []))     # صفوف التقرير تحمل قيدها ← رقم القيد/المستند رابط
+        for c in spec.get('columns', []):
+            is_num = c.get('numeric', False)
+            cols.append(Column(
+                key=c['key'],
+                label=c['label'],
+                kind='money' if is_num else 'text',
+                width=110 if is_num else 180,
+                minor=False,
+                link=bool(has_entry and c['key'] in ('no', 'posted_no', 'entry_no', 'doc_no'))
+            ))
+        self.grid = DataGrid(cols, grid_id=f"rep_{self._current_report_key()}")
+        self.grid.enable_cell_selection()
+        self.grid.set_print_context(lambda: self.spec)
+        self.grid.selectionChangedRows.connect(self._on_grid_select)
+        self.grid.rowActivated.connect(self._on_grid_activate)
+        self.grid.linkClicked.connect(lambda row, _k: self.open_source_doc(row))   # رقم القيد/المستند ← الشاشة الأصلية
+
+        self._current_rows = list(spec.get('rows', []))
+        self.grid.set_rows(self._current_rows)
+        self._fill_summary_row(spec, cols)
+
+        old_container = self.tabs.widget(1)
+        gl = old_container.layout()
+        old_grid = gl.itemAt(1).widget()
+        gl.removeWidget(old_grid)
+        old_grid.deleteLater()
+        gl.addWidget(self.grid, 1)
+
+    def _rerun_if_shown(self, *_):
+        """تغيير الرصيد/العملة/المجموعة بعد عرض تقرير من النوع نفسه ← إعادة التشغيل تلقائيًا."""
+        if self.spec and self.btn_run.isEnabled() and self._current_report_key() == getattr(self, '_spec_kind', None):
+            self.run()
+
+    def _fill_summary_row(self, spec, cols):
+        """صف «الإجمالي»: إجماليات التقرير أرقامًا تحت أعمدتها الرقمية (بترتيبها)، والمبلغ كتابةً في تلميح الماوس.
+        يُعرض فقط حين يطابق عدد الإجماليات عدد الأعمدة الرقمية (كشف حساب مجموعة وأمثاله)."""
+        from decimal import Decimal
+        from alhisabat.reporting import words as RW
+        from alhisabat.ui.core import format as fmt
+        totals = [t for t in (spec.get('totals') or []) if isinstance(t.get('value'), (Decimal, int)) and not isinstance(t.get('value'), bool)]
+        nums = [c for c in cols if c.kind == 'money']
+        if not totals or len(totals) != len(nums) or len(totals) != len(spec.get('totals') or []):
+            self.grid.set_summary_row(None)
+            return
+        try:
+            tips = RW.total_tips(spec, self.svc.base_currency())
+        except Exception:  # noqa: BLE001 — التفقيط للعرض فقط
+            tips = [''] * len(totals)
+        cells = {c.key: (fmt.fmt_money(Decimal(t['value'])), tips[i] if i < len(tips) else '') for i, (c, t) in enumerate(zip(nums, totals))}
+        self.grid.set_summary_row(cells)
+
+    def _on_grid_select(self, rows):
+        self._sel_row = rows[0] if len(rows) == 1 else None
+        can_drill = bool(self._sel_row and (self._sel_row.get('account_id') or self._sel_row.get('entry_id') or self._sel_row.get('code')))
+        self.btn_drill.setEnabled(can_drill)
+
+    def _on_grid_activate(self, row):
+        if not row:
+            return
+        if row.get('entry_id'):
+            d = JournalViewDialog(self, self.session, row['entry_id'])
+            self.exec_form(d)
+            return
+        aid = row.get('account_id')
+        if not aid and row.get('code'):
+            aid = readmodel.account_id_by_code(self.session.conn, self.session.company_id, row['code'])
+        if aid:
+            d_from = self.frm.date().toPython().isoformat()
+            d_to = self.to.date().toPython().isoformat()
+            d = AccountDrilldownDialog(self, self.session, aid, d_from, d_to,
+                                       branch_id=self.branch_combo.currentData())
+            self.exec_form(d)
+
+    def _drilldown_selected(self):
+        if self._sel_row:
+            self._on_grid_activate(self._sel_row)
+
+    # ---------------- Ribbon Actions ----------------
+    def ribbon_groups(self):
+        has_spec = bool(self.spec)
+        return [
+            ActionGroup('تصدير', [
+                Action('html', 'تصدير HTML', 'export',
+                       state_fn=lambda: ActionState(has_spec, 'اعرض التقرير أولًا'),
+                       handler=lambda: self._export('html')),
+                Action('xlsx', 'تصدير Excel', 'export',
+                       state_fn=lambda: ActionState(has_spec, 'اعرض التقرير أولًا'),
+                       handler=lambda: self._export('xlsx')),
+                Action('csv', 'تصدير CSV', 'export',
+                       state_fn=lambda: ActionState(has_spec, 'اعرض التقرير أولًا'),
+                       handler=lambda: self._export('csv')),
+            ]),
+            ActionGroup('طباعة', [
+                Action('print', 'طباعة المستند', 'print',
+                       state_fn=lambda: ActionState(has_spec, 'اعرض التقرير أولًا'),
+                       handler=lambda: self.sheet.print_()),
+                Action('pdf', 'معاينة وحفظ PDF', 'export',
+                       state_fn=lambda: ActionState(has_spec, 'اعرض التقرير أولًا'),
+                       handler=lambda: self.sheet.save_pdf()),
+            ]),
+            ActionGroup('عرض', [
+                Action('refresh', 'تحديث', 'refresh', handler=self.run),
+            ]),
+        ]
+
+    def _export(self, fmt_code):
+        if not self.spec:
+            return QMessageBox.information(self, self.title, 'اعرض التقرير أولًا.')
+        if fmt_code == 'html':
+            path = os.path.join(tempfile.gettempdir(), f"report_{os.getpid()}.html")
+            try:
+                self.svc.export_report(self.spec, 'html', path)
+                QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+            except Exception as e:
+                self.show_error(e)
+            return
+
+        title = self.spec.get('title', 'تقرير').replace('/', '_')
+        path, _ = QFileDialog.getSaveFileName(self, 'تصدير التقرير', f"{title}.{fmt_code}", f"*.{fmt_code}")
+        if path:
+            if not path.lower().endswith('.' + fmt_code):
+                path += '.' + fmt_code
+            try:
+                self.svc.export_report(self.spec, fmt_code, path)
+                self.notify(f'تم التصدير بنجاح: {os.path.basename(path)}')
+            except Exception as e:
+                self.show_error(e)

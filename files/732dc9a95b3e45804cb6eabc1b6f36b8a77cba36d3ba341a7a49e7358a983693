@@ -1,0 +1,122 @@
+"""نافذة «طباعة المحدد» لأي DataGrid: اختيار الأعمدة (وترتيبها) والصفوف ثم معاينة/طباعة. يتطلب PySide6.
+
+المنطق الخالص (بناء المواصفة) في grid_logic.build_print_spec؛ هنا واجهة فقط.
+"""
+from PySide6.QtCore import QSettings, Qt
+from PySide6.QtWidgets import (
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QMessageBox, QPushButton, QRadioButton, QVBoxLayout
+)
+
+from . import document_model as DM, grid_logic as G, print_service as PS
+
+
+class PrintSelectionDialog(QDialog):
+    def __init__(self, grid, parent=None):
+        super().__init__(parent or grid)
+        self.grid = grid
+        self.setWindowTitle('طباعة المحدد')
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.setMinimumWidth(460)
+        self.sel_rows, self.sel_cells, self.used = grid.selection_picks()
+        self.base = grid.print_base()
+
+        lay = QVBoxLayout(self)
+        r = QHBoxLayout()
+        r.addWidget(QLabel('عنوان الطباعة:'))
+        self.txt_title = QLineEdit(self.base.get('title') or grid.print_title())
+        r.addWidget(self.txt_title, 1)
+        lay.addLayout(r)
+
+        # الصفوف
+        self.rb_sel = QRadioButton(f'الصفوف المحددة فقط ({len(self.sel_rows)})')
+        self.rb_all = QRadioButton(f'كل الصفوف المعروضة ({len(grid.model.view)})')
+        (self.rb_sel if self.sel_rows else self.rb_all).setChecked(True)
+        self.rb_sel.setEnabled(bool(self.sel_rows))
+        lay.addWidget(self.rb_sel)
+        lay.addWidget(self.rb_all)
+
+        # الأعمدة
+        lay.addWidget(QLabel('الأعمدة المطلوب طباعتها (اسحب لتغيير الترتيب):'))
+        self.lst = QListWidget()
+        self.lst.setDragDropMode(QAbstractItemView.InternalMove)
+        self.lst.setMinimumHeight(190)
+        vis = grid.visible_keys()
+        saved = grid.saved_print_keys()
+        checked = set(G.pick_print_keys(vis, self.used, saved, grid.cell_mode()))
+        order = [k for k in (saved or []) if k in {c.key for c in grid.columns}]
+        order += [k for k in vis if k not in order] + [c.key for c in grid.columns if c.key not in order and c.key not in vis]
+        by = {c.key: c for c in grid.columns}
+        for k in order:
+            it = QListWidgetItem(by[k].label)
+            it.setData(Qt.UserRole, k)
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsDragEnabled)
+            it.setCheckState(Qt.Checked if k in checked else Qt.Unchecked)
+            self.lst.addItem(it)
+        lay.addWidget(self.lst)
+
+        r = QHBoxLayout()
+        for text, fn in (('تحديد الكل', lambda: self._set_all(True)), ('إلغاء الكل', lambda: self._set_all(False)),
+                         ('أعمدة التحديد فقط', self._only_selected_cols)):
+            b = QPushButton(text); b.clicked.connect(fn); r.addWidget(b)
+        r.addStretch(1)
+        lay.addLayout(r)
+
+        self.chk_totals = QCheckBox('إضافة مجموع الأعمدة الرقمية')
+        lay.addWidget(self.chk_totals)
+        r = QHBoxLayout()
+        r.addWidget(QLabel('الورق:'))
+        self.cb_paper = QComboBox()
+        for k, lab in DM.PAPER_LABELS.items():
+            self.cb_paper.addItem(lab, k)
+        r.addWidget(self.cb_paper)
+        r.addStretch(1)
+        lay.addLayout(r)
+
+        r = QHBoxLayout()
+        b_prev = QPushButton('معاينة / PDF'); b_prev.clicked.connect(lambda: self._go(preview=True))
+        b_print = QPushButton('طباعة'); b_print.setProperty('primary', True); b_print.clicked.connect(lambda: self._go(preview=False))
+        b_close = QPushButton('إغلاق'); b_close.clicked.connect(self.reject)
+        r.addWidget(b_prev); r.addWidget(b_print); r.addStretch(1); r.addWidget(b_close)
+        lay.addLayout(r)
+
+    def _items(self):
+        return [self.lst.item(i) for i in range(self.lst.count())]
+
+    def _set_all(self, on):
+        for it in self._items():
+            it.setCheckState(Qt.Checked if on else Qt.Unchecked)
+
+    def _only_selected_cols(self):
+        if not self.used:
+            return
+        for it in self._items():
+            it.setCheckState(Qt.Checked if it.data(Qt.UserRole) in self.used else Qt.Unchecked)
+
+    def build_spec(self):
+        keys = [it.data(Qt.UserRole) for it in self._items() if it.checkState() == Qt.Checked]
+        if self.rb_sel.isChecked():
+            rows, cells = self.sel_rows, self.sel_cells
+            if not set(keys) <= set(self.used):          # أُضيف عمود خارج التحديد: تُطبع الخلايا كاملة بدل تفريغها
+                cells = None
+            elif self.grid.cell_mode() is False:
+                cells = None
+        else:
+            rows, cells = self.grid.displayed_rows(), None
+        spec = G.build_print_spec(self.grid.columns, rows, keys, cell_keys=cells, base=self.base,
+                                  title=self.txt_title.text().strip() or None, with_totals=self.chk_totals.isChecked())
+        QSettings('AlhisabatPro', 'ui').setValue(f'printcols/{self.grid.grid_id}', keys)
+        return spec
+
+    def _go(self, preview):
+        try:
+            spec = self.build_spec()
+        except ValueError as e:
+            return QMessageBox.information(self, 'طباعة المحدد', str(e))
+        doc = DM.from_print_spec(spec, 'report')
+        paper = self.cb_paper.currentData()
+        if preview:
+            from .pdf_preview import show_pdf_preview
+            show_pdf_preview(self, doc, paper)
+        else:
+            PS.print_dialog(self, doc, paper)

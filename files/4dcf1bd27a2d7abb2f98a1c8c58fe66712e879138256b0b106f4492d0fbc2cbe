@@ -1,0 +1,305 @@
+"""Financial Integrity Check (المواصفات §54). كل فحص يرجع pass / fail / not_checked — لا نجاح مزيف للفحوص غير المنفذة."""
+from alhisabat.accounting import balance_engine as be, inventory_recon as ir
+from alhisabat.security import permissions
+
+
+def _c(name, status, detail=""):
+    return {"name": name, "status": status, "detail": detail}
+
+
+def _control_checks(conn, company_id, day):
+    """الحساب الرقابي للعملاء/الموردين: رصيده (بالتجميع عبر الشجرة) = مجموع أرصدة أطرافه (حساب مستقل)،
+    وكل حساب تحته مرتبط بطرف، وكل حساب طرف تحته، ولا حركة مباشرة عليه."""
+    ys = be.year_start(conn, company_id, day)
+    accs = be.load_accounts(conn, company_id)
+    tot = be.aggregate(accs, be.movements(conn, company_id, ys, day, ys))
+    out, mapped_any = [], False
+    all_party_accs = {r[0]: r[1] for r in conn.execute("SELECT account_id, kind FROM parties WHERE company_id=?", (company_id,))}
+    kind_ar = {"customer": "عميل", "supplier": "مورد", "employee": "موظف"}
+    for kind, key, label in (("customer", "customers", "العملاء"), ("supplier", "suppliers", "الموردين"), ("employee", "employees", "الموظفين")):
+        m = conn.execute("SELECT account_id FROM account_mappings WHERE company_id=? AND map_key=?", (company_id, key)).fetchone()
+        name = f"رصيد الحساب الرقابي لـ{label} = مجموع أرصدة أطرافه (وكل حساب تحته مرتبط بطرف)"
+        if not m or m[0] not in accs:
+            out.append(_c(name, "not_checked", "الحساب الرقابي غير مربوط"))
+            continue
+        mapped_any = True
+        ctl = m[0]
+        party_accs = [r[0] for r in conn.execute("SELECT account_id FROM parties WHERE company_id=? AND kind=?", (company_id, kind))]
+        group_accs = [r[0] for r in conn.execute("SELECT account_id FROM party_groups WHERE company_id=? AND kind=?", (company_id, kind))]
+        groups = set(group_accs)
+        mov = be.movements(conn, company_id, ys, day, ys, None, None, party_accs) if party_accs else {}
+        detail_sum = sum(v[0] + v[1] - v[2] for v in mov.values())
+        control_net = tot[ctl][0] + tot[ctl][1] - tot[ctl][2]
+        under = set(be.subtree_ids(conn, ctl, include_merged=False)) - {ctl}
+        foreign = sorted(f'{accs[a]["code"]} ({kind_ar.get(all_party_accs[a], "طرف")})' for a in under
+                         if a in all_party_accs and a not in set(party_accs))
+        orphans = sorted(accs[a]["code"] for a in under if a not in all_party_accs and a not in groups)
+        outside = sorted(accs[a]["code"] for a in party_accs if a not in under)
+        outside_groups = sorted(accs[a]["code"] for a in groups if a not in under)
+        direct = conn.execute("SELECT COUNT(*) FROM journal_lines l JOIN journal_entries e ON e.id=l.entry_id "
+                              f"WHERE l.account_id=? AND e.status IN {be.POSTED}", (ctl,)).fetchone()[0]
+        problems = []
+        if control_net != detail_sum:
+            problems.append(f"فرق: رقابي={control_net} مجموع الأطراف={detail_sum}")
+        if foreign:
+            problems.append(f"حسابات أطراف من نوع آخر تحت الحساب الرقابي لـ{label}: " + ",".join(foreign)
+                            + " — راجع «ربط الحسابات» فلكل نوع حساب رقابي مستقل")
+        if orphans:
+            problems.append("حسابات بلا طرف: " + ",".join(orphans))
+        if outside:
+            problems.append("حسابات أطراف خارج الرقابي: " + ",".join(outside))
+        if outside_groups:
+            problems.append("مجموعة خارج الرقابي: " + ",".join(outside_groups))
+        if direct:
+            problems.append("حركة مباشرة على الحساب الرقابي")
+        out.append(_c(name, "pass" if not problems else "fail", "؛ ".join(problems)))
+    return out if mapped_any else None
+
+
+def _sales_checks(conn, company_id):
+    """مستندات المبيعات: القيد المرتبط موجود ومصدره المستند وحالته صحيحة، التكلفة = حركات المخزون، الإجماليات = البنود والدفعات."""
+    if not conn.execute("SELECT 1 FROM sales_invoices WHERE company_id=? AND status<>'draft' LIMIT 1", (company_id,)).fetchone():
+        return []
+    bad_link, bad_cost, bad_tot = [], [], []
+    for r in conn.execute("SELECT * FROM sales_invoices WHERE company_id=? AND status IN ('posted','cancelled')", (company_id,)).fetchall():
+        e = conn.execute("SELECT * FROM journal_entries WHERE id=?", (r["journal_entry_id"],)).fetchone() if r["journal_entry_id"] else None
+        want = "posted" if r["status"] == "posted" else "reversed"
+        ok = e and e["status"] == want and e["source_type"] == "sales_invoice" and e["source_id"] == r["id"]
+        if ok and r["status"] == "cancelled":
+            c = conn.execute("SELECT status FROM journal_entries WHERE id=?", (r["cancel_entry_id"],)).fetchone() if r["cancel_entry_id"] else None
+            ok = bool(c) and c["status"] == "posted"
+        if not ok:
+            bad_link.append(r["invoice_no"] or str(r["id"]))
+        cost = conn.execute("SELECT COALESCE(SUM(cost_base_minor),0) FROM sales_invoice_lines WHERE invoice_id=?", (r["id"],)).fetchone()[0]
+        mv = conn.execute("SELECT COALESCE(SUM(m.value_base),0) FROM sales_invoice_lines l JOIN stock_movements m ON m.id=l.movement_id WHERE l.invoice_id=?", (r["id"],)).fetchone()[0]
+        if cost != mv:
+            bad_cost.append(r["invoice_no"])
+        tl = conn.execute("SELECT COALESCE(SUM(total_minor),0),COALESCE(SUM(tax_minor),0) FROM sales_invoice_lines WHERE invoice_id=?", (r["id"],)).fetchone()
+        pm = conn.execute("SELECT COALESCE(SUM(amount_minor),0) FROM invoice_payments WHERE invoice_id=?", (r["id"],)).fetchone()[0]
+        if tl[0] != r["grand_total"] or tl[1] != r["tax_total"] or pm != r["paid_total"]:
+            bad_tot.append(r["invoice_no"])
+    return [_c("مستندات المبيعات المرحّلة لها قيد مرتبط سليم (والملغاة قيدها معكوس)", "pass" if not bad_link else "fail", ",".join(map(str, bad_link))),
+            _c("تكلفة بنود المبيعات = قيمة حركاتها المخزنية", "pass" if not bad_cost else "fail", ",".join(map(str, bad_cost))),
+            _c("إجماليات مستند المبيعات = مجموع بنوده ودفعاته", "pass" if not bad_tot else "fail", ",".join(map(str, bad_tot)))]
+
+
+def _purchase_checks(conn, company_id):
+    """مستندات المشتريات: القيد المرتبط سليم، تكلفة البنود = حركات المخزون، الإجماليات = البنود والتكاليف والدفعات."""
+    if not conn.execute("SELECT 1 FROM purchase_invoices WHERE company_id=? AND status<>'draft' LIMIT 1", (company_id,)).fetchone():
+        return []
+    bad_link, bad_cost, bad_tot = [], [], []
+    for r in conn.execute("SELECT * FROM purchase_invoices WHERE company_id=? AND status IN ('posted','cancelled')", (company_id,)).fetchall():
+        e = conn.execute("SELECT * FROM journal_entries WHERE id=?", (r["journal_entry_id"],)).fetchone() if r["journal_entry_id"] else None
+        want = "posted" if r["status"] == "posted" else "reversed"
+        ok = e and e["status"] == want and e["source_type"] == "purchase_invoice" and e["source_id"] == r["id"]
+        if ok and r["status"] == "cancelled":
+            c = conn.execute("SELECT status FROM journal_entries WHERE id=?", (r["cancel_entry_id"],)).fetchone() if r["cancel_entry_id"] else None
+            ok = bool(c) and c["status"] == "posted"
+        if not ok:
+            bad_link.append(r["invoice_no"] or str(r["id"]))
+        cost = conn.execute("SELECT COALESCE(SUM(cost_base_minor),0) FROM purchase_invoice_lines WHERE invoice_id=?", (r["id"],)).fetchone()[0]
+        mv = conn.execute("SELECT COALESCE(SUM(m.value_base),0) FROM purchase_invoice_lines l JOIN stock_movements m ON m.id=l.movement_id WHERE l.invoice_id=?", (r["id"],)).fetchone()[0]
+        if cost != mv:
+            bad_cost.append(r["invoice_no"])
+        tl = conn.execute("SELECT COALESCE(SUM(total_minor),0),COALESCE(SUM(tax_minor),0),COALESCE(SUM(cost_share_minor),0) FROM purchase_invoice_lines WHERE invoice_id=?", (r["id"],)).fetchone()
+        dc = conn.execute("SELECT COALESCE(SUM(amount_minor),0) FROM purchase_direct_costs WHERE invoice_id=?", (r["id"],)).fetchone()[0]
+        pm = conn.execute("SELECT COALESCE(SUM(amount_minor),0) FROM purchase_payments WHERE invoice_id=?", (r["id"],)).fetchone()[0]
+        costs = dc if r["doc_type"] == "invoice" else tl[2]
+        if tl[0] + costs != r["grand_total"] or tl[1] != r["tax_total"] or costs != r["costs_total"] or pm != r["paid_total"]:
+            bad_tot.append(r["invoice_no"])
+    return [_c("مستندات المشتريات المرحّلة لها قيد مرتبط سليم (والملغاة قيدها معكوس)", "pass" if not bad_link else "fail", ",".join(map(str, bad_link))),
+            _c("تكلفة بنود المشتريات = قيمة حركاتها المخزنية", "pass" if not bad_cost else "fail", ",".join(map(str, bad_cost))),
+            _c("إجماليات مستند المشتريات = مجموع بنوده وتكاليفه ودفعاته", "pass" if not bad_tot else "fail", ",".join(map(str, bad_tot)))]
+
+
+def _cash_checks(conn, company_id, day):
+    accs = conn.execute("SELECT * FROM cash_accounts WHERE company_id=?", (company_id,)).fetchall()
+    if not accs or not day:
+        return []
+    out = []
+    ys = be.year_start(conn, company_id, day)
+    eff, counted, _x = be.frag("a")
+    args = {"c": company_id, "t": day, "ys": ys, "fl": be.perm_floor(conn, company_id, ys)}
+    neg = []
+    for a in accs:
+        if a["allow_negative"]:
+            continue
+        for r in conn.execute(f"SELECT l.currency,SUM(l.debit_orig-l.credit_orig) n FROM journal_lines l JOIN journal_entries e ON e.id=l.entry_id "
+                              f"JOIN accounts a ON a.id=l.account_id WHERE l.account_id=:acc AND e.company_id=:c AND e.status IN {be.POSTED} "
+                              f"AND e.entry_date<=:t AND {counted} GROUP BY l.currency HAVING n<0", {**args, "acc": a["account_id"]}):
+            neg.append(f"{a['name']} ({r['currency']}) = {r['n']}")
+    out.append(_c("أرصدة الصناديق غير سالبة (ما لم يُسمح بالسحب على المكشوف)", "pass" if not neg else "fail", "؛ ".join(neg)))
+    banks = [a for a in accs if a["kind"] == "bank"]
+    total_lines = conn.execute("SELECT COUNT(*) FROM bank_statement_lines WHERE company_id=?", (company_id,)).fetchone()[0]
+    if not banks or not total_lines:
+        out.append(_c("مطابقة البنوك: لا بنود كشف غير مطابقة", "not_checked", "لا توجد كشوف بنكية مستوردة"))
+    else:
+        un = conn.execute("SELECT COUNT(*) FROM bank_statement_lines WHERE company_id=? AND status='unmatched' AND txn_date<=?", (company_id, day)).fetchone()[0]
+        out.append(_c("مطابقة البنوك: لا بنود كشف غير مطابقة", "pass" if not un else "fail", f"{un} بند غير مطابق" if un else ""))
+    bad = []
+    for v in conn.execute("SELECT * FROM cash_vouchers WHERE company_id=? AND status IN ('posted','cancelled')", (company_id,)).fetchall():
+        e = conn.execute("SELECT * FROM journal_entries WHERE id=?", (v["journal_entry_id"],)).fetchone() if v["journal_entry_id"] else None
+        ok = e and e["status"] == ("posted" if v["status"] == "posted" else "reversed") and e["source_type"] == "cash_voucher" and e["source_id"] == v["id"]
+        if ok and v["status"] == "cancelled":
+            c = conn.execute("SELECT status FROM journal_entries WHERE id=?", (v["cancel_entry_id"],)).fetchone() if v["cancel_entry_id"] else None
+            ok = bool(c) and c["status"] == "posted"
+        al = conn.execute("SELECT COALESCE(SUM(amount_minor),0) FROM voucher_allocations WHERE voucher_id=?", (v["id"],)).fetchone()[0]
+        if not ok or al > v["amount_minor"]:
+            bad.append(v["voucher_no"] or str(v["id"]))
+    for t in conn.execute("SELECT * FROM cash_transfers WHERE company_id=?", (company_id,)).fetchall():
+        e = conn.execute("SELECT * FROM journal_entries WHERE id=?", (t["journal_entry_id"],)).fetchone()
+        if not e or e["status"] != ("posted" if t["status"] == "posted" else "reversed") or e["source_type"] != "cash_transfer":
+            bad.append(t["transfer_no"])
+    if conn.execute("SELECT 1 FROM cash_vouchers WHERE company_id=? AND status<>'draft' LIMIT 1", (company_id,)).fetchone() or \
+            conn.execute("SELECT 1 FROM cash_transfers WHERE company_id=? LIMIT 1", (company_id,)).fetchone():
+        out.append(_c("سندات القبض/الدفع والتحويلات: قيود مرتبطة سليمة وتخصيصات ضمن المبلغ", "pass" if not bad else "fail", ",".join(map(str, bad))))
+    return out
+
+
+def _asset_checks(conn, company_id, day):
+    from alhisabat.business import fixed_assets as fa
+    if not day or not conn.execute("SELECT 1 FROM fixed_assets WHERE company_id=? LIMIT 1", (company_id,)).fetchone():
+        return []
+    rec = fa.register_reconcile(conn, company_id, day)
+    out = [_c("سجل الأصول: مجموع مجمع الإهلاك = رصيد الحساب الرقابي", "pass" if rec and rec["matches"] else "fail",
+             "" if rec and rec["matches"] else str(rec))]
+    bad = []
+    for a in conn.execute("SELECT * FROM fixed_assets WHERE company_id=? AND status='disposed'", (company_id,)).fetchall():
+        e = conn.execute("SELECT status FROM journal_entries WHERE id=?", (a["disposal_entry_id"],)).fetchone() if a["disposal_entry_id"] else None
+        if not e or e["status"] != "posted":
+            bad.append(a["code"])
+    out.append(_c("الأصول المستبعدة لها قيد استبعاد مرحّل", "pass" if not bad else "fail", ",".join(bad)))
+    return out
+
+
+def _payroll_checks(conn, company_id):
+    if not conn.execute("SELECT 1 FROM payroll_runs WHERE company_id=? AND status<>'draft' LIMIT 1", (company_id,)).fetchone():
+        return []
+    bad = []
+    for r in conn.execute("SELECT * FROM payroll_runs WHERE company_id=? AND status IN ('posted','cancelled')", (company_id,)).fetchall():
+        e = conn.execute("SELECT * FROM journal_entries WHERE id=?", (r["journal_entry_id"],)).fetchone() if r["journal_entry_id"] else None
+        want = "posted" if r["status"] == "posted" else "reversed"
+        ok = e and e["status"] == want and e["source_type"] == "payroll_run" and e["source_id"] == r["id"]
+        if not ok:
+            bad.append(str(r["id"]))
+    return [_c("مسيرات الرواتب المرحّلة لها قيد مرتبط سليم (والملغاة قيدها معكوس)", "pass" if not bad else "fail", ",".join(bad))]
+
+
+def financial_integrity_check(conn, user_id, company_id, as_of=None):
+    permissions.require(conn, user_id, company_id, "report.view", check_branch=False)
+    checks = []
+    P = be.POSTED
+    d, c = conn.execute(f"SELECT COALESCE(SUM(l.debit_base),0),COALESCE(SUM(l.credit_base),0) FROM journal_lines l "
+                        f"JOIN journal_entries e ON e.id=l.entry_id WHERE e.company_id=? AND e.status IN {P}"
+                        + (" AND e.entry_date<=?" if as_of else ""), (company_id, *([as_of] if as_of else []))).fetchone()
+    checks.append(_c("إجمالي المدين = إجمالي الدائن", "pass" if d == c else "fail", f"مدين={d} دائن={c}"))
+
+    bad = conn.execute(f"SELECT e.id FROM journal_entries e WHERE e.company_id=? AND e.status IN {P} AND ("
+                       "(SELECT COALESCE(SUM(debit_base),0) FROM journal_lines WHERE entry_id=e.id)<>"
+                       "(SELECT COALESCE(SUM(credit_base),0) FROM journal_lines WHERE entry_id=e.id) OR "
+                       "(SELECT COUNT(*) FROM journal_lines WHERE entry_id=e.id)<2)", (company_id,)).fetchall()
+    checks.append(_c("كل قيد مرحّل متوازن وله سطران فأكثر", "pass" if not bad else "fail",
+                     "" if not bad else "قيود: " + ",".join(str(r[0]) for r in bad[:20])))
+
+    day = as_of or conn.execute("SELECT MAX(end_date) FROM fiscal_years WHERE company_id=?", (company_id,)).fetchone()[0]
+    if day:
+        ys = be.year_start(conn, company_id, day)
+        accs = be.load_accounts(conn, company_id)
+        N = {}
+        for aid, (o, pd, pc) in be.movements(conn, company_id, ys, day, ys).items():
+            N[accs[aid]["account_type"]] = N.get(accs[aid]["account_type"], 0) + o + pd - pc
+        prior = be.prior_unclosed_result(conn, company_id, day)
+        assets, liab, eq = N.get("asset", 0), -N.get("liability", 0), -N.get("equity", 0)
+        result = -(N.get("revenue", 0) + N.get("cogs", 0) + N.get("expense", 0))
+        ok = assets == liab + eq + result - prior
+        checks.append(_c("الأصول = الخصوم + حقوق الملكية + صافي النتيجة", "pass" if ok else "fail",
+                         f"أصول={assets} خصوم={liab} ملكية={eq} نتيجة السنة={result} نتيجة سابقة غير مقفلة={-prior}"))
+
+    grp = conn.execute(f"SELECT DISTINCT a.code FROM journal_lines l JOIN journal_entries e ON e.id=l.entry_id "
+                       f"JOIN accounts a ON a.id=l.account_id WHERE e.company_id=? AND e.status IN {P} AND a.is_group=1",
+                       (company_id,)).fetchall()
+    checks.append(_c("لا حركات مباشرة على حسابات تجميعية", "pass" if not grp else "fail", ",".join(r[0] for r in grp)))
+
+    gaps = []
+    for (yid,) in conn.execute("SELECT DISTINCT fiscal_year_id FROM journal_entries WHERE company_id=? AND posted_no IS NOT NULL", (company_id,)):
+        mx, n = conn.execute("SELECT MAX(posted_no),COUNT(*) FROM journal_entries WHERE company_id=? AND fiscal_year_id=? AND posted_no IS NOT NULL",
+                             (company_id, yid)).fetchone()
+        if mx != n:
+            gaps.append(yid)
+    checks.append(_c("تسلسل الأرقام الرسمية للقيود بلا فجوات", "pass" if not gaps else "fail", f"سنوات بها فجوات: {gaps}" if gaps else ""))
+
+    rev = conn.execute("SELECT o.id FROM journal_entries o WHERE o.company_id=? AND o.status='reversed' AND NOT EXISTS("
+                       "SELECT 1 FROM journal_entries r WHERE r.reverses_entry_id=o.id AND r.status='posted' AND r.entry_type='reversal')",
+                       (company_id,)).fetchall()
+    bad_net = conn.execute(
+        "SELECT o.id FROM journal_entries o JOIN journal_entries r ON r.reverses_entry_id=o.id AND r.status='posted' "
+        "WHERE o.company_id=? AND o.status='reversed' AND (SELECT COALESCE(SUM(debit_base-credit_base),0) FROM journal_lines WHERE entry_id=o.id) "
+        "+ (SELECT COALESCE(SUM(debit_base-credit_base),0) FROM journal_lines WHERE entry_id=r.id) <> 0", (company_id,)).fetchall()
+    ok = not rev and not bad_net
+    checks.append(_c("كل قيد معكوس له قيد عكسي مرحّل وصافي أثرهما صفر", "pass" if ok else "fail",
+                     f"بلا قيد عكسي: {[r[0] for r in rev]} أثر غير صفري: {[r[0] for r in bad_net]}" if not ok else ""))
+
+    # اتساق التجميع: نتيجة المحرك مقابل حساب مستقل بـ CTE لكل حساب تجميعي
+    mism = []
+    if day:
+        ys = be.year_start(conn, company_id, day)
+        accs = be.load_accounts(conn, company_id)
+        tot = be.aggregate(accs, be.movements(conn, company_id, ys, day, ys))
+        for a in accs.values():
+            if a["is_group"]:
+                ids = be.subtree_ids(conn, a["id"])
+                m = be.movements(conn, company_id, ys, day, ys, None, None, ids)
+                exp = [sum(v[i] for v in m.values()) for i in range(3)]
+                if exp != tot[a["id"]]:
+                    mism.append(a["code"])
+        checks.append(_c("رصيد كل حساب تجميعي = مجموع أبنائه (حساب مستقل)", "pass" if not mism else "fail", ",".join(mism)))
+    from alhisabat.accounting import opening_engine as oe
+    bad_open = []
+    opened = 0
+    for y in conn.execute("SELECT * FROM fiscal_years WHERE company_id=? ORDER BY start_date", (company_id,)).fetchall():
+        e = oe._active_opening(conn, company_id, y["id"], ("posted",))
+        prev = oe.prior_year_of(conn, company_id, y) if e else None
+        if e and prev and prev["status"] == "closed":
+            opened += 1
+            if any(r["diff_orig"] or r["diff_base"] for r in oe.compare(conn, company_id, prev, e["id"])):
+                bad_open.append(y["name"])
+    if opened:
+        checks.append(_c("قيد الافتتاح = أرصدة ختام السنة السابقة (لكل حساب/عملة)", "pass" if not bad_open else "fail", ",".join(bad_open)))
+    closed = conn.execute("SELECT * FROM fiscal_years WHERE company_id=? AND status='closed'", (company_id,)).fetchall()
+    if closed:
+        bad = []
+        for y in closed:
+            temp = conn.execute(f"SELECT COUNT(*) FROM (SELECT 1 FROM journal_lines l JOIN journal_entries e ON e.id=l.entry_id "
+                                f"JOIN accounts a ON a.id=l.account_id WHERE e.fiscal_year_id=? AND e.status IN {P} AND a.account_type NOT IN {be.PERM_SQL} "
+                                f"GROUP BY l.account_id HAVING SUM(l.debit_base-l.credit_base)<>0)", (y["id"],)).fetchone()[0]
+            drafts = conn.execute("SELECT COUNT(*) FROM journal_entries WHERE fiscal_year_id=? AND status='draft'", (y["id"],)).fetchone()[0]
+            openp = conn.execute("SELECT COUNT(*) FROM fiscal_periods WHERE fiscal_year_id=? AND status='open'", (y["id"],)).fetchone()[0]
+            rec = conn.execute("SELECT COUNT(*) FROM year_closings WHERE fiscal_year_id=? AND status='active'", (y["id"],)).fetchone()[0]
+            if temp or drafts or openp or not rec:
+                bad.append(f"{y['name']}(مؤقتة={temp},مسودات={drafts},فترات مفتوحة={openp},سجل إقفال={rec})")
+        checks.append(_c("السنوات المقفلة: حساباتها المؤقتة مصفّرة، بلا مسودات، فتراتها مقفلة، ولها سجل إقفال", "pass" if not bad else "fail", ";".join(bad)))
+    checks.extend(_sales_checks(conn, company_id))
+    checks.extend(_purchase_checks(conn, company_id))
+    checks.extend(_cash_checks(conn, company_id, day))
+    checks.extend(_asset_checks(conn, company_id, day))
+    checks.extend(_payroll_checks(conn, company_id))
+    ctl = _control_checks(conn, company_id, day) if day else None
+    if ctl is None:
+        checks.append(_c("رصيد الحساب الرقابي = مجموع الحسابات التابعة (العملاء/الموردون)", "not_checked",
+                         "غير منفذ: الحسابات الرقابية للعملاء/الموردين غير مربوطة (Account Mapping)"))
+    else:
+        checks.extend(ctl)
+    if day and ir.applicable(conn, company_id):
+        rc = ir.reconcile(conn, company_id, day)
+        bad_rows = [f"{r['code']}: تشغيلي={r['operational']} محاسبي={r['accounting']}" for r in rc["rows"] if r["diff"]]
+        checks.append(_c("رصيد المخزون المحاسبي = رصيد المخزون التشغيلي", "pass" if rc["ok"] else "fail",
+                         "؛ ".join(bad_rows) + (f" (حركات بلا قيد مرتبط: {rc['unlinked_movements']})" if bad_rows and rc["unlinked_movements"] else "")))
+        vc = ir.verify_cache(conn, company_id)
+        checks.append(_c("أرصدة المخزون المخزنة = مجموع الحركات", "pass" if not vc else "fail", f"{len(vc)} صنف/مستودع بفرق" if vc else ""))
+    else:
+        checks.append(_c("رصيد المخزون المحاسبي = رصيد المخزون التشغيلي", "not_checked", "لا توجد أصناف مخزنية بعد"))
+
+    prior = be.prior_unclosed_result(conn, company_id, day) if day else 0
+    return {"ok": all(x["status"] != "fail" for x in checks), "checks": checks,
+            "unclosed_prior_result": prior,
+            "notes": ["توجد نتيجة سنوات سابقة غير مقفلة (يعالجها إقفال السنة في Gate 06)"] if prior else []}

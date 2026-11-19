@@ -1,0 +1,152 @@
+DROP TRIGGER jl_ins_rules;
+
+-- ===== توسيع الأطراف لتشمل الموظف (حساب مستحقات رواتب، دفعات عبر نفس آلية سندات الدفع) =====
+CREATE TABLE parties_new(
+  id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id),
+  kind TEXT NOT NULL CHECK(kind IN ('customer','supplier','employee')),
+  seq INTEGER NOT NULL CHECK(seq>0), code TEXT NOT NULL, name TEXT NOT NULL CHECK(length(trim(name))>0),
+  phone TEXT NOT NULL DEFAULT '', email TEXT NOT NULL DEFAULT '', address TEXT NOT NULL DEFAULT '',
+  tax_no TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '',
+  account_id INTEGER NOT NULL UNIQUE REFERENCES accounts(id),
+  default_currency TEXT NOT NULL DEFAULT 'SAR' REFERENCES currencies(code),
+  credit_limit INTEGER NOT NULL DEFAULT 0 CHECK(credit_limit>=0),
+  payment_terms_days INTEGER NOT NULL DEFAULT 0 CHECK(payment_terms_days BETWEEN 0 AND 3650),
+  is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
+  created_by INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(company_id,kind,seq), UNIQUE(company_id,kind,code));
+INSERT INTO parties_new SELECT * FROM parties;
+DROP TABLE parties;
+ALTER TABLE parties_new RENAME TO parties;
+CREATE UNIQUE INDEX ux_parties_name ON parties(company_id,kind,name COLLATE NOCASE);
+CREATE INDEX ix_parties_phone ON parties(company_id,phone);
+CREATE TRIGGER party_immutable BEFORE UPDATE OF account_id,kind,company_id,code,seq ON parties BEGIN
+  SELECT RAISE(ABORT,'لا يمكن تغيير حساب الطرف أو نوعه أو رقمه: الرصيد نتيجة للعمليات');
+END;
+CREATE TRIGGER party_ins_rules BEFORE INSERT ON parties BEGIN
+  SELECT RAISE(ABORT,'حساب الطرف غير صالح (نوع الحساب لا يطابق نوع الطرف أو الحساب تجميعي أو من شركة أخرى)')
+   WHERE NOT EXISTS(SELECT 1 FROM accounts a WHERE a.id=NEW.account_id AND a.company_id=NEW.company_id AND a.is_group=0
+      AND a.account_type=CASE NEW.kind WHEN 'customer' THEN 'asset' ELSE 'liability' END);
+END;
+CREATE TRIGGER party_no_delete BEFORE DELETE ON parties BEGIN
+  SELECT RAISE(ABORT,'لا يمكن حذف طرف له حركات: استخدم التعطيل')
+   WHERE EXISTS(SELECT 1 FROM journal_lines WHERE account_id=OLD.account_id);
+END;
+
+CREATE TABLE employees(
+  party_id INTEGER PRIMARY KEY REFERENCES parties(id),
+  hire_date TEXT NOT NULL, job_title TEXT NOT NULL DEFAULT '',
+  base_salary_minor INTEGER NOT NULL CHECK(base_salary_minor>=0),
+  is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)));
+
+-- ===== مفاتيح ربط جديدة =====
+CREATE TABLE account_mappings_new(
+  company_id INTEGER NOT NULL REFERENCES companies(id),
+  map_key TEXT NOT NULL CHECK(map_key IN ('customers','suppliers','inventory','sales','cogs','cash','bank',
+      'retained_earnings','period_result','fx_differences','inventory_adjustment','sales_discount','sales_returns',
+      'cash_difference','employees','payroll_expense','payroll_deductions','accum_depreciation','depreciation_expense',
+      'disposal_gain_loss')),
+  account_id INTEGER NOT NULL REFERENCES accounts(id),
+  PRIMARY KEY(company_id,map_key));
+INSERT INTO account_mappings_new SELECT company_id,map_key,account_id FROM account_mappings;
+DROP TABLE account_mappings;
+ALTER TABLE account_mappings_new RENAME TO account_mappings;
+CREATE TRIGGER jl_ins_rules BEFORE INSERT ON journal_lines BEGIN
+  SELECT RAISE(ABORT,'لا يمكن إضافة سطر إلى قيد غير مسودة')
+   WHERE (SELECT status FROM journal_entries WHERE id=NEW.entry_id)<>'draft';
+  SELECT RAISE(ABORT,'القيد تحت المراجعة أو معتمد: أعده إلى المسودة قبل التعديل')
+   WHERE (SELECT workflow_state FROM journal_entries WHERE id=NEW.entry_id)<>'draft';
+  SELECT RAISE(ABORT,'الحساب غير موجود أو غير نشط أو تجميعي: لا تقبل الحركة')
+   WHERE NOT EXISTS(SELECT 1 FROM accounts a JOIN journal_entries e ON e.id=NEW.entry_id
+      WHERE a.id=NEW.account_id AND a.is_group=0 AND a.company_id=e.company_id
+        AND (a.is_active=1 OR e.entry_type IN ('reversal','closing','opening')));
+  SELECT RAISE(ABORT,'قيد الافتتاح يقبل حسابات الميزانية فقط (أصول/خصوم/حقوق ملكية)')
+   WHERE (SELECT entry_type FROM journal_entries WHERE id=NEW.entry_id)='opening'
+     AND (SELECT account_type FROM accounts WHERE id=NEW.account_id) NOT IN ('asset','liability','equity');
+  SELECT RAISE(ABORT,'حسابات العملاء والموردين والموظفين والمخزون لا تقبل قيدا يدويا عاديا: استخدم المستند المناسب أو قيد تسوية')
+   WHERE (SELECT entry_type FROM journal_entries WHERE id=NEW.entry_id)='general'
+     AND (EXISTS(SELECT 1 FROM parties WHERE account_id=NEW.account_id)
+          OR EXISTS(SELECT 1 FROM account_mappings m WHERE m.account_id=NEW.account_id AND m.map_key='inventory')
+          OR EXISTS(SELECT 1 FROM items WHERE inventory_account_id=NEW.account_id));
+  SELECT RAISE(ABORT,'مركز التكلفة غير صالح (غير موجود أو غير نشط أو تجميعي أو من شركة أخرى)')
+   WHERE NEW.cost_center_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM cost_centers cc JOIN journal_entries e ON e.id=NEW.entry_id
+      WHERE cc.id=NEW.cost_center_id AND cc.is_active=1 AND cc.is_group=0 AND cc.company_id=e.company_id);
+  SELECT RAISE(ABORT,'هذا الحساب يتطلب مركز تكلفة')
+   WHERE NEW.cost_center_id IS NULL AND EXISTS(SELECT 1 FROM accounts a WHERE a.id=NEW.account_id AND a.requires_cost_center=1);
+END;
+
+-- ===== الأصول الثابتة: كل أصل له حساب تكلفة وحساب مجمع إهلاك خاصان به (دفتر تفصيلي تحت حساب رقابي) =====
+CREATE TABLE fixed_assets(
+  id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id),
+  code TEXT NOT NULL, name TEXT NOT NULL CHECK(length(trim(name))>0), category TEXT NOT NULL DEFAULT '',
+  cost_account_id INTEGER NOT NULL UNIQUE REFERENCES accounts(id),
+  accum_depr_account_id INTEGER NOT NULL UNIQUE REFERENCES accounts(id),
+  acquisition_date TEXT NOT NULL, cost_minor INTEGER NOT NULL CHECK(cost_minor>0),
+  salvage_value_minor INTEGER NOT NULL DEFAULT 0 CHECK(salvage_value_minor>=0),
+  useful_life_months INTEGER NOT NULL CHECK(useful_life_months>0),
+  method TEXT NOT NULL DEFAULT 'straight_line' CHECK(method='straight_line'),
+  status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','disposed')),
+  disposal_date TEXT, disposal_proceeds_minor INTEGER, disposal_entry_id INTEGER REFERENCES journal_entries(id),
+  acquisition_entry_id INTEGER REFERENCES journal_entries(id),
+  created_by INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(company_id,code), CHECK(salvage_value_minor<cost_minor));
+CREATE TRIGGER fa_immutable BEFORE UPDATE OF cost_account_id,accum_depr_account_id,cost_minor,salvage_value_minor,useful_life_months,acquisition_date ON fixed_assets
+WHEN NEW.acquisition_entry_id IS NOT NULL BEGIN
+  SELECT RAISE(ABORT,'لا يمكن تغيير بيانات أصل بعد تسجيل قيد الاقتناء');
+END;
+CREATE TRIGGER fa_no_delete BEFORE DELETE ON fixed_assets BEGIN
+  SELECT RAISE(ABORT,'لا يمكن حذف أصل له حركات: الأصول لا تُحذف') WHERE EXISTS(SELECT 1 FROM journal_lines WHERE account_id IN (OLD.cost_account_id,OLD.accum_depr_account_id));
+END;
+
+CREATE TABLE asset_depreciation_runs(
+  id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), run_date TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','posted','cancelled')),
+  journal_entry_id INTEGER REFERENCES journal_entries(id),
+  created_by INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  posted_by INTEGER REFERENCES users(id), posted_at TEXT,
+  cancelled_by INTEGER REFERENCES users(id), cancelled_at TEXT, cancel_reason TEXT, cancel_entry_id INTEGER REFERENCES journal_entries(id),
+  UNIQUE(company_id,run_date));
+CREATE TABLE asset_depreciation_lines(
+  run_id INTEGER NOT NULL REFERENCES asset_depreciation_runs(id), asset_id INTEGER NOT NULL REFERENCES fixed_assets(id),
+  amount_minor INTEGER NOT NULL CHECK(amount_minor>0), PRIMARY KEY(run_id,asset_id));
+CREATE TRIGGER adr_no_delete BEFORE DELETE ON asset_depreciation_runs WHEN OLD.status<>'draft' BEGIN
+  SELECT RAISE(ABORT,'لا يحذف تشغيل إهلاك مرحّل: يُلغى بقيد عكسي'); END;
+CREATE TRIGGER adr_upd_rules BEFORE UPDATE ON asset_depreciation_runs WHEN OLD.status<>'draft' BEGIN
+  SELECT RAISE(ABORT,'لا يمكن تعديل تشغيل إهلاك مرحّل أو ملغى: التصحيح بالإلغاء')
+   WHERE NOT (OLD.status='posted' AND NEW.status='cancelled' AND NEW.run_date=OLD.run_date AND NEW.journal_entry_id IS OLD.journal_entry_id
+     AND NEW.cancel_reason IS NOT NULL AND length(trim(NEW.cancel_reason))>0);
+END;
+
+-- ===== الرواتب =====
+CREATE TABLE payroll_runs(
+  id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), period_month TEXT NOT NULL,
+  pay_date TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','posted','cancelled')),
+  journal_entry_id INTEGER REFERENCES journal_entries(id),
+  created_by INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  posted_by INTEGER REFERENCES users(id), posted_at TEXT,
+  cancelled_by INTEGER REFERENCES users(id), cancelled_at TEXT, cancel_reason TEXT, cancel_entry_id INTEGER REFERENCES journal_entries(id),
+  UNIQUE(company_id,period_month));
+CREATE TABLE payroll_lines(
+  id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES payroll_runs(id), employee_id INTEGER NOT NULL REFERENCES parties(id),
+  basic_minor INTEGER NOT NULL CHECK(basic_minor>=0), allowances_minor INTEGER NOT NULL DEFAULT 0 CHECK(allowances_minor>=0),
+  deductions_minor INTEGER NOT NULL DEFAULT 0 CHECK(deductions_minor>=0), net_minor INTEGER NOT NULL CHECK(net_minor>=0),
+  UNIQUE(run_id,employee_id), CHECK(net_minor=basic_minor+allowances_minor-deductions_minor));
+CREATE TRIGGER pl2_lock_ins BEFORE INSERT ON payroll_lines
+WHEN (SELECT status FROM payroll_runs WHERE id=NEW.run_id)<>'draft' BEGIN SELECT RAISE(ABORT,'مسير الرواتب مرحّل: لا يمكن تعديل بنوده'); END;
+CREATE TRIGGER pl2_lock_del BEFORE DELETE ON payroll_lines
+WHEN (SELECT status FROM payroll_runs WHERE id=OLD.run_id)<>'draft' BEGIN SELECT RAISE(ABORT,'مسير الرواتب مرحّل: لا يمكن تعديل بنوده'); END;
+CREATE TRIGGER pr_no_delete BEFORE DELETE ON payroll_runs WHEN OLD.status<>'draft' BEGIN SELECT RAISE(ABORT,'لا يحذف مسير مرحّل: يُلغى بقيد عكسي'); END;
+CREATE TRIGGER pr_upd_rules BEFORE UPDATE ON payroll_runs WHEN OLD.status<>'draft' BEGIN
+  SELECT RAISE(ABORT,'لا يمكن تعديل مسير مرحّل أو ملغى: التصحيح بالإلغاء')
+   WHERE NOT (OLD.status='posted' AND NEW.status='cancelled' AND NEW.period_month=OLD.period_month AND NEW.journal_entry_id IS OLD.journal_entry_id
+     AND NEW.cancel_reason IS NOT NULL AND length(trim(NEW.cancel_reason))>0);
+END;
+
+INSERT INTO permissions(code,name_ar,is_sensitive) VALUES
+ ('employee.view','عرض الموظفين',0),('employee.manage','إدارة بيانات الموظفين',1),
+ ('payroll.run','إعداد وترحيل مسير الرواتب',1),('payroll.cancel','إلغاء مسير رواتب',1),
+ ('asset.view','عرض الأصول الثابتة',0),('asset.manage','إدارة الأصول الثابتة',0),
+ ('asset.depreciate','ترحيل إهلاك الأصول',1),('asset.dispose','استبعاد أصل ثابت',1);
+INSERT INTO role_permissions SELECT r.id,'employee.view' FROM roles r WHERE r.id IN (1,2,3,4);
+INSERT INTO role_permissions SELECT r.id,p.code FROM roles r, permissions p WHERE r.id IN (1,2) AND p.code IN
+ ('employee.manage','payroll.run','payroll.cancel','asset.manage','asset.depreciate','asset.dispose');
+INSERT INTO role_permissions SELECT r.id,'asset.view' FROM roles r WHERE r.id IN (1,2,3,4);

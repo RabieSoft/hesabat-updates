@@ -1,0 +1,249 @@
+"""ربط الهاتف: تشغيل خدمة المزامنة من داخل البرنامج، رمز QR للاقتران، وإدارة الأجهزة المقترنة (بلا كونسول)."""
+import io
+
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QPixmap
+from PySide6.QtWidgets import (
+    QComboBox, QDialog, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMessageBox, QPushButton, QSpinBox, QVBoxLayout
+)
+
+from alhisabat.sync_api import SyncService
+from alhisabat.sync_api.runner import candidate_addresses, get_runner
+from alhisabat.ui.components.datagrid import DataGrid
+from alhisabat.ui.components.grid_logic import Column
+from alhisabat.ui.core.actions import Action, ActionGroup
+from alhisabat.ui.core.base_page import BasePage
+from alhisabat.ui.core.permissions import ActionState
+
+PAIR_MINUTES = 10
+
+
+def qr_pixmap(payload):
+    """QPixmap لرمز QR، أو None إذا لم تُثبَّت مكتبة qrcode."""
+    try:
+        import qrcode
+    except ImportError:
+        return None
+    buf = io.BytesIO()
+    qrcode.make(payload, box_size=8, border=4).convert("RGB").save(buf, format="PNG")   # خلفية بيضاء + هامش هادئ ليُقرأ الرمز دائمًا
+    pm = QPixmap()
+    pm.loadFromData(buf.getvalue())
+    return pm
+
+
+class QrDialog(QDialog):
+    """نافذة منبثقة تعرض رمز QR وتراقب الأجهزة: تُغلق تلقائيًا عند ظهور جهاز جديد (اكتمل الربط) أو عند انتهاء المدة."""
+
+    def __init__(self, parent, title, pixmap, info_text, list_devices, expire_minutes=None):
+        super().__init__(parent)
+        self.setWindowTitle(title); self.setModal(True); self.setLayoutDirection(Qt.RightToLeft)
+        self.setMinimumWidth(420)
+        self.paired_name = None
+        self._list_devices = list_devices
+        self._baseline = {d['id'] for d in list_devices()}
+        lay = QVBoxLayout(self)
+        self.qr = QLabel(); self.qr.setAlignment(Qt.AlignCenter)
+        self.qr.setStyleSheet('background:#FFFFFF; border:1px solid #C9D3E3; border-radius:8px;')
+        if pixmap is not None:
+            self.qr.setFixedSize(320, 320)
+            self.qr.setPixmap(pixmap.scaled(300, 300, Qt.KeepAspectRatio, Qt.FastTransformation))
+        else:
+            self.qr.setText('لعرض رمز QR ثبّت مرة واحدة: pip install qrcode (ثم أعد فتح البرنامج).')
+            self.qr.setWordWrap(True); self.qr.setMinimumHeight(120)
+        lay.addWidget(self.qr, 0, Qt.AlignHCenter)
+        self.info = QLabel(info_text); self.info.setWordWrap(True)
+        self.info.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        lay.addWidget(self.info)
+        self.state = QLabel('بانتظار الاقتران…'); self.state.setAlignment(Qt.AlignCenter)
+        self.state.setStyleSheet('font-weight:bold; color:#8A5A00;')
+        lay.addWidget(self.state)
+        btn = QPushButton('إغلاق'); btn.clicked.connect(self.reject)
+        lay.addWidget(btn, 0, Qt.AlignHCenter)
+        self._timer = QTimer(self); self._timer.setInterval(1500); self._timer.timeout.connect(self._check); self._timer.start()
+        if expire_minutes:
+            QTimer.singleShot(int(expire_minutes * 60 * 1000), self._expired)
+
+    def _check(self):
+        try:
+            rows = self._list_devices()
+        except Exception:
+            return
+        new = [r for r in rows if r['id'] not in self._baseline and not r.get('revoked_at')]
+        if new:
+            self._timer.stop()
+            self.paired_name = new[-1]['name']
+            self.state.setText(f'✔ تم ربط الجهاز «{self.paired_name}» بنجاح')
+            self.state.setStyleSheet('font-weight:bold; color:#1B7A4B;')
+            QTimer.singleShot(900, self.accept)
+
+    def _expired(self):
+        if self.isVisible() and self.paired_name is None:
+            self._timer.stop(); self.reject()
+
+    def done(self, result):
+        self._timer.stop()
+        super().done(result)
+
+
+class MobileLinkPage(BasePage):
+    key = 'mobile_link'; title = 'ربط الهاتف (أندرويد)'; icon = 'settings'; required_permission = 'settings.manage'
+
+    def build(self):
+        self.svc = SyncService(self.session.db_path)
+        self.runner = get_runner(self.session.db_path)
+        self._sel = None
+        lay = QVBoxLayout(self); lay.setContentsMargins(10, 10, 10, 10)
+
+        # ---- 1) الخدمة
+        g1 = QGroupBox('1) خدمة المزامنة'); l1 = QVBoxLayout(g1)
+        self.status = QLabel(); self.status.setStyleSheet('font-weight:bold;')
+        l1.addWidget(self.status)
+        row = QHBoxLayout()
+        row.addWidget(QLabel('العنوان:'))
+        self.addr = QComboBox()
+        for ip, label in candidate_addresses():
+            self.addr.addItem(f'{ip} — {label}', ip)
+        self.addr.setMinimumWidth(280)
+        row.addWidget(self.addr)
+        row.addWidget(QLabel('المنفذ:'))
+        self.port = QSpinBox(); self.port.setRange(1024, 65535); self.port.setValue(8765)
+        row.addWidget(self.port)
+        self.btn_toggle = QPushButton(); self.btn_toggle.clicked.connect(self._toggle)
+        row.addWidget(self.btn_toggle); row.addStretch(1)
+        l1.addLayout(row)
+        self.hint = QLabel(); self.hint.setWordWrap(True); l1.addWidget(self.hint)
+        lay.addWidget(g1)
+
+        # ---- 2) اقتران
+        g2 = QGroupBox('2) ربط هاتف جديد (المستخدمون يدخلون من الهاتف بأسمائهم وكلمات مرورهم)'); l2 = QVBoxLayout(g2)
+        brow = QHBoxLayout(); brow.addStretch(1)
+        self.btn_url = QPushButton('عرض رمز عنوان الخدمة (لتسجيل الدخول)'); self.btn_url.clicked.connect(self._show_url)
+        self.btn_pair = QPushButton('إنشاء رمز اقتران (طريقة قديمة)'); self.btn_pair.clicked.connect(self._pair)
+        brow.addWidget(self.btn_url); brow.addWidget(self.btn_pair)
+        l2.addLayout(brow)
+        self.pair_info = QLabel(); self.pair_info.setWordWrap(True); self.pair_info.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        l2.addWidget(self.pair_info)
+        lay.addWidget(g2)
+
+        # ---- 3) الأجهزة
+        g3 = QGroupBox('3) الأجهزة والجلسات'); l3 = QVBoxLayout(g3)
+        self.grid = DataGrid([Column('name', 'الجهاز', width=150), Column('user_label', 'المستخدم', width=140), Column('kind_ar', 'نوع الجلسة', width=90),
+                              Column('branch_id', 'الفرع', width=60), Column('created_at', 'تاريخ الاقتران', width=140),
+                              Column('last_seen_at', 'آخر ظهور', width=140), Column('status', 'الحالة', width=80)], grid_id='mobile_devices')
+        self.grid.selectionChangedRows.connect(lambda rows: (setattr(self, '_sel', rows[0] if len(rows) == 1 else None), self.actions_changed.emit()))
+        l3.addWidget(self.grid, 1)
+        self.btn_revoke = QPushButton('إنهاء جلسة الجهاز المحدد'); self.btn_revoke.clicked.connect(self._revoke)
+        l3.addWidget(self.btn_revoke, 0, Qt.AlignRight)
+        lay.addWidget(g3, 1)
+
+        self._poll = QTimer(self); self._poll.setInterval(2000)
+        self._poll.timeout.connect(lambda: self.isVisible() and self._load_devices())
+        self._poll.start()
+        self._sync_server_ui()
+
+    # ------------------------------------------------------------------ الخدمة
+    def _sync_server_ui(self):
+        up = self.runner.running
+        self.status.setText(f'الخدمة تعمل — رابط الهاتف: {self.runner.url}' if up else 'الخدمة متوقفة')
+        self.status.setStyleSheet('font-weight:bold; color:%s;' % ('#1B7A4B' if up else '#8A5A00'))
+        self.btn_toggle.setText('إيقاف الخدمة' if up else 'تشغيل الخدمة')
+        self.addr.setEnabled(not up); self.port.setEnabled(not up)
+        has_ts = any('Tailscale' in self.addr.itemText(i) for i in range(self.addr.count()))
+        self.hint.setText(
+            ('الهاتف يتصل ما دامت الخدمة تعمل وبرنامج المكتبي مفتوحًا. ' if up else '')
+            + ('' if has_ts else 'لم يُكتشف Tailscale على هذا الحاسوب؛ ثبّته وسجّل الدخول، ثم أعد فتح هذه الصفحة (أو اختر عنوان الشبكة المحلية إن كان الهاتف على نفس الواي فاي). ')
+            + 'عند أول تشغيل قد يسأل ويندوز عن السماح بالاتصال: وافق.')
+        self.actions_changed.emit()
+
+    def _toggle(self):
+        if self.runner.running:
+            self.runner.stop()
+        else:
+            try:
+                self.runner.start(self.addr.currentData(), self.port.value())
+            except Exception as e:
+                QMessageBox.warning(self, self.title, str(e))
+        self._sync_server_ui()
+
+    # ------------------------------------------------------------------ الدخول بالمستخدم
+    def _show_url(self):
+        """QR لعنوان الخدمة فقط: يمسحه الهاتف في شاشة الدخول ثم يدخل المستخدم باسمه وكلمة مروره (المنشأَين في إدارة المستخدمين)."""
+        if not self.runner.running:
+            return QMessageBox.information(self, self.title, 'شغّل الخدمة أولًا.')
+        url = self.runner.url
+        info = (f'في تطبيق الهاتف: اضغط «مسح عنوان الخادم» أو اكتب العنوان:\n{url}\n'
+                'ثم يدخل كل مستخدم باسم المستخدم وكلمة المرور من «إدارة المستخدمين».')
+        self._open_qr('عنوان الخدمة (تسجيل الدخول)', self.svc.qr_payload(None, url), info)
+
+    # ------------------------------------------------------------------ الاقتران
+    def _pair(self):
+        if not self.runner.running:
+            return QMessageBox.information(self, self.title, 'شغّل الخدمة أولًا ثم أنشئ رمز الاقتران.')
+        user = self.session.username()           # الاسم الظاهر (للعرض فقط)
+        login = self.session.login_name()        # اسم الدخول الحقيقي: هو الذي يُتحقق به من كلمة المرور
+        pw, ok = QInputDialog.getText(self, 'تأكيد الهوية', f'أدخل كلمة مرور «{user}» لإنشاء رمز الاقتران:', QLineEdit.Password)
+        if not ok:
+            return
+        if not pw:
+            return QMessageBox.information(self, self.title, 'أدخل كلمة المرور لإنشاء رمز الاقتران.')
+        try:
+            baseline = {d['id'] for d in self.svc.list_devices()}
+            r = self.svc.create_pairing(login, pw, company_id=self.session.company_id, branch_id=self.session.branch_id)
+        except Exception as e:
+            return self.show_error(e)
+        url = self.runner.url
+        info = (f'في تطبيق الهاتف اضغط «مسح رمز QR من المكتبي» ووجّه الكاميرا نحو الرمز.\nالعنوان: {url}\nالرمز: {r["code"]}\n'
+                f'صالح {PAIR_MINUTES} دقائق ولمرة واحدة. الفرع: {r.get("branch", "")}')
+        self._open_qr('اقتران هاتف جديد', self.svc.qr_payload(r['code'], url), info, PAIR_MINUTES)
+
+    def _open_qr(self, title, payload, info, expire_minutes=None):
+        """يعرض الرمز في نافذة منبثقة؛ تُغلق تلقائيًا عند اكتمال الربط ثم يُحدَّث جدول الأجهزة."""
+        dlg = QrDialog(self, title, qr_pixmap(payload), info, self.svc.list_devices, expire_minutes)
+        self.exec_form(dlg)
+        if dlg.paired_name:
+            self.pair_info.setText(f'✔ تم ربط الجهاز «{dlg.paired_name}» بنجاح.')
+        self._load_devices()
+
+    # ------------------------------------------------------------------ الأجهزة
+    def _load_devices(self):
+        keep = self._sel['id'] if self._sel else None
+        try:
+            rows = self.svc.list_devices()
+        except Exception as e:
+            return self.show_error(e)
+        for r in rows:
+            r['status'] = 'ملغى' if r.get('revoked_at') else 'فعّال'
+            r['user_label'] = f"{r.get('full_name') or r['username']} ({r['username']})"
+            r['kind_ar'] = 'دخول مستخدم' if r.get('auth_kind') == 'login' else 'اقتران برمز'
+        self.grid.set_rows(rows)
+        if keep is not None:
+            self.grid.select_where(lambda r: r['id'] == keep)
+
+    def _revoke(self):
+        if not self._sel:
+            return QMessageBox.information(self, self.title, 'حدد جهازًا من القائمة.')
+        if self._sel.get('revoked_at'):
+            return QMessageBox.information(self, self.title, 'هذا الجهاز ملغى الربط أصلًا.')
+        if QMessageBox.question(self, 'إلغاء الربط', f"إلغاء ربط «{self._sel['name']}»؟ سيتوقف عن المزامنة فورًا.",
+                                QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+        try:
+            self.svc.revoke_device(self._sel['id'], actor_id=self.session.user_id)
+        except Exception as e:
+            return self.show_error(e)
+        self._load_devices()
+
+    # ------------------------------------------------------------------ الصفحة
+    def refresh(self):
+        if not getattr(self, '_built', False):
+            return
+        self._sync_server_ui()
+        self._load_devices()
+
+    def ribbon_groups(self):
+        up = lambda: ActionState(True) if self.runner.running else ActionState(False, 'شغّل الخدمة أولًا')   # noqa: E731
+        sel = lambda: ActionState(True) if self._sel and not self._sel.get('revoked_at') else ActionState(False, 'حدد جهازًا فعّالًا')   # noqa: E731
+        return [ActionGroup('الخدمة', [Action('toggle', 'تشغيل / إيقاف الخدمة', 'refresh', handler=self._toggle)]),
+                ActionGroup('الأجهزة', [Action('pair', 'إنشاء رمز اقتران', 'new', primary=True, state_fn=up, handler=self._pair),
+                                        Action('revoke', 'إلغاء ربط الجهاز', 'delete', danger=True, state_fn=sel, handler=self._revoke)]),
+                ActionGroup('عرض', [Action('refresh', 'تحديث', 'refresh', handler=self.refresh)])]

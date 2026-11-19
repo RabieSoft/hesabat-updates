@@ -1,0 +1,201 @@
+"""Opening Balance Engine: الأرصدة الافتتاحية وقيد الافتتاح الرسمي.
+- لا تُنسخ القيود ولا الإيرادات/المصروفات؛ فقط أرصدة الحسابات الدائمة (بالعملة الأصلية والأساسية) في قيد افتتاح واحد فعّال لكل سنة.
+- قيد الافتتاح يمر بدورة المسودة/المراجعة/الاعتماد/الترحيل المعتادة."""
+from collections import defaultdict
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.accounting import balance_engine as be, journal_engine as je
+from alhisabat.audit import audit
+from alhisabat.database.tx import transaction
+from alhisabat.security import permissions
+
+
+def _year(conn, company_id, year_id):
+    y = conn.execute("SELECT * FROM fiscal_years WHERE id=? AND company_id=?", (year_id, company_id)).fetchone()
+    if not y:
+        raise AccountingError("السنة المالية غير موجودة في هذه الشركة")
+    return y
+
+
+def previous_closing(conn, company_id, from_year):
+    """{(account_id, currency): (net_orig, net_base)} لأرصدة الحسابات الدائمة في نهاية from_year (تراعي أرضية الافتتاح)."""
+    fl = be.perm_floor(conn, company_id, from_year["start_date"])
+    rows = conn.execute(
+        f"SELECT l.account_id, l.currency, SUM(l.debit_orig-l.credit_orig) o, SUM(l.debit_base-l.credit_base) b "
+        f"FROM journal_lines l JOIN journal_entries e ON e.id=l.entry_id JOIN accounts a ON a.id=l.account_id "
+        f"WHERE e.company_id=? AND e.status IN {be.POSTED} AND a.account_type IN {be.PERM_SQL} "
+        f"AND e.entry_date>=? AND e.entry_date<=? AND (e.entry_type<>'opening' OR e.entry_date=?) "
+        f"AND NOT (e.entry_type='reversal' AND EXISTS(SELECT 1 FROM journal_entries o WHERE o.id=e.reverses_entry_id "
+        f"AND o.entry_type='opening' AND o.entry_date<>?)) "
+        f"GROUP BY l.account_id,l.currency HAVING o<>0 OR b<>0", (company_id, fl, from_year["end_date"], fl, fl)).fetchall()
+    return {(r["account_id"], r["currency"]): (r["o"], r["b"]) for r in rows}
+
+
+def entry_balances(conn, entry_id):
+    rows = conn.execute("SELECT account_id,currency,SUM(debit_orig-credit_orig) o,SUM(debit_base-credit_base) b "
+                        "FROM journal_lines WHERE entry_id=? GROUP BY account_id,currency", (entry_id,)).fetchall()
+    return {(r["account_id"], r["currency"]): (r["o"], r["b"]) for r in rows}
+
+
+def _active_opening(conn, company_id, year_id, statuses=("draft", "posted")):
+    q = ",".join("?" * len(statuses))
+    return conn.execute(f"SELECT * FROM journal_entries WHERE company_id=? AND fiscal_year_id=? AND entry_type='opening' "
+                        f"AND status IN ({q})", (company_id, year_id, *statuses)).fetchone()
+
+
+def existing_opening_keys(conn, company_id, year_id):
+    """{(account_id, currency)} الموجودة فعلًا في قيود الافتتاح الفعّالة (مسودة/مرحّلة) للسنة، لمنع تكرار رصيد الطرف بنفس العملة."""
+    return {(r[0], r[1]) for r in conn.execute(
+        "SELECT DISTINCT l.account_id, l.currency FROM journal_lines l JOIN journal_entries e ON e.id=l.entry_id "
+        "WHERE e.company_id=? AND e.fiscal_year_id=? AND e.entry_type='opening' AND e.status IN ('draft','posted')",
+        (company_id, year_id))}
+
+
+def prior_year_of(conn, company_id, year):
+    return conn.execute("SELECT * FROM fiscal_years WHERE company_id=? AND end_date=date(?,'-1 day')",
+                        (company_id, year["start_date"])).fetchone()
+
+
+def compare(conn, company_id, from_year, opening_entry_id):
+    """فروقات: رصيد ختام السنة السابقة مقابل قيد الافتتاح (لكل حساب/عملة)."""
+    prev, cur = previous_closing(conn, company_id, from_year), entry_balances(conn, opening_entry_id)
+    out = []
+    for key in sorted(set(prev) | set(cur)):
+        po, pb = prev.get(key, (0, 0)); co, cb = cur.get(key, (0, 0))
+        out.append({"account_id": key[0], "currency": key[1], "previous_orig": po, "previous_base": pb,
+                    "opening_orig": co, "opening_base": cb, "diff_orig": co - po, "diff_base": cb - pb})
+    return out
+
+
+def opening_preview(conn, user_id, company_id, from_year_id, to_year_id):
+    """المواصفات §49: الحساب، رصيد السنة السابقة، الرصيد المرحّل (قيد الافتتاح)، والفرق — قبل الاعتماد."""
+    permissions.require(conn, user_id, company_id, "opening.manage", check_branch=False)
+    fy, ty = _year(conn, company_id, from_year_id), _year(conn, company_id, to_year_id)
+    e = _active_opening(conn, company_id, to_year_id)
+    rows = compare(conn, company_id, fy, e["id"]) if e else [
+        {"account_id": k[0], "currency": k[1], "previous_orig": v[0], "previous_base": v[1], "opening_orig": 0,
+         "opening_base": 0, "diff_orig": -v[0], "diff_base": -v[1]} for k, v in sorted(previous_closing(conn, company_id, fy).items())]
+    accs = be.load_accounts(conn, company_id)
+    for r in rows:
+        r["code"], r["name"] = accs[r["account_id"]]["code"], accs[r["account_id"]]["name"]
+    return {"from_year": fy["name"], "to_year": ty["name"], "opening_entry_id": e["id"] if e else None,
+            "opening_entry_status": e["status"] if e else None, "rows": rows,
+            "matches": bool(e) and all(r["diff_orig"] == 0 and r["diff_base"] == 0 for r in rows)}
+
+
+def generate_opening_entry(conn, user_id, company_id, from_year_id, to_year_id):
+    """يولّد مسودة قيد افتتاح للسنة to_year من أرصدة ختام from_year (المقفلة). الترحيل بعدها عبر الدورة المعتادة."""
+    permissions.require(conn, user_id, company_id, "opening.manage", check_branch=False)
+    fy, ty = _year(conn, company_id, from_year_id), _year(conn, company_id, to_year_id)
+    if prior_year_of(conn, company_id, ty) is None or prior_year_of(conn, company_id, ty)["id"] != fy["id"]:
+        raise AccountingError("السنة الجديدة يجب أن تبدأ في اليوم التالي لنهاية السنة السابقة مباشرة")
+    if fy["status"] != "closed":
+        raise AccountingError("السنة السابقة غير مقفلة: أقفلها أولا")
+    if conn.execute("SELECT COUNT(*) FROM fiscal_years WHERE company_id=? AND end_date<? AND status='open'",
+                    (company_id, fy["start_date"])).fetchone()[0]:
+        raise AccountingError("توجد سنوات أقدم غير مقفلة: أقفلها بالترتيب")
+    if ty["status"] != "open":
+        raise AccountingError("السنة الجديدة مقفلة")
+    if _active_opening(conn, company_id, to_year_id):
+        raise AccountingError("يوجد قيد افتتاح فعّال لهذه السنة: اعكسه أولا إن أردت إعادة التوليد")
+    temp = conn.execute(
+        f"SELECT COUNT(*) FROM (SELECT l.account_id FROM journal_lines l JOIN journal_entries e ON e.id=l.entry_id "
+        f"JOIN accounts a ON a.id=l.account_id WHERE e.company_id=? AND e.fiscal_year_id=? AND e.status IN {be.POSTED} "
+        f"AND a.account_type NOT IN {be.PERM_SQL} GROUP BY l.account_id HAVING SUM(l.debit_base-l.credit_base)<>0)",
+        (company_id, fy["id"])).fetchone()[0]
+    if temp:
+        raise AccountingError("الحسابات المؤقتة في السنة السابقة غير مصفّرة: أعد الإقفال")
+    base = conn.execute("SELECT base_currency FROM companies WHERE id=?", (company_id,)).fetchone()[0]
+    lines, accs = [], be.load_accounts(conn, company_id)
+    for (aid, cur), (no, nb) in sorted(previous_closing(conn, company_id, fy).items()):
+        if nb == 0:
+            raise AccountingError(f"رصيد الحساب {accs[aid]['code']} بعملة {cur}: قيمته الأساسية صفر وأصله غير صفري (يتطلب تسوية فروق عملة أولا)")
+        if no != 0 and (no > 0) != (nb > 0):
+            raise AccountingError(f"تعارض إشارة الرصيد الأصلي والأساسي للحساب {accs[aid]['code']} بعملة {cur}")
+        lines.append({"account_id": aid, "currency": cur, "side": "debit" if nb > 0 else "credit", "orig": abs(no), "base": abs(nb)})
+    if not lines:
+        raise AccountingError("لا توجد أرصدة دائمة لترحيلها")
+    if sum(l["base"] for l in lines if l["side"] == "debit") != sum(l["base"] for l in lines if l["side"] == "credit"):
+        raise AccountingError("أرصدة الحسابات الدائمة غير متوازنة: راجع سلامة السنة السابقة")
+    return je.create_draft_explicit(conn, company_id, user_id, ty["start_date"], lines,
+                                    f"قيد افتتاح سنة {ty['name']} من أرصدة ختام سنة {fy['name']}", "opening")
+
+
+def create_manual_opening(conn, user_id, company_id, year_id, lines, description="الأرصدة الافتتاحية الأولية", branch_id=None,
+                          allow_additional=False):
+    """للسنة الأولى فقط (لا توجد سنة سابقة). lines بنفس صيغة create_draft (debit/credit بالعملة الأصلية).
+    allow_additional=True: يسمح بقيود افتتاح إضافية في نفس السنة (دفعات استيراد: عملاء ثم موردون، أو عملة بعد عملة)؛
+    منع التكرار (نفس الطرف ونفس العملة) مسؤولية المستدعي، والمحرك لا يتأثر لأن أرصدة الافتتاح تُجمع كلها عند أرضية الافتتاح."""
+    permissions.require(conn, user_id, company_id, "opening.manage", check_branch=False)
+    ty = _year(conn, company_id, year_id)
+    if prior_year_of(conn, company_id, ty) is not None:
+        raise AccountingError("توجد سنة سابقة: ولّد الأرصدة الافتتاحية من إقفالها بدل الإدخال اليدوي")
+    if not allow_additional and _active_opening(conn, company_id, year_id):
+        raise AccountingError("يوجد قيد افتتاح فعّال لهذه السنة: اعكسه أولا إن أردت إعادة الإدخال")
+    return je.create_draft(conn, company_id, user_id, ty["start_date"], lines, description, branch_id=branch_id, entry_type="opening")
+
+
+# ───────────────────────── تقرير المطابقة والاعتماد الآمن وإعادة التوليد (V2.0.9) ─────────────────────────
+def inventory_opening_snapshot(conn, company_id, year):
+    """المخزون الافتتاحي بالكميات والقيم لكل (صنف، مستودع) عند بداية السنة (الحركات المخزنية مستمرة عبر السنوات ولا تُنسخ)."""
+    rows = conn.execute(
+        "SELECT mv.item_id, mv.warehouse_id, SUM(CASE mv.direction WHEN 'in' THEN mv.qty_milli ELSE -mv.qty_milli END) q, "
+        "SUM(CASE mv.direction WHEN 'in' THEN mv.value_base ELSE -mv.value_base END) v FROM stock_movements mv "
+        "WHERE mv.company_id=? AND mv.movement_date<? GROUP BY mv.item_id, mv.warehouse_id HAVING q<>0 OR v<>0",
+        (company_id, year["start_date"])).fetchall()
+    return {"rows": [dict(r) for r in rows], "qty_milli": sum(r["q"] for r in rows), "value_base": sum(r["v"] for r in rows)}
+
+
+def opening_report(conn, user_id, company_id, from_year_id, to_year_id):
+    """تقرير مطابقة واضح: لكل حساب/عملة الرصيد الختامي والافتتاحي والفرق، مع التوازن وإمكانية الاعتماد.
+    لا يسمح بالاعتماد (can_approve=False) إن وُجدت فروقات أو عدم توازن أو قيد غير موجود."""
+    pv = opening_preview(conn, user_id, company_id, from_year_id, to_year_id)
+    e = _active_opening(conn, company_id, to_year_id)
+    bal = None
+    if e:
+        d, c = conn.execute("SELECT COALESCE(SUM(debit_base),0),COALESCE(SUM(credit_base),0) FROM journal_lines WHERE entry_id=?", (e["id"],)).fetchone()
+        bal = {"debit": d, "credit": c, "balanced": d == c}
+    diffs = [r for r in pv["rows"] if r["diff_orig"] or r["diff_base"]]
+    ty = _year(conn, company_id, to_year_id)
+    inv = inventory_opening_snapshot(conn, company_id, ty)
+    inv_acc = None
+    m = conn.execute("SELECT account_id FROM account_mappings WHERE company_id=? AND map_key='inventory'", (company_id,)).fetchone()
+    if m and e:
+        r = conn.execute("SELECT COALESCE(SUM(debit_base-credit_base),0) FROM journal_lines WHERE entry_id=? AND account_id=?", (e["id"], m[0])).fetchone()
+        inv_acc = r[0]
+    return {**pv, "balance": bal, "diff_rows": diffs, "diff_count": len(diffs),
+            "inventory": {**inv, "opening_entry_value": inv_acc, "diff": None if inv_acc is None else inv["value_base"] - inv_acc},
+            "can_approve": bool(e) and bool(bal and bal["balanced"]) and not diffs}
+
+
+def post_opening_checked(conn, user_id, company_id, from_year_id, to_year_id, entry_id):
+    """يرحّل قيد الافتتاح فقط إن كان متوازنًا ومطابقًا تمامًا لأرصدة الختام (لا فروقات غير مبررة)."""
+    rep = opening_report(conn, user_id, company_id, from_year_id, to_year_id)
+    e = _active_opening(conn, company_id, to_year_id, ("draft",))
+    if not e or e["id"] != entry_id:
+        raise AccountingError("قيد الافتتاح المطلوب اعتماده ليس المسودة الفعّالة لهذه السنة")
+    if not rep["balance"] or not rep["balance"]["balanced"]:
+        raise AccountingError("قيد الافتتاح غير متوازن: لا يُعتمد")
+    if rep["diff_rows"]:
+        raise AccountingError(f"قيد الافتتاح يحتوي {rep['diff_count']} فرقًا غير مبرر عن أرصدة ختام السنة السابقة: لا يُعتمد")
+    je.post(conn, entry_id, user_id)
+    return entry_id
+
+
+def regenerate_opening_entry(conn, user_id, company_id, from_year_id, to_year_id, reason):
+    """إعادة توليد آمنة (بعد تصحيح إقفال السنة السابقة): يُعكس قيد الافتتاح المرحّل بقيد عكسي موثّق (لا حذف)،
+    ثم يُولَّد ويُعتمد قيد جديد من الأرصدة الختامية الحالية، كله في معاملة واحدة (أي فشل = تراجع كامل)."""
+    permissions.require(conn, user_id, company_id, "opening.manage", check_branch=False)
+    if not reason or not reason.strip():
+        raise AccountingError("إعادة توليد قيد الافتتاح تتطلب ذكر السبب")
+    ty = _year(conn, company_id, to_year_id)
+    with transaction(conn):
+        old = _active_opening(conn, company_id, to_year_id)
+        if old:
+            if old["status"] != "posted":
+                raise AccountingError("قيد الافتتاح الحالي مسودة: اعتمده أو احذفه من شاشة القيود أولًا (لا يُحذف تلقائيًا)")
+            je.reverse(conn, old["id"], user_id, ty["start_date"], f"إعادة توليد قيد الافتتاح: {reason}")
+        eid = generate_opening_entry(conn, user_id, company_id, from_year_id, to_year_id)
+        post_opening_checked(conn, user_id, company_id, from_year_id, to_year_id, eid)
+        audit.log(conn, user_id, "regenerate_opening", "journal_entries", eid, {"reversed": old["id"] if old else None},
+                  {"new_entry": eid}, reason)
+    return eid

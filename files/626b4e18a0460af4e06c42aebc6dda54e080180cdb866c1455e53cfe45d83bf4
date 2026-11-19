@@ -1,0 +1,167 @@
+"""حسابات الإدخال التفاعلي الخالصة (بلا PySide6 وبلا SQL وبلا float): الكمية × تكلفة الوحدة = الإجمالي في الاتجاهين، وتاريخ الانتهاء المرن.
+
+القاعدة: آخر حقل عدّله المستخدم من (تكلفة الوحدة، الإجمالي) هو «المرساة» ويبقى ثابتًا؛ تغيير الكمية يعيد حساب الآخر.
+هكذا تكتب الكمية ثم الإجمالي فتظهر تكلفة الحبة تلقائيًا، أو تكتب تكلفة الحبة فيظهر الإجمالي، دون فاقد تقريب
+(عند ارتكاز الإجمالي يُرسل الإجمالي نفسه للمحرك لا تكلفة الوحدة المقرّبة).
+"""
+import calendar
+import re
+from datetime import date
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+
+from .logic import strip_bidi, to_ascii_digits
+
+UNIT_PLACES = 4
+TOTAL_PLACES = 2
+
+
+def to_dec(text):
+    """نص → Decimal أو None إن كان فارغًا. يقبل الأرقام العربية وفواصل الآلاف. يرفع ValueError إن لم يكن رقمًا."""
+    if text is None:
+        return None
+    if isinstance(text, Decimal):
+        return text
+    t = strip_bidi(to_ascii_digits(str(text))).replace(',', '').replace(' ', '').strip()
+    if not t:
+        return None
+    try:
+        v = Decimal(t)
+    except InvalidOperation:
+        raise ValueError(str(text))
+    if not v.is_finite():
+        raise ValueError(str(text))
+    return v
+
+
+def _q(v, places):
+    return v.quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP)
+
+
+def fmt_num(v, places, trim=True):
+    """Decimal → نص بلا فواصل آلاف (صالح للتحرير)؛ trim يحذف الأصفار الزائدة بعد الفاصلة."""
+    if v is None:
+        return ''
+    s = f'{_q(v, places):f}'
+    if trim and '.' in s:
+        s = s.rstrip('0').rstrip('.')
+    return s
+
+
+def solve_line(qty, unit, total, anchor, edited, unit_places=UNIT_PLACES):
+    """يحسب الحقل التابع بعد تعديل `edited` ('qty'|'unit'|'total'). المدخلات Decimal أو None.
+    يرجع (qty, unit, total, anchor). لا يقسم على صفر ولا يمسح ما أدخله المستخدم.
+    unit_places: خانات تكلفة/سعر الوحدة (4 للمخزون الافتتاحي، 2 للفواتير لأن المحرك يحفظ السعر بالوحدة الصغرى)."""
+    if edited == 'unit':
+        anchor = 'unit'
+        if qty and unit is not None:
+            total = _q(qty * unit, TOTAL_PLACES)
+    elif edited == 'total':
+        anchor = 'total'
+        if qty and total is not None:
+            unit = _q(total / qty, unit_places)
+    else:                                              # qty
+        if qty:
+            if anchor == 'total' and total is not None:
+                unit = _q(total / qty, unit_places)
+            elif unit is not None:
+                total = _q(qty * unit, TOTAL_PLACES)
+            elif total is not None:
+                unit = _q(total / qty, unit_places)
+    return qty, unit, total, anchor
+
+
+def cost_args(qty, unit, total, anchor):
+    """ما يُرسل للمحرك: {'total_cost': ..} عند ارتكاز الإجمالي (دقيق)، وإلا {'unit_cost': ..}."""
+    if anchor == 'total' and total is not None:
+        return {'total_cost': str(total)}
+    return {'unit_cost': str(unit if unit is not None else (total / qty if total is not None and qty else Decimal(0)))}
+
+
+_DIGITS = re.compile(r'\d+')
+_BAD_EXPIRY = 'تاريخ الانتهاء غير صالح ({}). اكتب مثل 2027-05-31 أو 31/05/2027 أو 05/2027 (يُرتَّب تلقائيًا).'
+
+
+def _year(tok):
+    """سنة من نص: 4 خانات كما هي، وخانتان → 20xx."""
+    v = int(tok)
+    return v if len(tok) == 4 else 2000 + v
+
+
+def _split_compact(t):
+    """أرقام ملتصقة بلا فواصل: 31052027 · 20270531 · 052027 · 310527 · 0527 → قائمة أجزاء."""
+    n = len(t)
+    if n == 8:
+        return [t[:4], t[4:6], t[6:]] if t[:2] in ('19', '20') and 1 <= int(t[4:6]) <= 12 else [t[:2], t[2:4], t[4:]]
+    if n == 6:
+        return [t[:2], t[2:]] if t[2:4] in ('19', '20') and 1 <= int(t[:2]) <= 12 else [t[:2], t[2:4], t[4:]]
+    if n == 4:
+        return [t[:2], t[2:]]
+    raise ValueError
+
+
+def _order_three(a, b, c):
+    """ثلاثة أجزاء بأي ترتيب → (سنة، شهر، يوم). السنة هي الجزء ذو الأربع خانات؛ وإلا الأخير (يوم/شهر/سنة بخانتين).
+    اليوم والشهر: الأكبر من 12 هو اليوم حتمًا؛ وعند الالتباس نعتمد يوم/شهر (العُرف العربي) إلا مع سنة في البداية (سنة/شهر/يوم)."""
+    toks = [a, b, c]
+    four = [i for i, x in enumerate(toks) if len(x) == 4]
+    if len(four) > 1:
+        raise ValueError
+    yi = four[0] if four else 2
+    y = _year(toks[yi])
+    rest = [int(x) for i, x in enumerate(toks) if i != yi]
+    first, second = rest                                    # بالترتيب الذي كتبه المستخدم
+    if yi == 0:                                             # سنة أولًا: سنة/شهر/يوم (ISO) إلا إن كان الثاني لا يصلح شهرًا
+        mo, d = (first, second) if first <= 12 else (second, first)
+        if first > 12 and second > 12:
+            raise ValueError
+        return y, mo, d
+    if yi == 1:                                             # سنة في الوسط: غير معتاد، نعامله يوم/سنة/شهر
+        d, mo = (first, second) if second <= 12 else (second, first)
+        return y, mo, d
+    if first > 12 and second <= 12:                         # يوم/شهر/سنة
+        return y, second, first
+    if second > 12 and first <= 12:                         # شهر/يوم/سنة (أمريكي) صُحِّح تلقائيًا
+        return y, first, second
+    return y, second, first                                 # التباس: يوم/شهر
+
+
+def parse_expiry_input(text):
+    """تاريخ انتهاء مرن بأي ترتيب → YYYY-MM-DD أو '' إن كان فارغًا. يُرتِّب اليوم والشهر والسنة تلقائيًا:
+    2027-05-31 · 31/05/2027 · 05/31/2027 · 31.5.27 · 31052027 · 20270531 · 5/2027 · 2027-05 · 05/27 (الشهر وحده = آخر يوم فيه).
+    الفواصل: - / . \\ ومسافة. يرفع ValueError برسالة عربية."""
+    raw = text or ''
+    t = strip_bidi(to_ascii_digits(raw)).strip()
+    if not t:
+        return ''
+    try:
+        toks = _DIGITS.findall(t)
+        if not toks or re.sub(r'[\d\s\-/.\\،,_]', '', t):
+            raise ValueError
+        if len(toks) == 1:
+            toks = _split_compact(toks[0])
+        if len(toks) == 3:
+            y, mo, d = _order_three(*toks)
+        elif len(toks) == 2:                                # شهر وسنة (الشهر وحده = آخر يوم فيه)
+            a, b = toks
+            if len(a) == 4:
+                y, mo = _year(a), int(b)
+            elif len(b) == 4:
+                mo, y = int(a), _year(b)
+            elif int(a) > 12 >= int(b):
+                y, mo = _year(a), int(b)                    # 27/05
+            else:
+                mo, y = int(a), _year(b)                    # 05/27
+            d = calendar.monthrange(y, mo)[1]
+        else:
+            raise ValueError
+        return date(y, mo, d).isoformat()
+    except (ValueError, calendar.IllegalMonthError, OverflowError):
+        raise ValueError(_BAD_EXPIRY.format(raw))
+
+
+def expiry_tone(expiry_iso, today_iso, alert_days):
+    """للتلوين في الواجهة فقط: 'expired' | 'near' | 'ok' | ''. المرجع النهائي للمنع هو المحرك."""
+    if not expiry_iso:
+        return ''
+    left = (date.fromisoformat(expiry_iso) - date.fromisoformat(today_iso)).days
+    return 'expired' if left < 0 else ('near' if left <= alert_days else 'ok')

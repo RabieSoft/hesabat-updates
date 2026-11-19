@@ -1,0 +1,371 @@
+"""خدمات المخزون والأصناف والمستودعات وعمليات الجرد والتحويل والتسوية."""
+from datetime import date
+from decimal import Decimal
+
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.business import branch_scope, inventory, item_catalog, item_cleanup, item_info, item_variants, stock_lots
+
+
+class InventoryMixin:
+    def items(self, limit=500):
+        self.require('inventory.view')
+        f, fa = branch_scope.master_clause(self.conn, self.company_id, self.branch_id, col="i.branch_id")
+        return [dict(r) for r in self.conn.execute(
+            "SELECT i.id,i.code,i.name,u.name unit,i.base_unit_id unit_id,i.category,i.category_id,i.barcode,i.item_type kind,i.min_qty_milli,"
+            "COALESCE((SELECT SUM(sb.qty_milli) FROM stock_balances sb WHERE sb.item_id=i.id),0) stock_milli,i.is_active,i.cost_method,"
+            "EXISTS(SELECT 1 FROM stock_movements m WHERE m.item_id=i.id) has_moves,i.branch_id,i.track_expiry,i.expiry_alert_days,i.has_variants,i.parent_item_id,i.color_id,"
+            "(SELECT MIN(l.expiry_date) FROM stock_lots l WHERE l.item_id=i.id AND l.qty_milli>0 AND l.expiry_date<>'') next_expiry "
+            "FROM items i JOIN units u ON u.id=i.base_unit_id WHERE i.company_id=?" + f + " ORDER BY i.name LIMIT ?",
+            (self.company_id, *fa, int(limit)))]
+
+    def item_color_map(self):
+        """{item_id: [(اسم اللون، hex)]}: الأم = ألوان أبنائها الفعّالة، واللون التابع = لونه (لعمود «اللون» في جدول الأصناف)."""
+        self.require('inventory.view')
+        out = {}
+        for r in self.conn.execute(
+                "SELECT i.id,i.parent_item_id pid,c.name,c.shade_code,c.hex FROM items i JOIN colors c ON c.id=i.color_id "
+                "WHERE i.company_id=? ORDER BY c.color_family,c.name,c.shade_code", (self.company_id,)):
+            lab = f"{r['name']} {r['shade_code']}".strip()
+            out.setdefault(r['id'], []).append((lab, r['hex']))
+            if r['pid']: out.setdefault(r['pid'], []).append((lab, r['hex']))
+        return out
+
+    # ---------------- ألوان الأصناف (أقمشة/ملابس) ----------------
+    def colors(self, *, family=None, search=None, active_only=True):
+        return item_variants.list_colors(self.conn, self.user_id, self.company_id, family=family, search=search, active_only=active_only)
+
+    def create_color(self, v):
+        self.require('inventory.manage')
+        return item_variants.create_color(self.conn, self.user_id, self.company_id, v['name'], code=v.get('code') or None,
+                                          shade_code=v.get('shade_code', ''), color_family=v.get('color_family', ''), hex=v.get('hex', ''))
+
+    def set_color_active(self, color_id, active):
+        return item_variants.set_color_active(self.conn, self.user_id, color_id, active)
+
+    def enable_item_variants(self, item_id):
+        return item_variants.enable_variants(self.conn, self.user_id, item_id)
+
+    def add_item_colors(self, parent_id, color_ids):
+        return item_variants.generate_variants(self.conn, self.user_id, parent_id, list(color_ids))
+
+    def link_candidates(self, parent_id, search=None):
+        return item_variants.link_candidates(self.conn, self.user_id, self.company_id, parent_id, search=search)
+
+    def link_item_to_parent(self, item_id, parent_id, color_id):
+        return item_variants.link_to_parent(self.conn, self.user_id, item_id, parent_id, color_id)
+
+    def unlink_item_from_parent(self, item_id):
+        return item_variants.unlink_from_parent(self.conn, self.user_id, item_id)
+
+    def add_item_color(self, parent_id, color_id):
+        return item_variants.add_variant(self.conn, self.user_id, parent_id, color_id)
+
+    def item_totals(self, parent_id):
+        return item_variants.parent_totals(self.conn, self.user_id, self.company_id, parent_id)
+
+    def item_variants(self, parent_id):
+        return item_variants.list_variants(self.conn, self.user_id, self.company_id, parent_id)
+
+    def stock_by_color(self, **flt):
+        return item_variants.stock_by_color(self.conn, self.user_id, self.company_id, **flt)
+
+    def warehouses(self, all_branches=False):
+        """مخازن الفرع الحالي فقط (كل فرع مستقل)، ومقيَّدة بمخازن المستخدم إن وُجد تقييد.
+        all_branches=True لشاشات الإدارة التي تحتاج كل المخازن (مثل نافذة تقييد المستخدم)."""
+        self.require('inventory.view')
+        f, fa = ("", []) if all_branches else branch_scope.txn_clause(self.conn, self.company_id, self.branch_id)
+        g, ga = ("", []) if all_branches else self._access_clause('user_warehouse_access', 'warehouse_id')
+        return [dict(r) for r in self.conn.execute(
+            "SELECT id,code,name,branch_id,is_active FROM warehouses WHERE company_id=?" + f + g + " ORDER BY name", (self.company_id, *fa, *ga))]
+
+    def create_warehouse(self, v):
+        self.require('inventory.manage')
+        return inventory.create_warehouse(self.conn, self.user_id, self.company_id, v['name'], code=v.get('code') or None,
+                                          branch_id=v.get('branch_id') or self.branch_id)
+
+    def set_warehouse_active(self, warehouse_id, active):
+        return inventory.set_warehouse_active(self.conn, self.user_id, int(warehouse_id), bool(active))
+
+    def set_item_active(self, item_id, active):
+        return inventory.set_item_active(self.conn, self.user_id, int(item_id), bool(active))
+
+    def item_units(self, item_id):
+        self.require('inventory.view')
+        return [dict(r) for r in self.conn.execute(
+            "SELECT u.id, u.name, u.code, iu.factor_milli, (iu.unit_id=i.base_unit_id) is_base FROM item_units iu "
+            "JOIN units u ON u.id=iu.unit_id JOIN items i ON i.id=iu.item_id "
+            "WHERE iu.item_id=? ORDER BY is_base DESC, u.name", (int(item_id),))]
+
+    def stock_report(self, warehouse_id=None, item_id=None, include_zero=False):
+        return inventory.stock_report(
+            self.conn, self.user_id, self.company_id,
+            warehouse_id=int(warehouse_id) if warehouse_id else None,
+            item_id=int(item_id) if item_id else None,
+            include_zero=bool(include_zero), branch_id=self.branch_id)
+
+    def low_stock(self):
+        return inventory.low_stock(self.conn, self.user_id, self.company_id)
+
+    def transfer_stock(self, v):
+        return inventory.transfer_stock(
+            self.conn, self.user_id, self.company_id,
+            int(v['item_id']), int(v['from_wh']), int(v['to_wh']),
+            v.get('date') or str(date.today()),
+            Decimal(str(v['qty'])),
+            unit_id=int(v['unit_id']) if v.get('unit_id') else None,
+            note=v.get('note') or '')
+
+    def adjust_stock(self, v):
+        return inventory.adjust_stock(
+            self.conn, self.user_id, self.company_id,
+            int(v['item_id']), int(v['warehouse_id']),
+            v.get('date') or str(date.today()),
+            v['direction'], Decimal(str(v['qty'])), v.get('reason') or '',
+            unit_id=int(v['unit_id']) if v.get('unit_id') else None,
+            unit_cost=Decimal(str(v['unit_cost'])) if v.get('unit_cost') not in (None, '') else None,
+            expiry_date=v.get('expiry_date') or None, lot_no=v.get('lot_no') or '',
+            lot_id=int(v['lot_id']) if v.get('lot_id') else None)
+
+    def post_opening_stock(self, v):
+        rows = []
+        for r in v["rows"]:
+            row = {"item_id": int(r["item_id"]), "warehouse_id": int(r["warehouse_id"]), "qty": Decimal(str(r["qty"])),
+                   "unit_cost": Decimal(str(r.get("unit_cost") or 0)), "expiry_date": r.get("expiry_date") or None,
+                   "lot_no": r.get("lot_no") or ""}
+            if r.get("total_cost") not in (None, ""):      # الإجمالي هو المرساة: يُرسل كما أُدخل بلا فاقد تقريب
+                row["total_cost"] = Decimal(str(r["total_cost"]))
+            rows.append(row)
+        return inventory.post_opening_stock(self.conn, self.user_id, self.company_id, v.get("date") or str(date.today()),
+                                            rows, note=v.get("note") or "",
+                                            counter_account_id=v.get("counter_account_id"))
+
+    def item_card(self, item_id, warehouse_id, date_from, date_to, limit=200):
+        return inventory.item_card(
+            self.conn, self.user_id, self.company_id,
+            int(item_id), int(warehouse_id), date_from, date_to, limit=limit)
+
+    def list_stock_counts(self, limit=100):
+        self.require('inventory.view')
+        return [dict(r) for r in self.conn.execute(
+            "SELECT c.id,c.count_date,c.status,c.is_full,c.note,w.name warehouse,c.created_at,"
+            "(SELECT COUNT(*) FROM stock_count_lines l WHERE l.count_id=c.id) lines "
+            "FROM stock_counts c JOIN warehouses w ON w.id=c.warehouse_id "
+            "WHERE c.company_id=? ORDER BY c.id DESC LIMIT ?",
+            (self.company_id, int(limit)))]
+
+    def create_stock_count(self, warehouse_id, count_date, is_full=False, note=''):
+        return inventory.create_count(
+            self.conn, self.user_id, self.company_id, int(warehouse_id), count_date,
+            is_full=bool(is_full), note=note or '')
+
+    def set_count_line(self, count_id, item_id, counted_qty, unit_cost=None):
+        return inventory.set_count_line(
+            self.conn, self.user_id, int(count_id), int(item_id),
+            Decimal(str(counted_qty)),
+            unit_cost=Decimal(str(unit_cost)) if unit_cost not in (None, '') else None)
+
+    def count_sheet(self, count_id):
+        """ورقة الجرد: كل صنف مخزني مفعّل (الأم المجمِّعة تُستثنى وتُجرد ألوانها) برصيد النظام في مستودع الجرد وما أُدخل سابقًا."""
+        self.require('inventory.count')
+        c = self.conn.execute("SELECT warehouse_id,status FROM stock_counts WHERE id=? AND company_id=?", (int(count_id), self.company_id)).fetchone()
+        if not c: raise AccountingError('عملية الجرد غير موجودة')
+        return c['status'], [dict(r) for r in self.conn.execute(
+            "SELECT i.id item_id,i.code,i.name,COALESCE(p.name,'') parent_name,COALESCE(c.name,'') color_name,COALESCE(c.shade_code,'') shade_code,COALESCE(c.hex,'') color_hex,"
+            "COALESCE((SELECT qty_milli FROM stock_balances b WHERE b.item_id=i.id AND b.warehouse_id=?),0) system_qty_milli,"
+            "(SELECT counted_qty_milli FROM stock_count_lines l WHERE l.count_id=? AND l.item_id=i.id) counted_qty_milli "
+            "FROM items i LEFT JOIN items p ON p.id=i.parent_item_id LEFT JOIN colors c ON c.id=i.color_id "
+            "WHERE i.company_id=? AND i.item_type='stock' AND i.is_active=1 AND i.has_variants=0 ORDER BY COALESCE(p.code,i.code),c.name,i.code",
+            (c['warehouse_id'], int(count_id), self.company_id))]
+
+    def save_count_lines(self, count_id, qtys):
+        """يحفظ الكميات المعدودة {item_id: qty} في معاملة واحدة."""
+        from alhisabat.database.tx import transaction
+        with transaction(self.conn):
+            for item_id, q in qtys.items():
+                self.set_count_line(count_id, item_id, q)
+        return len(qtys)
+
+    def post_stock_count(self, count_id):
+        return inventory.post_count(self.conn, self.user_id, int(count_id))
+
+    def cancel_stock_count(self, count_id, reason=''):
+        return inventory.cancel_count(self.conn, self.user_id, int(count_id), reason=reason or '')
+
+    def stock_count_lines(self, count_id):
+        self.require('inventory.view')
+        return [dict(r) for r in self.conn.execute(
+            "SELECT l.item_id,i.code,i.name,l.system_qty_milli,l.counted_qty_milli,l.diff_qty_milli,"
+            "l.diff_value_base,l.unit_cost_minor "
+            "FROM stock_count_lines l JOIN items i ON i.id=l.item_id WHERE l.count_id=? ORDER BY i.code",
+            (int(count_id),))]
+
+    # ---------------- الأصناف (ربط بالتصنيف والوحدة بالمعرّف)
+    def create_item(self, v):
+        self.require('inventory.manage')
+        unit_id = v.get('unit_id')
+        if not unit_id:   # توافق: اسم وحدة نصي (ينشئها إن لم توجد)
+            unit_name = (v.get('unit') or 'قطعة').strip()
+            u = self.conn.execute("SELECT id FROM units WHERE company_id=? AND name=? COLLATE NOCASE", (self.company_id, unit_name)).fetchone()
+            unit_id = u[0] if u else inventory.create_unit(self.conn, self.user_id, self.company_id, unit_name)
+        return inventory.create_item(
+            self.conn, self.user_id, self.company_id, v['name'], int(unit_id),
+            code=v.get('code') or None, barcode=v.get('barcode', ''),
+            category_id=int(v['category_id']) if v.get('category_id') else None,
+            category='' if v.get('category_id') else v.get('category', ''),
+            min_qty=Decimal(str(v.get('min_qty') or 0)),
+            item_type=v.get('kind') or v.get('item_type') or 'stock', cost_method=v.get('cost_method') or '',
+            branch_id=self._master_branch(), track_expiry=bool(v.get('track_expiry')),
+            expiry_alert_days=int(v.get('expiry_alert_days') or 0) if v.get('expiry_alert_days') not in (None, '') else 30)
+
+    def edit_item(self, item_id, v):
+        kw = {}
+        if 'category_id' in v:      # None = فك الارتباط بالتصنيف
+            kw['category_id'] = int(v['category_id']) if v['category_id'] else None
+        else:
+            kw['category'] = v.get('category')
+        return inventory.edit_item(self.conn, self.user_id, int(item_id), name=v.get('name'), barcode=v.get('barcode'),
+                                   min_qty=Decimal(str(v['min_qty'])) if v.get('min_qty') not in (None, '') else None,
+                                   cost_method=v.get('cost_method') if 'cost_method' in v else None,
+                                   track_expiry=bool(v['track_expiry']) if 'track_expiry' in v else None,
+                                   expiry_alert_days=int(v['expiry_alert_days']) if v.get('expiry_alert_days') not in (None, '') else None, **kw)
+
+    # ---------------- تنظيف الأصناف: بلا حركات / مكررة الاسم
+    def unused_items(self):
+        return item_cleanup.list_unused_items(self.conn, self.user_id, self.company_id, branch_id=self.branch_id)
+
+    def duplicate_items(self):
+        return item_cleanup.find_duplicate_items(self.conn, self.user_id, self.company_id, branch_id=self.branch_id)
+
+    def delete_unused_items(self, item_ids):
+        return item_cleanup.delete_unused_items(self.conn, self.user_id, self.company_id, item_ids, branch_id=self.branch_id)
+
+    def delete_duplicate_items(self, item_ids):
+        return item_cleanup.delete_duplicate_items(self.conn, self.user_id, self.company_id, item_ids, branch_id=self.branch_id)
+
+    # ---------------- دليل الوحدات
+    def units(self, include_inactive=False):
+        """للقوائم المنسدلة: الوحدات النشطة افتراضيًا."""
+        return [{k: r[k] for k in ('id', 'name', 'code', 'is_active')}
+                for r in item_catalog.list_units(self.conn, self.user_id, self.company_id, include_inactive=include_inactive,
+                                                 branch_id=self.branch_id)]
+
+    def units_catalog(self):
+        return item_catalog.list_units(self.conn, self.user_id, self.company_id, include_inactive=True, branch_id=self.branch_id)
+
+    def create_unit(self, name, code=None, notes=''):
+        return item_catalog.create_unit(self.conn, self.user_id, self.company_id, name, code=code or None, notes=notes,
+                                        branch_id=self._master_branch())
+
+    def edit_unit(self, unit_id, v):
+        return item_catalog.edit_unit(self.conn, self.user_id, self.company_id, int(unit_id),
+                                      name=v.get('name'), code=v.get('code'), notes=v.get('notes'),
+                                          cost_method=v.get('cost_method') if 'cost_method' in v else None)
+
+    def set_unit_active(self, unit_id, active):
+        return item_catalog.set_unit_active(self.conn, self.user_id, self.company_id, int(unit_id), bool(active))
+
+    def delete_unit(self, unit_id):
+        return item_catalog.delete_unit(self.conn, self.user_id, self.company_id, int(unit_id))
+
+    def add_item_unit(self, item_id, unit_id, factor):
+        return inventory.add_item_unit(self.conn, self.user_id, int(item_id), int(unit_id), factor)
+
+    def update_item_unit(self, item_id, unit_id, factor):
+        return item_catalog.update_item_unit(self.conn, self.user_id, self.company_id, int(item_id), int(unit_id), factor)
+
+    def remove_item_unit(self, item_id, unit_id):
+        return item_catalog.remove_item_unit(self.conn, self.user_id, self.company_id, int(item_id), int(unit_id))
+
+    # ---------------- دليل التصنيفات (شجرة)
+    def category_tree(self, include_inactive=True):
+        return item_catalog.list_categories(self.conn, self.user_id, self.company_id, include_inactive=include_inactive,
+                                            branch_id=self.branch_id)
+
+    def create_category(self, v):
+        return item_catalog.create_category(self.conn, self.user_id, self.company_id, v['name'],
+                                            parent_id=int(v['parent_id']) if v.get('parent_id') else None,
+                                            code=v.get('code') or None, notes=v.get('notes') or '',
+                                            cost_method=v.get('cost_method') or '', branch_id=self._master_branch())
+
+    def edit_category(self, cat_id, v):
+        return item_catalog.edit_category(self.conn, self.user_id, self.company_id, int(cat_id),
+                                          name=v.get('name'), code=v.get('code'), notes=v.get('notes'))
+
+    def move_category(self, cat_id, parent_id):
+        return item_catalog.move_category(self.conn, self.user_id, self.company_id, int(cat_id), parent_id)
+
+    def set_category_active(self, cat_id, active):
+        return item_catalog.set_category_active(self.conn, self.user_id, self.company_id, int(cat_id), bool(active))
+
+    def delete_category(self, cat_id):
+        return item_catalog.delete_category(self.conn, self.user_id, self.company_id, int(cat_id))
+
+    def assign_items_category(self, item_ids, category_id):
+        return item_catalog.assign_items(self.conn, self.user_id, self.company_id, item_ids,
+                                         int(category_id) if category_id else None)
+
+    def category_descendants(self, cat_id):
+        self.require('inventory.view')
+        return item_catalog.descendants_ids(self.conn, int(cat_id))
+
+    # ---------------- الصلاحية (الدفعات وتاريخ الانتهاء)
+    def expiry_report(self, status=None, warehouse_id=None, item_id=None, within_days=None):
+        return stock_lots.lots_report(self.conn, self.user_id, self.company_id, status=status, within_days=within_days,
+                                      warehouse_id=int(warehouse_id) if warehouse_id else None,
+                                      item_id=int(item_id) if item_id else None)
+
+    def expiry_summary(self):
+        return stock_lots.expiry_summary(self.conn, self.user_id, self.company_id)
+
+    def item_lots(self, item_id, warehouse_id=None):
+        self.require('inventory.view')
+        return stock_lots.item_lots(self.conn, int(item_id), int(warehouse_id) if warehouse_id else None)
+
+    def untracked_qty_milli(self, item_id, warehouse_id):
+        self.require('inventory.view')
+        return stock_lots.untracked_qty_milli(self.conn, int(item_id), int(warehouse_id))
+
+    def assign_untracked(self, item_id, warehouse_id, expiry_date, lot_no='', qty=None):
+        return stock_lots.assign_untracked(self.conn, self.user_id, self.company_id, int(item_id), int(warehouse_id), expiry_date, lot_no,
+                                           qty=Decimal(str(qty)) if qty not in (None, '') else None)
+
+    # ---------------- معلومات الصنف (شاشة «معلومات الصنف»)
+    def item_info(self, item_id):
+        self.require('inventory.view')
+        wc = self._access_clause('user_warehouse_access', 'warehouse_id')
+        return item_info.load(self.conn, self.company_id, int(item_id), str(date.today()), wc)
+
+    def item_movements(self, item_id, limit=300):
+        self.require('inventory.view')
+        item_info._item(self.conn, item_id, self.company_id)
+        return item_info.movements(self.conn, item_id, limit)
+
+    def item_invoice_history(self, item_id, kind, limit=100):
+        self.require('inventory.view')
+        item_info._item(self.conn, item_id, self.company_id)
+        return item_info.invoice_history(self.conn, self.company_id, int(item_id), kind, limit)
+
+    def item_barcodes(self, item_id):
+        self.require('inventory.view')
+        return item_info.list_barcodes(self.conn, self.company_id, int(item_id))
+
+    def item_find_barcode(self, code):
+        self.require('inventory.view')
+        return item_info.find_by_barcode(self.conn, self.company_id, code)
+
+    def item_update_extras(self, item_id, **kw):
+        return item_info.update_extras(self.conn, self.user_id, self.company_id, int(item_id), **kw)
+
+    def item_add_barcode(self, item_id, barcode, unit_id=None, note=''):
+        return item_info.add_barcode(self.conn, self.user_id, self.company_id, int(item_id), barcode, unit_id, note)
+
+    def item_remove_barcode(self, barcode_id):
+        return item_info.remove_barcode(self.conn, self.user_id, self.company_id, int(barcode_id))
+
+    def currency_view(self, code, on_date=None):
+        """معامل تحويل العملة الأساسية إلى عملة العرض: (الرمز, عدد وحدات الأساسية لوحدة واحدة من العملة). الأساسية = 1."""
+        from alhisabat.accounting import rates
+        base = rates.base_currency(self.conn, self.company_id)
+        if not code or code == base:
+            return base, Decimal(1)
+        return code, Decimal(str(rates.get_rate(self.conn, self.company_id, code, on_date or str(date.today()))))

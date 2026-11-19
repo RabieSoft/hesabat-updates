@@ -1,0 +1,9 @@
+CREATE TABLE backups(
+  id INTEGER PRIMARY KEY, path TEXT NOT NULL, size_bytes INTEGER NOT NULL, checksum TEXT NOT NULL,
+  last_migration TEXT, reason TEXT NOT NULL DEFAULT '', created_by INTEGER NOT NULL REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+
+INSERT INTO permissions(code,name_ar,is_sensitive) VALUES
+ ('backup.manage','إنشاء نسخ احتياطية وعرضها',1),('backup.restore','استعادة نسخة احتياطية',1);
+INSERT INTO role_permissions SELECT r.id,p.code FROM roles r, permissions p WHERE r.id=1 AND p.code IN ('backup.manage','backup.restore');
+INSERT INTO role_permissions SELECT 2,'backup.manage';

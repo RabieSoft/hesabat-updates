@@ -1,0 +1,542 @@
+"""الموارد: موظفون، مراكز تكلفة، مسيرات رواتب، أصول ثابتة وإهلاكها.
+
+بلا float، بلا منطق محاسبي مباشر (عبر HrService).
+الصفحات خفيفة ومرتبطة بـ DocumentSheet للطباعة والمعاينة.
+"""
+from datetime import date
+from decimal import Decimal
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QComboBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+    QSplitter, QTabWidget, QVBoxLayout, QWidget, QInputDialog
+)
+
+from alhisabat.ui.components import document_model as DM
+from alhisabat.ui.components.basic import ask_reason, DateField
+from alhisabat.ui.components.datagrid import DataGrid
+from alhisabat.ui.components.document_sheet import DocumentSheet
+from alhisabat.ui.components.grid_logic import Column
+from alhisabat.ui.components.panels import RelatedPanel
+from alhisabat.ui.core.actions import Action, ActionGroup
+from alhisabat.ui.core.base_page import BasePage
+from alhisabat.ui.core.hr_service import HrService
+from alhisabat.ui.core.permissions import ActionState
+
+
+class EmployeesPage(BasePage):
+    key = 'employees'; title = 'الموظفون'; icon = 'user'; required_permission = 'employee.view'
+
+    def build(self):
+        self.svc = HrService(self.session); self._sel = None; self._all = []
+        self._period = None                      # (من، إلى) لكشف الحساب؛ None = من أول السنة إلى اليوم
+        lay = QVBoxLayout(self); lay.setContentsMargins(6, 6, 6, 6)
+        bar = QHBoxLayout()
+        self.search = QLineEdit(); self.search.setPlaceholderText('بحث بالاسم أو الكود أو الهاتف أو الوظيفة…'); self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(lambda _t: self._apply_filter())
+        self.status = QComboBox()
+        for lab, val in (('الكل', None), ('على رأس العمل', True), ('منتهي الخدمة', False)): self.status.addItem(lab, val)
+        self.status.currentIndexChanged.connect(lambda _i: self._apply_filter())
+        bar.addWidget(self.search, 1); bar.addWidget(QLabel('الحالة:')); bar.addWidget(self.status)
+        self.summary = QLabel(''); self.summary.setObjectName('ctxKey'); bar.addWidget(self.summary)
+        lay.addLayout(bar)
+        split = QSplitter(Qt.Horizontal)
+        self.grid = DataGrid([
+            Column('code', 'الكود', width=80),
+            Column('name', 'الاسم', width=170),
+            Column('job_title', 'الوظيفة', width=110),
+            Column('phone', 'الهاتف', width=100),
+            Column('hire_date', 'تاريخ التعيين', width=95),
+            Column('base_salary_minor', 'الراتب الأساسي', 'money', 100, minor=True),
+            Column('balance_minor', 'الرصيد', 'money', 100, minor=True),
+            Column('is_active', 'نشط', 'status', 60)
+        ], grid_id='employees')
+        self.grid.selectionChangedRows.connect(self._on_select)
+        self.grid.rowActivated.connect(lambda _r: self.do('edit'))
+        split.addWidget(self.grid)
+        right = QWidget(); rl = QVBoxLayout(right); rl.setContentsMargins(0, 0, 0, 0)
+        self.sheet = DocumentSheet(self.window_.prefs.get('paper')); self.sheet.paperChanged.connect(lambda p: self.window_.prefs.set('paper', p))
+        self.related = RelatedPanel(); self.related.setMaximumHeight(100)
+        self.related.openRequested.connect(lambda page, params: self.open_page_requested.emit(page, params))
+        rl.addWidget(self.sheet, 1); rl.addWidget(self.related)
+        split.addWidget(right); split.setStretchFactor(0, 3); split.setStretchFactor(1, 2)
+        lay.addWidget(split, 1)
+
+    # ------------------------------------------------------------ بيانات
+    def refresh(self):
+        if not getattr(self, '_built', False): return
+        try: self._all = self.svc.employees()
+        except Exception as e: self.show_error(e); self._all = []
+        self._apply_filter()
+
+    def _apply_filter(self):
+        keep = self._sel['id'] if self._sel else None
+        q = self.search.text().strip().lower(); st = self.status.currentData()
+        rows = [r for r in self._all
+                if (st is None or bool(r.get('is_active')) == st)
+                and (not q or any(q in str(r.get(k) or '').lower() for k in ('name', 'code', 'phone', 'job_title')))]
+        self.grid.set_rows(rows)
+        act = [r for r in rows if r.get('is_active')]
+        from alhisabat.ui.core import format as fmt
+        sal = sum(int(r.get('base_salary_minor') or 0) for r in act)
+        self.summary.setText(f"{len(rows)} موظف — إجمالي الرواتب الأساسية: {fmt.fmt_money(sal, minor=True)}")
+        if keep is None or not self.grid.select_where(lambda r: r['id'] == keep): self._on_select([])
+        self.actions_changed.emit()
+
+    def _range(self):
+        if self._period: return self._period
+        today = date.today()
+        return f"{today.year}-01-01", today.isoformat()
+
+    def _on_select(self, rows):
+        prev = self._sel['id'] if self._sel else None
+        self._sel = rows[0] if len(rows) == 1 else None
+        if (self._sel['id'] if self._sel else None) != prev: self._period = None
+        self._show_statement()
+        self.actions_changed.emit()
+
+    def _show_statement(self):
+        if not self._sel:
+            self.sheet.set_document(None); self.related.set_items([]); return
+        try:
+            d_from, d_to = self._range()
+            self.sheet.set_document(DM.from_print_spec(self.svc.statement_spec(self._sel['id'], d_from, d_to), 'statement', status=''))
+        except Exception:
+            self.sheet.set_document(None)
+        items = []
+        if self._sel.get('account_id'):
+            items.append(('كشف الحساب', f"دفتر أستاذ {self._sel['name']}", 'ledger', {'account_id': self._sel['account_id']}))
+        self.related.set_items(items)
+
+    # ------------------------------------------------------------ الإجراءات
+    def _state(self, k):
+        if k == 'add': return self.access.state('employee.manage')
+        if not self._sel: return ActionState(False, 'حدد موظفًا أولاً')
+        active = bool(self._sel.get('is_active'))
+        if k == 'edit': return self.access.state('employee.manage')
+        if k == 'terminate':
+            if not active: return ActionState(False, 'إنهاء الخدمة للموظف النشط فقط')
+            return self.access.state('employee.manage')
+        if k == 'reactivate':
+            if active: return ActionState(False, 'الموظف على رأس العمل')
+            return self.access.state('employee.manage')
+        if k == 'delete':
+            st = self.access.state('employee.manage')
+            if not st.enabled: return st
+            return self.access.state('party.delete')
+        if k in ('pay', 'advance'):
+            if not active: return ActionState(False, 'الصرف للموظف النشط فقط')
+            p_st = self.access.state('payroll.pay')
+            if not p_st.enabled: return p_st
+            return self.access.state('cash.voucher')
+        if k == 'period': return ActionState(True)
+        return ActionState(True)
+
+    def ribbon_groups(self):
+        def a(k, lab, icon, **kw):
+            return Action(k, lab, icon, state_fn=lambda kk=k: self._state(kk), handler=lambda kk=k: self.do(kk), **kw)
+        return [
+            ActionGroup('موظف', [
+                a('add', 'تعيين موظف', 'new', primary=True),
+                a('edit', 'تعديل بيانات', 'edit'),
+                a('terminate', 'إنهاء الخدمة', 'delete', danger=True),
+                a('reactivate', 'إعادة تفعيل', 'refresh'),
+                a('delete', 'حذف', 'delete', danger=True)
+            ]),
+            ActionGroup('المالية', [
+                a('pay', 'صرف راتب', 'coins'),
+                a('advance', 'سلفة', 'coins'),
+                a('period', 'فترة الكشف…', 'calendar')
+            ]),
+            ActionGroup('عرض', [
+                Action('print', 'طباعة الكشف', 'print', state_fn=lambda: ActionState(bool(self._sel), 'حدد موظفًا'), handler=lambda: self.sheet.print_()),
+                Action('refresh', 'تحديث', 'refresh', handler=self.refresh)
+            ])
+        ]
+
+    def _done(self, msg=None):
+        if msg: self.notify(msg)
+        self.refresh(); self.window_.data_changed(self.key)
+
+    def do(self, k):
+        if k == 'add': return self._add() if self._state('add').enabled else QMessageBox.information(self, self.title, self._state('add').reason)
+        st = self._state(k)
+        if not st.enabled: return QMessageBox.information(self, self.title, st.reason)
+        name = self._sel.get('name', '')
+        if k == 'edit': return self._edit()
+        if k == 'pay': return self._pay()
+        if k == 'advance': return self._pay(advance=True)
+        if k == 'period': return self._pick_period()
+        if k == 'terminate':
+            if ask_reason(self, 'إنهاء الخدمة', [f"هل تريد إنهاء خدمة «{name}»؟ يشترط تصفية مستحقاته (رصيده صفر) أولًا."], need_reason=False, confirm_text='إنهاء الخدمة') is None: return
+            ok, _ = self.guarded(self.svc.terminate, self._sel['id'], reload=False)
+            if ok: self._done('تم إنهاء الخدمة')
+        elif k == 'reactivate':
+            if ask_reason(self, 'إعادة تفعيل', [f"إعادة «{name}» إلى رأس العمل؟"], need_reason=False, confirm_text='إعادة تفعيل') is None: return
+            ok, _ = self.guarded(self.svc.reactivate, self._sel['id'], reload=False)
+            if ok: self._done('تمت إعادة التفعيل')
+        elif k == 'delete':
+            if ask_reason(self, 'حذف موظف', [f"حذف «{name}» نهائيًا مع حسابه؟",
+                                             'لا يُحذف إلا موظف بلا أي حركة أو مسير راتب؛ ومن له حركات يُنهى تعيينه فقط.'],
+                          need_reason=False, confirm_text='حذف', danger=True) is None: return
+            ok, _ = self.guarded(self.svc.delete_employee, self._sel['id'], reload=False)
+            if ok: self._done('تم حذف الموظف')
+
+    def _add(self):
+        from alhisabat.ui.app_dialogs.hr import EmployeeDialog
+        d = EmployeeDialog(self)
+        if self.exec_form(d):
+            ok, _ = self.guarded(self.svc.hire, d.values(), reload=False)
+            if ok: self._done('تم تعيين الموظف')
+
+    def _edit(self):
+        from alhisabat.ui.app_dialogs.hr import EmployeeDialog
+        d = EmployeeDialog(self, self._sel)
+        if self.exec_form(d):
+            ok, _ = self.guarded(self.svc.edit, self._sel['id'], d.values(), reload=False)
+            if ok: self._done()
+
+    def _pay(self, advance=False):
+        if not self._sel: return
+        from alhisabat.ui.app_dialogs.hr import PayEmployeeDialog
+        d = PayEmployeeDialog(self, self._sel, advance=advance)
+        if self.exec_form(d):
+            v = d.values()
+            ok, _ = self.guarded(self.svc.pay_employee, v['cash_id'], self._sel['id'], v['amount'], v['date'], description=v.get('description', ''), reload=False)
+            if ok: self._done('تم تسجيل السلفة وسند الدفع' if advance else 'تم تسجيل صرف الراتب وسند الدفع بنجاح')
+
+    def _pick_period(self):
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox, QFormLayout
+        d = QDialog(self); d.setWindowTitle('فترة كشف الحساب'); d.setLayoutDirection(Qt.RightToLeft)
+        f = QFormLayout(d); a, b = DateField(), DateField()
+        cur = self._range(); a.set_iso(cur[0]); b.set_iso(cur[1])
+        f.addRow('من', a); f.addRow('إلى', b)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel); bb.accepted.connect(d.accept); bb.rejected.connect(d.reject); f.addRow(bb)
+        if self.exec_form(d):
+            if a.iso() > b.iso(): return QMessageBox.warning(self, self.title, 'تاريخ البداية بعد تاريخ النهاية')
+            self._period = (a.iso(), b.iso()); self._show_statement()
+
+
+class CostCentersPage(BasePage):
+    key = 'cost_centers'; title = 'مراكز التكلفة'; icon = 'tag'; required_permission = 'costcenter.view'
+
+    def build(self):
+        self.svc = HrService(self.session); self._sel = None
+        lay = QVBoxLayout(self); lay.setContentsMargins(6, 6, 6, 6)
+        self.grid = DataGrid([
+            Column('code', 'الكود', width=90),
+            Column('name', 'الاسم', width=220),
+            Column('is_active', 'نشط', 'status', 90)
+        ], grid_id='cost_centers')
+        self.grid.selectionChangedRows.connect(lambda rows: (setattr(self, '_sel', rows[0] if len(rows) == 1 else None), self.actions_changed.emit()))
+        lay.addWidget(self.grid, 1)
+
+    def refresh(self):
+        if not getattr(self, '_built', False): return
+        keep = self._sel['id'] if self._sel else None
+        try: rows = self.svc.cost_centers()
+        except Exception as e: self.show_error(e); rows = []
+        self.grid.set_rows(rows)
+        if keep is not None: self.grid.select_where(lambda r: r['id'] == keep)
+        self.actions_changed.emit()
+
+    def _state(self, k):
+        if k == 'add': return self.access.state('costcenter.manage')
+        if not self._sel: return ActionState(False, 'حدد مركز تكلفة')
+        return self.access.state('costcenter.manage')
+
+    def ribbon_groups(self):
+        def a(k, lab, icon, **kw):
+            return Action(k, lab, icon, state_fn=lambda kk=k: self._state(kk), handler=lambda kk=k: self.do(kk), **kw)
+        return [
+            ActionGroup('مركز تكلفة', [
+                a('add', '+ مركز تكلفة', 'new', primary=True),
+                a('edit', 'تعديل', 'edit'),
+                a('toggle', 'تفعيل/تعطيل', 'refresh'),
+                a('delete', 'حذف', 'delete', danger=True)
+            ]),
+            ActionGroup('عرض', [Action('refresh', 'تحديث', 'refresh', handler=self.refresh)])
+        ]
+
+    def do(self, k):
+        st = self._state(k)
+        if not st.enabled: return QMessageBox.information(self, self.title, st.reason)
+        if k == 'add':
+            from alhisabat.ui.app_dialogs.hr import CostCenterDialog
+            d = CostCenterDialog(self)
+            if self.exec_form(d):
+                ok, _ = self.guarded(self.svc.create_cc, d.values(), reload=False)
+                if ok: self.refresh(); self.window_.data_changed(self.key)
+        if k == 'edit':
+            from alhisabat.ui.app_dialogs.hr import CostCenterDialog
+            d = CostCenterDialog(self, self._sel)
+            if self.exec_form(d):
+                ok, _ = self.guarded(self.svc.edit_cc, self._sel['id'], d.values(), reload=False)
+                if ok: self.refresh(); self.window_.data_changed(self.key)
+        if k == 'toggle':
+            verb = 'تعطيل' if self._sel.get('is_active') else 'تفعيل'
+            ok, _ = self.guarded(self.svc.set_cc_active, self._sel['id'], not bool(self._sel.get('is_active')), reload=False)
+            if ok: self.refresh(); self.window_.data_changed(self.key)
+        if k == 'delete':
+            if ask_reason(self, 'حذف', [f"حذف «{self._sel.get('name')}»؟ يشترط عدم استخدامه في قيود."], need_reason=False, confirm_text='حذف', danger=True) is None: return
+            ok, _ = self.guarded(self.svc.delete_cc, self._sel['id'], reload=False)
+            if ok: self.refresh(); self.window_.data_changed(self.key)
+
+
+class PayrollPage(BasePage):
+    key = 'payroll'; title = 'مسيرات الرواتب'; icon = 'receipt'; required_permission = 'payroll.run'
+    source_targets = {'payroll_run': ('grid', None, 0)}
+
+    def build(self):
+        self.svc = HrService(self.session); self._sel = None
+        lay = QVBoxLayout(self); lay.setContentsMargins(6, 6, 6, 6)
+        self.grid = DataGrid([
+            Column('id', 'المعرف', 'int', 70),
+            Column('period_month', 'الشهر', width=100),
+            Column('pay_date', 'تاريخ الصرف', 'date', 95),
+            Column('status', 'الحالة', 'status', 90),
+            Column('employees', 'عدد الموظفين', 'int', 90),
+            Column('total_minor', 'الإجمالي', 'money', 120, minor=True)
+        ], grid_id='payroll_runs')
+        self.grid.selectionChangedRows.connect(self._on_payroll_select)
+        self.related = RelatedPanel()
+        self.related.setMaximumHeight(90)
+        self.related.openRequested.connect(lambda page, params: self.open_page_requested.emit(page, params))
+        lay.addWidget(self.grid, 1)
+        lay.addWidget(self.related)
+
+    def _on_payroll_select(self, rows):
+        self._sel = rows[0] if len(rows) == 1 else None
+        if self._sel and self._sel.get('journal_entry_id'):
+            self.related.set_items([('قيد اليومية', f"قيد الرواتب #{self._sel['journal_entry_id']}", 'journal', {'id': self._sel['journal_entry_id']})])
+        else:
+            self.related.set_items([])
+        self.actions_changed.emit()
+
+    def refresh(self):
+        if not getattr(self, '_built', False): return
+        keep = self._sel['id'] if self._sel else None
+        try: rows = self.svc.payroll_runs()
+        except Exception as e: self.show_error(e); rows = []
+        self.grid.set_rows(rows)
+        if keep is not None: self.grid.select_where(lambda r: r['id'] == keep)
+        if not self._sel: self.related.set_items([])
+        self.actions_changed.emit()
+
+    def _state(self, k):
+        if k == 'new': return self.access.state('payroll.run')
+        if not self._sel: return ActionState(False, 'حدد مسيرًا أولاً')
+        st = self._sel.get('status')
+        if k == 'post': return ActionState(st == 'draft', 'الترحيل للمسيرة المسودة فقط')
+        if k == 'delete': return ActionState(st == 'draft', 'الحذف للمسودة فقط')
+        if k == 'cancel':
+            if st != 'posted': return ActionState(False, 'الإلغاء للمسير المرحل فقط')
+            p_st = self.access.state('payroll.run')
+            if not p_st.enabled: return p_st
+            return self.access.state('journal.reverse')
+        return ActionState(True)
+
+    def ribbon_groups(self):
+        def a(k, lab, icon, **kw):
+            return Action(k, lab, icon, state_fn=lambda kk=k: self._state(kk), handler=lambda kk=k: self.do(kk), **kw)
+        return [
+            ActionGroup('مسير', [
+                a('new', 'مسير جديد', 'new', primary=True),
+                a('post', 'ترحيل المسير', 'post'),
+                a('delete', 'حذف المسودة', 'delete', danger=True),
+                a('cancel', 'إلغاء المسير', 'delete', danger=True)
+            ]),
+            ActionGroup('عرض', [Action('refresh', 'تحديث', 'refresh', handler=self.refresh)])
+        ]
+
+    def do(self, k):
+        st = self._state(k)
+        if not st.enabled: return QMessageBox.information(self, self.title, st.reason)
+        if k == 'new':
+            from alhisabat.ui.app_dialogs.hr import PayrollDialog
+            d = PayrollDialog(self)
+            if self.exec_form(d):
+                ok, _ = self.guarded(self.svc.create_payroll, d.values(), reload=False)
+                if ok: self.refresh(); self.window_.data_changed(self.key)
+        if k == 'post':
+            if ask_reason(self, 'ترحيل المسير', ['سيُنشأ القيد المحاسبي للرواتب وتُسجل المستحقات.'], need_reason=False, confirm_text='ترحيل') is None: return
+            self.run_service(HrService, 'post_payroll', self._sel['id'],
+                             on_done=lambda _r: (self.notify('تم ترحيل المسير'), self.refresh(), self.window_.data_changed(self.key)))
+        if k == 'delete':
+            if ask_reason(self, 'حذف مسودة المسير', [f"هل تريد حذف مسودة مسير شهر {self._sel.get('period_month')} نهائيًا؟"], need_reason=False, confirm_text='حذف المسودة', danger=True) is None: return
+            ok, _ = self.guarded(self.svc.delete_run_draft, self._sel['id'], reload=False)
+            if ok: self.notify('تم حذف مسودة المسير'); self.refresh(); self.window_.data_changed(self.key)
+        if k == 'cancel':
+            r = ask_reason(self, 'إلغاء المسير', [f"هل تريد إلغاء مسير شهر {self._sel.get('period_month')}؟", "سيُنشأ قيد عكسي."], need_reason=True, confirm_text='إلغاء المسير', danger=True)
+            if not r: return
+            from datetime import date as _d
+            ok, _ = self.guarded(self.svc.cancel_run, self._sel['id'], _d.today().isoformat(), r, reload=False)
+            if ok: self.notify('تم إلغاء المسير وعكس القيد'); self.refresh(); self.window_.data_changed(self.key)
+
+
+class AssetsPage(BasePage):
+    key = 'assets'; title = 'الأصول الثابتة'; icon = 'cube'; required_permission = 'asset.view'
+    source_targets = {'fixed_asset': ('grid', 'tabs', 0), 'fixed_asset_disposal': ('grid', 'tabs', 0),
+                      'asset_depreciation': ('dep_grid', 'tabs', 1), 'depreciation_run': ('dep_grid', 'tabs', 1)}
+
+    def build(self):
+        self.svc = HrService(self.session); self._sel = None; self._dep_sel = None
+        lay = QVBoxLayout(self); lay.setContentsMargins(6, 6, 6, 6)
+        self.tabs = QTabWidget(); self.tabs.setLayoutDirection(Qt.RightToLeft)
+
+        # تبويب الأصول
+        w_assets = QWidget(); l_assets = QVBoxLayout(w_assets)
+        self.grid = DataGrid([
+            Column('code', 'الكود', width=90),
+            Column('name', 'الاسم', width=180),
+            Column('cost_minor', 'التكلفة', 'money', 110, minor=True),
+            Column('accumulated_depreciation_minor', 'مجمع الإهلاك', 'money', 110, minor=True),
+            Column('book_value_minor', 'القيمة الدفترية', 'money', 110, minor=True),
+            Column('status', 'الحالة', 'status', 90)
+        ], grid_id='assets')
+        self.grid.selectionChangedRows.connect(self._on_asset_select)
+        l_assets.addWidget(self.grid, 1)
+        self.tabs.addTab(w_assets, 'سجل الأصول')
+
+        # تبويب دورات الإهلاك
+        w_dep = QWidget(); l_dep = QVBoxLayout(w_dep)
+        self.dep_grid = DataGrid([
+            Column('id', 'المعرف', 'int', 70),
+            Column('run_date', 'تاريخ التشغيل', 'date', 95),
+            Column('status', 'الحالة', 'status', 90),
+            Column('assets_count', 'عدد الأصول', 'int', 90),
+            Column('total_minor', 'إجمالي الإهلاك', 'money', 120, minor=True)
+        ], grid_id='asset_dep_runs')
+        self.dep_grid.selectionChangedRows.connect(self._on_dep_select)
+        l_dep.addWidget(self.dep_grid, 1)
+        self.tabs.addTab(w_dep, 'دورات الإهلاك')
+
+        self.related = RelatedPanel()
+        self.related.setMaximumHeight(90)
+        self.related.openRequested.connect(lambda page, params: self.open_page_requested.emit(page, params))
+        lay.addWidget(self.tabs, 1)
+        lay.addWidget(self.related)
+
+    def _on_asset_select(self, rows):
+        self._sel = rows[0] if len(rows) == 1 else None
+        self._update_related()
+        self.actions_changed.emit()
+
+    def _on_dep_select(self, rows):
+        self._dep_sel = rows[0] if len(rows) == 1 else None
+        self._update_related()
+        self.actions_changed.emit()
+
+    def _update_related(self):
+        items = []
+        if self._dep_sel and self._dep_sel.get('journal_entry_id'):
+            items.append(('قيد اليومية', f"قيد الإهلاك #{self._dep_sel['journal_entry_id']}", 'journal', {'id': self._dep_sel['journal_entry_id']}))
+        if self._sel:
+            if self._sel.get('account_id'):
+                items.append(('شجرة الحسابات', f"حساب الأصل: {self._sel['name']}", 'accounts', {'id': self._sel['account_id']}))
+        self.related.set_items(items)
+
+    def refresh(self):
+        if not getattr(self, '_built', False): return
+        keep = self._sel['id'] if self._sel else None
+        keep_dep = self._dep_sel['id'] if self._dep_sel else None
+        try:
+            rows = self.svc.assets()
+            dep_rows = self.svc.depreciation_runs()
+        except Exception as e:
+            self.show_error(e); rows = []; dep_rows = []
+        self.grid.set_rows(rows)
+        self.dep_grid.set_rows(dep_rows)
+        if keep is not None: self.grid.select_where(lambda r: r['id'] == keep)
+        if keep_dep is not None: self.dep_grid.select_where(lambda r: r['id'] == keep_dep)
+        if not self._sel and not self._dep_sel: self.related.set_items([])
+        self.actions_changed.emit()
+
+    def _state(self, k):
+        if k == 'add': return self.access.state('asset.manage')
+        if k in ('acq', 'dispose'):
+            if not self._sel: return ActionState(False, 'حدد أصلاً أولاً')
+            if k == 'acq': return ActionState(self._sel.get('status') == 'registered', 'الاقتناء للأصول المسجلة فقط')
+            if k == 'dispose': return ActionState(self._sel.get('status') in ('active', 'fully_depreciated'), 'الاستبعاد للأصول النشطة فقط')
+        if k == 'dep_preview': return self.access.state('asset.depreciate')
+        if k == 'dep_run': return self.access.state('asset.depreciate')
+        if k == 'post_dep':
+            if not self._dep_sel: return ActionState(False, 'حدد دورة إهلاك مسودة')
+            if self._dep_sel.get('status') != 'draft': return ActionState(False, 'الترحيل للمسودة فقط')
+            return self.access.state('asset.depreciate')
+        if k == 'cancel_dep':
+            if not self._dep_sel: return ActionState(False, 'حدد دورة إهلاك مرحلة')
+            if self._dep_sel.get('status') != 'posted': return ActionState(False, 'الإلغاء للدورات المرحلة فقط')
+            d_st = self.access.state('asset.depreciate')
+            if not d_st.enabled: return d_st
+            return self.access.state('journal.reverse')
+        return ActionState(True)
+
+    def ribbon_groups(self):
+        def a(k, lab, icon, **kw):
+            return Action(k, lab, icon, state_fn=lambda kk=k: self._state(kk), handler=lambda kk=k: self.do(kk), **kw)
+        return [
+            ActionGroup('أصل', [
+                a('add', '+ أصل جديد', 'new', primary=True),
+                a('acq', 'تسجيل اقتناء', 'post'),
+                a('dispose', 'استبعاد/بيع أصل', 'delete', danger=True)
+            ]),
+            ActionGroup('إهلاك دوري', [
+                a('dep_preview', 'معاينة الإهلاك', 'search'),
+                a('dep_run', 'تشغيل إهلاك جديد', 'refresh'),
+                a('post_dep', 'ترحيل دورة الإهلاك', 'post'),
+                a('cancel_dep', 'إلغاء دورة الإهلاك', 'delete', danger=True)
+            ]),
+            ActionGroup('عرض', [Action('refresh', 'تحديث', 'refresh', handler=self.refresh)])
+        ]
+
+    def do(self, k):
+        st = self._state(k)
+        if not st.enabled: return QMessageBox.information(self, self.title, st.reason)
+        if k == 'add':
+            from alhisabat.ui.app_dialogs.hr import AssetDialog
+            d = AssetDialog(self)
+            if self.exec_form(d):
+                ok, _ = self.guarded(self.svc.create_asset, d.values(), reload=False)
+                if ok: self.refresh(); self.window_.data_changed(self.key)
+        if k == 'acq':
+            from alhisabat.ui.app_dialogs.hr import AcquisitionDialog
+            d = AcquisitionDialog(self, self._sel)
+            if self.exec_form(d):
+                v = d.values()
+                ok, _ = self.guarded(self.svc.acquisition, self._sel['id'], v['account_id'], v.get('description', ''), reload=False)
+                if ok: self.refresh(); self.window_.data_changed(self.key)
+        if k == 'dispose':
+            from alhisabat.ui.app_dialogs.hr import AssetDisposalDialog
+            d = AssetDisposalDialog(self, self._sel)
+            if self.exec_form(d):
+                v = d.values()
+                ok, _ = self.guarded(self.svc.dispose_asset, self._sel['id'], v['date'], v['proceeds'], v['counter_account_id'], reason=v.get('reason', ''), reload=False)
+                if ok: self.notify('تم استبعاد الأصل وتسجيل قيود التخلص'); self.refresh(); self.window_.data_changed(self.key)
+        if k == 'dep_preview':
+            from datetime import date as _d
+            res = self.svc.dep_preview(_d.today().isoformat())
+            from alhisabat.ui.components.datagrid import format_minor
+            tot = res.get('total_depreciation_minor', 0)
+            n = len(res.get('lines', []))
+            QMessageBox.information(self, 'معاينة الإهلاك', f"عدد الأصول القابلة للإهلاك: {n}\nإجمالي الإهلاك المتوقع: {format_minor(tot)}")
+        if k == 'dep_run':
+            from datetime import date as _d
+            res = ask_reason(self, 'تشغيل الإهلاك', ['سيتم احتساب الإهلاك لجميع الأصول النشطة حتى اليوم وإنشاء مسودة دورة إهلاك.'], need_reason=False, confirm_text='تشغيل الإهلاك')
+            if res is None: return
+            self.run_service(HrService, 'run_dep', _d.today().isoformat(), post=False,
+                             on_done=lambda _r: (self.notify('تم إنشاء دورة الإهلاك كمسودة'), self.refresh(), self.window_.data_changed(self.key)))
+        if k == 'post_dep':
+            if not self._dep_sel: return
+            rid = self._dep_sel['id']
+            if ask_reason(self, 'ترحيل دورة الإهلاك', [f"هل تريد ترحيل دورة الإهلاك رقم {rid} وإنشاء القيود؟"], need_reason=False, confirm_text='ترحيل') is None: return
+            self.run_service(HrService, 'post_depreciation_run', rid,
+                             on_done=lambda _r: (self.notify('تم ترحيل دورة الإهلاك بنجاح'), self.refresh(), self.window_.data_changed(self.key)))
+        if k == 'cancel_dep':
+            if not self._dep_sel: return
+            rid = self._dep_sel['id']
+            r = ask_reason(self, 'إلغاء دورة الإهلاك', [f"هل تريد إلغاء دورة الإهلاك رقم {rid}؟", "سيتم إلغاء القيد وعكسه."], need_reason=True, confirm_text='إلغاء الدورة', danger=True)
+            if not r: return
+            from datetime import date as _d
+            ok, _ = self.guarded(self.svc.cancel_depreciation_run, rid, _d.today().isoformat(), r, reload=False)
+            if ok: self.notify('تم إلغاء دورة الإهلاك بنجاح'); self.refresh(); self.window_.data_changed(self.key)

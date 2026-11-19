@@ -1,0 +1,708 @@
+"""مكوّنات أساسية: StatusBadge وStatusStamp وKpiCard وMoneyEdit وDateField وCurrencyRateField وConfirmDangerDialog. يتطلب PySide6.
+
+الألوان كلها من QSS المولَّد (خصائص tone/badge)، فلا ألوان ثابتة هنا.
+"""
+from datetime import date
+from decimal import Decimal
+
+from PySide6.QtCore import QDate, Qt, Signal
+from PySide6.QtGui import QRegularExpressionValidator
+from PySide6.QtCore import QRegularExpression
+from PySide6.QtWidgets import (
+    QButtonGroup, QRadioButton, QTextEdit, QDateEdit, QDialog, QDialogButtonBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QVBoxLayout, QWidget
+)
+
+from alhisabat.ui.core import format as fmt, strings_ar as S
+from alhisabat.ui.design import tokens as T
+
+
+def repolish(w):
+    w.style().unpolish(w)
+    w.style().polish(w)
+
+
+class StatusBadge(QLabel):
+    """شارة حالة بدلالة لونية ثابتة (مسودة/مراجعة/معتمد/مرحّل/ملغى...). النص يحمل المعنى مع اللون."""
+
+    def __init__(self, status=None, workflow_state=None, parent=None):
+        super().__init__(parent)
+        self.setProperty('badge', True)
+        self.setAlignment(Qt.AlignCenter)
+        self.set_status(status, workflow_state)
+
+    def set_status(self, status, workflow_state=None):
+        code = T.workflow_badge(status, workflow_state)
+        self.setText(T.status_label(code))
+        self.setProperty('tone', T.status_tone(code))
+        repolish(self)
+
+
+class KpiCard(QFrame):
+    clicked = Signal()
+
+    def __init__(self, title, value='—', sub='', parent=None):
+        super().__init__(parent)
+        self.setObjectName('kpiCard')
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 8, 12, 8)
+        lay.setSpacing(2)
+        self.t = QLabel(title)
+        self.t.setObjectName('kpiTitle')
+        self.v = QLabel(value)
+        self.v.setObjectName('kpiValue')
+        self.s = QLabel(sub)
+        self.s.setObjectName('ctxKey')
+        for w in (self.t, self.v, self.s):
+            lay.addWidget(w)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def set_value(self, value, sub=''):
+        self.v.setText(value)
+        self.s.setText(sub)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(e)
+
+
+class MoneyEdit(QLineEdit):
+    """حقل مبلغ بـDecimal: يقبل الأرقام العربية والفواصل، يتحقق لحظيًا، ويُنسّق عند فقد التركيز."""
+    valueChanged = Signal(object)
+
+    def __init__(self, currency='', allow_negative=False, places=2, parent=None):
+        super().__init__(parent)
+        self.currency, self.allow_negative, self.places = currency, allow_negative, places
+        self.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.setLayoutDirection(Qt.LeftToRight)
+        self.setPlaceholderText('0.00')
+        self.setValidator(QRegularExpressionValidator(QRegularExpression(r'[-0-9٠-٩,٬.٫ ]*')))
+        self.textChanged.connect(self._changed)
+
+    def value(self):
+        """Decimal أو None إن كان الحقل فارغًا/غير صالح."""
+        try:
+            t = self.text().strip()
+            return None if not t else fmt.parse_money(t, allow_negative=self.allow_negative)
+        except ValueError:
+            return None
+
+    def set_value(self, v):
+        self.setText('' if v is None else fmt.fmt_money(v, self.places).replace('(', '-').replace(')', '').replace(',', ''))
+
+    def _changed(self, _t):
+        v = self.value()
+        bad = bool(self.text().strip()) and v is None
+        self.setProperty('invalid', bad)
+        repolish(self)
+        self.setToolTip('قيمة غير صالحة' if bad else '')
+        self.valueChanged.emit(v)
+
+    def focusOutEvent(self, e):
+        v = self.value()
+        if v is not None:
+            self.blockSignals(True)
+            self.set_value(v)
+            self.blockSignals(False)
+        super().focusOutEvent(e)
+
+
+class DateField(QDateEdit):
+    """حقل تاريخ يحترم حدود السنة والفترة: خارج [min,max] يُرفض، والفترة المقفلة تُفسَّر في التلميح."""
+    dateIso = Signal(str)
+
+    def __init__(self, start=None, end=None, closed_reason_fn=None, parent=None):
+        super().__init__(parent)
+        self.setCalendarPopup(True)
+        self.setDisplayFormat('yyyy-MM-dd')
+        self.setLayoutDirection(Qt.LeftToRight)
+        self._reason_fn = closed_reason_fn      # دالة (iso) → سبب إغلاق أو ''
+        self.set_bounds(start, end)
+        self.setDate(QDate.currentDate())
+        self.dateChanged.connect(self._on_change)
+
+    def set_bounds(self, start, end):
+        if start:
+            self.setMinimumDate(QDate.fromString(str(start), 'yyyy-MM-dd'))
+        if end:
+            self.setMaximumDate(QDate.fromString(str(end), 'yyyy-MM-dd'))
+
+    def iso(self):
+        return self.date().toString('yyyy-MM-dd')
+
+    def set_iso(self, iso):
+        self.setDate(QDate.fromString(str(iso)[:10], 'yyyy-MM-dd'))
+
+    def _on_change(self, _d):
+        why = self._reason_fn(self.iso()) if self._reason_fn else ''
+        self.setProperty('invalid', bool(why))
+        repolish(self)
+        self.setToolTip(why)
+        self.dateIso.emit(self.iso())
+
+
+class CurrencyRateField(QWidget):
+    """سعر الصرف: يعرض السعر ومصدره، والتجاوز مقفل إلا بصلاحية currency.override_rate ويُحذَّر منه."""
+    changed = Signal()
+
+    def __init__(self, can_override, parent=None):
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.edit = MoneyEdit(places=8)
+        self.edit.setReadOnly(True)
+        self.note = QLabel('')
+        self.note.setObjectName('ctxKey')
+        lay.addWidget(self.edit)
+        lay.addWidget(self.note, 1)
+        self._can = can_override
+        self.edit.valueChanged.connect(lambda _v: self.changed.emit())
+
+    def set_rate(self, rate, source=''):
+        self.edit.set_value(rate)
+        self.note.setText(source or 'من جدول أسعار الصرف')
+        self.edit.setReadOnly(not self._can)
+        self.edit.setToolTip('' if self._can else 'تعديل السعر يتطلب صلاحية «تجاوز سعر الصرف»')
+
+    def missing(self, currency, date_iso):
+        self.edit.set_value(None)
+        self.note.setText(f'لا يوجد سعر للعملة {currency} بتاريخ {date_iso}: أضفه من «العملات وأسعار الصرف»')
+        self.edit.setReadOnly(True)
+
+    def value(self):
+        return self.edit.value()
+
+
+class AmountInWords(QLabel):
+    """المبلغ كتابةً بالعربية (عرض فقط، دون أثر محاسبي)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWordWrap(True)
+
+    def set_amount(self, amount, currency='SAR'):
+        self.setText(fmt.amount_in_words(amount, currency) if amount is not None else '')
+
+
+class ConfirmDangerDialog(QDialog):
+    """تأكيد الإجراءات الحرجة: يعرض الأثر المتوقع ويطلب سببًا نصيًا حين يشترطه المحرك.
+    زر التأكيد معطّل حتى يُكتب السبب (إن كان إلزاميًا). يستعمل: dlg.reason() بعد exec()."""
+
+    def __init__(self, parent, title, impact_lines, need_reason=True, confirm_text='تأكيد', danger=True):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.setMinimumWidth(460)
+        lay = QVBoxLayout(self)
+        h = QLabel(title)
+        h.setObjectName('panelTitle')
+        lay.addWidget(h)
+        for line in impact_lines:
+            lb = QLabel('• ' + line)
+            lb.setWordWrap(True)
+            lay.addWidget(lb)
+        self._need = need_reason
+        self._reason = QPlainTextEdit()
+        self._reason.setFixedHeight(70)
+        if need_reason:
+            lay.addWidget(QLabel(S.GENERIC['reason_required']))
+            lay.addWidget(self._reason)
+            self._reason.textChanged.connect(self._sync)
+        bb = QDialogButtonBox()
+        self._ok = bb.addButton(confirm_text, QDialogButtonBox.AcceptRole)
+        self._ok.setProperty('danger' if danger else 'primary', True)
+        cancel = bb.addButton(S.ACTION['cancel'], QDialogButtonBox.RejectRole)
+        cancel.setDefault(True)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+        self._sync()
+
+    def _sync(self):
+        self._ok.setEnabled(not self._need or bool(self._reason.toPlainText().strip()))
+
+    def reason(self):
+        return self._reason.toPlainText().strip()
+
+
+def ask_reason(parent, title, impact_lines=(), need_reason=True, confirm_text='تأكيد', danger=True):
+    """نافذة تأكيد + سبب: تُرجع النص (قد يكون '') أو None عند الإلغاء."""
+    dlg = ConfirmDangerDialog(parent, title, list(impact_lines), need_reason, confirm_text, danger)
+    return dlg.reason() if dlg.exec() == QDialog.Accepted else None
+
+
+def make_resizable(dlg, width=None, height=None, min_size=(420, 300)):
+    """يجعل النافذة قابلة للتكبير والتصغير بالسحب من الحواف/المقبض السفلي، وزر التكبير في شريط العنوان (ونقر مزدوج عليه).
+    يُستدعى في __init__ قبل العرض. لا يغيّر ترتيب المكوّنات: تتمدد بحسب الـlayout."""
+    dlg.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
+    dlg.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
+    dlg.setSizeGripEnabled(True)
+    if min_size:
+        dlg.setMinimumSize(*min_size)
+    if width and height:
+        dlg.resize(width, height)
+    return dlg
+
+
+# ---------------------------------------------------------------------------------------------
+# حماية الإغلاق + تصغير النافذة (v1.9.1) — مشتركة لكل نوافذ الإدخال
+# ---------------------------------------------------------------------------------------------
+class DialogGuardMixin:
+    """يوضع قبل QDialog في الوراثة: ``class MyDialog(DialogGuardMixin, QDialog)``.
+
+    - X/Esc/زر إغلاق ← reject() ← إن وُجدت تعديلات: «حفظ وإغلاق / حفظ / إغلاق فقط / إلغاء الأمر».
+    - الصنف الوارث يعرّف: ``has_unsaved()`` و``save_from_guard(close)`` (تعيد True عند نجاح الحفظ).
+    - زر «–» (add_minimize_button) يصغّر النافذة دون إغلاقها وتبقى بياناتها كما هي.
+    """
+    guard_title = 'تنبيه قبل الإغلاق'
+    draft_key = None            # مفتاح المسودة؛ None = بلا حفظ تلقائي
+    draft_title = ''            # اسم النافذة في رسالة الاستئناف
+    draft_page = ''             # مفتاح الصفحة التي تفتح منها النافذة (لإعادة فتحها عند الاستئناف)
+    draft_interval_ms = 3000
+    guard_save_stay = True      # False للنوافذ التي يتم حفظها في الصفحة بعد exec(): تُخفى خيار «حفظ» ويبقى «حفظ وإغلاق»
+    nonmodal_exec = False       # True: exec() لا يقيّد الشاشة الرئيسية (حلقة أحداث محلية) فيمكن تصغير النافذة والعمل في غيرها
+    draft_clear_on_page_save = False   # True: الصفحة هي التي تحفظ بعد القبول؛ تُحذف المسودة عند نجاح حفظها (d.clear_draft())
+    center_on_show = False      # True: تُعرض النافذة في وسط الشاشة الرئيسية عند أول ظهور (الصنف والفاتورة)
+    auto_guard = True           # يضيف زر «–» ويلتقط نقطة الأساس للتعديلات عند أول عرض
+    embedded = False            # True: النموذج مضمَّن في جسم الصفحة (لا نافذة): بلا أعلام نافذة ولا زر تصغير ولا توسيط
+    _resume = False
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # مهم: تغيير أعلام النافذة بعد عرضها (داخل showEvent) يعيد إنشاء النافذة فتظهر بيضاء ومنبثقة عشوائيًا.
+        # لذلك يُفعَّل زر التصغير هنا قبل أول عرض.
+        if self.auto_guard and not self.embedded:
+            self.setWindowFlag(Qt.WindowMinimizeButtonHint, True)
+
+    # ---- إعداد تلقائي عند أول عرض: زر «–» + خط أساس لكشف التعديلات + المسودة ----
+    def showEvent(self, ev):
+        if not getattr(self, '_guard_ready', False):
+            self._guard_ready = True
+            if self.auto_guard:
+                try:
+                    from PySide6.QtWidgets import QVBoxLayout
+                    lay = self.layout()
+                    if isinstance(lay, QVBoxLayout):
+                        self.add_minimize_button(lay)
+                    self._baseline = self._widget_snapshot()
+                except Exception:  # noqa: BLE001 — الحماية لا يجوز أن تمنع فتح النافذة
+                    self._baseline = None
+            if self.draft_key and not hasattr(self, '_draft_store') and getattr(getattr(self, 'page', None), 'window_', None) is not None:
+                from PySide6.QtCore import QTimer
+                self.setup_drafts(self.page)
+                QTimer.singleShot(0, lambda: self._restored_flag(self.offer_draft_restore(auto=self._resume)))
+        if self.center_on_show and not getattr(self, '_centered', False):
+            self._centered = True
+            self._center_now()
+        super().showEvent(ev)
+
+    def _center_now(self):
+        try:
+            host = self.parent().window() if self.parent() is not None else None
+            scr = (host.screen() if host is not None else self.screen())
+            avail = scr.availableGeometry()
+            w, h = min(self.width(), avail.width() - 40), min(self.height(), avail.height() - 60)
+            if (w, h) != (self.width(), self.height()): self.resize(w, h)
+            ref = host.frameGeometry() if (host is not None and host.isVisible() and not host.isMinimized()) else avail
+            x = ref.center().x() - w // 2; y = ref.center().y() - h // 2
+            x = max(avail.left(), min(x, avail.right() - w)); y = max(avail.top(), min(y, avail.bottom() - h))
+            self.move(x, y)
+        except Exception:  # noqa: BLE001 — التوسيط تجميلي ولا يمنع الفتح
+            pass
+
+    def _restored_flag(self, restored):
+        self._restored = bool(restored)
+
+    def _widget_snapshot(self):
+        """لقطة نصية لكل حقول النافذة (نصوص/قوائم/خانات/تواريخ/جداول) لكشف «هل تغيّر شيء منذ الفتح»."""
+        from PySide6.QtWidgets import (QAbstractButton, QCheckBox, QComboBox, QDateEdit, QDoubleSpinBox, QLineEdit, QPlainTextEdit,
+                                       QSpinBox, QTableWidget, QTextEdit)
+        out = []
+        for w in self.findChildren(QWidget):
+            if isinstance(w, QLineEdit):
+                if not w.isReadOnly():
+                    out.append(w.text())
+            elif isinstance(w, QComboBox):
+                out.append(w.currentIndex())
+            elif isinstance(w, QCheckBox):
+                out.append(w.isChecked())
+            elif isinstance(w, (QPlainTextEdit, QTextEdit)):
+                out.append(w.toPlainText())
+            elif isinstance(w, QDateEdit):
+                out.append(w.date().toString('yyyy-MM-dd'))
+            elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
+                out.append(w.value())
+            elif isinstance(w, QTableWidget):
+                out.append([[(w.item(r, c).text() if w.item(r, c) else '') for c in range(w.columnCount())] for r in range(w.rowCount())])
+        return repr(out)
+
+    def exec(self):
+        if not self.nonmodal_exec:
+            return super().exec()
+        reg = DialogGuardMixin._open_nonmodal
+        key = (type(self).__name__, id(self.parent()))
+        other = reg.get(key)
+        if other is not None and other is not self:
+            try:                                  # نافذة من نفس النوع مفتوحة: أعدها للواجهة بدل فتح ثانية
+                if other.isMinimized():
+                    other.showNormal()
+                other.show(); other.raise_(); other.activateWindow()
+                return 0
+            except RuntimeError:
+                reg.pop(key, None)
+        reg[key] = self
+        from PySide6.QtCore import QEventLoop
+        self.setModal(False)
+        self.setWindowModality(Qt.NonModal)
+        loop = QEventLoop(self)
+        self.finished.connect(loop.quit)
+        self.destroyed.connect(loop.quit)
+        self.show()
+        loop.exec()
+        if reg.get(key) is self:
+            reg.pop(key, None)
+        return self.result()
+
+    _open_nonmodal = {}
+
+    # ---- المسودة التلقائية (انقطاع الكهرباء) ----
+    def draft_state(self) -> dict:
+        return {}
+
+    def restore_state(self, state: dict) -> None:
+        pass
+
+    def setup_drafts(self, page):
+        """يُستدعى في نهاية __init__: يربط المخزن ويبدأ الحفظ التلقائي. page.window_.drafts هو المخزن."""
+        from PySide6.QtCore import QTimer
+        self._draft_store = getattr(getattr(page, 'window_', None), 'drafts', None)
+        self._draft_last = None
+        self._draft_lbl = getattr(self, '_draft_lbl', None)
+        if self._draft_store is None or not self.draft_key:
+            return
+        self._draft_timer = QTimer(self)
+        self._draft_timer.timeout.connect(self._autosave_draft)
+        self._draft_timer.start(self.draft_interval_ms)
+
+    def pending_draft(self):
+        st = getattr(self, '_draft_store', None)
+        return st.load(self.draft_key) if st and self.draft_key else None
+
+    def offer_draft_restore(self, auto=False):
+        """إن وُجدت مسودة: auto=True تستعيدها مباشرة (بعد موافقة المستخدم عند بدء البرنامج)، وإلا تسأل: استعادة أم بداية جديدة."""
+        got = self.pending_draft()
+        if not got:
+            return False
+        payload, _meta, saved_at = got
+        if not auto:
+            from PySide6.QtWidgets import QMessageBox
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Question)
+            box.setWindowTitle('مسودة غير محفوظة')
+            box.setText(f'وُجد إدخال غير محفوظ في «{self.draft_title or self.windowTitle()}» (آخر حفظ تلقائي {saved_at}).')
+            box.setInformativeText('هل تريد استعادته ومتابعة العمل من حيث توقفت؟')
+            box.setLayoutDirection(Qt.RightToLeft)
+            b_y = box.addButton('استعادة المسودة', QMessageBox.AcceptRole)
+            b_n = box.addButton('بداية جديدة (حذف المسودة)', QMessageBox.DestructiveRole)
+            box.setDefaultButton(b_y)
+            box.exec()
+            if box.clickedButton() is b_n:
+                self.clear_draft()
+                return False
+        try:
+            self.restore_state(payload)
+        except Exception:  # noqa: BLE001 — مسودة تالفة لا تمنع فتح النافذة
+            self.clear_draft()
+            return False
+        self._draft_last = None
+        self._mark_draft_label(f'تمت استعادة المسودة ({saved_at})')
+        return True
+
+    def _autosave_draft(self):
+        if not getattr(self, '_draft_store', None) or not self.draft_key or not self.has_unsaved():
+            return
+        try:
+            state = self.draft_state()
+        except Exception:  # noqa: BLE001
+            return
+        import json
+        sig = json.dumps(state, ensure_ascii=False, sort_keys=True, default=str)
+        if sig == self._draft_last:
+            return
+        meta = {'page': self.draft_page, 'title': self.draft_title or self.windowTitle()}
+        if self._draft_store.save(self.draft_key, state, meta):
+            self._draft_last = sig
+            import time
+            self._mark_draft_label('حُفظ تلقائيًا ' + time.strftime('%H:%M:%S'))
+
+    def clear_draft(self):
+        st = getattr(self, '_draft_store', None)
+        if st and self.draft_key:
+            st.clear(self.draft_key)
+        self._draft_last = None
+        self._mark_draft_label('')
+
+    def _mark_draft_label(self, text):
+        lbl = getattr(self, '_draft_lbl', None)
+        if lbl is not None:
+            lbl.setText(text)
+
+    def done(self, result):
+        # أي إغلاق فعلي (حفظ ناجح أو «إغلاق فقط») يحذف المسودة؛ أما انقطاع التيار فلا يمر من هنا فتبقى.
+        # النوافذ التي تحفظ صفحتُها بعد القبول (draft_clear_on_page_save) تُبقي المسودة حتى تستدعي الصفحة clear_draft() بعد نجاح الحفظ.
+        accepted = result == QDialog.Accepted
+        if accepted and self.draft_clear_on_page_save:
+            self._autosave_draft()
+        elif getattr(self, '_force_close', False) or not self.has_unsaved():
+            self.clear_draft()
+        t = getattr(self, '_draft_timer', None)
+        if t is not None:
+            t.stop()
+        return super().done(result)
+
+    def has_unsaved(self) -> bool:
+        if getattr(self, '_restored', False):
+            return True                          # مسودة مستعادة لم تُحفظ بعد
+        base = getattr(self, '_baseline', None)
+        if base is None:
+            return False
+        try:
+            return self._widget_snapshot() != base
+        except Exception:  # noqa: BLE001
+            return False
+
+    def save_from_guard(self, close: bool) -> bool:
+        """الافتراضي: يضغط زر «حفظ» الأساسي (self.ok) فيمر بنفس التحقق؛ ينجح إن قُبلت النافذة."""
+        ok = getattr(self, 'ok', None)
+        if ok is None or not ok.isEnabled():
+            return False
+        ok.click()
+        return self.result() == QDialog.Accepted
+
+    def add_minimize_button(self, layout):
+        """يضيف صفًا علويًا فيه زر «–» (يظهر يسار النافذة) ويفعّل زر التصغير في شريط العنوان."""
+        if getattr(self, '_min_btn', None) is not None:
+            return self._min_btn
+        from PySide6.QtWidgets import QPushButton
+        if self.embedded:                          # المضمَّن: لا صف علوي فارغ؛ سطر «حُفظ تلقائيًا» يوضع في شريط الأزرار السفلي بيد المحرر
+            if getattr(self, '_draft_lbl', None) is None:
+                self._draft_lbl = QLabel('')
+                self._draft_lbl.setObjectName('ctxKey')
+            b = QPushButton('–')
+            b.setVisible(False)
+            self._min_btn = b
+            return b
+        row = QHBoxLayout()
+        self._draft_lbl = QLabel('')
+        self._draft_lbl.setObjectName('ctxKey')
+        row.addWidget(self._draft_lbl)
+        row.addStretch(1)
+        b = QPushButton('–')
+        b.setFixedWidth(40)
+        b.setAutoDefault(False)
+        b.setDefault(False)
+        b.setToolTip('تصغير النافذة دون إغلاقها (بياناتك تبقى كما هي، وتعود بالنقر عليها)')
+        b.setVisible(not self.embedded)          # المضمَّن: يبقى سطر «حُفظ تلقائيًا» بلا زر تصغير
+        b.clicked.connect(self.showMinimized)
+        row.addWidget(b)
+        layout.insertLayout(0, row)
+        self._min_btn = b
+        return b
+
+    def _ask_close(self):
+        """'save_close' | 'save' | 'discard' | 'cancel'"""
+        from PySide6.QtWidgets import QMessageBox
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle(self.guard_title)
+        box.setText('توجد بيانات أُدخلت أو عُدّلت ولم تُحفظ بعد.')
+        box.setInformativeText('ماذا تريد أن تفعل؟')
+        box.setLayoutDirection(Qt.RightToLeft)
+        b_sc = box.addButton('حفظ وإغلاق', QMessageBox.AcceptRole)
+        b_s = box.addButton('حفظ', QMessageBox.AcceptRole) if self.guard_save_stay else None
+        b_d = box.addButton('إغلاق فقط', QMessageBox.DestructiveRole)
+        b_c = box.addButton('إلغاء الأمر', QMessageBox.RejectRole)
+        box.setDefaultButton(b_c)
+        box.setEscapeButton(b_c)
+        box.exec()
+        clicked = box.clickedButton()
+        return {b_sc: 'save_close', b_s: 'save', b_d: 'discard'}.get(clicked, 'cancel') if clicked is not None else 'cancel'
+
+    def reject(self):
+        if getattr(self, '_force_close', False) or not self.has_unsaved():
+            return super().reject()
+        choice = self._ask_close()
+        if choice == 'cancel':
+            return
+        if choice == 'discard':
+            self._force_close = True
+            return super().reject()
+        if choice == 'save_close':
+            self.save_from_guard(True)       # عند النجاح تُغلق النافذة من داخل الحفظ نفسه
+            return
+        self.save_from_guard(False)          # «حفظ»: تبقى النافذة مفتوحة
+
+    def closeEvent(self, ev):
+        if getattr(self, '_force_close', False) or not self.has_unsaved():
+            return super().closeEvent(ev)
+        ev.ignore()                          # X: نمرّ عبر reject() ليظهر التنبيه
+        self.reject()
+
+
+def show_singleton(page, attr, factory):
+    """يفتح النافذة غير مقيِّدة (non-modal) مرة واحدة فقط؛ إن كانت مصغَّرة/مفتوحة يعيدها للواجهة بدل نافذة جديدة."""
+    d = getattr(page, attr, None)
+    if d is not None:
+        try:
+            if d.isMinimized():
+                d.showNormal()
+            d.show(); d.raise_(); d.activateWindow()
+            return d
+        except RuntimeError:                 # حُذف الكائن
+            setattr(page, attr, None)
+    d = factory()
+    setattr(page, attr, d)
+    d.setModal(False)
+
+    def _gone(*_):
+        setattr(page, attr, None)
+        d.deleteLater()
+    d.finished.connect(_gone)
+    d.show()
+    return d
+
+
+class ModeRadio(QWidget):
+    """خيارات قليلة (نقدي/آجل، قبض/صرف، زيادة/نقص) بأزرار راديو بدل قائمة منسدلة: نقرة واحدة بدل اثنتين.
+    يوفّر واجهة QComboBox المستخدمة في المحررات (currentData/findData/setCurrentIndex/currentIndexChanged/activated/count/itemData)،
+    و`activated` يصدر عند نقر المستخدم فقط (لا عند التغيير البرمجي)، و`setItemEnabled` لتعطيل خيار."""
+
+    currentIndexChanged = Signal(int)
+    activated = Signal(int)
+
+    def __init__(self, items, parent=None):
+        super().__init__(parent)
+        self.setLayoutDirection(Qt.RightToLeft)
+        self._data, self._btns = [], []
+        self._grp = QButtonGroup(self)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(16)
+        for i, (text, data) in enumerate(items):
+            b = QRadioButton(text)
+            b.setMinimumHeight(30)
+            self._grp.addButton(b, i)
+            self._data.append(data)
+            self._btns.append(b)
+            lay.addWidget(b)
+            b.toggled.connect(lambda on, ix=i: on and self.currentIndexChanged.emit(ix))
+            b.clicked.connect(lambda _c=False, ix=i: self.activated.emit(ix))
+        lay.addStretch(1)
+        if self._btns:
+            self._btns[0].setChecked(True)
+
+    def currentIndex(self):
+        return self._grp.checkedId()
+
+    def currentData(self):
+        i = self.currentIndex()
+        return self._data[i] if 0 <= i < len(self._data) else None
+
+    def findData(self, data):
+        return self._data.index(data) if data in self._data else -1
+
+    def setCurrentIndex(self, i):
+        if 0 <= i < len(self._btns):
+            self._btns[i].setChecked(True)
+
+    def count(self):
+        return len(self._btns)
+
+    def itemData(self, i):
+        return self._data[i] if 0 <= i < len(self._data) else None
+
+    def setItemEnabled(self, i, flag):
+        if 0 <= i < len(self._btns):
+            self._btns[i].setEnabled(bool(flag))
+
+
+def field_block(caption, widget, height=30):
+    """حقل بعنوان صغير فوقه (كتلة واحدة يمكن إخفاؤها كاملة: block.setVisible). يُرجع الكتلة وفيها block.caption."""
+    blk = QWidget()
+    bl = QVBoxLayout(blk)
+    bl.setContentsMargins(0, 0, 0, 0)
+    bl.setSpacing(2)
+    lab = QLabel(caption)
+    lab.setObjectName('invFieldLbl')
+    bl.addWidget(lab)
+    bl.addWidget(widget)
+    if height and not isinstance(widget, (ModeRadio, QPlainTextEdit, QTextEdit)):
+        widget.setFixedHeight(height)
+    blk.caption = lab
+    return blk
+
+
+def compact_rows(layout, rows, spacing=10):
+    """يضيف إلى layout صفوفًا أفقية مضغوطة من حقول بعناوين: rows=[[(عنوان, ويدجت, تمدد=0), ...], ...].
+    يُرجع قاموسًا {id(ويدجت): كتلته} ليسهل إخفاء حقل بعنوانه. بديل QFormLayout الذي يهدر ارتفاعًا وعرضًا."""
+    blocks = {}
+    for row in rows:
+        h = QHBoxLayout()
+        h.setSpacing(spacing)
+        for cap, w, stretch in row:
+            blk = field_block(cap, w)
+            blocks[id(w)] = blk
+            h.addWidget(blk, stretch)
+        layout.addLayout(h)
+    return blocks
+
+
+class CompactForm(QVBoxLayout):
+    """بديل QFormLayout بنفس واجهة addRow(عنوان, ويدجت) لكن الحقول في صفوف أفقية (عنوان صغير فوق كل حقل) بدل عمود طويل.
+    per_row = عدد الحقول في الصف؛ addWide(عنوان, ويدجت) حقل بصف كامل؛ addRow(ويدجت/تخطيط) وحده (أزرار الحفظ) يُضاف كما هو.
+    حقل أُخفي من الخارج (blk = form.block(widget)) يخفي كتلته بعنوانها."""
+
+    def __init__(self, parent=None, per_row=2):
+        super().__init__(parent)
+        self.setSpacing(6)
+        self.setContentsMargins(12, 8, 12, 8)
+        self._per, self._row, self._n, self._blocks = per_row, None, 0, {}
+
+    def _put(self, caption, w, stretch=1):
+        if isinstance(w, QHBoxLayout) or isinstance(w, QVBoxLayout):
+            holder = QWidget()
+            holder.setLayout(w)
+            w = holder
+        blk = field_block(caption, w)
+        self._blocks[id(w)] = blk
+        return blk
+
+    def addRow(self, a, b=None):
+        if b is None:                                   # ويدجت/تخطيط وحده (مثل أزرار OK/Cancel)
+            self._flush()
+            if isinstance(a, QWidget):
+                self.addWidget(a)
+            else:
+                self.addLayout(a)
+            return
+        cap = a if isinstance(a, str) else a.text()
+        blk = self._put(cap, b)
+        if self._row is None or self._n >= self._per:
+            self._row = QHBoxLayout()
+            self._row.setSpacing(10)
+            self.addLayout(self._row)
+            self._n = 0
+        self._row.addWidget(blk, 1)
+        self._n += 1
+
+    def addWide(self, caption, w):
+        self._flush()
+        row = QHBoxLayout()
+        row.addWidget(self._put(caption, w), 1)
+        self.addLayout(row)
+
+    def block(self, w):
+        return self._blocks.get(id(w))
+
+    def _flush(self):
+        self._row, self._n = None, 0

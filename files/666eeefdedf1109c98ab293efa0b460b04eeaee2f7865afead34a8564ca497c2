@@ -1,0 +1,111 @@
+"""نوافذ إدارة العملات وأسعار الصرف.
+"""
+from decimal import Decimal
+
+from PySide6.QtCore import Qt, QDate
+from PySide6.QtWidgets import (
+    QComboBox, QDateEdit, QDialog, QDialogButtonBox, QFormLayout,
+    QLineEdit, QMessageBox, QVBoxLayout, QCheckBox
+)
+
+
+class AddCurrencyDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("إضافة عملة جديدة")
+        self.resize(360, 220)
+        self.setLayoutDirection(Qt.RightToLeft)
+
+        lay = QVBoxLayout(self)
+        f = QFormLayout()
+
+        self.code_edit = QLineEdit()
+        self.code_edit.setMaxLength(3)
+        self.code_edit.setPlaceholderText("مثال: USD")
+        f.addRow("رمز العملة (3 أحرف):", self.code_edit)
+
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("مثال: دولار أمريكي")
+        f.addRow("اسم العملة بالعربية:", self.name_edit)
+
+        self.symbol_edit = QLineEdit()
+        self.symbol_edit.setPlaceholderText("مثال: $")
+        f.addRow("العلامة / الرمز المختصر:", self.symbol_edit)
+
+        lay.addLayout(f)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self._validate)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def _validate(self):
+        c = self.code_edit.text().strip().upper()
+        if len(c) != 3 or not c.isalpha():
+            return QMessageBox.warning(self, "خطأ", "رمز العملة يجب أن يكون 3 أحرف لاتينية.")
+        if not self.name_edit.text().strip():
+            return QMessageBox.warning(self, "خطأ", "اسم العملة بالعربية مطلوب.")
+        self.accept()
+
+    def values(self):
+        return {
+            'code': self.code_edit.text().strip().upper(),
+            'name_ar': self.name_edit.text().strip(),
+            'symbol': self.symbol_edit.text().strip() or self.code_edit.text().strip().upper(),
+        }
+
+
+class SetRateDialog(QDialog):
+    def __init__(self, parent, currencies):
+        super().__init__(parent)
+        self.setWindowTitle("تسجيل سعر صرف")
+        self.resize(400, 280)
+        self.setLayoutDirection(Qt.RightToLeft)
+
+        lay = QVBoxLayout(self)
+        f = QFormLayout()
+
+        self.cur_combo = QComboBox()
+        self.cur_combo.addItems(currencies)
+        f.addRow("العملة:", self.cur_combo)
+
+        self.date_edit = QDateEdit(QDate.currentDate())
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setDisplayFormat('yyyy-MM-dd')
+        f.addRow("التاريخ:", self.date_edit)
+
+        self.rate_edit = QLineEdit()
+        self.rate_edit.setPlaceholderText("مثال: 535.50")
+        f.addRow("سعر الصرف:", self.rate_edit)
+
+        self.reason_edit = QLineEdit()
+        self.reason_edit.setPlaceholderText("سبب التعديل أو التجاوز")
+        f.addRow("السبب:", self.reason_edit)
+
+        self.force_check = QCheckBox("تأكيد التغيير الكبير (> 30%)")
+        f.addRow("", self.force_check)
+
+        lay.addLayout(f)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self._validate)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def _validate(self):
+        try:
+            r = Decimal(self.rate_edit.text().strip())
+            if r <= 0:
+                raise ValueError()
+        except Exception:
+            return QMessageBox.warning(self, "خطأ", "أدخل سعر صرف رقمي موجب صحيح.")
+        self.accept()
+
+    def values(self):
+        return {
+            'currency': self.cur_combo.currentText(),
+            'rate_date': self.date_edit.date().toPython().isoformat(),
+            'rate': Decimal(self.rate_edit.text().strip()),
+            'reason': self.reason_edit.text().strip(),
+            'force': self.force_check.isChecked(),
+        }

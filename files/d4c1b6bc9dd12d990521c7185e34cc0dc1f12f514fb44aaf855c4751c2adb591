@@ -1,0 +1,145 @@
+"""الصلاحيات في الواجهة: غلاف `Access` حول can() + حالة الإجراء (مفعّل/معطّل بسبب) + أسماء الصلاحيات بالعربية.
+
+الواجهة تخفي وتعطّل، والمحرك هو الحَكَم النهائي. بلا PySide6.
+"""
+from dataclasses import dataclass
+
+# رمز الصلاحية ← وصفها بالعربية (مستخرج من ترحيلات قاعدة البيانات)
+PERMISSION_LABELS = {
+    'account.create': 'إضافة حساب',
+    'account.deactivate': 'تعطيل حساب',
+    'account.delete': 'حذف حساب',
+    'account.edit': 'تعديل حساب',
+    'account.merge': 'دمج حسابات',
+    'account.move': 'نقل حساب',
+    'account.system_edit': 'تعديل الحسابات النظامية',
+    'account.view': 'عرض الحسابات',
+    'asset.depreciate': 'ترحيل إهلاك الأصول',
+    'asset.dispose': 'استبعاد أصل ثابت',
+    'asset.manage': 'إدارة الأصول الثابتة',
+    'asset.view': 'عرض الأصول الثابتة',
+    'audit.view': 'عرض سجل التدقيق',
+    'backup.manage': 'إنشاء نسخ احتياطية وعرضها',
+    'backup.restore': 'استعادة نسخة احتياطية',
+    'cash.cancel': 'إلغاء سندات النقدية والتحويلات',
+    'cash.count': 'جرد الصناديق',
+    'cash.manage': 'إدارة الصناديق والبنوك',
+    'cash.reconcile': 'مطابقة كشوف البنوك',
+    'cash.view': 'عرض الصناديق والبنوك',
+    'cash.voucher': 'إنشاء وترحيل سندات النقدية',
+    'costcenter.manage': 'إدارة مراكز التكلفة',
+    'costcenter.view': 'عرض مراكز التكلفة',
+    'currency.manage': 'إدارة العملات',
+    'currency.override_rate': 'تجاوز سعر الصرف المسجّل في قيد',
+    'currency.rates': 'إدخال أسعار الصرف',
+    'data.import': 'استيراد بيانات (عملاء/موردون/أصناف/أرصدة)',
+    'employee.manage': 'إدارة بيانات الموظفين',
+    'employee.view': 'عرض الموظفين',
+    'fiscalyear.close': 'إغلاق السنة المالية',
+    'fiscalyear.create': 'إنشاء سنة مالية',
+    'fiscalyear.reopen': 'إعادة فتح السنة المالية',
+    'fx.revalue': 'إعادة تقييم أرصدة العملات الأجنبية',
+    'inventory.adjust': 'تسويات المخزون المباشرة',
+    'inventory.count': 'جرد المخزون',
+    'inventory.manage': 'إدارة الأصناف والمستودعات والوحدات',
+    'inventory.move': 'حركات المخزون (شراء/بيع/مرتجع)',
+    'inventory.transfer': 'تحويل بين مستودعات',
+    'inventory.view': 'عرض المخزون',
+    'journal.approve': 'اعتماد قيد',
+    'journal.create': 'إنشاء قيد',
+    'journal.post': 'ترحيل قيد',
+    'journal.post_direct': 'ترحيل مباشر دون استكمال دورة المراجعة',
+    'journal.reverse': 'عكس قيد',
+    'journal.review': 'مراجعة قيد',
+    'journal.view': 'عرض القيود',
+    'opening.manage': 'إدارة قيود الأرصدة الافتتاحية',
+    'party.agreement_template': 'تعديل قالب اتفاقية فتح حساب العملاء',
+    'party.create': 'إضافة عميل/مورد',
+    'party.deactivate': 'تعطيل/تفعيل عميل/مورد',
+    'party.delete': 'حذف عميل/مورد بلا حركات',
+    'party.edit': 'تعديل بيانات عميل/مورد',
+    'journal.edit_posted': 'تعديل قيد مرحّل (بالعكس وإعادة الترحيل) وتفعيله من الإعدادات',
+    'journal.delete_posted': 'حذف قيد مرحّل يدوي من فترة مفتوحة وتفعيله من الإعدادات',
+    'journal.party_manual': 'قيد يدوي على حسابات العملاء والموردين (مدير النظام)',
+    'message.manage': 'إدارة إعدادات ورسائل واتساب',
+    'message.send': 'إرسال رسائل واتساب',
+    'party.view': 'عرض العملاء والموردين',
+    'payroll.cancel': 'إلغاء مسير رواتب',
+    'payroll.run': 'إعداد وترحيل مسير الرواتب',
+    'period.close': 'إغلاق فترة',
+    'period.reopen': 'إعادة فتح فترة',
+    'purchases.cancel': 'إلغاء مستندات المشتريات',
+    'purchases.create': 'إنشاء فواتير ومرتجعات مشتريات (مسودة)',
+    'purchases.post': 'ترحيل فواتير ومرتجعات المشتريات',
+    'purchases.view': 'عرض المشتريات',
+    'report.view': 'عرض التقارير المحاسبية والأرصدة',
+    'sales.cancel': 'إلغاء مستندات المبيعات',
+    'sales.edit_posted': 'تعديل فاتورة مبيعات مرحّلة (أصنافها/أسعارها) وتفعيله من الإعدادات',
+    'stock.allow_negative': 'السماح ببيع كمية سالبة من المخزون وتفعيله من الإعدادات',
+    'sales.create': 'إنشاء فواتير ومرتجعات مبيعات (مسودة)',
+    'sales.post': 'ترحيل فواتير ومرتجعات المبيعات',
+    'sales.view': 'عرض المبيعات',
+    'settings.manage': 'إدارة إعدادات الشركة',
+    'tax.manage': 'إدارة نسب الضرائب',
+    'user.manage': 'إدارة المستخدمين والصلاحيات',
+}
+
+
+def label(code):
+    return PERMISSION_LABELS.get(code, code)
+
+
+@dataclass(frozen=True)
+class ActionState:
+    """حالة زر/إجراء: visible=False يخفيه، enabled=False يعطّله و`reason` يظهر في التلميح."""
+    enabled: bool = True
+    reason: str = ''
+    visible: bool = True
+
+    def __bool__(self):
+        return self.enabled
+
+
+ALLOWED = ActionState(True, '')
+
+
+class Access:
+    """غلاف صلاحيات فوق دالة `can(code) -> bool` (مثل AppSession.can). يخزّن النتائج مؤقتًا حتى `invalidate()`."""
+
+    def __init__(self, can):
+        self._can = can
+        self._cache = {}
+
+    def invalidate(self):
+        self._cache.clear()
+
+    def has(self, code):
+        if not code:
+            return True
+        if code not in self._cache:
+            self._cache[code] = bool(self._can(code))
+        return self._cache[code]
+
+    def any_of(self, *codes):
+        return any(self.has(c) for c in codes)
+
+    def all_of(self, *codes):
+        return all(self.has(c) for c in codes)
+
+    def state(self, perm=None, *checks, read_only_reason='', hide_if_denied=False):
+        """يحسب ActionState: الصلاحية أولًا، ثم وضع القراءة فقط، ثم الشروط بالترتيب؛ أول فشل يحدد السبب.
+
+        checks: أزواج (ok: bool, reason: str).
+        """
+        if perm and not self.has(perm):
+            return ActionState(False, f'تتطلب صلاحية «{label(perm)}»', visible=not hide_if_denied)
+        if read_only_reason:
+            return ActionState(False, read_only_reason)
+        for ok, why in checks:
+            if not ok:
+                return ActionState(False, why)
+        return ALLOWED
+
+
+def deny_all(reason='غير متاح'):
+    return ActionState(False, reason)

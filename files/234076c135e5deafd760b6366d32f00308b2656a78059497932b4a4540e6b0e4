@@ -1,0 +1,80 @@
+"""شريط السياق: الشركة / الفرع (قابل للتبديل) / السنة / الفترة وحالتها / المستخدم + شارة «قراءة فقط». يعرض AppState ويحدّثه."""
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import QComboBox, QFrame, QHBoxLayout, QLabel
+
+from alhisabat.ui.core import strings_ar as S
+from alhisabat.ui.design import tokens as T
+
+from alhisabat.ui.components.basic import StatusBadge
+
+
+class ContextBar(QFrame):
+    branchSelected = Signal(int)
+
+    def __init__(self, state, parent=None):
+        super().__init__(parent)
+        self.setObjectName('contextBar')
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.state = state
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 3, 10, 3)
+        lay.setSpacing(6)
+
+        def pair(key):
+            k = QLabel(key + ':')
+            k.setObjectName('ctxKey')
+            v = QLabel('—')
+            v.setObjectName('ctxVal')
+            lay.addWidget(k)
+            lay.addWidget(v)
+            lay.addSpacing(10)
+            return v
+
+        self.company = pair(S.GENERIC['company'])
+        k = QLabel(S.GENERIC['branch'] + ':')
+        k.setObjectName('ctxKey')
+        self.branch = QComboBox()
+        self.branch.setMinimumWidth(150)
+        self.branch.activated.connect(lambda _i: self.branchSelected.emit(self.branch.currentData()))
+        lay.addWidget(k)
+        lay.addWidget(self.branch)
+        lay.addSpacing(10)
+        self.year = pair(S.GENERIC['year'])
+        self.period = pair(S.GENERIC['period'])
+        self.period_status = StatusBadge()
+        lay.addWidget(self.period_status)
+        lay.addStretch(1)
+        self.read_only = QLabel('🔒 ' + S.GENERIC['read_only'])
+        self.read_only.setObjectName('readOnlyBadge')
+        self.read_only.setVisible(False)
+        lay.addWidget(self.read_only)
+        self.user = pair(S.GENERIC['user'])
+        state.subscribe(lambda _keys: self.refresh())
+        self.refresh()
+
+    def refresh(self):
+        s = self.state
+        c, y, p, u = s.get('company'), s.get('year'), s.get('period'), s.get('user')
+        self.company.setText((c or {}).get('name', '—'))
+        self.year.setText((y or {}).get('name', '—'))
+        self.period.setText((p or {}).get('name', '—'))
+        if p:
+            self.period_status.set_status(p.get('status'))
+        self.period_status.setVisible(bool(p))
+        self.user.setText((u or {}).get('name', '—'))
+        self.branch.blockSignals(True)
+        self.branch.clear()
+        branches = s.get('branches') or []
+        for b in branches:
+            self.branch.addItem(b['name'], b['id'])
+        cur = s.get('branch')
+        if cur:
+            i = self.branch.findData(cur['id'])
+            if i >= 0:
+                self.branch.setCurrentIndex(i)
+        self.branch.setEnabled(len(branches) > 1)
+        self.branch.setToolTip('' if len(branches) > 1 else 'لا يوجد فرع آخر متاح لك')
+        self.branch.blockSignals(False)
+        why = s.read_only_reason
+        self.read_only.setVisible(bool(why))
+        self.read_only.setToolTip(why)

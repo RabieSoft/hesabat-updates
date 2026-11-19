@@ -1,0 +1,176 @@
+-- النقدية والبنوك والمطابقة البنكية
+CREATE TABLE cash_accounts(
+  id INTEGER PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id),
+  kind TEXT NOT NULL CHECK(kind IN ('cashbox','bank')),
+  code TEXT NOT NULL,
+  name TEXT NOT NULL,
+  account_id INTEGER NOT NULL REFERENCES accounts(id),
+  currency TEXT NOT NULL REFERENCES currencies(code),
+  branch_id INTEGER REFERENCES branches(id),
+  bank_name TEXT NOT NULL DEFAULT '',
+  account_no TEXT NOT NULL DEFAULT '',
+  allow_negative INTEGER NOT NULL DEFAULT 0 CHECK(allow_negative IN (0,1)),
+  is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
+  created_by INTEGER REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(company_id,code),
+  UNIQUE(company_id,name),
+  UNIQUE(account_id)
+);
+CREATE INDEX ix_cash_accounts_company ON cash_accounts(company_id,is_active);
+CREATE INDEX ix_cash_accounts_account ON cash_accounts(account_id);
+
+CREATE TABLE user_cash_access(
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  cash_account_id INTEGER NOT NULL REFERENCES cash_accounts(id),
+  PRIMARY KEY(user_id,cash_account_id)
+);
+
+CREATE TABLE cash_vouchers(
+  id INTEGER PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id),
+  branch_id INTEGER REFERENCES branches(id),
+  voucher_type TEXT NOT NULL CHECK(voucher_type IN ('receipt','payment')),
+  voucher_date TEXT NOT NULL,
+  cash_account_id INTEGER NOT NULL REFERENCES cash_accounts(id),
+  party_id INTEGER REFERENCES parties(id),
+  currency TEXT NOT NULL REFERENCES currencies(code),
+  amount_minor INTEGER NOT NULL CHECK(amount_minor>0),
+  description TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','posted','cancelled')),
+  voucher_no TEXT,
+  journal_entry_id INTEGER REFERENCES journal_entries(id),
+  exchange_rate TEXT,
+  realized_fx_minor INTEGER NOT NULL DEFAULT 0,
+  created_by INTEGER NOT NULL REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  posted_by INTEGER REFERENCES users(id), posted_at TEXT,
+  cancelled_by INTEGER REFERENCES users(id), cancelled_at TEXT,
+  cancel_reason TEXT, cancel_entry_id INTEGER REFERENCES journal_entries(id)
+);
+CREATE INDEX ix_cash_vouchers_company_date ON cash_vouchers(company_id,voucher_date,id);
+CREATE INDEX ix_cash_vouchers_cash ON cash_vouchers(cash_account_id,status);
+
+CREATE TABLE cash_voucher_lines(
+  id INTEGER PRIMARY KEY,
+  voucher_id INTEGER NOT NULL REFERENCES cash_vouchers(id),
+  line_no INTEGER NOT NULL,
+  account_id INTEGER NOT NULL REFERENCES accounts(id),
+  amount_minor INTEGER NOT NULL CHECK(amount_minor>0),
+  description TEXT NOT NULL DEFAULT '',
+  UNIQUE(voucher_id,line_no)
+);
+
+CREATE TABLE voucher_allocations(
+  id INTEGER PRIMARY KEY,
+  voucher_id INTEGER NOT NULL REFERENCES cash_vouchers(id),
+  doc_type TEXT NOT NULL CHECK(doc_type IN ('sales_invoice','purchase_invoice')),
+  doc_id INTEGER NOT NULL,
+  amount_minor INTEGER NOT NULL CHECK(amount_minor>0),
+  UNIQUE(voucher_id,doc_type,doc_id)
+);
+CREATE INDEX ix_voucher_alloc_doc ON voucher_allocations(doc_type,doc_id);
+
+CREATE TABLE cash_transfers(
+  id INTEGER PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id),
+  transfer_no TEXT NOT NULL,
+  transfer_date TEXT NOT NULL,
+  from_cash_id INTEGER NOT NULL REFERENCES cash_accounts(id),
+  to_cash_id INTEGER NOT NULL REFERENCES cash_accounts(id),
+  from_amount_minor INTEGER NOT NULL CHECK(from_amount_minor>0),
+  to_amount_minor INTEGER NOT NULL CHECK(to_amount_minor>0),
+  fee_minor INTEGER NOT NULL DEFAULT 0 CHECK(fee_minor>=0),
+  realized_fx_minor INTEGER NOT NULL DEFAULT 0,
+  description TEXT NOT NULL DEFAULT '',
+  journal_entry_id INTEGER REFERENCES journal_entries(id),
+  status TEXT NOT NULL DEFAULT 'posted' CHECK(status IN ('posted','cancelled')),
+  created_by INTEGER NOT NULL REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  cancelled_by INTEGER REFERENCES users(id), cancelled_at TEXT,
+  cancel_reason TEXT, cancel_entry_id INTEGER REFERENCES journal_entries(id),
+  UNIQUE(company_id,transfer_no),
+  CHECK(from_cash_id<>to_cash_id)
+);
+CREATE INDEX ix_cash_transfers_company_date ON cash_transfers(company_id,transfer_date);
+
+CREATE TABLE cash_counts(
+  id INTEGER PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id),
+  cash_account_id INTEGER NOT NULL REFERENCES cash_accounts(id),
+  count_date TEXT NOT NULL,
+  book_minor INTEGER NOT NULL,
+  counted_minor INTEGER NOT NULL CHECK(counted_minor>=0),
+  diff_minor INTEGER NOT NULL,
+  journal_entry_id INTEGER REFERENCES journal_entries(id),
+  note TEXT NOT NULL DEFAULT '',
+  created_by INTEGER NOT NULL REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX ix_cash_counts_cash_date ON cash_counts(cash_account_id,count_date);
+
+CREATE TABLE bank_statement_lines(
+  id INTEGER PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id),
+  cash_account_id INTEGER NOT NULL REFERENCES cash_accounts(id),
+  txn_date TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  reference TEXT NOT NULL DEFAULT '',
+  amount_minor INTEGER NOT NULL CHECK(amount_minor<>0),
+  balance_minor INTEGER,
+  status TEXT NOT NULL DEFAULT 'unmatched' CHECK(status IN ('unmatched','matched','ignored')),
+  ignore_reason TEXT,
+  created_by INTEGER NOT NULL REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX ix_bank_statement_cash_date ON bank_statement_lines(cash_account_id,txn_date,id);
+
+CREATE TABLE bank_matches(
+  id INTEGER PRIMARY KEY,
+  statement_line_id INTEGER NOT NULL UNIQUE REFERENCES bank_statement_lines(id),
+  journal_line_id INTEGER NOT NULL UNIQUE REFERENCES journal_lines(id),
+  matched_by INTEGER NOT NULL REFERENCES users(id),
+  matched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- منع العبث بالسجلات المرحّلة/المطابقة والجرد والتحويلات
+CREATE TRIGGER cash_vouchers_immutable_update BEFORE UPDATE ON cash_vouchers
+WHEN OLD.status<>'draft' AND NOT (
+  NEW.status='cancelled' AND OLD.status='posted' AND
+  NEW.cancelled_by IS NOT NULL AND NEW.cancel_reason IS NOT NULL AND NEW.cancel_entry_id IS NOT NULL
+) BEGIN SELECT RAISE(ABORT,'لا يمكن تعديل سند نقدية مرحّل'); END;
+CREATE TRIGGER cash_vouchers_immutable_delete BEFORE DELETE ON cash_vouchers
+WHEN OLD.status<>'draft' BEGIN SELECT RAISE(ABORT,'لا يمكن حذف سند نقدية مرحّل'); END;
+CREATE TRIGGER cash_voucher_lines_immutable BEFORE UPDATE ON cash_voucher_lines
+WHEN (SELECT status FROM cash_vouchers WHERE id=OLD.voucher_id)<>'draft' BEGIN SELECT RAISE(ABORT,'بنود السند المرحّل غير قابلة للتعديل'); END;
+CREATE TRIGGER cash_voucher_lines_no_delete BEFORE DELETE ON cash_voucher_lines
+WHEN (SELECT status FROM cash_vouchers WHERE id=OLD.voucher_id)<>'draft' BEGIN SELECT RAISE(ABORT,'بنود السند المرحّل غير قابلة للحذف'); END;
+CREATE TRIGGER voucher_alloc_immutable BEFORE UPDATE ON voucher_allocations
+WHEN (SELECT status FROM cash_vouchers WHERE id=OLD.voucher_id)<>'draft' BEGIN SELECT RAISE(ABORT,'تخصيصات السند المرحّل غير قابلة للتعديل'); END;
+CREATE TRIGGER voucher_alloc_no_delete BEFORE DELETE ON voucher_allocations
+WHEN (SELECT status FROM cash_vouchers WHERE id=OLD.voucher_id)<>'draft' BEGIN SELECT RAISE(ABORT,'تخصيصات السند المرحّل غير قابلة للحذف'); END;
+CREATE TRIGGER cash_transfer_immutable BEFORE UPDATE ON cash_transfers
+WHEN OLD.status<>'posted' OR NOT (NEW.status='cancelled' AND NEW.cancel_entry_id IS NOT NULL AND NEW.cancel_reason IS NOT NULL) BEGIN
+  SELECT RAISE(ABORT,'لا يمكن تعديل تحويل نقدية مرحّل');
+END;
+CREATE TRIGGER cash_transfer_no_delete BEFORE DELETE ON cash_transfers BEGIN SELECT RAISE(ABORT,'لا يمكن حذف تحويل نقدية'); END;
+CREATE TRIGGER cash_count_immutable_update BEFORE UPDATE ON cash_counts BEGIN SELECT RAISE(ABORT,'سجل الجرد غير قابل للتعديل'); END;
+CREATE TRIGGER cash_count_immutable_delete BEFORE DELETE ON cash_counts BEGIN SELECT RAISE(ABORT,'سجل الجرد غير قابل للحذف'); END;
+CREATE TRIGGER bank_statement_immutable_update BEFORE UPDATE ON bank_statement_lines
+WHEN OLD.status<>'unmatched' OR NOT (NEW.status IN ('matched','ignored')) BEGIN SELECT RAISE(ABORT,'سطر كشف البنك غير قابل للتعديل'); END;
+CREATE TRIGGER bank_statement_no_delete BEFORE DELETE ON bank_statement_lines BEGIN SELECT RAISE(ABORT,'لا يمكن حذف سطر كشف البنك'); END;
+CREATE TRIGGER bank_match_no_update BEFORE UPDATE ON bank_matches BEGIN SELECT RAISE(ABORT,'المطابقة غير قابلة للتعديل'); END;
+CREATE TRIGGER bank_match_no_delete BEFORE DELETE ON bank_matches BEGIN SELECT RAISE(ABORT,'المطابقة غير قابلة للحذف'); END;
+
+INSERT INTO permissions(code,name_ar,is_sensitive) VALUES
+ ('cash.view','عرض الصناديق والبنوك',0),('cash.manage','إدارة الصناديق والبنوك',1),
+ ('cash.voucher','إنشاء وترحيل سندات النقدية',0),('cash.cancel','إلغاء سندات النقدية والتحويلات',1),
+ ('cash.count','جرد الصناديق',1),('cash.reconcile','مطابقة كشوف البنوك',0);
+INSERT INTO role_permissions SELECT r.id,p.code FROM roles r, permissions p WHERE r.id IN (1,2) AND p.code LIKE 'cash.%';
+INSERT INTO role_permissions SELECT 3,p.code FROM permissions p WHERE p.code IN ('cash.view','cash.voucher','cash.reconcile','cash.count');
+INSERT INTO role_permissions SELECT 4,'cash.view' FROM roles WHERE id=4;
+
+INSERT INTO account_mappings(company_id,map_key,account_id)
+SELECT c.id,'cash',a.id FROM companies c JOIN accounts a ON a.company_id=c.id AND a.code='1101'
+WHERE NOT EXISTS(SELECT 1 FROM account_mappings m WHERE m.company_id=c.id AND m.map_key='cash');

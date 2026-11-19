@@ -1,0 +1,299 @@
+"""نافذة الفاتورة المنبثقة (المبيعات والمشتريات): نفس تصميم محرر الفاتورة، في نافذة احترافية متوسطة الحجم تتوسط الشاشة.
+
+الدورة: فاتورة جديدة ← Ctrl+S ← تُحفظ كمسودة ← إشعار أخضر «تم الحفظ» ← النافذة لا تُغلق: تُفرَّغ كل الخانات لفاتورة جديدة
+مع الإبقاء على تاريخ وعملة الفاتورة السابقة (الذاكرة على مستوى النافذة الرئيسية فتبقى بعد إغلاق النافذة وإعادة فتحها).
+المحرر هو نفسه EmbeddedInvoiceEditor (نفس التحقق والمعاينة الحية من المحرك والمسودة التلقائية). المنطق في core/inline_invoice_logic.py.
+يتطلب PySide6.
+"""
+from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QTimer, Qt, Signal
+from PySide6.QtGui import QGuiApplication
+from PySide6.QtWidgets import (QDialog, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QMessageBox, QVBoxLayout)
+
+from alhisabat.ui.app_dialogs.invoice import EmbeddedInvoiceEditor
+from alhisabat.ui.components.basic import ask_reason
+from alhisabat.ui.core import inline_invoice_logic as L
+
+TOAST_MS = 2200
+
+
+def _memory_store(page):
+    """ذاكرة (التاريخ، العملة) لكل نوع فاتورة، محفوظة على النافذة الرئيسية لتبقى بين فتحات النافذة."""
+    host = getattr(page, 'window_', None)
+    if host is None:
+        return {}
+    store = getattr(host, '_inv_memory', None)
+    if store is None:
+        store = {}
+        host._inv_memory = store
+    return store
+
+
+class InvoicePopup(QDialog):
+    saved = Signal(int)                      # معرّف الفاتورة بعد حفظ ناجح
+
+    def __init__(self, page):
+        super().__init__(page)
+        self.page = page
+        self.kind = page._kind()
+        self._ed = None
+        self._mode = L.NEW
+        self._invoice = None
+        self._busy = False
+        self._force_close = False
+        self.setObjectName('invPopup')
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.setWindowTitle(L.doc_name(self.kind))
+        self.setModal(False)                                  # يمكن تصفح الصفحة خلفها؛ الحفظ لا يغلقها
+        self.setWindowFlags(Qt.Dialog | Qt.CustomizeWindowHint | Qt.WindowTitleHint | Qt.WindowCloseButtonHint
+                            | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint)
+        self.setSizeGripEnabled(True)
+        self.setMinimumSize(900, 600)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(10, 8, 10, 8)
+        v.setSpacing(6)
+        head = QFrame(); head.setObjectName('invPopupHead'); head.setProperty('kind', self.kind)
+        hl = QHBoxLayout(head); hl.setContentsMargins(14, 8, 14, 8); hl.setSpacing(12)
+        self.title = QLabel(''); self.title.setObjectName('invPopupTitle')
+        self.sub = QLabel(''); self.sub.setObjectName('invPopupSub')
+        hl.addWidget(self.title); hl.addStretch(1); hl.addWidget(self.sub)
+        v.addWidget(head)
+        self.notice = QLabel(''); self.notice.setObjectName('invWarn'); self.notice.setWordWrap(True); self.notice.setVisible(False)
+        v.addWidget(self.notice)
+        self.host = QFrame(); self.host.setObjectName('invPopupHost')
+        self.host_l = QVBoxLayout(self.host); self.host_l.setContentsMargins(0, 0, 0, 0)
+        v.addWidget(self.host, 1)
+        # إشعار أخضر عائم أعلى النافذة (لا يحجب الإدخال ويتلاشى وحده)
+        self._toast = QLabel('', self); self._toast.setObjectName('invToast'); self._toast.setAlignment(Qt.AlignCenter)
+        self._toast.setAttribute(Qt.WA_TransparentForMouseEvents, True); self._toast.hide()
+        self._fx = QGraphicsOpacityEffect(self._toast); self._toast.setGraphicsEffect(self._fx)
+        self._fade = QPropertyAnimation(self._fx, b'opacity', self)
+        self._fade.setDuration(450); self._fade.setStartValue(1.0); self._fade.setEndValue(0.0); self._fade.setEasingCurve(QEasingCurve.InQuad)
+        self._fade.finished.connect(self._toast.hide)
+        self._hold = QTimer(self); self._hold.setSingleShot(True); self._hold.timeout.connect(self._fade.start)
+        self._header()
+
+    # ------------------------------------------------------------------ حالة
+    @property
+    def mode(self):
+        return self._mode
+
+    def is_dirty(self):
+        ed = self._ed
+        try:
+            return bool(ed is not None and self.isVisible() and ed.has_unsaved())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _header(self):
+        no = (self._invoice or {}).get('invoice_no')
+        t, sub = L.header_text(self.kind, self._mode, no)
+        self.title.setText(t)
+        self.sub.setText(sub)
+
+    def _memory(self):
+        return dict(_memory_store(self.page).get(self.kind) or {})
+
+    def _remember(self, ed):
+        try:
+            _memory_store(self.page)[self.kind] = ed.memory()
+        except Exception:  # noqa: BLE001 — الذاكرة تحسين؛ لا تُفشل الحفظ
+            pass
+
+    # ------------------------------------------------------------------ العرض
+    def _fit_and_center(self):
+        host = self.page.window()
+        scr = host.screen() if host is not None else QGuiApplication.primaryScreen()
+        av = scr.availableGeometry()
+        w, h = L.popup_size(av.width(), av.height())
+        self.resize(w, h)
+        ref = host.frameGeometry() if (host is not None and host.isVisible() and not host.isMinimized()) else av
+        x = max(av.left(), min(ref.center().x() - w // 2, av.right() - w))
+        y = max(av.top(), min(ref.center().y() - h // 2, av.bottom() - h))
+        self.move(x, y)
+
+    def _present(self):
+        if not self.isVisible():
+            self._fit_and_center()
+            self.show()
+        if self.isMinimized():
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def toast(self, text):
+        t = self._toast
+        self._hold.stop(); self._fade.stop()
+        t.setText(text)
+        t.adjustSize()
+        t.move(max((self.width() - t.width()) // 2, 8), 58)
+        self._fx.setOpacity(1.0)
+        t.show(); t.raise_()
+        self._hold.start(TOAST_MS)
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        if self._toast.isVisible():
+            self._toast.move(max((self.width() - self._toast.width()) // 2, 8), 58)
+
+    # ------------------------------------------------------------------ التركيب
+    def _allowed(self, mode):
+        """(مسموح، سبب). الجديدة: صلاحية الإنشاء وحالة الفترة فقط؛ التعديل: حالة الصفحة للسجل."""
+        if mode == L.NEW:
+            perm = 'sales.create' if self.kind == 'sales' else 'purchases.create'
+            state = self.page.access.state(perm)
+            return L.entry_allowed(state, bool(getattr(self.page.state, 'is_read_only', False)))
+        return L.entry_allowed(self.page._action_state('edit_posted' if mode == L.POSTED else 'edit'), False)
+
+    def _mount(self, mode, invoice=None, resume=False):
+        ok, why = self._allowed(mode)
+        self._drop_editor()
+        self._mode, self._invoice = mode, invoice
+        self._header()
+        self.notice.setVisible(not ok)
+        self.notice.setText(why)
+        if not ok:
+            return
+        defaults = self._memory() if mode == L.NEW else None
+        ed = EmbeddedInvoiceEditor(self.page, self.kind, invoice, defaults=defaults)
+        ed._resume = resume
+        ed.submitted.connect(self._on_submitted)
+        ed.clearRequested.connect(self._on_clear)
+        self._ed = ed
+        self.host_l.addWidget(ed)
+        QTimer.singleShot(0, self.focus_first)
+
+    def _drop_editor(self):
+        ed, self._ed = self._ed, None
+        if ed is None:
+            return
+        try:
+            t = getattr(ed, '_draft_timer', None)
+            if t is not None:
+                t.stop()
+            ed.submitted.disconnect(); ed.clearRequested.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+        self.host_l.removeWidget(ed)
+        ed.hide()
+        ed.deleteLater()
+
+    def focus_first(self):
+        ed = self._ed
+        if ed is None:
+            return
+        try:
+            if self._mode == L.NEW:
+                ed._focus_entry()                            # بيع سريع: المؤشر في خانة الصنف مباشرة (العميل اختياري)
+            else:
+                ed.lines.setFocus()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ------------------------------------------------------------------ واجهة الصفحة
+    def _confirm_replace(self, target):
+        if not L.confirm_replace(self.is_dirty(), self._mode, target):
+            return True
+        r = QMessageBox.question(self, self.page.title, L.replace_text(self._mode), QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        return r == QMessageBox.Yes
+
+    def _deny(self, mode):
+        ok, why = self._allowed(mode)
+        if not ok:
+            QMessageBox.information(self.page, self.page.title, why)       # بلا نافذة فارغة: السبب في رسالة واضحة
+        return not ok
+
+    def start_new(self, resume=False, force=False):
+        if self._deny(L.NEW):
+            return
+        if self.isVisible() and not force and self._ed is not None and self._mode == L.NEW and not resume:
+            self._present()
+            self.focus_first()                              # فاتورة جديدة مفتوحة أصلًا: لا نمسح ما كُتب
+            return
+        if self.isVisible() and not force and not self._confirm_replace(L.NEW):
+            return
+        self._mount(L.NEW, None, resume)
+        self._present()
+
+    def start_edit(self, invoice, posted=False):
+        mode = L.mode_of(invoice, posted)
+        if self._deny(mode):
+            return
+        if self.isVisible() and not self._confirm_replace(mode):
+            return
+        self._mount(mode, invoice)
+        self._present()
+
+    def reload_context(self):
+        """تغيّر الفرع/السنة/الفترة (وبالتالي الصلاحيات والقوائم): نبني المحرر من جديد إن لم يكن فيه إدخال غير محفوظ."""
+        if self.isVisible():
+            if not self.is_dirty():
+                self._mount(L.NEW)
+        else:
+            self._drop_editor()
+
+    def _on_clear(self):
+        if not self._confirm_replace(L.NEW):
+            return
+        if self._ed is not None:
+            self._ed._force_close = True
+            self._ed.clear_draft()                           # مسح صريح: لا تُعرض هذه الفاتورة كمسودة مستعادة لاحقًا
+        self._mount(L.NEW)
+
+    # ------------------------------------------------------------------ الإغلاق
+    def closeEvent(self, ev):
+        if self._busy:
+            ev.ignore()
+            return
+        if self.is_dirty() and not self._force_close:
+            r = QMessageBox.question(self, self.page.title, L.close_text(self._mode), QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if r != QMessageBox.Yes:
+                ev.ignore()
+                return
+        self._hold.stop(); self._fade.stop(); self._toast.hide()
+        self._drop_editor()                                  # المسودة التلقائية تبقى وتُعرض للاستعادة عند فتح فاتورة جديدة
+        super().closeEvent(ev)
+
+    def reject(self):
+        self.close()
+
+    # ------------------------------------------------------------------ الحفظ
+    def _on_submitted(self):
+        ed = self._ed
+        if ed is None or self._busy:
+            return
+        self._busy = True
+        try:
+            reason = None
+            if L.needs_reason(self._mode):
+                reason = ask_reason(self, 'تعديل فاتورة مرحّلة',
+                                    ['يُعكس القيد القديم والحركات المخزنية بقيد عكسي، ثم تُرحَّل الفاتورة بالقيم الجديدة بنفس رقمها.',
+                                     'يُسجَّل التعديل وسببه في التدقيق.'], True, 'تعديل وترحيل')
+                if reason is None:
+                    return
+            name, args = L.call_args(self._mode, self.kind, (self._invoice or {}).get('id'), ed.values(), reason)
+            ok, res = self.page.guarded(getattr(self.page.svc, name), *args, reload=False)
+            if not ok:
+                return                                       # الخطأ ظهر مترجمًا؛ المحرر يبقى بقيمه للتصحيح
+            mode = self._mode
+            iid = res if mode == L.NEW else (self._invoice or {}).get('id')
+            no = self._saved_no(iid)
+            self._remember(ed)                               # قبل تفريغ الخانات: التاريخ والعملة للفاتورة التالية
+            ed.clear_draft()
+            self.page._sel = {'id': iid} if iid else None
+            self.page.refresh()
+            self.page.window_.data_changed(self.page.key)
+            self._mount(L.NEW)                               # كل الخانات فارغة لفاتورة جديدة (بالتاريخ والعملة المتذكَّرين)
+            msg = L.saved_message(mode)
+            self.toast(f'✔ {msg}' + (f' — {no}' if no else ''))
+            self.page.notify(msg)
+            self.saved.emit(int(iid) if iid else 0)
+        finally:
+            self._busy = False
+
+    def _saved_no(self, iid):
+        if not iid:
+            return ''
+        try:
+            return str(self.page.svc.get(self.kind, iid).get('invoice_no') or '')
+        except Exception:  # noqa: BLE001 — رقم الفاتورة في الإشعار تجميلي
+            return ''

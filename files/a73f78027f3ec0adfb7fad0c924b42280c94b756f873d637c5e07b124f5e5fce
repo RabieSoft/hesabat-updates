@@ -1,0 +1,496 @@
+"""نماذج قراءة خفيفة للسياق (السنة/الفترة/العدّادات): SELECT فقط، لا كتابة ولا منطق محاسبي.
+
+هذا الملف وcore/session.py هما المكانان الوحيدان في حزم الواجهة الجديدة المسموح فيهما بـSQL للقراءة
+(لأن المحرك لا يوفر دوال سرد للسنوات والفترات). أي قراءة أخرى تمر عبر دوال المحرك. يفحص ذلك اختبار ساكن.
+"""
+from datetime import date
+
+from .readmodel_journal import entry_source, journal_sides, simple_entry_counters  # noqa: F401 — إعادة تصدير
+
+
+def fiscal_overview(conn, company_id):
+    """كل السنوات المالية مع فتراتها وحالاتها: [{id,name,start,end,status,periods:[{id,no,name,start,end,status}]}]."""
+    years = []
+    for y in conn.execute("SELECT id,name,start_date,end_date,status FROM fiscal_years WHERE company_id=? ORDER BY start_date", (company_id,)):
+        periods = [{'id': p['id'], 'no': p['period_no'], 'name': p['name'], 'start': p['start_date'], 'end': p['end_date'], 'status': p['status']}
+                   for p in conn.execute("SELECT id,period_no,name,start_date,end_date,status FROM fiscal_periods WHERE fiscal_year_id=? ORDER BY period_no", (y['id'],))]
+        years.append({'id': y['id'], 'name': y['name'], 'start': y['start_date'], 'end': y['end_date'], 'status': y['status'], 'periods': periods})
+    return years
+
+
+def current_fiscal_context(conn, company_id, today=None):
+    """(سنة، فترة) لتاريخ اليوم؛ وإن لم يقع اليوم في أي فترة فآخر فترة معرّفة. (None, None) إن لم توجد سنوات."""
+    iso = (today or date.today()).isoformat()
+    r = conn.execute(
+        "SELECT y.id yid,y.name yname,y.start_date ys_,y.end_date ye_,y.status ystatus,"
+        "p.id pid,p.name pname,p.start_date ps_,p.end_date pe_,p.status pstatus "
+        "FROM fiscal_periods p JOIN fiscal_years y ON y.id=p.fiscal_year_id "
+        "WHERE y.company_id=? AND ? BETWEEN p.start_date AND p.end_date", (company_id, iso)).fetchone()
+    if not r:
+        r = conn.execute(
+            "SELECT y.id yid,y.name yname,y.start_date ys_,y.end_date ye_,y.status ystatus,"
+            "p.id pid,p.name pname,p.start_date ps_,p.end_date pe_,p.status pstatus "
+            "FROM fiscal_periods p JOIN fiscal_years y ON y.id=p.fiscal_year_id "
+            "WHERE y.company_id=? ORDER BY p.end_date DESC LIMIT 1", (company_id,)).fetchone()
+    if not r:
+        return None, None
+    return ({'id': r['yid'], 'name': r['yname'], 'start': r['ys_'], 'end': r['ye_'], 'status': r['ystatus']},
+            {'id': r['pid'], 'name': r['pname'], 'start': r['ps_'], 'end': r['pe_'], 'status': r['pstatus']})
+
+
+def pending_journal_counts(conn, company_id, branch_id=None):
+    """عدد مسودات القيود بحسب حالة سير العمل: {'draft': n, 'reviewed': n, 'approved': n}."""
+    q = "SELECT workflow_state ws, COUNT(*) n FROM journal_entries WHERE company_id=? AND status='draft'"
+    a = [company_id]
+    if branch_id:
+        q += " AND (branch_id=? OR branch_id IS NULL)"       # القيد بلا فرع إجراؤه ممكن من أي فرع، فيُنبَّه إليه
+        a.append(branch_id)
+    q += " GROUP BY workflow_state"
+    got = {r['ws']: r['n'] for r in conn.execute(q, a)}
+    return {'draft': got.get('draft', 0), 'reviewed': got.get('reviewed', 0), 'approved': got.get('approved', 0)}
+
+
+def draft_document_counts(conn, company_id, branch_id=None):
+    """مستندات مسودة لم تُرحَّل: فواتير مبيعات ومشتريات وسندات."""
+    out = {}
+    for key, table in (('sales', 'sales_invoices'), ('purchases', 'purchase_invoices'), ('vouchers', 'cash_vouchers')):
+        q = f"SELECT COUNT(*) FROM {table} WHERE company_id=? AND status='draft'"
+        a = [company_id]
+        if branch_id:
+            q += " AND (branch_id=? OR branch_id IS NULL)"       # القيد بلا فرع إجراؤه ممكن من أي فرع، فيُنبَّه إليه
+            a.append(branch_id)
+        out[key] = conn.execute(q, a).fetchone()[0]
+    return out
+
+
+def journal_counterparties(conn, rows):
+    """«من / إلى (الطرف المقابل)» لقيود السندات النقدية في قائمة القيود (SELECT فقط): {entry_id: «من: X» | «إلى: X»}.
+
+    سند القبض «من» الطرف المقابل، وسند الصرف «إلى» الطرف المقابل. الطرف المقابل هو العميل/المورد/الموظف إن وُجد، وإلا أسماء
+    الحسابات المقابلة في بنود السند. والقيد اليدوي البسيط يعرض «إلى: الحساب الدائن». غير ذلك يبقى بلا قيمة.
+    """
+    out = simple_entry_counters(conn, rows)
+    by_voucher = {}
+    for r in rows:
+        if r.get('source_type') == 'cash_voucher' and r.get('source_id'):
+            by_voucher.setdefault(int(r['source_id']), []).append(r['id'])
+    if not by_voucher:
+        return out
+    vids = list(by_voucher)
+    ph = ','.join('?' for _ in vids)
+    vouchers = {v['id']: v for v in conn.execute(
+        f"SELECT v.id, v.voucher_type, p.name AS party_name FROM cash_vouchers v LEFT JOIN parties p ON p.id=v.party_id "
+        f"WHERE v.id IN ({ph})", vids)}
+    accs = {}
+    for l in conn.execute(f"SELECT l.voucher_id v, a.name n FROM cash_voucher_lines l JOIN accounts a ON a.id=l.account_id "
+                          f"WHERE l.voucher_id IN ({ph}) ORDER BY l.voucher_id, l.line_no", vids):
+        accs.setdefault(l['v'], []).append(l['n'])
+    for vid, eids in by_voucher.items():
+        v = vouchers.get(vid)
+        if not v:
+            continue
+        cp = v['party_name'] or '، '.join(dict.fromkeys(accs.get(vid, [])))
+        if cp:
+            label = ('من: ' if v['voucher_type'] == 'receipt' else 'إلى: ') + cp
+            for e in eids:
+                out[e] = label
+    return out
+
+
+def journal_voucher_notes(conn, rows):
+    """بيان سندات القبض/الصرف لقيودها في قائمة القيود (SELECT فقط): {entry_id: البيان}. هو البيان والمرجع (ملاحظة/رقم السند الدفتري)."""
+    by_voucher = {}
+    for r in rows:
+        if r.get('source_type') == 'cash_voucher' and r.get('source_id'):
+            by_voucher.setdefault(int(r['source_id']), []).append(r['id'])
+    if not by_voucher:
+        return {}
+    vids = list(by_voucher)
+    out = {}
+    for i in range(0, len(vids), 500):
+        part = vids[i:i + 500]
+        for v in conn.execute(f"SELECT id, description FROM cash_vouchers WHERE id IN ({','.join('?' for _ in part)})", part):
+            note = (v['description'] or '').strip()
+            if note:
+                for e in by_voucher[v['id']]:
+                    out[e] = note
+    return out
+
+
+def journal_list_extras(conn, entry_ids):
+    """إثراء قائمة القيود: الإجمالي والمرفقات وروابط العكس (SELECT فقط)."""
+    if not entry_ids:
+        return {}
+    ph = ','.join('?' for _ in entry_ids)
+    totals = {r['eid']: r['total'] for r in conn.execute(
+        f"SELECT entry_id eid, COALESCE(SUM(debit_base),0) total FROM journal_lines WHERE entry_id IN ({ph}) GROUP BY entry_id",
+        entry_ids)}
+    curs = {}                                              # عملة القيد: رمزها إن كانت كل أسطره بعملة واحدة وإلا «متعددة»
+    for r in conn.execute(
+            f"SELECT entry_id eid, currency cur, COALESCE(SUM(debit_orig),0) d FROM journal_lines WHERE entry_id IN ({ph}) "
+            f"GROUP BY entry_id, currency", entry_ids):
+        curs.setdefault(r['eid'], []).append((r['cur'], r['d']))
+    has_att = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='journal_attachments'").fetchone()
+    atts = {}
+    if has_att:
+        for r in conn.execute(f"SELECT entry_id eid, COUNT(*) n FROM journal_attachments WHERE entry_id IN ({ph}) GROUP BY entry_id", entry_ids):
+            atts[r['eid']] = r['n']
+    id_to_label = {}
+    label_to_id = {}
+    for r in conn.execute(f"SELECT id, COALESCE(posted_no, entry_no) label_no FROM journal_entries WHERE id IN ({ph})", entry_ids):
+        id_to_label[r['id']] = r['label_no']
+        if r['label_no'] is not None:
+            label_to_id[r['label_no']] = r['id']
+    reverses = {}
+    reversed_by = {}
+    for r in conn.execute(f"SELECT id, reverses_entry_id FROM journal_entries WHERE id IN ({ph}) AND reverses_entry_id IS NOT NULL", entry_ids):
+        reverses[r['id']] = id_to_label.get(r['reverses_entry_id'])
+    if entry_ids:
+        for r in conn.execute(f"SELECT reverses_entry_id rid, id FROM journal_entries WHERE reverses_entry_id IN ({ph})", entry_ids):
+            if r['rid'] in id_to_label:
+                reversed_by[r['rid']] = id_to_label.get(r['id'])
+    out = {}
+    for eid in entry_ids:
+        cl = curs.get(eid) or []
+        out[eid] = {'total_minor': totals.get(eid, 0), 'attachments': atts.get(eid, 0),
+                    'currency': (cl[0][0] if len(cl) == 1 else ('متعددة' if cl else '')),
+                    'total_orig_minor': (cl[0][1] if len(cl) == 1 else None),
+                    'label_no': id_to_label.get(eid), 'reverses_no': reverses.get(eid), 'reversed_by_no': reversed_by.get(eid)}
+    return out
+
+
+def account_mappings(conn, company_id):
+    """خرائط ربط الحسابات: {map_key: {map_key, account_id, code, name}}."""
+    return {r['map_key']: dict(r) for r in conn.execute(
+        "SELECT m.map_key, m.account_id, a.code, a.name FROM account_mappings m JOIN accounts a ON a.id=m.account_id WHERE m.company_id=?", (company_id,))}
+
+
+def cash_accounts(conn, company_id, branch_id=None):
+    from alhisabat.business import branch_scope
+    f, fa = branch_scope.txn_clause(conn, company_id, branch_id)
+    return [dict(r) for r in conn.execute("SELECT id,code,name,kind,currency,bank_name,is_active,allow_negative FROM cash_accounts WHERE company_id=?" + f + " ORDER BY name", (company_id, *fa))]
+
+
+def cash_account_names(conn, company_id):
+    return {r['id']: r['name'] for r in conn.execute("SELECT id,name FROM cash_accounts WHERE company_id=?", (company_id,))}
+
+
+def party_names(conn, company_id):
+    return {r['id']: r['name'] for r in conn.execute("SELECT id,name FROM parties WHERE company_id=?", (company_id,))}
+
+
+def bank_account_ids(conn, company_id):
+    return [r['id'] for r in conn.execute("SELECT id FROM cash_accounts WHERE company_id=? AND kind='bank' AND is_active=1", (company_id,))]
+
+
+def bank_accounts(conn, company_id):
+    return [dict(r) for r in conn.execute("SELECT id,name FROM cash_accounts WHERE company_id=? AND kind='bank' AND is_active=1", (company_id,))]
+
+
+def has_mapping(conn, company_id, map_key):
+    return conn.execute("SELECT 1 FROM account_mappings WHERE company_id=? AND map_key=?", (company_id, map_key)).fetchone() is not None
+
+
+def employees(conn, company_id):
+    """الموظفون مع الهاتف وحساب الموظف والرصيد (موجب = مستحق للموظف علينا، سالب = سلفة عليه) بالعملة الأساسية."""
+    from alhisabat.business import parties as _pt
+    rows = [dict(r) for r in conn.execute(
+        "SELECT e.party_id id,p.code,p.name,p.phone,p.account_id,e.job_title,e.base_salary_minor,e.hire_date,e.is_active "
+        "FROM employees e JOIN parties p ON p.id=e.party_id WHERE p.company_id=? ORDER BY p.name", (company_id,))]
+    if rows:
+        bal = _pt.balances(conn, company_id, [{'id': r['id'], 'account_id': r['account_id'], 'kind': 'employee'} for r in rows], _pt.latest_day(conn, company_id))
+        for r in rows:
+            r['balance_minor'] = bal[r['id']]
+    return rows
+
+
+def payroll_runs(conn, company_id):
+    return [dict(r) for r in conn.execute(
+        "SELECT r.id,r.period_month,r.pay_date,r.status,COUNT(l.id) employees,COALESCE(SUM(l.net_minor),0) total_minor "
+        "FROM payroll_runs r LEFT JOIN payroll_lines l ON l.run_id=r.id WHERE r.company_id=? GROUP BY r.id ORDER BY r.id DESC", (company_id,))]
+
+
+def payroll_active_employees(conn, company_id):
+    return list(conn.execute(
+        "SELECT e.party_id,e.base_salary_minor FROM employees e JOIN parties p ON p.id=e.party_id "
+        "WHERE p.company_id=? AND e.is_active=1 ORDER BY e.party_id", (company_id,)))
+
+
+def users(conn, company_id):
+    return [dict(r) for r in conn.execute(
+        "SELECT u.id,u.username,u.full_name,GROUP_CONCAT(r.name_ar,'، ') roles,u.is_active FROM users u "
+        "JOIN user_roles ur ON ur.user_id=u.id AND ur.company_id=? JOIN roles r ON r.id=ur.role_id GROUP BY u.id ORDER BY u.username", (company_id,))]
+
+
+def my_profile(conn, user_id):
+    r = conn.execute("SELECT username, full_name FROM users WHERE id=?", (user_id,)).fetchone()
+    return {'username': r['username'], 'full_name': r['full_name']} if r else {'username': '', 'full_name': ''}
+
+
+def settings_rows(conn, company_id, tables_map):
+    rows = []
+    comp = conn.execute("SELECT name, base_currency FROM companies WHERE id=?", (company_id,)).fetchone()
+    if comp:
+        rows += [{'group': 'الشركة', 'key': 'الاسم', 'value': comp['name'] or ''},
+                 {'group': 'الشركة', 'key': 'العملة الأساسية', 'value': comp['base_currency'] or ''}]
+    for table, (group, names) in tables_map.items():
+        r = conn.execute(f"SELECT * FROM {table} WHERE company_id=?", (company_id,)).fetchone()
+        if r:
+            for k, label in names.items():
+                v = r[k]
+                rows.append({'group': group, 'key': label, 'value': ('نعم' if v == 1 else 'لا') if k in ('require_review', 'require_approval', 'enforce_separation', 'allow_manual_party_entries', 'allow_edit_posted_entries', 'allow_delete_posted_entries', 'transfer_to_retained', 'allow_edit_posted_invoice', 'allow_negative_stock') else v})
+    return rows
+
+
+def invoices(conn, company_id, kind='sales', limit=300):
+    if kind == 'sales':
+        q = ("SELECT i.id,i.invoice_no,i.invoice_date,i.due_date,p.name party,i.doc_type,i.status,"
+             "i.grand_total g,i.paid_total pt,i.due_total dt,i.currency,i.notes "
+             "FROM sales_invoices i LEFT JOIN parties p ON p.id=i.customer_id "
+             "WHERE i.company_id=? ORDER BY i.invoice_date DESC,i.id DESC LIMIT ?")
+    else:
+        q = ("SELECT i.id,i.invoice_no,i.invoice_date,i.due_date,p.name party,i.doc_type,i.status,"
+             "i.grand_total g,i.paid_total pt,i.due_total dt,i.currency,i.notes "
+             "FROM purchase_invoices i LEFT JOIN parties p ON p.id=i.supplier_id "
+             "WHERE i.company_id=? ORDER BY i.invoice_date DESC,i.id DESC LIMIT ?")
+    out = []
+    for r in conn.execute(q, (company_id, int(limit))):
+        out.append({'id': r['id'], 'invoice_no': r['invoice_no'], 'invoice_date': r['invoice_date'],
+                    'due_date': r['due_date'], 'party': r['party'], 'doc_type': r['doc_type'],
+                    'status': r['status'], 'grand_total_minor': r['g'], 'paid_total_minor': r['pt'],
+                    'due_total_minor': r['dt'], 'currency': r['currency'], 'notes': r['notes'], 'kind': kind})
+    return out
+
+
+def last_price(conn, company_id, kind, item_id, party_id=None, exclude_invoice_id=None):
+    """آخر سعر (بيع/شراء) لصنف: يُفضَّل سعر آخر فاتورة لنفس الطرف إن وُجد، وإلا آخر سعر عام. المرحَّلة والمسودات (غير الملغاة)
+    كي يتذكر المحرر ما أدخله المستخدم نفسه؛ وتُستثنى الفاتورة الجاري تعديلها. يعيد أيضًا الوحدة ومعاملها لتحويل السعر بين الوحدات.
+    عرض مساعد أثناء الإدخال فقط (بلا فحص صلاحية مستقل؛ الصفحة التي تستدعيه محمية أصلًا بصلاحية الفواتير)."""
+    if kind == 'sales':
+        tbl, htbl, pcol = 'sales_invoice_lines', 'sales_invoices', 'customer_id'
+    else:
+        tbl, htbl, pcol = 'purchase_invoice_lines', 'purchase_invoices', 'supplier_id'
+    base = (f"SELECT l.unit_price_minor p, l.unit_id u, l.factor_milli f, h.invoice_date d, h.invoice_no n, h.currency c, h.status st "
+            f"FROM {tbl} l JOIN {htbl} h ON h.id=l.invoice_id "
+            f"WHERE h.company_id=? AND l.item_id=? AND h.status IN ('posted','draft')")
+    args = [company_id, item_id]
+    if exclude_invoice_id:
+        base += " AND h.id<>?"
+        args.append(int(exclude_invoice_id))
+
+    def pack(r, same):
+        return {'price_minor': r['p'], 'unit_id': r['u'], 'factor_milli': r['f'] or 1000, 'date': r['d'], 'invoice_no': r['n'],
+                'currency': r['c'], 'status': r['st'], 'same_party': same}
+    if party_id:
+        r = conn.execute(base + f" AND h.{pcol}=? ORDER BY h.invoice_date DESC,h.id DESC LIMIT 1", (*args, party_id)).fetchone()
+        if r:
+            return pack(r, True)
+    r = conn.execute(base + " ORDER BY h.invoice_date DESC,h.id DESC LIMIT 1", args).fetchone()
+    return pack(r, False) if r else None
+
+
+def stock_on_hand(conn, company_id, item_id, warehouse_id=None):
+    """الكمية الحالية بالمخزون (وحدة ملّي) لصنف: بمستودع محدد أو مجموع كل المستودعات. عرض مساعد فقط أثناء الإدخال."""
+    if warehouse_id:
+        r = conn.execute("SELECT qty_milli FROM stock_balances WHERE item_id=? AND warehouse_id=?", (item_id, warehouse_id)).fetchone()
+        return r['qty_milli'] if r else 0
+    r = conn.execute("SELECT COALESCE(SUM(b.qty_milli),0) FROM stock_balances b JOIN items i ON i.id=b.item_id "
+                     "WHERE b.item_id=? AND i.company_id=?", (item_id, company_id)).fetchone()
+    return r[0] if r else 0
+
+
+def fiscal_year(conn, company_id, year_id):
+    y = conn.execute("SELECT * FROM fiscal_years WHERE id=? AND company_id=?", (year_id, company_id)).fetchone()
+    if not y:
+        from alhisabat.accounting.errors import AccountingError
+        raise AccountingError("السنة المالية غير موجودة في هذه الشركة")
+    return y
+
+
+def unmatched_bank_lines(conn, company_id):
+    return conn.execute("SELECT COUNT(*) FROM bank_statement_lines WHERE company_id=? AND status='unmatched'", (company_id,)).fetchone()[0]
+
+
+def has_foreign_currency(conn, company_id):
+    """هل فُعِّلت عملة غير الأساس؟ (للإفصاح التدريجي: إخفاء واجهات العملات حتى تلزم)."""
+    base = conn.execute("SELECT base_currency FROM companies WHERE id=?", (company_id,)).fetchone()
+    if not base:
+        return False
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if 'company_currencies' not in tables:
+        return False
+    return conn.execute("SELECT COUNT(*) FROM company_currencies WHERE company_id=? AND currency<>? AND is_enabled=1",
+                        (company_id, base[0])).fetchone()[0] > 0
+
+
+def cost_centers_list(conn, company_id):
+    """قائمة مراكز التكلفة للشركة: [{id, code, name}]."""
+    rows = conn.execute("SELECT id, code, name FROM cost_centers WHERE company_id=? ORDER BY code",
+                        (company_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def fiscal_years_list(conn, company_id):
+    """قائمة السنوات المالية: [{id, name, start_date, end_date, is_closed}]."""
+    rows = conn.execute("SELECT id, name, start_date, end_date, status, (status='closed') AS is_closed FROM fiscal_years WHERE company_id=? ORDER BY start_date DESC",
+                        (company_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def account_id_by_code(conn, company_id, code):
+    """معرف الحساب من رمزه/كوده."""
+    r = conn.execute("SELECT id FROM accounts WHERE company_id=? AND code=?",
+                     (company_id, str(code).strip())).fetchone()
+    return r[0] if r else None
+
+
+def company_name(conn, company_id):
+    """اسم الشركة."""
+    r = conn.execute("SELECT name FROM companies WHERE id=?", (company_id,)).fetchone()
+    return r[0] if r else None
+
+
+def cost_center_info(conn, cost_center_id):
+    """معلومات مركز التكلفة: (name, code)."""
+    r = conn.execute("SELECT name, code FROM cost_centers WHERE id=?", (cost_center_id,)).fetchone()
+    return (r[0], r[1]) if r else (None, None)
+
+
+def currencies_list(conn, company_id):
+    """قائمة كل العملات في النظام مع حالتها في الشركة."""
+    base = conn.execute("SELECT base_currency FROM companies WHERE id=?", (company_id,)).fetchone()
+    base_cur = base[0] if base else ''
+    q = (
+        "SELECT c.code, c.name_ar, c.symbol, c.minor_digits, "
+        "COALESCE(cc.is_enabled, 1) as is_enabled, "
+        "(c.code = ?) as is_base "
+        "FROM currencies c "
+        "LEFT JOIN company_currencies cc ON cc.currency=c.code AND cc.company_id=? "
+        "WHERE c.is_active=1 "
+        "ORDER BY is_base DESC, c.code"
+    )
+    rows = [dict(r) for r in conn.execute(q, (base_cur, company_id)).fetchall()]
+    dflt = default_currency_code(conn, company_id, rows)
+    for r in rows:
+        r['is_default'] = (r['code'] == dflt)
+    return rows
+
+
+def default_currency_code(conn, company_id, rows=None):
+    """رمز عملة الإدخال الافتراضية الفعلية: المحددة للشركة إن كانت مفعّلة، وإلا الأساسية."""
+    r = conn.execute("SELECT base_currency, default_currency FROM companies WHERE id=?", (company_id,)).fetchone()
+    if not r:
+        return ''
+    base, d = r[0], r[1]
+    if not d or d == base:
+        return base
+    if rows is not None:
+        ok = any(x['code'] == d and x.get('is_enabled') for x in rows)
+    else:
+        c = conn.execute("SELECT is_enabled FROM company_currencies WHERE company_id=? AND currency=?", (company_id, d)).fetchone()
+        ok = c is None or bool(c[0])
+    return d if ok else base
+
+
+def cash_transfers(conn, company_id, limit=200):
+    return [dict(r) for r in conn.execute(
+        "SELECT t.id, t.transfer_no, t.transfer_date, t.from_cash_id, t.to_cash_id, "
+        "t.from_amount_minor, t.to_amount_minor, t.fee_minor, t.status, t.description, "
+        "f.name from_cash_name, to_c.name to_cash_name "
+        "FROM cash_transfers t "
+        "JOIN cash_accounts f ON f.id=t.from_cash_id "
+        "JOIN cash_accounts to_c ON to_c.id=t.to_cash_id "
+        "WHERE t.company_id=? ORDER BY t.id DESC LIMIT ?",
+        (company_id, int(limit))
+    )]
+
+
+def cash_counts(conn, company_id, limit=200):
+    return [dict(r) for r in conn.execute(
+        "SELECT c.id, c.cash_account_id, c.count_date, c.book_minor, c.counted_minor, c.diff_minor, c.note, "
+        "ca.name cash_name "
+        "FROM cash_counts c JOIN cash_accounts ca ON ca.id=c.cash_account_id "
+        "WHERE c.company_id=? ORDER BY c.id DESC LIMIT ?",
+        (company_id, int(limit))
+    )]
+
+
+def depreciation_runs(conn, company_id, limit=200):
+    return [dict(r) for r in conn.execute(
+        "SELECT r.id, r.run_date, r.status, r.journal_entry_id, "
+        "COUNT(l.asset_id) assets_count, COALESCE(SUM(l.amount_minor), 0) total_minor "
+        "FROM asset_depreciation_runs r "
+        "LEFT JOIN asset_depreciation_lines l ON l.run_id=r.id "
+        "WHERE r.company_id=? GROUP BY r.id ORDER BY r.id DESC LIMIT ?",
+        (company_id, int(limit))
+    )]
+
+
+def user_restrictions(conn, user_id):
+    branches = [r[0] for r in conn.execute("SELECT branch_id FROM user_branch_access WHERE user_id=?", (user_id,))]
+    warehouses = [r[0] for r in conn.execute("SELECT warehouse_id FROM user_warehouse_access WHERE user_id=?", (user_id,))]
+    cash_accounts = [r[0] for r in conn.execute("SELECT cash_account_id FROM user_cash_access WHERE user_id=?", (user_id,))]
+    return {'branches': branches, 'warehouses': warehouses, 'cash_accounts': cash_accounts}
+
+
+def branches_list(conn, company_id, user_id=None):
+    """الفروع النشطة؛ ومع user_id يُقتصر على فروع المستخدم المقيَّد (بلا تقييد = كلها)."""
+    q, a = "SELECT id, code, name FROM branches WHERE company_id=? AND is_active=1", [company_id]
+    if user_id is not None and conn.execute("SELECT 1 FROM user_branch_access WHERE user_id=? LIMIT 1", (user_id,)).fetchone():
+        q += " AND id IN (SELECT branch_id FROM user_branch_access WHERE user_id=?)"; a.append(user_id)
+    return [dict(r) for r in conn.execute(q + " ORDER BY id", a)]
+
+
+def tax_report_data(conn, company_id, date_from, date_to, branch_id=None):
+    """بيانات الإقرار الضريبي: مبيعات ومشتريات مع مرتجعاتها وضريبتها للفترة."""
+    q_s = (
+        "SELECT doc_type, COALESCE(SUM(net_ex_total), 0) net, COALESCE(SUM(tax_total), 0) tax "
+        "FROM sales_invoices "
+        "WHERE company_id=? AND status='posted' AND invoice_date BETWEEN ? AND ?"
+    )
+    p_s = [company_id, date_from, date_to]
+    if branch_id:
+        q_s += " AND branch_id=?"
+        p_s.append(branch_id)
+    q_s += " GROUP BY doc_type"
+    sales_rows = {r['doc_type']: (r['net'], r['tax']) for r in conn.execute(q_s, p_s)}
+
+    q_p = (
+        "SELECT doc_type, COALESCE(SUM(net_ex_total), 0) net, COALESCE(SUM(tax_total), 0) tax "
+        "FROM purchase_invoices "
+        "WHERE company_id=? AND status='posted' AND invoice_date BETWEEN ? AND ?"
+    )
+    p_p = [company_id, date_from, date_to]
+    if branch_id:
+        q_p += " AND branch_id=?"
+        p_p.append(branch_id)
+    q_p += " GROUP BY doc_type"
+    purch_rows = {r['doc_type']: (r['net'], r['tax']) for r in conn.execute(q_p, p_p)}
+
+    return {'sales': sales_rows, 'purchases': purch_rows}
+
+
+def default_view_label(conn, company_id):
+    """نص خيار «العرض الافتراضي» في قوائم اختيار عملة الكشوف: كل الحركات محوّلة بسعر الصرف إلى العملة الأساسية."""
+    row = next((c for c in currencies_list(conn, company_id) if c.get('is_base')), None)
+    name = (row.get('name_ar') or row['code']) if row else 'العملة الأساسية'
+    return f'العرض الافتراضي (محوّل بسعر الصرف إلى {name})'
+
+
+def party_account_options(conn, company_id, kind):
+    """[(account_id, «code — name»)] لحسابات العملاء أو الموردين النشطين (القيد يُرحَّل على حساب الطرف التفصيلي)."""
+    return [(r['account_id'], f"{r['code']} — {r['name']}") for r in conn.execute(
+        "SELECT account_id,code,name FROM parties WHERE company_id=? AND kind=? AND is_active=1 AND account_id IS NOT NULL ORDER BY name",
+        (company_id, kind))]
+
+
+def mapped_account_id(conn, company_id, map_key):
+    r = conn.execute("SELECT account_id FROM account_mappings WHERE company_id=? AND map_key=?", (company_id, map_key)).fetchone()
+    return r[0] if r else None
+
+
+def enabled_currencies(conn, company_id):
+    """العملات المفعّلة للشركة: [{code,name_ar,is_base}] الأساسية أولًا."""
+    return [{'code': c['code'], 'name_ar': c.get('name_ar') or c['code'], 'is_base': bool(c.get('is_base')),
+             'is_default': bool(c.get('is_default'))}
+            for c in currencies_list(conn, company_id) if c.get('is_enabled')]

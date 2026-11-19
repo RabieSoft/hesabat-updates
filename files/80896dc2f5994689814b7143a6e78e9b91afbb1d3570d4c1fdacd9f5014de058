@@ -1,0 +1,93 @@
+"""منطق التوحيد الخالص (بلا PySide6): فئات أحجام النوافذ، حدود الشاشة، وموضع الإظهار.
+
+تستعمله `shell/dialog_policy.py` (يطبّق النتيجة على النوافذ) ويفحصه tests/test_ui_unified.py بلا واجهة.
+الهدف: كل نافذة تنتمي لفئة حجم واحدة من أربع، لا تتجاوز الشاشة، وتظهر دائمًا في المكان نفسه (أعلى الوسط تحت الشريط)
+بدل أحجام ومواضع عشوائية.
+"""
+from . import tokens as T
+
+# فئات العرض: (اسم الفئة، أقصى عرض مقترح لمحتوى النافذة، العرض الموحّد المطبَّق)
+WIDTH_CLASSES = (('S', 460, 440), ('M', 620, 580), ('L', 820, 780), ('XL', 10 ** 6, 1000))
+MAX_SCREEN_W = 0.80               # أقصى نسبة من عرض الشاشة المتاحة
+MAX_SCREEN_H = 0.85
+MIN_H = 160
+TOP_OFFSET = 96                   # بعد الشريط العلوي وشريط الإجراءات تقريبًا (موضع الظهور الثابت)
+
+# نوافذ لا تمسّها السياسة (تسجيل الدخول، التشغيل السريع، رسائل النظام...)
+EXCLUDED_OBJECT_NAMES = frozenset({'loginDialog', 'bootstrapDialog', 'quickLaunch', 'activationDialog'})
+EXCLUDED_CLASS_PREFIXES = ('QMessageBox', 'QFileDialog', 'QInputDialog', 'QColorDialog', 'QFontDialog', 'QProgressDialog',
+                           'QPrint', 'QPageSetup', 'QWizard', 'QErrorMessage')
+
+
+def excluded(class_names, object_name=''):
+    """class_names: أسماء أصناف النافذة عبر سلسلة الوراثة."""
+    if object_name in EXCLUDED_OBJECT_NAMES:
+        return True
+    return any(n.startswith(EXCLUDED_CLASS_PREFIXES) for n in class_names)
+
+
+def width_class(content_w):
+    """الفئة المناسبة لعرض المحتوى المقترح (sizeHint أو ما ضبطه المؤلف)."""
+    for name, limit, _target in WIDTH_CLASSES:
+        if content_w <= limit:
+            return name
+    return 'XL'
+
+
+def snap_width(w):
+    """أصغر عرض موحّد يتّسع لـw؛ ما زاد عن أكبر فئة يبقى كما هو (محتوى عريض جدًا لا يُقصّ)."""
+    for _n, _l, t in WIDTH_CLASSES:
+        if w <= t:
+            return t
+    return w
+
+
+def class_width(name):
+    return next(t for n, _l, t in WIDTH_CLASSES if n == name)
+
+
+def target_size(hint_w, hint_h, author_w, author_h, avail_w, avail_h, min_w=0, min_h=0):
+    """الحجم الموحّد: عرض الفئة (لا أصغر من حاجة المحتوى)، وارتفاع المحتوى بلا فراغ زائد، ومحصور بالشاشة.
+
+    author_*: ما ضبطه مؤلف النافذة بـresize() (0 إن لم يضبط). النوافذ الكبيرة عمدًا (فاتورة/قيد) تبقى كبيرة لكن ضمن فئة XL والشاشة.
+    """
+    need_w = max(hint_w, min_w)
+    base_w = max(need_w, author_w) if author_w else need_w
+    cls = width_class(base_w)
+    w = snap_width(max(class_width(cls), need_w))       # لا يبقى عرض «بين الفئات»: يرتفع لأقرب فئة تتّسع للمحتوى
+    max_w = int(avail_w * MAX_SCREEN_W)
+    max_h = int(avail_h * MAX_SCREEN_H)
+    w = min(w, max_w)
+    base_h = max(hint_h, min_h)
+    h = base_h + 8
+    if author_h and cls in ('L', 'XL'):              # النوافذ الكبيرة تحتفظ بارتفاعها المقصود (جداول)
+        h = max(h, author_h)
+    h = max(MIN_H, min(h, max_h))
+    return w, h
+
+
+def anchor_pos(parent_x, parent_y, parent_w, parent_h, w, h, avail_x, avail_y, avail_w, avail_h, top_offset=TOP_OFFSET):
+    """أعلى منتصف النافذة الرئيسية تحت الأشرطة؛ وإن لم تكن هناك نافذة أم فمنتصف الشاشة. مع حصر داخل الشاشة."""
+    if parent_w and parent_h:
+        x = parent_x + (parent_w - w) // 2
+        y = parent_y + top_offset
+    else:
+        x = avail_x + (avail_w - w) // 2
+        y = avail_y + (avail_h - h) // 2
+    x = max(avail_x, min(x, avail_x + avail_w - w))
+    y = max(avail_y, min(y, avail_y + avail_h - h))
+    return x, y
+
+
+def inline_eligible(hint_w, hint_h, inputs, has_views, class_name, blocked=()):
+    """هل يُعرض النموذج داخل لوحة الإدخال بالصفحة؟ نماذج صغيرة بحقلين فأكثر بلا جداول ولا رسائل تأكيد."""
+    if class_name in blocked or class_name == 'ConfirmDangerDialog':
+        return False
+    if has_views or inputs < 2:
+        return False
+    return hint_h <= INLINE_MAX_H and hint_w <= INLINE_MAX_W
+
+
+INLINE_MAX_H = 430
+INLINE_MAX_W = 780
+DOCK_MAX_H = 360                  # أقصى ارتفاع للوحة الإدخال قبل ظهور تمرير داخلها (يبقى الجدول مرئيًا)

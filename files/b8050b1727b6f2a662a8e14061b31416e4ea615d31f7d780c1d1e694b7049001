@@ -1,0 +1,190 @@
+"""نوافذ الموارد: موظف، مركز تكلفة، مسير، أصل.
+"""
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLineEdit, QMessageBox
+
+from alhisabat.ui.components.basic import DateField
+from alhisabat.ui.core import strings_ar as S
+
+class EmployeeDialog(QDialog):
+    def __init__(self, page, existing=None):
+        super().__init__(page); self.setWindowTitle('تعديل موظف' if existing else 'تعيين موظف'); self.setLayoutDirection(Qt.RightToLeft); self.setMinimumWidth(420)
+        form=QFormLayout(self)
+        self.name=QLineEdit(existing.get('name','') if existing else ''); self.job=QLineEdit(existing.get('job_title','') if existing else '')
+        from decimal import Decimal
+        sal_val = Decimal(existing.get('base_salary_minor') or 0) / Decimal(100) if existing else ''
+        self.salary = QLineEdit(f"{sal_val:.2f}" if sal_val != '' else '')
+        self.phone = QLineEdit(existing.get('phone') or '' if existing else '')
+        self.date=DateField()
+        if existing and existing.get('hire_date'): self.date.set_iso(existing['hire_date'])
+        form.addRow('الاسم *', self.name); 
+        form.addRow('تاريخ التعيين', self.date)
+        form.addRow('الوظيفة', self.job); form.addRow('الراتب الأساسي *', self.salary)
+        form.addRow('الهاتف', self.phone)
+        bb=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel); bb.accepted.connect(self._accept); bb.rejected.connect(self.reject); form.addRow(bb)
+    def _accept(self):
+        if not self.name.text().strip(): return QMessageBox.warning(self,'خطأ','الاسم مطلوب')
+        if not self.salary.text().strip(): return QMessageBox.warning(self,'خطأ','الراتب مطلوب')
+        self.accept()
+    def values(self):
+        out={'name':self.name.text().strip(),'job':self.job.text().strip(),'salary':self.salary.text().strip().replace(',', '')}
+        if hasattr(self,'phone'): out['phone']=self.phone.text().strip()
+        if hasattr(self,'date'): out['date']=self.date.iso()
+        return out
+
+class CostCenterDialog(QDialog):
+    def __init__(self, page, existing=None):
+        super().__init__(page); self.setWindowTitle('تعديل مركز تكلفة' if existing else 'مركز تكلفة جديد'); self.setLayoutDirection(Qt.RightToLeft); self.setMinimumWidth(380)
+        form=QFormLayout(self)
+        self.name=QLineEdit(existing.get('name','') if existing else ''); self.code=QLineEdit(existing.get('code','') if existing else '')
+        self.code.setPlaceholderText('فارغ = تلقائي')
+        form.addRow('الاسم *', self.name)
+        if not existing: form.addRow('الكود', self.code)
+        bb=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel); bb.accepted.connect(self._accept); bb.rejected.connect(self.reject); form.addRow(bb)
+    def _accept(self):
+        if not self.name.text().strip(): return QMessageBox.warning(self,'خطأ','الاسم مطلوب')
+        self.accept()
+    def values(self): return {'name':self.name.text().strip(),'code':self.code.text().strip() or None}
+
+class PayrollDialog(QDialog):
+    def __init__(self, page):
+        super().__init__(page); self.setWindowTitle('مسير رواتب جديد'); self.setLayoutDirection(Qt.RightToLeft); form=QFormLayout(self)
+        from datetime import date as _d
+        self.period=QLineEdit(_d.today().strftime('%Y-%m')); self.period.setPlaceholderText('YYYY-MM')
+        self.date=DateField()
+        form.addRow('الشهر (YYYY-MM) *', self.period); form.addRow('تاريخ الدفع', self.date)
+        bb=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel); bb.accepted.connect(self._accept); bb.rejected.connect(self.reject); form.addRow(bb)
+    def _accept(self):
+        if not self.period.text().strip(): return QMessageBox.warning(self,'خطأ','الشهر مطلوب')
+        self.accept()
+    def values(self): return {'period':self.period.text().strip(),'date':self.date.iso()}
+
+class AssetDialog(QDialog):
+    def __init__(self, page):
+        super().__init__(page); self.setWindowTitle('أصل ثابت جديد'); self.setLayoutDirection(Qt.RightToLeft); form=QFormLayout(self)
+        self.name=QLineEdit(); self.cost=QLineEdit(); self.cost.setPlaceholderText('0.00'); self.life=QLineEdit(); self.life.setPlaceholderText('بالأشهر (مثل 60)')
+        self.date=DateField(); self.account=QComboBox()
+        try:
+            for aid,lab in page.session.lookup_accounts(types=['asset'], groups=True): self.account.addItem(lab, aid)   # فئة الأصل يجب أن تكون حسابًا تجميعيًا (fixed_assets.register_asset)
+        except Exception: pass
+        form.addRow('اسم الأصل *', self.name); form.addRow('فئة الأصل (حساب تجميعي) *', self.account); form.addRow('تاريخ الاقتناء', self.date); form.addRow('التكلفة *', self.cost); form.addRow('العمر الإنتاجي (شهر) *', self.life)
+        bb=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel); bb.accepted.connect(self._accept); bb.rejected.connect(self.reject); form.addRow(bb)
+    def _accept(self):
+        if not self.name.text().strip(): return QMessageBox.warning(self,'خطأ','الاسم مطلوب')
+        if self.account.currentData() is None: return QMessageBox.warning(self,'خطأ','اختر حساب الأصل')
+        if not self.cost.text().strip(): return QMessageBox.warning(self,'خطأ','التكلفة مطلوبة')
+        if not self.life.text().strip(): return QMessageBox.warning(self,'خطأ','العمر مطلوب')
+        self.accept()
+    def values(self): return {'name':self.name.text().strip(),'account_id':self.account.currentData(),'date':self.date.iso(),'cost':self.cost.text().strip().replace(',', ''),'life':self.life.text().strip()}
+
+class AcquisitionDialog(QDialog):
+    def __init__(self, page, asset):
+        super().__init__(page); self.setWindowTitle(f"تسجيل اقتناء: {asset.get('name','')}"); self.setLayoutDirection(Qt.RightToLeft); form=QFormLayout(self)
+        self.account=QComboBox()
+        try:
+            for aid,lab in page.session.lookup_accounts(groups=False): self.account.addItem(lab, aid)
+        except Exception: pass
+        self.desc=QLineEdit()
+        form.addRow('الحساب المقابل *', self.account); form.addRow('البيان', self.desc)
+        bb=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel); bb.accepted.connect(self._accept); bb.rejected.connect(self.reject); form.addRow(bb)
+    def _accept(self):
+        if self.account.currentData() is None: return QMessageBox.warning(self,'خطأ','اختر الحساب المقابل')
+        self.accept()
+    def values(self): return {'account_id':self.account.currentData(),'description':self.desc.text().strip()}
+
+
+class AssetDisposalDialog(QDialog):
+    """استبعاد أو بيع أصل ثابت."""
+    def __init__(self, page, asset):
+        super().__init__(page)
+        self.setWindowTitle(f"استبعاد أصل: {asset.get('name', '')}")
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.setMinimumWidth(440)
+        form = QFormLayout(self)
+        self.date = DateField()
+        self.proceeds = QLineEdit('0.00')
+        self.account = QComboBox()
+        try:
+            for aid, lab in page.session.lookup_accounts(groups=False):
+                self.account.addItem(lab, aid)
+        except Exception: pass
+        self.reason = QLineEdit()
+        self.reason.setPlaceholderText("سبب الاستبعاد...")
+
+        form.addRow('تاريخ الاستبعاد *', self.date)
+        form.addRow('عوائد البيع (0 إن أُتلف) *', self.proceeds)
+        form.addRow('الحساب المقابل للعوائد *', self.account)
+        form.addRow('السبب', self.reason)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self._accept)
+        bb.rejected.connect(self.reject)
+        form.addRow(bb)
+
+    def _accept(self):
+        if self.account.currentData() is None:
+            return QMessageBox.warning(self, 'خطأ', 'اختر الحساب المقابل')
+        try:
+            from decimal import Decimal
+            Decimal(self.proceeds.text().strip().replace(',', ''))
+        except Exception:
+            return QMessageBox.warning(self, 'خطأ', 'مبلغ العوائد غير صالح')
+        self.accept()
+
+    def values(self):
+        return {
+            'date': self.date.iso(),
+            'proceeds': self.proceeds.text().strip().replace(',', ''),
+            'counter_account_id': self.account.currentData(),
+            'reason': self.reason.text().strip()
+        }
+
+
+class PayEmployeeDialog(QDialog):
+    """سداد راتب موظف نقداً أو عبر البنك."""
+    def __init__(self, page, employee, advance=False):
+        super().__init__(page)
+        self.setWindowTitle(f"{'سلفة' if advance else 'صرف راتب'} — {employee.get('name', '')}")
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.setMinimumWidth(440)
+        form = QFormLayout(self)
+
+        self.cash = QComboBox()
+        try:
+            for cid, lab in page.session.lookup_cash():
+                self.cash.addItem(lab, cid)
+        except Exception: pass
+
+        from decimal import Decimal
+        base_sal = Decimal(employee.get('base_salary_minor') or 0) / Decimal(100)
+        self.amount = QLineEdit('' if advance else f"{base_sal:.2f}")
+        self.date = DateField()
+        self.desc = QLineEdit(f"{'سلفة موظف' if advance else 'صرف راتب'} {employee.get('name', '')}")
+
+        form.addRow('صندوق/بنك الصرف *', self.cash)
+        form.addRow('المبلغ *', self.amount)
+        form.addRow('تاريخ الصرف *', self.date)
+        form.addRow('البيان', self.desc)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self._accept)
+        bb.rejected.connect(self.reject)
+        form.addRow(bb)
+
+    def _accept(self):
+        if not self.cash.currentData():
+            return QMessageBox.warning(self, 'خطأ', 'اختر الصندوق أو البنك')
+        try:
+            from decimal import Decimal
+            Decimal(self.amount.text().strip().replace(',', ''))
+        except Exception:
+            return QMessageBox.warning(self, 'خطأ', 'المبلغ غير صالح')
+        self.accept()
+
+    def values(self):
+        return {
+            'cash_id': self.cash.currentData(),
+            'amount': self.amount.text().strip().replace(',', ''),
+            'date': self.date.iso(),
+            'description': self.desc.text().strip()
+        }

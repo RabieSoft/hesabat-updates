@@ -1,0 +1,1 @@
+"""المكوّنات المشتركة (القسم 5 من prompt.md). document_model وdocument_html خالصان (بلا PySide6) ومختبَران؛ بقية الملفات تحتاج PySide6."""

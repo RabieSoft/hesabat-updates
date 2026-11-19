@@ -1,0 +1,218 @@
+"""الرواتب: موظف = طرف (Party، نوع employee) بحساب مستحقات تحت حساب رقابي، بالإضافة إلى بيانات تعيين (تاريخ التعيين، الراتب الأساسي).
+مسير شهري واحد لكل شهر: بنود (أساسي + بدلات − استقطاعات = صافي) تُرحَّل بقيد واحد مجمَّع، ثم يُدفَع الصافي كسند صرف عادي
+(cash.create_payment مع employee_id) دون تخصيص على مستند — فهو سداد كامل لمستحقات الموظف وليس فاتورة."""
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.accounting import journal_engine as je, period_engine
+from alhisabat.audit import audit
+from alhisabat.business import parties as pt
+from alhisabat.database.tx import transaction
+from alhisabat.security import permissions
+
+
+def _mapping(conn, company_id, key):
+    r = conn.execute("SELECT account_id FROM account_mappings WHERE company_id=? AND map_key=?", (company_id, key)).fetchone()
+    return r[0] if r else None
+
+
+def hire_employee(conn, actor_id, company_id, name, hire_date, base_salary, *, job_title="", phone="", email="", notes=""):
+    permissions.require(conn, actor_id, company_id, "employee.manage", check_branch=False)
+    if je._minor(base_salary) < 0:
+        raise AccountingError("الراتب الأساسي لا يقبل قيمة سالبة")
+    with transaction(conn):
+        pid = pt.create_party(conn, actor_id, company_id, "employee", name, phone=phone, email=email, notes=notes)
+        conn.execute("INSERT INTO employees(party_id,hire_date,job_title,base_salary_minor) VALUES(?,?,?,?)",
+                     (pid, hire_date, job_title, je._minor(base_salary)))
+        audit.log(conn, actor_id, "hire_employee", "employees", pid, after={"name": name, "hire_date": hire_date})
+    return pid
+
+
+def edit_employee(conn, actor_id, employee_id, *, name=None, job_title=None, base_salary=None, phone=None, hire_date=None):
+    p = pt.get_party(conn, actor_id, _company_of(conn, employee_id), employee_id)
+    permissions.require(conn, actor_id, p["company_id"], "employee.manage", check_branch=False)
+    if name is not None or phone is not None:
+        pt.edit_party(conn, actor_id, employee_id, name=name, phone=phone)
+    emp = conn.execute("SELECT * FROM employees WHERE party_id=?", (employee_id,)).fetchone()
+    new_title = emp["job_title"] if job_title is None else job_title
+    new_sal = emp["base_salary_minor"] if base_salary is None else je._minor(base_salary)
+    if new_sal < 0:
+        raise AccountingError("الراتب الأساسي لا يقبل قيمة سالبة")
+    new_hire = emp["hire_date"] if not hire_date else str(hire_date)[:10]
+    with transaction(conn):
+        conn.execute("UPDATE employees SET job_title=?,base_salary_minor=?,hire_date=? WHERE party_id=?", (new_title, new_sal, new_hire, employee_id))
+        audit.log(conn, actor_id, "edit_employee", "employees", employee_id, after={"job_title": new_title, "base_salary": new_sal, "hire_date": new_hire})
+
+
+def reactivate_employee(conn, actor_id, employee_id, reason=""):
+    """إعادة تفعيل موظف أُنهيت خدمته."""
+    cid = _company_of(conn, employee_id)
+    permissions.require(conn, actor_id, cid, "employee.manage", check_branch=False)
+    with transaction(conn):
+        pt.set_active(conn, actor_id, employee_id, True, reason)
+        conn.execute("UPDATE employees SET is_active=1 WHERE party_id=?", (employee_id,))
+        audit.log(conn, actor_id, "reactivate_employee", "employees", employee_id, reason=reason or None)
+
+
+def delete_employee(conn, actor_id, employee_id):
+    """حذف موظف لا حركة له إطلاقًا (لا قيود ولا مسيرات): يُحذف سجله وحسابه. من له حركات يُنهى تعيينه ولا يُحذف."""
+    cid = _company_of(conn, employee_id)
+    permissions.require(conn, actor_id, cid, "employee.manage", check_branch=False)
+    if conn.execute("SELECT 1 FROM payroll_lines WHERE employee_id=? LIMIT 1", (employee_id,)).fetchone():
+        raise AccountingError("للموظف مسيرات رواتب: لا يمكن حذفه، استخدم «إنهاء الخدمة»")
+    with transaction(conn):
+        p = pt.get_party(conn, actor_id, cid, employee_id)
+        conn.execute("DELETE FROM employees WHERE party_id=?", (employee_id,))
+        pt.delete_party(conn, actor_id, employee_id)          # يرفض إن كان للحساب أي قيد (حتى المسودة) فتتراجع المعاملة كلها
+        audit.log(conn, actor_id, "delete_employee", "employees", employee_id, before={"code": p["code"], "name": p["name"]})
+
+
+def _company_of(conn, employee_id):
+    r = conn.execute("SELECT company_id FROM parties WHERE id=? AND kind='employee'", (employee_id,)).fetchone()
+    if not r:
+        raise AccountingError("الموظف غير موجود")
+    return r[0]
+
+
+def terminate_employee(conn, actor_id, employee_id, reason=""):
+    """إنهاء خدمة: يعطّل الموظف (كعميل/مورد) بشرط تصفير مستحقاته أولا."""
+    cid = _company_of(conn, employee_id)
+    permissions.require(conn, actor_id, cid, "employee.manage", check_branch=False)
+    pt.set_active(conn, actor_id, employee_id, False, reason)
+    with transaction(conn):
+        conn.execute("UPDATE employees SET is_active=0 WHERE party_id=?", (employee_id,))
+        audit.log(conn, actor_id, "terminate_employee", "employees", employee_id, reason=reason or None)
+
+
+def list_employees(conn, user_id, company_id, active_only=False):
+    permissions.require(conn, user_id, company_id, "employee.view", check_branch=False)
+    rows = pt.list_parties(conn, user_id, company_id, "employee", active_only=active_only)["rows"]
+    emp = {r["party_id"]: r for r in conn.execute("SELECT * FROM employees")}
+    return [{**r, **{k: v for k, v in dict(emp.get(r["id"], {})).items() if k != "party_id"}} for r in rows]
+
+
+def get_employee(conn, user_id, employee_id):
+    cid = _company_of(conn, employee_id)
+    p = pt.get_party(conn, user_id, cid, employee_id)
+    emp = conn.execute("SELECT * FROM employees WHERE party_id=?", (employee_id,)).fetchone()
+    return {**p, **{k: v for k, v in dict(emp).items() if k != "party_id"}}
+
+
+# ---------------- المسير ----------------
+def create_run(conn, actor_id, company_id, period_month, pay_date, lines):
+    """lines: [{employee_id, allowances?, deductions?, basic?(افتراضيا الراتب الأساسي المسجَّل)}]."""
+    permissions.require(conn, actor_id, company_id, "payroll.run", check_branch=False)
+    if not lines:
+        raise AccountingError("المسير يجب أن يحتوي موظفا واحدا على الأقل")
+    seen, rows = set(), []
+    for ln in lines:
+        eid = ln["employee_id"]
+        if eid in seen:
+            raise AccountingError("موظف مكرر في المسير")
+        seen.add(eid)
+        emp = conn.execute("SELECT e.*,p.company_id,p.is_active FROM employees e JOIN parties p ON p.id=e.party_id WHERE e.party_id=?", (eid,)).fetchone()
+        if not emp or emp["company_id"] != company_id:
+            raise AccountingError("الموظف غير موجود في هذه الشركة")
+        if not emp["is_active"]:
+            raise AccountingError("لا يمكن إدراج موظف غير نشط في المسير")
+        basic = je._minor(ln["basic"]) if ln.get("basic") is not None else emp["base_salary_minor"]
+        allow = je._minor(ln.get("allowances", 0))
+        ded = je._minor(ln.get("deductions", 0))
+        if basic < 0 or allow < 0 or ded < 0:
+            raise AccountingError("المبالغ لا تقبل قيما سالبة")
+        if ded > basic + allow:
+            raise AccountingError("الاستقطاعات تتجاوز الراتب والبدلات")
+        rows.append((eid, basic, allow, ded, basic + allow - ded))
+    with transaction(conn):
+        rid = conn.execute("INSERT INTO payroll_runs(company_id,period_month,pay_date,created_by) VALUES(?,?,?,?)",
+                           (company_id, period_month, pay_date, actor_id)).lastrowid
+        for (eid, b, a, d, n) in rows:
+            conn.execute("INSERT INTO payroll_lines(run_id,employee_id,basic_minor,allowances_minor,deductions_minor,net_minor) VALUES(?,?,?,?,?,?)",
+                         (rid, eid, b, a, d, n))
+        audit.log(conn, actor_id, "create_payroll_run", "payroll_runs", rid, after={"period": period_month, "employees": len(rows)})
+    return rid
+
+
+def _run(conn, run_id):
+    r = conn.execute("SELECT * FROM payroll_runs WHERE id=?", (run_id,)).fetchone()
+    if not r:
+        raise AccountingError("المسير غير موجود")
+    return r
+
+
+def delete_run_draft(conn, actor_id, run_id):
+    r = _run(conn, run_id)
+    permissions.require(conn, actor_id, r["company_id"], "payroll.run", check_branch=False)
+    if r["status"] != "draft":
+        raise AccountingError("لا يُحذف إلا المسير المسودة")
+    with transaction(conn):
+        conn.execute("DELETE FROM payroll_lines WHERE run_id=?", (run_id,))
+        conn.execute("DELETE FROM payroll_runs WHERE id=?", (run_id,))
+        audit.log(conn, actor_id, "delete_payroll_run", "payroll_runs", run_id)
+
+
+def post_run(conn, actor_id, run_id):
+    r = _run(conn, run_id)
+    cid = r["company_id"]
+    permissions.require(conn, actor_id, cid, "payroll.run", check_branch=False)
+    permissions.require(conn, actor_id, cid, "journal.create", check_branch=False)
+    permissions.require(conn, actor_id, cid, "journal.post", check_branch=False)
+    if r["status"] != "draft":
+        raise AccountingError("المسير ليس مسودة")
+    lines = conn.execute("SELECT * FROM payroll_lines WHERE run_id=?", (run_id,)).fetchall()
+    if not lines:
+        raise AccountingError("المسير بلا بنود")
+    per = period_engine.find_period(conn, cid, r["pay_date"])
+    je._assert_open(per)
+    exp = _mapping(conn, cid, "payroll_expense")
+    ded_acc = _mapping(conn, cid, "payroll_deductions")
+    if not exp:
+        raise AccountingError("اربط حساب مصروف الرواتب (Account Mapping: payroll_expense)")
+    total_ded = sum(l["deductions_minor"] for l in lines)
+    if total_ded and not ded_acc:
+        raise AccountingError("اربط حساب استقطاعات الرواتب (Account Mapping: payroll_deductions)")
+    gross = sum(l["basic_minor"] + l["allowances_minor"] for l in lines)
+    jl = [{"account_id": exp, "debit": gross / 100, "credit": 0}]
+    if total_ded:
+        jl.append({"account_id": ded_acc, "debit": 0, "credit": total_ded / 100})
+    emp_accounts = {r["id"]: r["account_id"] for r in conn.execute("SELECT id,account_id FROM parties WHERE id IN (%s)" %
+                   ",".join(str(l["employee_id"]) for l in lines))}
+    for l in lines:
+        jl.append({"account_id": emp_accounts[l["employee_id"]], "debit": 0, "credit": l["net_minor"] / 100})
+    with transaction(conn):
+        eid = je.create_draft(conn, cid, actor_id, r["pay_date"], jl, f"مسير رواتب {r['period_month']}", entry_type="auto",
+                              source_type="payroll_run", source_id=run_id)
+        je.post(conn, eid, actor_id)
+        conn.execute("UPDATE payroll_runs SET status='posted',journal_entry_id=?,posted_by=?,posted_at=CURRENT_TIMESTAMP WHERE id=?", (eid, actor_id, run_id))
+        audit.log(conn, actor_id, "post_payroll_run", "payroll_runs", run_id, after={"entry": eid, "gross": gross, "deductions": total_ded})
+    return {"run_id": run_id, "entry_id": eid, "gross": gross, "deductions": total_ded}
+
+
+def cancel_run(conn, actor_id, run_id, cancel_date, reason):
+    r = _run(conn, run_id)
+    permissions.require(conn, actor_id, r["company_id"], "payroll.cancel", check_branch=False)
+    permissions.require(conn, actor_id, r["company_id"], "journal.reverse", check_branch=False)
+    if not reason or not reason.strip():
+        raise AccountingError("الإلغاء يتطلب ذكر السبب")
+    if r["status"] != "posted":
+        raise AccountingError("يُلغى المسير المرحّل فقط")
+    if cancel_date < r["pay_date"]:
+        raise AccountingError("تاريخ الإلغاء أقدم من تاريخ الصرف")
+    with transaction(conn):
+        rid = je.reverse(conn, r["journal_entry_id"], actor_id, cancel_date, reason)
+        conn.execute("UPDATE payroll_runs SET status='cancelled',cancelled_by=?,cancelled_at=CURRENT_TIMESTAMP,cancel_reason=?,cancel_entry_id=? WHERE id=?",
+                     (actor_id, reason, rid, run_id))
+        audit.log(conn, actor_id, "cancel_payroll_run", "payroll_runs", run_id, {"status": "posted"}, {"status": "cancelled", "reversal": rid}, reason)
+    return {"run_id": run_id, "reversal_entry_id": rid}
+
+
+def get_run(conn, user_id, run_id):
+    r = _run(conn, run_id)
+    permissions.require(conn, user_id, r["company_id"], "payroll.run" if False else "employee.view", check_branch=False)
+    lines = [dict(x) for x in conn.execute("SELECT l.*,p.name employee_name,p.code employee_code FROM payroll_lines l "
+                                           "JOIN parties p ON p.id=l.employee_id WHERE l.run_id=? ORDER BY p.code", (run_id,))]
+    return {**dict(r), "lines": lines}
+
+
+def pay_employee(conn, actor_id, company_id, cash_id, employee_id, amount, pay_date, description=""):
+    """دفع مستحقات موظف عبر سند صرف عادي (بلا تخصيص على مستند)."""
+    from alhisabat.business import cash
+    return cash.create_payment(conn, actor_id, company_id, pay_date, cash_id, amount, employee_id=employee_id, description=description)

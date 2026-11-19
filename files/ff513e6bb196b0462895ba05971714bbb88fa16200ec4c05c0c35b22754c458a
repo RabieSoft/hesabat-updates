@@ -1,0 +1,141 @@
+"""الطباعة وPDF عبر Qt (قرار معتمد): نفس QTextDocument للشاشة والطباعة (WYSIWYG)، بلا مكتبات خارجية.
+
+التدفق: DocumentSpec ← render_document_html ← QTextDocument ← QPdfWriter / QPrinter / QImage (معاينة).
+Qt هو من يشكّل الحروف العربية ويضبط الاتجاه ويضمّن الخطوط في PDF. لم تُجرَّب هذه الطبقة في بيئة التدقيق؛ شغّل
+tools/qt_print_selftest.py على Windows أولًا. يتطلب PySide6 (QtGui وQtPrintSupport).
+"""
+from PySide6.QtCore import QMarginsF, QSizeF
+from PySide6.QtGui import QFont, QPageLayout, QPageSize, QPdfWriter, QTextDocument
+
+from .document_html import paper_px, render_document_html, uses_classic
+from alhisabat.ui.core import print_settings as PSET
+
+from .document_model import PAPERS, effective_dims
+
+DPI = 96                      # دقة المنطق المعتمدة لتخطيط المستند على الشاشة
+FOOTER_SAFETY_PX = 14         # هامش أمان عند دفع التذييل لأسفل الصفحة كي لا يتسرب لصفحة إضافية
+
+
+def _font():
+    f = QFont()
+    f.setFamilies(['Segoe UI', 'Tahoma', 'Noto Sans Arabic', 'Arial'])
+    f.setPointSize(10)
+    return f
+
+
+def _make_doc(spec, paper, opts, inner_w, fill_px=0, pages=None):
+    doc = QTextDocument()
+    doc.setDefaultFont(_font())
+    doc.setDocumentMargin(0)
+    doc.setHtml(render_document_html(spec, paper, opts, fill_px=fill_px, pages=pages))
+    doc.setTextWidth(inner_w)
+    return doc
+
+
+def build_qdocument(spec, paper='A4'):
+    """QTextDocument جاهز بعرض الصفحة. للإيصال: الارتفاع يُحسب من المحتوى (ورق متصل).
+    قالب «الربيع» (التقارير والكشوف): التذييل يُدفع لأسفل الصفحة الأخيرة بمساحة تُحسب من ارتفاع المحتوى، ويُرقَّم «ن / ن»."""
+    opts = PSET.active()
+    w_px, h_px, m_px = paper_px(paper, DPI)
+    inner_w = w_px - 2 * m_px
+    doc = _make_doc(spec, paper, opts, inner_w)
+    if h_px is not None and uses_classic(spec, paper, opts):
+        page_h = h_px - 2 * m_px
+        content_h = doc.size().height()                  # قبل ضبط ارتفاع الصفحة: ارتفاع المحتوى الكلي
+        if content_h < page_h:                           # صفحة واحدة: املأ الباقي ليستقر التذييل أسفل الورقة
+            room = int(page_h - content_h) - FOOTER_SAFETY_PX
+            doc = _make_doc(spec, paper, opts, inner_w, fill_px=max(room, 0), pages=1)
+        else:                                            # عدة صفحات: رقّم التذييل بآخر صفحة
+            doc.setPageSize(QSizeF(inner_w, page_h))
+            doc = _make_doc(spec, paper, opts, inner_w, pages=max(doc.pageCount(), 1))
+    if h_px is None:                                   # إيصال متصل
+        doc.setPageSize(QSizeF(inner_w, max(doc.size().height(), 1)))
+    else:
+        doc.setPageSize(QSizeF(inner_w, h_px - 2 * m_px))
+    return doc
+
+
+def page_layout(spec, paper='A4', doc=None, opts=None):
+    """QPageLayout مطابق للورق (الهوامش بالمليمتر) مع اتجاه الورق وهامش المستخدم. الإيصال: ارتفاع من المحتوى."""
+    opts = opts or PSET.active()
+    w, h, _m = PAPERS[paper]                           # الأبعاد الأصلية عموديًا؛ الاتجاه يُضبط بالتخطيط نفسه
+    m = effective_dims(paper, opts)[2]
+    landscape = h is not None and opts.orientation == 'landscape'
+    if h is None:
+        doc = doc or build_qdocument(spec, paper)
+        h = max(doc.size().height() * 25.4 / DPI + 2 * m, 40)
+    size = QPageSize(QSizeF(w, h), QPageSize.Millimeter, f'{paper}')
+    orientation = QPageLayout.Landscape if landscape else QPageLayout.Portrait
+    return QPageLayout(size, orientation, QMarginsF(m, m, m, m), QPageLayout.Millimeter)
+
+
+def export_pdf(spec, paper, path):
+    """يكتب PDF ويُرجع عدد الصفحات. الخطوط تُضمَّن تلقائيًا."""
+    doc = build_qdocument(spec, paper)
+    writer = QPdfWriter(path)
+    writer.setResolution(600)
+    writer.setPageLayout(page_layout(spec, paper, doc))
+    writer.setTitle(spec.title)
+    doc.print_(writer)
+    return doc.pageCount()
+
+
+def export_html(spec, paper, path):
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(render_document_html(spec, paper))
+
+
+def print_to_printer(spec, paper, printer):
+    """يطبع على QPrinter جاهز (بعد حوار الطباعة). يضبط الورق ليطابق المستند."""
+    doc = build_qdocument(spec, paper)
+    printer.setPageLayout(page_layout(spec, paper, doc))
+    doc.print_(printer)
+    return doc.pageCount()
+
+
+def _apply_printer_options(printer, opts):
+    """الطابعة المفضلة وعدد النسخ من إعدادات المستخدم (قبل حوار الطباعة ليظهر مختارًا)."""
+    if opts.printer_name:
+        try:
+            from PySide6.QtPrintSupport import QPrinterInfo
+            if opts.printer_name in QPrinterInfo.availablePrinterNames():
+                printer.setPrinterName(opts.printer_name)
+        except Exception:  # noqa: BLE001 — الطابعة المفضلة اختيارية؛ يبقى حوار الطباعة متاحًا
+            pass
+    if opts.copies > 1:
+        try:
+            printer.setCopyCount(opts.copies)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def print_dialog(parent, spec, paper='A4'):
+    """حوار الطباعة القياسي ثم الطباعة. يُرجع True إن طُبع."""
+    from PySide6.QtPrintSupport import QPrintDialog, QPrinter
+    printer = QPrinter(QPrinter.HighResolution)
+    printer.setDocName(spec.title)
+    _apply_printer_options(printer, PSET.active())
+    dlg = QPrintDialog(printer, parent)
+    if dlg.exec() != QPrintDialog.Accepted:
+        return False
+    print_to_printer(spec, paper, printer)
+    return True
+
+
+def print_many(parent, specs, paper='A4'):
+    """يطبع عدة مستندات، كلٌّ كمهمة طباعة مستقلة، بعد اختيار الطابعة مرة واحدة. يُرجع عدد ما طُبع."""
+    from PySide6.QtPrintSupport import QPrintDialog, QPrinter
+    if not specs:
+        return 0
+    printer = QPrinter(QPrinter.HighResolution)
+    printer.setDocName(specs[0].title)
+    _apply_printer_options(printer, PSET.active())
+    dlg = QPrintDialog(printer, parent)
+    if dlg.exec() != QPrintDialog.Accepted:
+        return 0
+    n = 0
+    for spec in specs:
+        printer.setDocName(spec.title)
+        print_to_printer(spec, paper, printer)
+        n += 1
+    return n

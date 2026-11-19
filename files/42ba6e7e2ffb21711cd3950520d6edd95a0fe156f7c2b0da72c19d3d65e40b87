@@ -1,0 +1,158 @@
+"""RibbonBar (شريط الإجراءات): صف أفقي واحد مضغوط تحت القوائم المنسدلة — أيقونة صغيرة + نص بجانبها، وفاصل رفيع بين المجموعات.
+
+كان شريطًا بارتفاع 100 بكسل بأزرار كبيرة وعناوين مجموعات؛ صار ~42 بكسل ليبقى معظم الشاشة للوحة الإدخال ثم الجدول.
+الأزرار تأتي من `page.ribbon_groups()` (core/actions.py) كما كانت، ويتفاعل مع السجل المحدد والصلاحية والفترة،
+ويشرح سبب التعطيل في التلميح. يُخفى الشريط كله إن لم تكن للصفحة أزرار. يتطلب PySide6.
+"""
+from PySide6.QtCore import QSize, Qt
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QMenu, QSizePolicy, QToolButton
+
+from alhisabat.ui.design import icons, tokens as T
+
+MORE_LABEL = 'المزيد'
+
+
+def clean_label(label, has_icon):
+    """«+ صندوق» ← «صندوق» حين تكون للزر أيقونة (أيقونة الإضافة تكفي)."""
+    t = (label or '').strip()
+    if has_icon and t.startswith('+'):
+        t = t[1:].strip()
+    return t
+
+
+class RibbonBar(QFrame):
+    def __init__(self, access, parent=None):
+        super().__init__(parent)
+        self.setObjectName('ribbon')
+        self.setFixedHeight(T.RIBBON_HEIGHT)
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.access = access
+        self._lay = QHBoxLayout(self)
+        self._lay.setContentsMargins(10, 4, 10, 4)
+        self._lay.setSpacing(4)
+        self._groups, self._buttons, self._ro, self._mode = [], [], '', 'light'
+        self._items, self._states, self._more, self._fit_busy = [], {}, None, False
+        self.setVisible(False)
+
+    def set_groups(self, groups, read_only_reason='', mode='light'):
+        self._groups, self._ro, self._mode = list(groups), read_only_reason, mode
+        self._rebuild()
+
+    def set_mode(self, mode):
+        self._mode = mode
+        self._rebuild()
+
+    def _clear(self):
+        while self._lay.count():
+            it = self._lay.takeAt(0)
+            w = it.widget()
+            if w:
+                w.hide()
+                w.setParent(None)                      # لا يبقى القديم مرسومًا ريثما يُحذف
+                w.deleteLater()
+        self._buttons, self._items, self._states, self._more = [], [], {}, None
+
+    def _rebuild(self):
+        self._clear()
+        pal = T.palette(self._mode)
+        first = True
+        for g in self._groups:
+            if not g.actions:
+                continue
+            if not first:
+                sep = QFrame()
+                sep.setObjectName('ribbonSep')
+                sep.setFixedWidth(1)
+                self._lay.addWidget(sep)
+                self._items.append(('sep', sep))
+            first = False
+            for a in g.actions:
+                b = QToolButton()
+                b.setObjectName('ribbonBtn')
+                b.setText(clean_label(a.label, bool(a.icon)))
+                b.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+                b.setIconSize(QSize(T.ACTION_ICON, T.ACTION_ICON))
+                if a.icon:
+                    col = pal['danger'] if a.danger else (pal['accent_text'] if a.primary else pal['accent'])
+                    b.setIcon(icons.qicon(a.icon, col, T.ACTION_ICON))
+                b.setCursor(Qt.PointingHandCursor)
+                b.setProperty('primary', bool(a.primary))
+                if a.shortcut:
+                    b.setShortcut(a.shortcut)
+                b.setProperty('danger', bool(a.danger))
+                b.clicked.connect(lambda _c=False, act=a: act.handler() if act.handler else None)
+                b.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)     # عرض طبيعي ثابت: لا ضغط ولا تداخل للنص
+                self._lay.addWidget(b)
+                self._buttons.append((a, b))
+                self._items.append(('btn', a, b))
+        self._lay.addStretch(1)
+        self._more = QToolButton()                                         # زر الفائض
+        self._more.setObjectName('ribbonBtn')
+        self._more.setText(MORE_LABEL + '  ▾')
+        self._more.setPopupMode(QToolButton.InstantPopup)
+        self._more.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self._more.setCursor(Qt.PointingHandCursor)
+        self._more_menu = QMenu(self._more)
+        self._more_menu.setLayoutDirection(Qt.RightToLeft)
+        self._more.setMenu(self._more_menu)
+        self._more.setVisible(False)
+        self._lay.addWidget(self._more)
+        self.refresh_states()
+        self.setVisible(bool(self._buttons))
+
+    def refresh_states(self):
+        """يعيد حساب التفعيل والتلميحات (يُستدعى عند تغيّر التحديد/السياق/الصلاحيات)."""
+        self._states = {}
+        for a, b in self._buttons:
+            st = a.resolve(self.access, self._ro)
+            self._states[id(b)] = st
+            b.setEnabled(st.enabled)
+            tip = a.tip or a.label
+            b.setToolTip(tip if st.enabled else f'{a.label}: {st.reason}')
+        self._fit()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._fit()
+
+    def _fit(self):
+        """يُظهر من الأزرار ما يتّسع له الشريط (بتسمياتها كاملة)، وينقل الباقي إلى قائمة «المزيد»."""
+        if self._fit_busy or not self._items or self._more is None:
+            return
+        self._fit_busy = True
+        try:
+            m = self._lay.contentsMargins()
+            avail = self.width() - m.left() - m.right()
+            sp = self._lay.spacing()
+            more_w = self._more.sizeHint().width() + sp
+            vis = [(it[1], it[2]) for it in self._items
+                   if it[0] == 'btn' and self._states.get(id(it[2])) and self._states[id(it[2])].visible]
+            seps = max(0, len(self._groups) - 1) * (sp + 1)
+            total = sum(b.sizeHint().width() + sp for _a, b in vis) + seps
+            budget = avail if total <= avail else avail - more_w
+            used, overflow, shown = seps, [], set()
+            for a, b in vis:
+                w = b.sizeHint().width() + sp
+                if not overflow and used + w <= budget:
+                    used += w
+                    shown.add(id(b))
+                else:
+                    overflow.append((a, b))
+            for it in self._items:
+                if it[0] == 'btn':
+                    it[2].setVisible(id(it[2]) in shown)
+            seq = [(it, it[0] == 'btn' and id(it[2]) in shown) for it in self._items]
+            for i, (it, _v) in enumerate(seq):                 # الفاصل فقط بين زرّين ظاهرين
+                if it[0] != 'sep':
+                    continue
+                it[1].setVisible(any(v for _x, v in seq[:i]) and any(v for _x, v in seq[i + 1:]))
+            self._more_menu.clear()
+            for a, b in overflow:
+                act = self._more_menu.addAction(b.icon(), b.text())
+                st = self._states.get(id(b))
+                act.setEnabled(bool(st and st.enabled))
+                act.setToolTip(b.toolTip())
+                act.triggered.connect(lambda _c=False, ac=a: ac.handler() if ac.handler else None)
+            self._more.setVisible(bool(overflow))
+        finally:
+            self._fit_busy = False

@@ -1,0 +1,498 @@
+"""دفتر الملاحظات (الأدوات): قائمة بحث وتصفية (مثبتة، تذكيرات، مشتركة، أرشيف، وسوم، ألوان) + محرر نص منسق بحفظ تلقائي.
+متاح لكل مستخدم. الملاحظات المشتركة من الزملاء للقراءة فقط. المنطق كله في business.notebook (الصفحة عرض فقط)."""
+import html as _html
+from datetime import date
+
+from PySide6.QtCore import QDate, Qt, QTimer
+from PySide6.QtGui import QBrush, QColor, QFont, QKeySequence, QShortcut, QTextCharFormat, QTextCursor, QTextDocument, QTextListFormat
+from PySide6.QtPrintSupport import QPrintPreviewDialog, QPrinter
+from PySide6.QtWidgets import (
+    QApplication, QCheckBox, QComboBox, QDateEdit, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QMessageBox, QSplitter, QTextEdit, QToolButton, QVBoxLayout, QWidget
+)
+
+from alhisabat.business import notebook as NB
+from alhisabat.ui.core.actions import Action, ActionGroup
+from alhisabat.ui.core.base_page import BasePage
+from alhisabat.ui.core.permissions import ActionState
+from alhisabat.ui.design import tokens as T
+
+_TONE = {'yellow': 'warning', 'green': 'success', 'blue': 'info', 'red': 'danger', 'purple': 'accent', 'gray': 'neutral'}
+_MODES = (('active', 'كل الملاحظات'), ('pinned', 'المثبتة'), ('reminders', 'التذكيرات'), ('shared', 'مشتركة معي'), ('archived', 'الأرشيف'))
+_SAVE_DELAY_MS = 1200
+
+
+def _soft(color):
+    p = T.active_palette()
+    return QColor(p[_TONE[color] + '_soft']) if color in _TONE else None
+
+
+class NotebookPage(BasePage):
+    key = 'notebook'
+    title = 'دفتر الملاحظات'
+    icon = 'notes'
+
+    def build(self):
+        self._cur = None                 # الملاحظة المفتوحة (dict) أو None = جديدة
+        self._loading = False
+        self._dirty = False
+        self._mine = True
+        self._saver = QTimer(self, singleShot=True, interval=_SAVE_DELAY_MS, timeout=self._autosave)
+        self._finder = QTimer(self, singleShot=True, interval=200, timeout=self._reload_list)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+        split = QSplitter(Qt.Horizontal)
+        split.addWidget(self._build_list_panel())
+        split.addWidget(self._build_editor_panel())
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        split.setSizes([340, 760])
+        lay.addWidget(split)
+        QShortcut(QKeySequence('Ctrl+F'), self, activated=lambda: (self.search.setFocus(), self.search.selectAll()))
+        self._style()
+        self._set_editor_enabled(True)
+
+    def _style(self):
+        p = T.active_palette()
+        self.setStyleSheet(
+            f"QListWidget#noteList{{background:{p['surface']};border:1px solid {p['border']};border-radius:8px;outline:0;}}"
+            f"QListWidget#noteList::item{{border-bottom:1px solid {p['border']};padding:8px;}}"
+            f"QListWidget#noteList::item:selected{{background:{p['selection']};color:{p['selection_text']};}}"
+            f"QTextEdit#noteBody{{background:{p['surface']};color:{p['text']};border:1px solid {p['border']};border-radius:8px;padding:8px;}}"
+            f"QLineEdit#noteTitle{{font-size:17pt;font-weight:bold;border:0;border-bottom:2px solid {p['border']};background:transparent;padding:4px;}}"
+            f"QLabel#noteBanner{{background:{p['warning_soft']};color:{p['warning']};border-radius:6px;padding:6px;}}"
+            f"QLabel#noteStatus{{color:{p['muted']};}}"
+            f"QToolButton{{border:1px solid transparent;border-radius:6px;padding:3px 8px;min-width:24px;}}"
+            f"QToolButton:hover{{background:{p['surface2']};border-color:{p['border']};}}"
+            f"QToolButton:checked{{background:{p['accent_soft']};color:{p['accent_soft_text']};}}")
+
+    # ---------------------------------------------------------------- اللوحات
+    def _build_list_panel(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        self.search = QLineEdit(placeholderText='ابحث في العنوان والنص والوسوم…  (Ctrl+F)', clearButtonEnabled=True)
+        self.search.textChanged.connect(lambda _t: self._finder.start())
+        self.mode = QComboBox()
+        for k, label in _MODES:
+            self.mode.addItem(label, k)
+        self.mode.currentIndexChanged.connect(lambda _i: self._reload_list())
+        self.tag = QComboBox()
+        self.tag.currentIndexChanged.connect(lambda _i: self._reload_list())
+        self.color_filter = QComboBox()
+        self.color_filter.addItem('كل الألوان', '')
+        for k in NB.COLORS[1:]:
+            self.color_filter.addItem(NB.COLOR_LABELS[k], k)
+        self.color_filter.currentIndexChanged.connect(lambda _i: self._reload_list())
+        self.list = QListWidget(objectName='noteList')
+        self.list.currentItemChanged.connect(self._on_pick)
+        self.count_lbl = QLabel('', objectName='noteStatus')
+        row = QHBoxLayout()
+        row.addWidget(self.tag, 1)
+        row.addWidget(self.color_filter, 1)
+        v.addWidget(self.search)
+        v.addWidget(self.mode)
+        v.addLayout(row)
+        v.addWidget(self.list, 1)
+        v.addWidget(self.count_lbl)
+        return w
+
+    def _tool(self, text, tip, fn, checkable=False):
+        b = QToolButton(text=text, toolTip=tip, checkable=checkable)
+        b.clicked.connect(fn)
+        b.setFocusPolicy(Qt.NoFocus)                       # لا يسحب التركيز من المحرر
+        return b
+
+    def _build_editor_panel(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        self.banner = QLabel('', objectName='noteBanner')
+        self.banner.setVisible(False)
+        self.title_edit = QLineEdit(placeholderText='عنوان الملاحظة', objectName='noteTitle')
+        self.title_edit.textEdited.connect(self._touch)
+        self.tags_edit = QLineEdit(placeholderText='وسوم مفصولة بفاصلة، مثل: عملاء، مهم، اجتماع')
+        self.tags_edit.textEdited.connect(self._touch)
+        self.color = QComboBox()
+        for k in NB.COLORS:
+            self.color.addItem(NB.COLOR_LABELS[k], k)
+        self.color.currentIndexChanged.connect(lambda _i: self._touch())
+        self.remind_chk = QCheckBox('تذكير في')
+        self.remind_date = QDateEdit(QDate.currentDate(), calendarPopup=True, displayFormat='yyyy-MM-dd')
+        self.remind_chk.toggled.connect(lambda on: (self.remind_date.setEnabled(on), self._touch()))
+        self.remind_date.dateChanged.connect(lambda _d: self._touch())
+        self.remind_date.setEnabled(False)
+        self.shared_chk = QCheckBox('مشاركة للقراءة مع الزملاء')
+        self.shared_chk.toggled.connect(lambda _on: self._touch())
+        meta = QHBoxLayout()
+        for x in (self.tags_edit, self.color, self.remind_chk, self.remind_date, self.shared_chk):
+            meta.addWidget(x, 1 if x is self.tags_edit else 0)
+        self.editor = QTextEdit(objectName='noteBody', acceptRichText=True)
+        self.editor.setLayoutDirection(Qt.RightToLeft)
+        self.editor.setFont(QFont(self.font().family(), 11))
+        self.editor.textChanged.connect(self._touch)
+        self.status = QLabel('', objectName='noteStatus')
+        self.stats = QLabel('', objectName='noteStatus')
+        foot = QHBoxLayout()
+        foot.addWidget(self.status, 1)
+        foot.addWidget(self.stats)
+        v.addWidget(self.banner)
+        v.addWidget(self.title_edit)
+        v.addLayout(meta)
+        v.addLayout(self._build_toolbar())
+        v.addWidget(self.editor, 1)
+        v.addLayout(foot)
+        return w
+
+    def _build_toolbar(self):
+        row = QHBoxLayout()
+        row.setSpacing(2)
+        self.btn_bold = self._tool('B', 'غامق (Ctrl+B)', self._bold, True)
+        self.btn_ital = self._tool('I', 'مائل (Ctrl+I)', lambda: self.editor.setFontItalic(not self.editor.fontItalic()), True)
+        self.btn_under = self._tool('U', 'تسطير (Ctrl+U)', lambda: self.editor.setFontUnderline(not self.editor.fontUnderline()), True)
+        self.btn_mark = self._tool('تمييز', 'تمييز النص بلون', self._highlight, True)
+        self.size = QComboBox()
+        self.size.addItems(['عادي', 'عنوان كبير', 'عنوان صغير'])
+        self.size.setFocusPolicy(Qt.NoFocus)
+        self.size.activated.connect(self._heading)
+        row.addWidget(self.size)
+        for b in (self.btn_bold, self.btn_ital, self.btn_under, self.btn_mark):
+            row.addWidget(b)
+        for text, tip, fn in (('• قائمة', 'قائمة نقطية', lambda: self._list(QTextListFormat.ListDisc)),
+                              ('1. قائمة', 'قائمة مرقمة', lambda: self._list(QTextListFormat.ListDecimal)),
+                              ('☐ مهمة', 'إضافة مربع مهمة في بداية السطر', self._check_add),
+                              ('☑ إنجاز', 'تبديل المهمة منجزة/غير منجزة', self._check_toggle),
+                              ('📅 اليوم', 'إدراج تاريخ اليوم', self._insert_today),
+                              ('↶', 'تراجع (Ctrl+Z)', lambda: self.editor.undo()),
+                              ('↷', 'إعادة (Ctrl+Y)', lambda: self.editor.redo()),
+                              ('✕ تنسيق', 'مسح التنسيق من النص المحدد', self._clear_format)):
+            row.addWidget(self._tool(text, tip, fn))
+        row.addStretch(1)
+        return row
+
+    # ---------------------------------------------------------------- التنسيق
+    def _merge(self, fmt):
+        c = self.editor.textCursor()
+        c.mergeCharFormat(fmt)
+        self.editor.mergeCurrentCharFormat(fmt)
+
+    def _bold(self):
+        f = QTextCharFormat()
+        f.setFontWeight(QFont.Normal if self.editor.fontWeight() > 500 else QFont.Bold)
+        self._merge(f)
+
+    def _highlight(self):
+        f = QTextCharFormat()
+        on = self.editor.textCursor().charFormat().background().style() != Qt.NoBrush
+        if on:
+            f.setBackground(QBrush(Qt.NoBrush))
+        else:
+            f.setBackground(QColor(T.active_palette()['warning_soft']))
+            f.setForeground(QColor(T.active_palette()['text']))
+        self._merge(f)
+
+    def _heading(self, idx):
+        f = QTextCharFormat()
+        f.setFontPointSize((11, 18, 14)[idx])
+        f.setFontWeight(QFont.Bold if idx else QFont.Normal)
+        c = self.editor.textCursor()
+        if not c.hasSelection():
+            c.select(QTextCursor.LineUnderCursor)
+        c.mergeCharFormat(f)
+        self.editor.setFocus()
+
+    def _list(self, style):
+        c = self.editor.textCursor()
+        cur = c.currentList()
+        if cur is not None and cur.format().style() == style:     # إيقاف القائمة عند الضغط ثانيةً
+            cur.remove(c.block())
+            bf = c.blockFormat()
+            bf.setIndent(0)
+            c.setBlockFormat(bf)
+        else:
+            c.createList(style)
+        self.editor.setFocus()
+
+    def _line_start(self):
+        c = self.editor.textCursor()
+        c.movePosition(QTextCursor.StartOfBlock)
+        return c
+
+    def _check_add(self):
+        c = self._line_start()
+        c.movePosition(QTextCursor.NextCharacter, QTextCursor.KeepAnchor, 2)
+        if c.selectedText() not in ('☐ ', '☑ '):
+            c = self._line_start()
+            c.insertText('☐ ')
+        self.editor.setFocus()
+
+    def _check_toggle(self):
+        c = self._line_start()
+        c.movePosition(QTextCursor.NextCharacter, QTextCursor.KeepAnchor, 2)
+        t = c.selectedText()
+        if t in ('☐ ', '☑ '):
+            c.insertText('☑ ' if t == '☐ ' else '☐ ')
+        else:
+            self._check_add()
+
+    def _insert_today(self):
+        self.editor.insertPlainText(date.today().isoformat())
+
+    def _clear_format(self):
+        c = self.editor.textCursor()
+        if c.hasSelection():
+            c.setCharFormat(QTextCharFormat())
+
+    # ---------------------------------------------------------------- القائمة
+    def refresh(self):
+        if not self._built:
+            return
+        keep = self._cur['id'] if self._cur else None
+        self._reload_filters()
+        self._reload_list(select=keep)
+
+    def _reload_filters(self):
+        try:
+            cnt, tags = self.session.note_counts(), self.session.note_tags()
+        except Exception as exc:  # noqa: BLE001
+            return self.show_error(exc)
+        self._counts = cnt
+        self.mode.blockSignals(True)
+        for i, (k, label) in enumerate(_MODES):
+            n = cnt.get(k, 0)
+            extra = f'، {cnt.get("due", 0)} مستحقة' if k == 'reminders' and cnt.get('due') else ''
+            self.mode.setItemText(i, f'{label} ({n}{extra})')
+        self.mode.blockSignals(False)
+        cur = self.tag.currentData()
+        self.tag.blockSignals(True)
+        self.tag.clear()
+        self.tag.addItem('كل الوسوم', '')
+        for name, n in tags:
+            self.tag.addItem(f'{name} ({n})', name)
+        i = self.tag.findData(cur)
+        self.tag.setCurrentIndex(max(0, i))
+        self.tag.blockSignals(False)
+
+    def _reload_list(self, select=None):
+        if not self._built:
+            return
+        try:
+            rows = self.session.notes_list(self.mode.currentData(), self.search.text(), self.tag.currentData() or '', self.color_filter.currentData() or '')
+        except Exception as exc:  # noqa: BLE001
+            return self.show_error(exc)
+        want = select if select is not None else (self._cur['id'] if self._cur else None)
+        self._loading = True
+        self.list.clear()
+        target = None
+        for r in rows:
+            it = QListWidgetItem(self._item_text(r))
+            it.setData(Qt.UserRole, r['id'])
+            bg = _soft(r['color'])
+            if bg:
+                it.setBackground(bg)
+            self.list.addItem(it)
+            if r['id'] == want:
+                target = it
+        if not rows:
+            ph = QListWidgetItem('لا توجد ملاحظات هنا — اضغط «جديدة» لإضافة أول ملاحظة' if not self.search.text() else 'لا نتائج للبحث')
+            ph.setFlags(Qt.NoItemFlags)
+            self.list.addItem(ph)
+        self.count_lbl.setText(f'{len(rows)} ملاحظة')
+        if target is not None:
+            self.list.setCurrentItem(target)
+        self._loading = False
+
+    @staticmethod
+    def _item_text(r):
+        head = ('★ ' if r['pinned'] else '') + r['title']
+        meta = [r['updated_at'][:16]]
+        if r['remind_on']:
+            meta.append(('⏰ مستحقة ' if r['due'] else '⏰ ') + r['remind_on'])
+        if not r['mine']:
+            meta.append('من ' + (r['owner_name'] or 'زميل'))
+        if r['tags_list']:
+            meta.append('# ' + ' # '.join(r['tags_list'][:3]))
+        return f"{head}\n{r['snippet'][:90]}\n{'   ·   '.join(meta)}".replace('\n\n', '\n')
+
+    def _on_pick(self, cur, _prev):
+        if self._loading or cur is None or cur.data(Qt.UserRole) is None:
+            return
+        nid = cur.data(Qt.UserRole)
+        if self._cur and self._cur['id'] == nid:
+            return
+        if not self._flush():
+            return
+        self._open(nid)
+
+    # ---------------------------------------------------------------- المحرر
+    def _open(self, nid):
+        try:
+            n = self.session.note_get(nid)
+        except Exception as exc:  # noqa: BLE001
+            return self.show_error(exc)
+        self._fill(n)
+
+    def _fill(self, n):
+        self._loading = True
+        self._cur = n
+        self._mine = True if n is None else n['mine']
+        self.title_edit.setText(n['title'] if n else '')
+        self.tags_edit.setText('، '.join(n['tags_list']) if n else '')
+        self.color.setCurrentIndex(max(0, self.color.findData(n['color'] if n else '')))
+        on = bool(n and n['remind_on'])
+        self.remind_chk.setChecked(on)
+        self.remind_date.setDate(QDate.fromString(n['remind_on'], 'yyyy-MM-dd') if on else QDate.currentDate())
+        self.shared_chk.setChecked(bool(n and n['shared']))
+        if n:
+            self.editor.setHtml(n['body'])
+        else:
+            self.editor.clear()
+        self._dirty = False
+        self._loading = False
+        self._set_editor_enabled(self._mine)
+        owner = '' if self._mine else f"ملاحظة مشتركة من {n['owner_name'] or 'زميل'} — للقراءة فقط"
+        self.banner.setText(owner)
+        self.banner.setVisible(bool(owner))
+        self.status.setText('')
+        self._count()
+        self.actions_changed.emit()
+
+    def _set_editor_enabled(self, mine):
+        for w in (self.title_edit, self.tags_edit, self.color, self.remind_chk, self.shared_chk):
+            w.setEnabled(mine)
+        self.remind_date.setEnabled(mine and self.remind_chk.isChecked())
+        self.editor.setReadOnly(not mine)
+
+    def _touch(self, *_a):
+        if self._loading or not self._mine:
+            return
+        self._dirty = True
+        self.status.setText('تعديلات غير محفوظة…')
+        self._count()
+        self._saver.start()
+
+    def _count(self):
+        t = self.editor.toPlainText()
+        self.stats.setText(f'{len(t.split())} كلمة · {len(t)} حرفًا')
+
+    def _values(self):
+        return {'title': self.title_edit.text(), 'body': self.editor.toHtml(), 'tags': self.tags_edit.text(), 'color': self.color.currentData() or '',
+             'shared': self.shared_chk.isChecked(), 'remind_on': self.remind_date.date().toPython().isoformat() if self.remind_chk.isChecked() else ''}
+
+    def _empty(self):
+        return not (self.title_edit.text().strip() or self.editor.toPlainText().strip() or self.tags_edit.text().strip())
+
+    def _flush(self):
+        """يحفظ ما لم يُحفظ قبل مغادرة الملاحظة. False = فشل الحفظ (يبقى المستخدم في مكانه)."""
+        self._saver.stop()
+        if not self._dirty or not self._mine:
+            return True
+        return self._save(quiet=True)
+
+    def _autosave(self):
+        self._save(quiet=True)
+
+    def _save(self, quiet=False):
+        if not self._mine:
+            return True
+        if self._cur is None and self._empty():
+            self._dirty = False
+            return True
+        try:
+            n = self.session.note_save(self._cur['id'] if self._cur else None, self._values())
+        except Exception as exc:  # noqa: BLE001
+            self.status.setText('تعذّر الحفظ')
+            self.show_error(exc)
+            return False
+        self._cur = n
+        self._dirty = False
+        self.status.setText('تم الحفظ ' + n['updated_at'][11:16])
+        if not quiet:
+            self.notify('تم حفظ الملاحظة')
+        self.actions_changed.emit()
+        self._reload_filters()
+        self._reload_list(select=n['id'])
+        return True
+
+    # ---------------------------------------------------------------- الإجراءات
+    def can_close(self):
+        return self._flush()
+
+    def is_dirty(self):
+        return self._dirty
+
+    def _has(self):
+        return ActionState(True) if self._cur and self._mine else ActionState(False, 'اختر ملاحظة من ملاحظاتك')
+
+    def _any(self):
+        return ActionState(True) if self._cur else ActionState(False, 'اختر ملاحظة')
+
+    def ribbon_groups(self):
+        return [ActionGroup('ملاحظة', [Action('new', 'جديدة', 'new', primary=True, shortcut='Ctrl+N', handler=self._new),
+                                       Action('save', 'حفظ', 'save', shortcut='Ctrl+S', handler=lambda: self._save(False)),
+                                       Action('pin', 'تثبيت / إلغاء التثبيت', 'stamp', state_fn=self._has, handler=lambda: self._flag('pinned')),
+                                       Action('archive', 'أرشفة / استرجاع', 'backup', state_fn=self._has, handler=lambda: self._flag('archived')),
+                                       Action('delete', 'حذف', 'delete', danger=True, state_fn=self._has, handler=self._delete)]),
+                ActionGroup('إخراج', [Action('print', 'معاينة وطباعة', 'print', state_fn=self._any, handler=self._print),
+                                      Action('txt', 'حفظ كملف نصي', 'export', state_fn=self._any, handler=self._export),
+                                      Action('copy', 'نسخ النص', 'copy', state_fn=self._any, handler=self._copy)]),
+                ActionGroup('عرض', [Action('refresh', 'تحديث', 'refresh', handler=self.refresh)])]
+
+    def _new(self):
+        if not self._flush():
+            return
+        self.list.clearSelection()
+        self._fill(None)
+        self.title_edit.setFocus()
+
+    def _flag(self, name):
+        if not self._cur or not self._flush():
+            return
+        ok, n = self.guarded(self.session.note_flags, self._cur['id'], **{name: not self._cur[name]}, reload=False)
+        if ok:
+            self._cur = n
+            self.notify('تم' if name == 'pinned' else ('أُرشفت الملاحظة' if n['archived'] else 'استُرجعت الملاحظة'))
+            self.refresh()
+            self.actions_changed.emit()
+
+    def _delete(self):
+        if not self._cur:
+            return
+        if QMessageBox.question(self, self.title, f"حذف الملاحظة «{self._cur['title']}» نهائيًا؟\nيمكنك أرشفتها بدل الحذف.") != QMessageBox.Yes:
+            return
+        self._saver.stop()
+        ok, _r = self.guarded(self.session.note_delete, self._cur['id'], reload=False)
+        if ok:
+            self._fill(None)
+            self.notify('حُذفت الملاحظة')
+            self.refresh()
+
+    def _document(self):
+        n = dict(self._cur or {})
+        meta = ' · '.join(x for x in (('الوسوم: ' + '، '.join(n.get('tags_list', []))) if n.get('tags_list') else '', n.get('updated_at', '')) if x)
+        doc = QTextDocument()
+        doc.setDefaultStyleSheet('body{font-family:Tahoma;} h1{font-size:18pt;} .m{color:gray;font-size:9pt;}')
+        doc.setHtml(f"<body dir='rtl'><h1>{_html.escape(self.title_edit.text() or n.get('title', ''))}</h1><p class='m'>{_html.escape(meta)}</p><hr/>{self.editor.toHtml()}</body>")
+        return doc
+
+    def _print(self):
+        if not self._flush() or not self._cur:
+            return
+        doc = self._document()
+        dlg = QPrintPreviewDialog(QPrinter(QPrinter.HighResolution), self)
+        dlg.paintRequested.connect(doc.print_)
+        dlg.exec()
+
+    def _export(self):
+        if not self._flush() or not self._cur:
+            return
+        path, _f = QFileDialog.getSaveFileName(self, 'حفظ الملاحظة', f"{self._cur['title'][:40]}.txt", 'ملف نصي (*.txt)')
+        if path:
+            with open(path, 'w', encoding='utf-8-sig') as fh:
+                fh.write(NB.export_text(self._cur))
+            self.notify('حُفظ الملف: ' + path)
+
+    def _copy(self):
+        if self._cur:
+            QApplication.clipboard().setText(self.editor.toPlainText())
+            self.notify('نُسخ نص الملاحظة')

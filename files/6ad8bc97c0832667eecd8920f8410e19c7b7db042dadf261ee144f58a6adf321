@@ -1,0 +1,178 @@
+"""تفضيلات متصفح واتساب ويب (لكل جهاز) + قراءة اختصار واتساب الذي أنشأه المستخدم.
+
+- تُحفظ في ملف JSON بجانب ملفات تعريف الجلسة (لا تغيير في قاعدة البيانات)؛ لأن المتصفح خاصية الجهاز لا الفرع.
+- الافتراضي: Google Chrome (وليس Edge).
+- خالص بلا Qt؛ أجزاء Windows (اختصار .lnk والسجل) معزولة في دوال صغيرة.
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional
+
+WA_URL = "https://web.whatsapp.com"
+BROWSERS = ("chrome", "msedge", "auto")
+_DEFAULTS = {"browser": "chrome", "shortcut": "", "keep_window_open": True}
+
+
+def root_dir() -> Path:
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        p = Path(base) / "AlhisabatPro" / "whatsapp"
+    else:
+        p = Path.home() / ".alhisabat" / "whatsapp"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _prefs_path() -> Path:
+    return root_dir() / "browser.json"
+
+
+def load_prefs() -> Dict[str, object]:
+    data = dict(_DEFAULTS)
+    try:
+        p = _prefs_path()
+        if p.is_file():
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                data.update({k: raw[k] for k in _DEFAULTS if k in raw})
+    except Exception:
+        pass
+    if data.get("browser") not in BROWSERS:
+        data["browser"] = "chrome"
+    return data
+
+
+def save_prefs(prefs: Dict[str, object]) -> None:
+    data = dict(_DEFAULTS)
+    data.update({k: prefs[k] for k in _DEFAULTS if k in prefs})
+    if data["browser"] not in BROWSERS:
+        data["browser"] = "chrome"
+    _prefs_path().write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# ----------------------------------------------------------------- تحليل وسائط الاختصار
+_ARG_RE = re.compile(r'--([\w-]+)(?:=("[^"]*"|\S+))?')
+
+
+def parse_args(args: str) -> Dict[str, str]:
+    """يحوّل نص وسائط سطر الأوامر إلى قاموس {الاسم: القيمة}؛ القيمة '' للأعلام بلا قيمة."""
+    out: Dict[str, str] = {}
+    for m in _ARG_RE.finditer(args or ""):
+        out[m.group(1)] = (m.group(2) or "").strip('"')
+    return out
+
+
+def read_shortcut(path: str) -> Dict[str, str]:
+    """يقرأ اختصار .lnk (Windows فقط) ويعيد {'target': ..., 'args': ...}؛ فارغ عند الفشل."""
+    path = (path or "").strip().strip('"')
+    if not path or not os.path.isfile(path):
+        return {}
+    if not path.lower().endswith(".lnk"):
+        return {"target": path, "args": ""}          # ملف exe مباشر
+    if sys.platform != "win32":
+        return {}
+    ps = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:WA_LNK);"
+          "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+          "Write-Output $s.TargetPath;Write-Output $s.Arguments")
+    try:
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, encoding="utf-8", timeout=15,
+            env={**os.environ, "WA_LNK": path}, creationflags=0x08000000,
+        )
+        lines = (res.stdout or "").splitlines()
+        return {"target": (lines[0] if lines else "").strip(), "args": (lines[1] if len(lines) > 1 else "").strip()}
+    except Exception:
+        return {}
+
+
+# ----------------------------------------------------------------- مسارات المتصفحات
+def _win_candidates(kind: str) -> List[str]:
+    pf = os.environ.get("PROGRAMFILES", r"C:\Program Files")
+    pf86 = os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")
+    la = os.environ.get("LOCALAPPDATA", "")
+    if kind == "chrome":
+        rel = r"Google\Chrome\Application\chrome.exe"
+    else:
+        rel = r"Microsoft\Edge\Application\msedge.exe"
+    out = [os.path.join(pf, rel), os.path.join(pf86, rel)]
+    if la:
+        out.append(os.path.join(la, rel))
+    try:
+        import winreg
+        exe = "chrome.exe" if kind == "chrome" else "msedge.exe"
+        for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            try:
+                with winreg.OpenKey(hive, rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe}") as k:
+                    out.insert(0, winreg.QueryValue(k, None))
+            except OSError:
+                pass
+    except Exception:
+        pass
+    return out
+
+
+def find_browser_exe(kind: str) -> Optional[str]:
+    if sys.platform == "win32":
+        for c in _win_candidates(kind):
+            if c and os.path.isfile(c):
+                return c
+        return None
+    names = ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser") if kind == "chrome" else ("microsoft-edge", "msedge")
+    for n in names:
+        p = shutil.which(n)
+        if p:
+            return p
+    return None
+
+
+def default_chrome_user_data_dir() -> str:
+    """مجلد بيانات Chrome الافتراضي؛ يمنع Chrome 136+ تفعيل منفذ التحكم عليه."""
+    la = os.environ.get("LOCALAPPDATA", "")
+    return os.path.normcase(os.path.normpath(os.path.join(la, "Google", "Chrome", "User Data"))) if la else ""
+
+
+def resolve_launch_plan(prefs: Dict[str, object]) -> Dict[str, object]:
+    """يحدد كيف نفتح نافذة واتساب: ملف المتصفح، مجلد البيانات المخصص (إن وجد باختصار المستخدم)، منفذ التحكم المحدد (إن وجد)."""
+    plan: Dict[str, object] = {"exe": None, "kind": "chrome", "user_data_dir": "", "profile_directory": "", "port": 0, "note": ""}
+    sc = read_shortcut(str(prefs.get("shortcut") or ""))
+    args = parse_args(sc.get("args", "")) if sc else {}
+    target = (sc.get("target") or "") if sc else ""
+    tl = os.path.basename(target).lower()
+
+    exe = None
+    kind = str(prefs.get("browser") or "chrome")
+    if target:
+        if tl in ("chrome.exe", "msedge.exe") and os.path.isfile(target):
+            exe, kind = target, ("chrome" if tl == "chrome.exe" else "msedge")
+        elif tl.startswith("chrome_proxy") or tl.startswith("msedge_proxy"):
+            kind = "chrome" if tl.startswith("chrome") else "msedge"
+            sib = os.path.join(os.path.dirname(target), "chrome.exe" if kind == "chrome" else "msedge.exe")
+            exe = sib if os.path.isfile(sib) else None
+    if not exe:
+        order = ["chrome", "msedge"] if kind == "auto" else [kind]
+        for k in order:
+            exe = find_browser_exe(k)
+            if exe:
+                kind = k
+                break
+    plan["exe"], plan["kind"] = exe, kind
+
+    port = args.get("remote-debugging-port", "")
+    if port.isdigit():
+        plan["port"] = int(port)
+
+    udd = args.get("user-data-dir", "")
+    if udd:
+        if os.path.normcase(os.path.normpath(udd)) == default_chrome_user_data_dir() and not plan["port"]:
+            plan["note"] = ("اختصارك يستخدم مجلد Chrome الافتراضي، ولا يسمح Chrome بالتحكم فيه؛ "
+                            "استُعمل ملف تعريف خاص بالبرنامج (امسح QR مرة واحدة).")
+        else:
+            plan["user_data_dir"] = udd
+            plan["profile_directory"] = args.get("profile-directory", "")
+    return plan

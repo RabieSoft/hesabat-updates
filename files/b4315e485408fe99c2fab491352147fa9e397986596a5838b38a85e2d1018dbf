@@ -1,0 +1,241 @@
+"""جلسة الواجهة الأساسية: الاتصال والمصادقة والتحقق من الصلاحيات وقوائم الاختيار."""
+from datetime import date
+from pathlib import Path
+
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.business import chart_of_accounts as coa
+from alhisabat.business import branch_scope
+from alhisabat.database.connection import connect, migrate
+from alhisabat.database.schema_guard import ensure_schema
+from alhisabat.security import auth, permissions
+
+IMPORT_TARGETS = {'عملاء': 'customer', 'موردون': 'supplier', 'أصناف': 'item'}
+
+REPORTS = [
+    'ميزان المراجعة', 'قائمة الدخل', 'المركز المالي', 'التدفقات النقدية', 'كشف حساب',
+    'أعمار ديون العملاء', 'أعمار ديون الموردين', 'تقرير المخزون'
+]
+
+_SETTINGS_TABLES = {
+    'numbering_settings': ('الترقيم', {'mode': 'النمط', 'segment_lengths': 'أطوال المقاطع', 'prefix': 'البادئة'}),
+    'journal_settings': ('القيود', {'require_review': 'المراجعة إلزامية', 'require_approval': 'الاعتماد إلزامي',
+                                    'enforce_separation': 'فصل المهام',
+                                    'allow_manual_party_entries': 'السماح بقيد يدوي على العملاء والموردين', 'allow_edit_posted_entries': 'السماح بتعديل القيود المرحّلة', 'allow_delete_posted_entries': 'السماح بحذف القيود المرحّلة'}),
+    'closing_settings': ('الإقفال', {'transfer_to_retained': 'ترحيل النتيجة إلى الأرباح المبقاة'}),
+    'sales_settings': ('المبيعات', {'credit_limit_mode': 'وضع الحد الائتماني',
+                                    'allow_edit_posted_invoice': 'السماح بتعديل الفاتورة المرحّلة (أصنافها/أسعارها)',
+                                    'allow_negative_stock': 'السماح ببيع كمية سالبة من المخزون'}),
+}
+
+
+class SessionBase:
+    def __init__(self, db_path):
+        self.db_path = str(db_path)
+        self.conn = connect(self.db_path)
+        migrate(self.conn, db_path=self.db_path, auto_backup=True)
+        self.healed_migrations = ensure_schema(self.conn, db_path=self.db_path)   # يصلح قاعدة سُجّل ترحيلها دون أعمدته
+        self.user_id = None
+        self.company_id = None
+        self.branch_id = None
+
+    def close(self):
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+    def logout(self):
+        self.user_id = None
+        self.company_id = None
+        self.branch_id = None
+
+    def companies(self):
+        return [dict(r) for r in self.conn.execute("SELECT * FROM companies WHERE is_active=1 ORDER BY name")]
+
+    def list_login_users(self):
+        return [dict(r) for r in self.conn.execute(
+            "SELECT id, username, full_name FROM users WHERE is_active=1 ORDER BY username")]
+
+    def companies_for_user(self, user_id):
+        return [dict(r) for r in self.conn.execute(
+            "SELECT c.id, c.name FROM companies c JOIN user_roles ur ON ur.company_id=c.id "
+            "WHERE ur.user_id=? AND c.is_active=1 GROUP BY c.id ORDER BY c.name", (int(user_id),))]
+
+    def _user_id_by_name(self, username):
+        row = self.conn.execute(
+            "SELECT id FROM users WHERE username=? AND is_active=1", (str(username).strip(),)).fetchone()
+        return row['id'] if row else None
+
+    def list_companies_for_user(self, username):
+        """شركات المستخدم (بالاسم) لشاشة الدخول؛ قائمة فارغة إن لم يوجد المستخدم."""
+        uid = self._user_id_by_name(username)
+        return self.companies_for_user(uid) if uid is not None else []
+
+    def list_branches_for_user(self, username, company_id):
+        """الفروع المسموحة للمستخدم (بالاسم) في شركة؛ قائمة فارغة إن لم يوجد المستخدم."""
+        uid = self._user_id_by_name(username)
+        return self.branches_for_user(uid, company_id) if uid is not None else []
+
+    def branches_for_user(self, user_id, company_id):
+        restricted = self.conn.execute(
+            "SELECT COUNT(*) FROM user_branch_access WHERE user_id=?", (int(user_id),)).fetchone()[0]
+        if restricted:
+            rows = self.conn.execute(
+                "SELECT b.id, b.name FROM branches b "
+                "JOIN user_branch_access uba ON uba.branch_id=b.id AND uba.user_id=? "
+                "WHERE b.company_id=? AND b.is_active=1 ORDER BY b.name",
+                (int(user_id), int(company_id))).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT id, name FROM branches WHERE company_id=? AND is_active=1 ORDER BY name",
+                (int(company_id),)).fetchall()
+        return [dict(r) for r in rows]
+
+    def multi_currency_enabled(self):
+        from alhisabat.ui.core import readmodel
+        return readmodel.has_foreign_currency(self.conn, self.company_id)
+
+    def authenticate(self, username, password, company_id=None, branch_id=None):
+        uid = auth.authenticate(self.conn, username.strip(), password)
+        companies = self.companies_for_user(uid)
+        if not companies:
+            raise AccountingError("المستخدم لا يملك شركة نشطة مرتبطة به")
+        chosen = next((r for r in companies if company_id and r['id'] == company_id), companies[0])
+        cid = chosen['id']
+        branches = self.branches_for_user(uid, cid)
+        if not branches:
+            raise AccountingError("لا يوجد فرع نشط متاح لهذا المستخدم")
+        if branch_id is not None:
+            if not any(b['id'] == int(branch_id) for b in branches):
+                raise AccountingError("الفرع المحدد غير مسموح لهذا المستخدم")
+            bid = int(branch_id)
+        else:
+            bid = branches[0]['id']
+        self.user_id = uid
+        self.company_id = cid
+        self.branch_id = bid
+        company = dict(self.conn.execute("SELECT * FROM companies WHERE id=?", (cid,)).fetchone())
+        company['branch_id'] = bid
+        company['branch_name'] = next((b['name'] for b in branches if b['id'] == bid), '')
+        return uid, company
+
+    def has_users(self):
+        return self.conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] > 0
+
+    def bootstrap(self, company_name, username, full_name, password, load_chart=True, base_currency='SAR'):
+        if self.has_users():
+            raise AccountingError("يوجد مستخدمون بالفعل")
+        base_currency = (base_currency or 'SAR').strip().upper()
+        if not self.conn.execute("SELECT 1 FROM currencies WHERE code=? AND is_active=1", (base_currency,)).fetchone():
+            raise AccountingError("العملة الأساسية غير معروفة أو غير مفعّلة")
+        with self.conn:
+            cid = self.conn.execute("INSERT INTO companies(name,base_currency) VALUES(?,?)", (company_name.strip(), base_currency)).lastrowid
+        uid = auth.bootstrap_admin(self.conn, cid, username.strip(), full_name.strip() or username.strip(), password)
+        self.conn.execute("INSERT INTO branches(company_id,name) VALUES(?,?)", (cid, "الفرع الرئيسي"))
+        from alhisabat.accounting import period_engine
+        y = date.today().year
+        period_engine.create_fiscal_year(self.conn, cid, str(y), date(y, 1, 1), date(y, 12, 31), uid)
+        loaded = False
+        self.chart_error = ''
+        if load_chart:
+            try:
+                coa.load_default_template(self.conn, uid, cid)
+                loaded = True
+            except Exception as e:   # لا نُسقط التهيئة، لكن نحتفظ بالسبب ليعرضه الطلب للمستخدم بدل الفشل الصامت
+                self.chart_error = str(e) or e.__class__.__name__
+        return uid, cid, loaded
+
+    def can(self, code):
+        return bool(self.user_id and self.company_id and permissions.has(self.conn, self.user_id, self.company_id, code))
+
+    def require(self, code):
+        permissions.require(self.conn, self.user_id, self.company_id, code, check_branch=False)
+
+    def company(self):
+        r = self.conn.execute("SELECT * FROM companies WHERE id=?", (self.company_id,)).fetchone()
+        return dict(r) if r else {}
+
+    def username(self):
+        r = self.conn.execute("SELECT full_name,username FROM users WHERE id=?", (self.user_id,)).fetchone()
+        return (r['full_name'] or r['username']) if r else ''
+
+    def login_name(self):
+        """اسم الدخول الحقيقي (admin مثلًا)، وهو غير الاسم الكامل الذي يعرضه username(). استعمله عند إعادة التحقق من كلمة المرور."""
+        r = self.conn.execute("SELECT username FROM users WHERE id=?", (self.user_id,)).fetchone()
+        return r['username'] if r else ''
+
+    def lookup_accounts(self, types=None, groups=False):
+        self.require('account.view')
+        q = "SELECT id,code,name,account_type FROM accounts WHERE company_id=? AND is_active=1"
+        if groups is not None:
+            q += " AND is_group=?"
+        a = [self.company_id] + ([1 if groups else 0] if groups is not None else [])
+        if types:
+            q += f" AND account_type IN ({','.join('?' * len(types))})"
+            a += list(types)
+        hide = branch_scope.foreign_account_ids(self.conn, self.company_id, self.branch_id)
+        return [(r['id'], f"{r['code']} — {r['name']}") for r in self.conn.execute(q + " ORDER BY code", a) if r['id'] not in hide]
+
+    def _master_branch(self):
+        """فرع السجل الأساسي الجديد: الفرع الحالي في وضع العزل الكامل، وإلا None (مشترك بين الفروع)."""
+        return self.branch_id if branch_scope.get_mode(self.conn, self.company_id) == 'isolated' else None
+
+    def lookup_parties(self, kind):
+        self.require('party.view')
+        f, fa = branch_scope.master_clause(self.conn, self.company_id, self.branch_id)
+        return [(r['id'], f"{r['code']} — {r['name']}") for r in self.conn.execute(
+            "SELECT id,code,name FROM parties WHERE company_id=? AND kind=? AND is_active=1" + f + " ORDER BY name",
+            (self.company_id, kind, *fa))]
+
+    def lookup_items(self):
+        self.require('inventory.view')
+        f, fa = branch_scope.master_clause(self.conn, self.company_id, self.branch_id)
+        return [(r['id'], f"{r['code']} — {r['name']}") for r in self.conn.execute(
+            "SELECT id,code,name FROM items WHERE company_id=? AND is_active=1 AND has_variants=0" + f + " ORDER BY name", (self.company_id, *fa))]
+
+    def lookup_items_for_invoice(self):
+        """أصناف الفواتير: العادية + الأصناف الأم التي لها لون فعّال (يُختار لونها من عمود اللون). الألوان نفسها لا تُعرض هنا."""
+        self.require('inventory.view')
+        f, fa = branch_scope.master_clause(self.conn, self.company_id, self.branch_id)
+        return [(r['id'], f"{r['code']} — {r['name']}") for r in self.conn.execute(
+            "SELECT id,code,name FROM items WHERE company_id=? AND is_active=1 AND parent_item_id IS NULL AND (has_variants=0 OR EXISTS("
+            "SELECT 1 FROM items c WHERE c.parent_item_id=items.id AND c.is_active=1))" + f + " ORDER BY name", (self.company_id, *fa))]
+
+    def is_branch_restricted(self):
+        """هل المستخدم الحالي مقيَّد بفروع محددة (فلا يرى «كل الفروع»)؟"""
+        return self.conn.execute("SELECT 1 FROM user_branch_access WHERE user_id=? LIMIT 1", (self.user_id,)).fetchone() is not None
+
+    def _access_clause(self, table, col):
+        """تقييد المستخدم بمخازن/صناديق محددة: (sql, args). بلا تقييد → لا شرط."""
+        if self.conn.execute(f"SELECT 1 FROM {table} WHERE user_id=? LIMIT 1", (self.user_id,)).fetchone():
+            return f" AND id IN (SELECT {col} FROM {table} WHERE user_id=?)", [self.user_id]
+        return "", []
+
+    def lookup_warehouses(self):
+        self.require('inventory.view')
+        f, fa = branch_scope.txn_clause(self.conn, self.company_id, self.branch_id)
+        g, ga = self._access_clause('user_warehouse_access', 'warehouse_id')
+        return [(r['id'], f"{r['code']} — {r['name']}") for r in self.conn.execute(
+            "SELECT id,code,name FROM warehouses WHERE company_id=? AND is_active=1" + f + g + " ORDER BY name", (self.company_id, *fa, *ga))]
+
+    def lookup_cash(self, kind=None):
+        self.require('cash.view')
+        q, a = "SELECT id,code,name,currency FROM cash_accounts WHERE company_id=? AND is_active=1", [self.company_id]
+        f, fa = branch_scope.txn_clause(self.conn, self.company_id, self.branch_id)
+        g, ga = self._access_clause('user_cash_access', 'cash_account_id')
+        q += f + g; a += fa + ga
+        if kind:
+            q += " AND kind=?"
+            a.append(kind)
+        return [(r['id'], f"{r['name']} ({r['currency']})") for r in self.conn.execute(q + " ORDER BY name", a)]
+
+    def lookup_pay_accounts(self):
+        """صناديق/بنوك للدفع في الفواتير: المعرّف هو حساب الأستاذ (account_id) لا رقم الصندوق، لأن المحرك يرحّل على الحساب."""
+        self.require('cash.view')
+        q, a = "SELECT account_id,name,currency FROM cash_accounts WHERE company_id=? AND is_active=1", [self.company_id]
+        f, fa = branch_scope.txn_clause(self.conn, self.company_id, self.branch_id)
+        g, ga = self._access_clause('user_cash_access', 'cash_account_id')
+        return [(r['account_id'], f"{r['name']} ({r['currency']})") for r in self.conn.execute(q + f + g + " ORDER BY name", a + list(fa) + ga)]
+
+    def lookup_roles(self):
+        return [(r['id'], r['name_ar']) for r in self.conn.execute("SELECT id,name_ar FROM roles ORDER BY id")]

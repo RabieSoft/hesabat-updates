@@ -1,0 +1,83 @@
+"""WorkflowBar: مراحل القيد (مسودة ← مراجعة ← اعتماد ← ترحيل) + الإجراءات المتاحة للمستخدم الحالي فقط، بسبب تعطيل في التلميح.
+
+الحساب كله في core/workflow.py (خالص ومختبَر ومطابق للمحرك). هنا عرض فقط. يتطلب PySide6.
+"""
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QWidget
+
+from alhisabat.ui.core import workflow as W
+from alhisabat.ui.design import icons, tokens as T
+
+from .basic import StatusBadge, repolish
+
+
+class StageChip(QLabel):
+    def __init__(self, text, parent=None):
+        super().__init__(text, parent)
+        self.setAlignment(Qt.AlignCenter)
+        self.setProperty('badge', True)
+        self.setMinimumWidth(70)
+
+    def set_state(self, state):          # done | current | todo
+        self.setProperty('tone', {'done': 'success', 'current': 'info', 'todo': 'neutral'}[state])
+        f = self.font()
+        f.setBold(state == 'current')
+        self.setFont(f)
+        repolish(self)
+
+
+class WorkflowBar(QFrame):
+    actionTriggered = Signal(str)        # مفتاح الإجراء (review/approve/post/reverse/...)
+
+    def __init__(self, access, user_id, parent=None):
+        super().__init__(parent)
+        self.setObjectName('panel')
+        self.access, self.user_id = access, user_id
+        self._lay = QHBoxLayout(self)
+        self._lay.setContentsMargins(8, 4, 8, 4)
+        self.setLayoutDirection(Qt.RightToLeft)
+        self._stage_chips = {}
+        for st in W.STAGES:
+            chip = StageChip(W.STAGE_LABELS[st])
+            self._stage_chips[st] = chip
+            self._lay.addWidget(chip)
+            if st != W.STAGES[-1]:
+                arrow = QLabel('←')
+                arrow.setObjectName('ctxKey')
+                self._lay.addWidget(arrow)
+        self.badge = StatusBadge()
+        self._lay.addSpacing(12)
+        self._lay.addWidget(self.badge)
+        self._lay.addStretch(1)
+        self._btns = []
+        self._entry, self._settings, self._ro = None, W.WorkflowSettings(), ''
+
+    def set_entry(self, entry, settings, read_only_reason='', mode='light'):
+        """entry: dict (status, workflow_state, entry_type, created_by). None ← يفرغ الشريط."""
+        self._entry, self._settings, self._ro = entry, settings, read_only_reason
+        for b in self._btns:
+            self._lay.removeWidget(b)
+            b.deleteLater()
+        self._btns = []
+        if not entry:
+            for chip in self._stage_chips.values():
+                chip.set_state('todo')
+            return
+        cur = W.stage_of(entry)
+        order = list(W.STAGES)
+        for st, chip in self._stage_chips.items():
+            chip.set_state('current' if st == cur else ('done' if order.index(st) < order.index(cur) else 'todo'))
+        self.badge.set_status(entry.get('status'), entry.get('workflow_state'))
+        pal = T.palette(mode)
+        for a in W.journal_actions(entry, settings, self.access, self.user_id, read_only_reason):
+            b = QPushButton(a.label)
+            b.setIcon(icons.qicon(a.icon, pal['text']))
+            b.setEnabled(a.enabled)
+            b.setToolTip(a.reason if not a.enabled else a.label)
+            if a.primary:
+                b.setProperty('primary', True)
+            if a.danger:
+                b.setProperty('danger', True)
+            b.clicked.connect(lambda _c=False, k=a.key: self.actionTriggered.emit(k))
+            self._lay.addWidget(b)
+            self._btns.append(b)

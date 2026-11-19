@@ -1,0 +1,22 @@
+DROP TRIGGER IF EXISTS bank_statement_immutable_update;
+CREATE TRIGGER bank_statement_immutable_update BEFORE UPDATE ON bank_statement_lines
+WHEN OLD.status='ignored' OR (OLD.status='matched' AND NEW.status NOT IN ('matched','unmatched'))
+     OR (OLD.status='unmatched' AND NEW.status NOT IN ('matched','ignored','unmatched'))
+BEGIN SELECT RAISE(ABORT,'سطر كشف البنك غير قابل للتعديل'); END;
+
+CREATE TABLE year_closings(
+  id INTEGER PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id),
+  fiscal_year_id INTEGER NOT NULL REFERENCES fiscal_years(id),
+  result_base INTEGER NOT NULL,
+  closing_entry_id INTEGER REFERENCES journal_entries(id),
+  transfer_entry_id INTEGER REFERENCES journal_entries(id),
+  closed_by INTEGER NOT NULL REFERENCES users(id),
+  closed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','reopened','superseded')),
+  reopened_by INTEGER REFERENCES users(id),
+  reopened_at TEXT,
+  reopen_reason TEXT
+);
+
+CREATE UNIQUE INDEX ux_year_closings_active ON year_closings(company_id,fiscal_year_id) WHERE status='active';

@@ -1,0 +1,2 @@
+-- دخول المستخدمين من الهاتف: نوع جلسة الجهاز ('pair' = اقتران برمز، 'login' = دخول باسم المستخدم وكلمة المرور).
+ALTER TABLE sync_devices ADD COLUMN auth_kind TEXT NOT NULL DEFAULT 'pair';

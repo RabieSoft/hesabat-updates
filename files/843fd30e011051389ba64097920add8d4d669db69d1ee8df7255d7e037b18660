@@ -1,0 +1,70 @@
+"""خدمات الأطراف (العملاء والموردين)."""
+from decimal import Decimal
+
+from alhisabat.business import parties
+
+
+class PartiesMixin:
+    def parties(self, kind=None, limit=500, group_id=None, currency=None):
+        self.require('party.view')
+        q = ("SELECT p.id,p.code,p.name,p.kind,p.phone,p.credit_limit credit_limit_minor,p.payment_terms_days,p.is_active,"
+             "p.id_type,p.id_number,p.id_issuer,p.id_issue_date,g.id group_id,ga.name group_name "
+             "FROM parties p "
+             "JOIN accounts a ON a.id=p.account_id "
+             "LEFT JOIN party_groups g ON g.account_id=a.parent_id "
+             "LEFT JOIN accounts ga ON ga.id=g.account_id "
+             "WHERE p.company_id=?")
+        args = [self.company_id]
+        if kind:
+            q += " AND p.kind=?"
+            args.append(kind)
+        if group_id in (0, '0', 'none', 'None'):
+            q += " AND g.id IS NULL"
+        elif group_id is not None:
+            q += " AND g.id=?"
+            args.append(int(group_id))
+        cur = (currency or '').strip().upper()
+        if cur:                                            # من لهم حركات مرحّلة بهذه العملة على حساب الطرف (بحسب ما قُيِّد)
+            q += (" AND EXISTS (SELECT 1 FROM journal_lines jl JOIN journal_entries je ON je.id=jl.entry_id "
+                  "WHERE jl.account_id=p.account_id AND jl.currency=? AND je.status IN ('posted','reversed'))")
+            args.append(cur)
+        from alhisabat.business import branch_scope
+        f, fa = branch_scope.master_clause(self.conn, self.company_id, self.branch_id, col="p.branch_id")
+        q += f; args += fa
+        return [dict(r) for r in self.conn.execute(q + " ORDER BY p.name LIMIT ?", args + [int(limit)])]
+
+    def create_party(self, kind, v):
+        self.require('party.create')
+        return parties.create_party(self.conn, self.user_id, self.company_id, kind, v['name'], phone=v.get('phone', ''),
+                                    email=v.get('email', ''), address=v.get('address', ''),
+                                    credit_limit=Decimal(str(v.get('credit') or 0)) if kind == 'customer' else 0,
+                                    payment_terms_days=int(v.get('terms') or 0), branch_id=self._master_branch())
+
+    def edit_party(self, party_id, v):
+        kw = {'name': v.get('name'), 'phone': v.get('phone'), 'email': v.get('email'), 'address': v.get('address')}
+        if 'credit' in v and v['credit'] not in (None, ''):
+            kw['credit_limit'] = Decimal(str(v['credit']))
+        if 'terms' in v and v['terms'] not in (None, ''):
+            kw['payment_terms_days'] = int(v['terms'])
+        return parties.edit_party(self.conn, self.user_id, int(party_id), **kw)
+
+    def set_party_active(self, party_id, active, reason=''):
+        return parties.set_active(self.conn, self.user_id, int(party_id), bool(active), reason)
+
+    def delete_party(self, party_id):
+        return parties.delete_party(self.conn, self.user_id, int(party_id))
+
+    def party(self, party_id):
+        self.require('party.view')
+        row = self.conn.execute(
+            "SELECT id,code,name,kind,phone,credit_limit credit_limit_minor,payment_terms_days,is_active FROM parties WHERE id=? AND company_id=?",
+            (int(party_id), self.company_id)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def party_balance(self, party_id):
+        self.require('party.view')
+        rows = parties.balance_by_currency(self.conn, self.user_id, self.company_id, int(party_id))
+        if rows:
+            return rows[0].get('balance', Decimal('0'))
+        return Decimal('0')

@@ -1,0 +1,921 @@
+"""المخزون: أصناف، وحدات، مستودعات، وحركات مخزنية بتكلفة مسجَّلة وقت الحركة (متوسط مرجّح افتراضيًا، أو FIFO/LIFO حسب الصنف/التصنيف).
+مبادئ: (1) الرصيد نتيجة الحركات فقط (تريغر + حارس)، (2) الحركة لا تُعدَّل ولا تُحذف (عكس فقط)،
+(3) تكلفة الحركة تُثبَّت عند حدوثها ولا يُعاد احتساب التاريخ (ولذلك لا حركة بتاريخ أقدم من آخر حركة للصنف/المستودع)،
+(4) لا رصيد سالب (فحص + CHECK في قاعدة البيانات)، (5) كل أثر مالي يمر عبر محرك القيود.
+الكميات بالألف (milli) بوحدة الأساس؛ القيم بالوحدة الصغرى للعملة الأساسية."""
+from decimal import Decimal, ROUND_HALF_UP
+from datetime import date as _date
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.accounting import journal_engine as je, period_engine
+from alhisabat.audit import audit
+from alhisabat.business import branch_scope
+from alhisabat.business import item_catalog, stock_lots
+from alhisabat.database.tx import transaction
+from alhisabat.security import permissions
+
+IN_TYPES = ("opening", "purchase", "sale_return", "adjustment_in", "transfer_in")
+OUT_TYPES = ("purchase_return", "sale", "adjustment_out", "transfer_out")
+PERM_BY_TYPE = {"opening": "inventory.adjust", "adjustment_in": "inventory.adjust", "adjustment_out": "inventory.adjust",
+                "transfer_in": "inventory.transfer", "transfer_out": "inventory.transfer"}
+
+
+def _units(minor):
+    return Decimal(int(minor)) / 100
+
+
+def _round(x):
+    return int(Decimal(x).quantize(Decimal(1), ROUND_HALF_UP))
+
+
+# ---------------- صلاحيات ومساعدات ----------------
+def can_use_warehouse(conn, user_id, warehouse_id):
+    restricted = conn.execute("SELECT COUNT(*) FROM user_warehouse_access WHERE user_id=?", (user_id,)).fetchone()[0]
+    if not restricted:
+        return True
+    return conn.execute("SELECT 1 FROM user_warehouse_access WHERE user_id=? AND warehouse_id=?", (user_id, warehouse_id)).fetchone() is not None
+
+
+def _req(conn, user_id, company_id, code, *warehouse_ids):
+    permissions.require(conn, user_id, company_id, code, check_branch=False)
+    for w in warehouse_ids:
+        if w is not None and not can_use_warehouse(conn, user_id, w):
+            audit.log(conn, user_id, "permission_denied", "warehouses", w, after={"permission": code})
+            raise permissions.PermissionDenied("ليس لديك صلاحية العمل على هذا المستودع")
+
+
+def _item(conn, item_id, company_id=None):
+    r = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+    if not r or (company_id is not None and r["company_id"] != company_id):
+        raise AccountingError("الصنف غير موجود في هذه الشركة")
+    return r
+
+
+def _wh(conn, warehouse_id, company_id=None):
+    r = conn.execute("SELECT * FROM warehouses WHERE id=?", (warehouse_id,)).fetchone()
+    if not r or (company_id is not None and r["company_id"] != company_id):
+        raise AccountingError("المستودع غير موجود في هذه الشركة")
+    return r
+
+
+def to_milli(conn, item_id, unit_id, qty):
+    """كمية بوحدة الحركة → وحدات أساس ×1000 (تقريب لأقرب 1/1000 من وحدة الأساس)."""
+    it = _item(conn, item_id)
+    unit_id = unit_id or it["base_unit_id"]
+    f = conn.execute("SELECT factor_milli FROM item_units WHERE item_id=? AND unit_id=?", (item_id, unit_id)).fetchone()
+    if not f:
+        raise AccountingError("الوحدة غير معرّفة لهذا الصنف")
+    try:
+        q = Decimal(str(qty))
+    except Exception:
+        raise AccountingError("كمية غير صالحة")
+    if q <= 0:
+        raise AccountingError("الكمية يجب أن تكون أكبر من صفر")
+    m = _round(q * f[0])
+    if m <= 0:
+        raise AccountingError("الكمية أصغر من أدنى وحدة قابلة للتسجيل")
+    return m
+
+
+# ---------------- البيانات الرئيسية ----------------
+def create_unit(conn, actor_id, company_id, name, *, code=None, notes="", branch_id=None):
+    return item_catalog.create_unit(conn, actor_id, company_id, name, code=code, notes=notes, branch_id=branch_id)
+
+
+def create_warehouse(conn, actor_id, company_id, name, *, code=None, branch_id=None):
+    _req(conn, actor_id, company_id, "inventory.manage")
+    branch_id = branch_scope.resolve(conn, company_id, branch_id)
+    with transaction(conn):
+        if not code:
+            n = conn.execute("SELECT COUNT(*)+1 FROM warehouses WHERE company_id=?", (company_id,)).fetchone()[0]
+            code = f"W{n:02d}"
+        wid = conn.execute("INSERT INTO warehouses(company_id,code,name,branch_id) VALUES(?,?,?,?)",
+                           (company_id, code, (name or "").strip(), branch_id)).lastrowid
+        audit.log(conn, actor_id, "create_warehouse", "warehouses", wid, after={"code": code, "name": name})
+    return wid
+
+
+def restrict_to_warehouse(conn, actor_id, company_id, user_id, warehouse_id):
+    permissions.require(conn, actor_id, company_id, "user.manage")
+    _wh(conn, warehouse_id, company_id)
+    with transaction(conn):
+        conn.execute("INSERT OR IGNORE INTO user_warehouse_access VALUES(?,?)", (user_id, warehouse_id))
+        audit.log(conn, actor_id, "restrict_warehouse", "user_warehouse_access", user_id, after={"warehouse": warehouse_id})
+
+
+def set_warehouse_active(conn, actor_id, warehouse_id, active: bool):
+    w = _wh(conn, warehouse_id)
+    _req(conn, actor_id, w["company_id"], "inventory.manage")
+    if not active and conn.execute("SELECT 1 FROM stock_balances WHERE warehouse_id=? AND qty_milli<>0", (warehouse_id,)).fetchone():
+        raise AccountingError("لا يمكن تعطيل مستودع فيه رصيد")
+    with transaction(conn):
+        conn.execute("UPDATE warehouses SET is_active=? WHERE id=?", (int(active), warehouse_id))
+        audit.log(conn, actor_id, "warehouse_active", "warehouses", warehouse_id, after={"active": active})
+
+
+def _check_account(conn, company_id, account_id, types, what):
+    if account_id is None:
+        return
+    a = conn.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+    if not a or a["company_id"] != company_id or a["is_group"] or not a["is_active"] or a["account_type"] not in types:
+        raise AccountingError(f"حساب {what} غير صالح (يجب أن يكون حساب حركة نشطا من النوع المناسب)")
+
+
+def _clean_expiry_settings(item_type, track_expiry, alert_days):
+    try:
+        days = int(alert_days)
+    except (TypeError, ValueError):
+        raise AccountingError("أيام التنبيه قبل الانتهاء عدد صحيح")
+    if not 0 <= days <= 3650:
+        raise AccountingError("أيام التنبيه قبل الانتهاء بين 0 و3650")
+    if track_expiry and item_type != "stock":
+        raise AccountingError("تتبع الصلاحية للأصناف المخزنية فقط")
+    return int(bool(track_expiry)), days
+
+
+def create_item(conn, actor_id, company_id, name, base_unit_id, *, code=None, item_type="stock", barcode="", category="",
+                category_id=None, min_qty=0, inventory_account_id=None, cogs_account_id=None, revenue_account_id=None, notes="",
+                cost_method="", branch_id=None, track_expiry=False, expiry_alert_days=30):
+    _req(conn, actor_id, company_id, "inventory.manage")
+    branch_id = branch_scope.default_master_branch(conn, company_id, branch_id)
+    cost_method = item_catalog.clean_cost_method(cost_method)
+    if item_type not in ("stock", "service"):
+        raise AccountingError("نوع الصنف غير معروف")
+    u = conn.execute("SELECT is_active FROM units WHERE id=? AND company_id=?", (base_unit_id, company_id)).fetchone()
+    if not u:
+        raise AccountingError("الوحدة الأساسية غير موجودة")
+    if not u[0]:
+        raise AccountingError("الوحدة الأساسية معطّلة")
+    _check_account(conn, company_id, inventory_account_id, ("asset",), "المخزون")
+    _check_account(conn, company_id, cogs_account_id, ("cogs", "expense"), "تكلفة المبيعات")
+    _check_account(conn, company_id, revenue_account_id, ("revenue",), "الإيراد")
+    if item_type == "service" and (inventory_account_id or cogs_account_id):
+        raise AccountingError("الصنف الخدمي لا يحتاج حساب مخزون أو تكلفة")
+    mm = _round(Decimal(str(min_qty)) * 1000)
+    if mm < 0:
+        raise AccountingError("الحد الأدنى لا يقبل قيمة سالبة")
+    track_expiry, expiry_alert_days = _clean_expiry_settings(item_type, track_expiry, expiry_alert_days)
+    with transaction(conn):
+        category_id, category = item_catalog.resolve_category(conn, actor_id, company_id, category_id, category)
+        if not code:
+            code = "I%05d" % conn.execute("SELECT COALESCE(MAX(CAST(substr(code,2) AS INTEGER)),0)+1 FROM items "
+                                          "WHERE company_id=? AND code GLOB 'I[0-9]*'", (company_id,)).fetchone()[0]
+        iid = conn.execute(
+            "INSERT INTO items(company_id,code,name,barcode,item_type,base_unit_id,category,category_id,min_qty_milli,inventory_account_id,"
+            "cogs_account_id,revenue_account_id,notes,created_by,cost_method,branch_id,track_expiry,expiry_alert_days) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (company_id, code, (name or "").strip(), barcode or "", item_type, base_unit_id, category or "", category_id, mm,
+             inventory_account_id, cogs_account_id, revenue_account_id, notes or "", actor_id, cost_method, branch_id,
+             track_expiry, expiry_alert_days)).lastrowid
+        conn.execute("INSERT INTO item_units VALUES(?,?,1000)", (iid, base_unit_id))
+        audit.log(conn, actor_id, "create_item", "items", iid, after={"code": code, "name": name, "type": item_type})
+    return iid
+
+
+def add_item_unit(conn, actor_id, item_id, unit_id, factor):
+    it = _item(conn, item_id)
+    _req(conn, actor_id, it["company_id"], "inventory.manage")
+    u = conn.execute("SELECT is_active FROM units WHERE id=? AND company_id=?", (unit_id, it["company_id"])).fetchone()
+    if not u:
+        raise AccountingError("الوحدة غير موجودة")
+    if not u[0]:
+        raise AccountingError("الوحدة معطّلة")
+    if conn.execute("SELECT 1 FROM item_units WHERE item_id=? AND unit_id=?", (item_id, unit_id)).fetchone():
+        raise AccountingError("الوحدة مضافة لهذا الصنف مسبقًا؛ عدّل معاملها بدل إضافتها")
+    f = _round(Decimal(str(factor)) * 1000)
+    if f <= 0:
+        raise AccountingError("معامل التحويل يجب أن يكون أكبر من صفر")
+    with transaction(conn):
+        conn.execute("INSERT INTO item_units VALUES(?,?,?)", (item_id, unit_id, f))
+        audit.log(conn, actor_id, "add_item_unit", "items", item_id, after={"unit": unit_id, "factor": str(factor)})
+
+
+_KEEP = object()
+
+
+def edit_item(conn, actor_id, item_id, *, name=None, barcode=None, category=None, category_id=_KEEP, min_qty=None, notes=None,
+              inventory_account_id=None, cogs_account_id=None, revenue_account_id=None, cost_method=None,
+              track_expiry=None, expiry_alert_days=None):
+    it = _item(conn, item_id)
+    _req(conn, actor_id, it["company_id"], "inventory.manage")
+    new_cat_id, new_cat = it["category_id"], it["category"]
+    if category_id is not _KEEP:                      # ربط صريح بتصنيف (None = فك الارتباط)
+        new_cat_id, new_cat = item_catalog.resolve_category(conn, actor_id, it["company_id"], category_id, "")
+    elif category is not None and category.strip() != (it["category"] or "").strip():   # نص حر (استيراد/واجهة قديمة)
+        new_cat_id, new_cat = item_catalog.resolve_category(conn, actor_id, it["company_id"], None, category)
+    new = {"name": it["name"] if name is None else name, "barcode": it["barcode"] if barcode is None else barcode,
+           "category": new_cat, "category_id": new_cat_id, "notes": it["notes"] if notes is None else notes,
+           "min_qty_milli": it["min_qty_milli"] if min_qty is None else _round(Decimal(str(min_qty)) * 1000),
+           "inventory_account_id": it["inventory_account_id"] if inventory_account_id is None else inventory_account_id,
+           "cogs_account_id": it["cogs_account_id"] if cogs_account_id is None else cogs_account_id,
+           "revenue_account_id": it["revenue_account_id"] if revenue_account_id is None else revenue_account_id,
+           "cost_method": it["cost_method"] if cost_method is None else item_catalog.clean_cost_method(cost_method)}
+    if not new["name"].strip() or new["min_qty_milli"] < 0:
+        raise AccountingError("بيانات غير صالحة")
+    te, ad = _clean_expiry_settings(it["item_type"], it["track_expiry"] if track_expiry is None else track_expiry,
+                                    it["expiry_alert_days"] if expiry_alert_days is None else expiry_alert_days)
+    if it["track_expiry"] and not te and conn.execute("SELECT 1 FROM stock_lots WHERE item_id=? AND qty_milli>0 LIMIT 1", (item_id,)).fetchone():
+        raise AccountingError("لا يمكن إيقاف تتبع الصلاحية لصنف له دفعات قائمة بكميات")
+    _check_account(conn, it["company_id"], new["inventory_account_id"], ("asset",), "المخزون")
+    _check_account(conn, it["company_id"], new["cogs_account_id"], ("cogs", "expense"), "تكلفة المبيعات")
+    _check_account(conn, it["company_id"], new["revenue_account_id"], ("revenue",), "الإيراد")
+    if new["inventory_account_id"] != it["inventory_account_id"] and conn.execute(
+            "SELECT 1 FROM stock_movements WHERE item_id=? LIMIT 1", (item_id,)).fetchone():
+        raise AccountingError("لا يمكن تغيير حساب مخزون صنف له حركات")
+    old = {k: it[k] for k in new}
+    with transaction(conn):
+        has_moves = conn.execute("SELECT 1 FROM stock_movements WHERE item_id=? LIMIT 1", (item_id,)).fetchone()
+        before = item_catalog.moved_methods(conn, [item_id])
+        conn.execute("UPDATE items SET name=?,barcode=?,category=?,category_id=?,notes=?,min_qty_milli=?,inventory_account_id=?,cogs_account_id=?,"
+                     "revenue_account_id=?,cost_method=?,track_expiry=?,expiry_alert_days=? WHERE id=?", (new["name"].strip(), new["barcode"], new["category"], new["category_id"], new["notes"],
+                                                        new["min_qty_milli"], new["inventory_account_id"], new["cogs_account_id"],
+                                                        new["revenue_account_id"], new["cost_method"], te, ad, item_id))
+        if has_moves:                                    # ربط بتصنيف آخر قد يغيّر الطريقة الموروثة
+            item_catalog.assert_methods_unchanged(conn, before)
+        audit.log(conn, actor_id, "edit_item", "items", item_id, old, new)
+
+
+def set_item_active(conn, actor_id, item_id, active: bool):
+    it = _item(conn, item_id)
+    _req(conn, actor_id, it["company_id"], "inventory.manage")
+    if not active and conn.execute("SELECT 1 FROM stock_balances WHERE item_id=? AND qty_milli<>0", (item_id,)).fetchone():
+        raise AccountingError("لا يمكن تعطيل صنف له رصيد")
+    with transaction(conn):
+        conn.execute("UPDATE items SET is_active=? WHERE id=?", (int(active), item_id))
+        audit.log(conn, actor_id, "item_active", "items", item_id, after={"active": active})
+
+
+def _mapping(conn, company_id, key):
+    r = conn.execute("SELECT account_id FROM account_mappings WHERE company_id=? AND map_key=?", (company_id, key)).fetchone()
+    return r[0] if r else None
+
+
+def item_accounts(conn, item_id):
+    """حسابات الصنف: مخصّصة له أو من Account Mapping. لا أرقام حسابات ثابتة في الكود."""
+    it = _item(conn, item_id)
+    c = it["company_id"]
+    return {"inventory": it["inventory_account_id"] or _mapping(conn, c, "inventory"),
+            "cogs": it["cogs_account_id"] or _mapping(conn, c, "cogs"),
+            "revenue": it["revenue_account_id"] or _mapping(conn, c, "sales")}
+
+
+def find_items(conn, user_id, company_id, search=None, *, limit=50, offset=0, active_only=False, branch_id=None, exclude_parents=False):
+    _req(conn, user_id, company_id, "inventory.view")
+    q, a = "SELECT * FROM items WHERE company_id=?", [company_id]
+    if search:
+        q += " AND (code LIKE ? OR name LIKE ? OR barcode LIKE ?)"; a += [f"%{search}%"] * 3
+    if active_only:
+        q += " AND is_active=1"
+    if exclude_parents:                                  # أمهات الألوان لا تُختار في الحركات والفواتير؛ تُختار ألوانها
+        q += " AND has_variants=0"
+    f, fa = branch_scope.master_clause(conn, company_id, branch_id)
+    q += f; a += fa
+    return [dict(r) for r in conn.execute(q + " ORDER BY code LIMIT ? OFFSET ?", (*a, min(int(limit), 500), int(offset)))]
+
+
+# ---------------- الحركات ----------------
+def _balance(conn, item_id, warehouse_id):
+    r = conn.execute("SELECT qty_milli,value_base FROM stock_balances WHERE item_id=? AND warehouse_id=?", (item_id, warehouse_id)).fetchone()
+    return (r[0], r[1]) if r else (0, 0)
+
+
+def _returned(conn, ref_id, types):
+    q = ",".join("?" * len(types))
+    r = conn.execute(f"SELECT COALESCE(SUM(m.qty_milli),0),COALESCE(SUM(m.value_base),0) FROM stock_movements m WHERE m.ref_movement_id=? "
+                     f"AND m.movement_type IN ({q}) AND NOT EXISTS(SELECT 1 FROM stock_movements v WHERE v.ref_movement_id=m.id "
+                     f"AND v.movement_type='reversal')", (ref_id, *types)).fetchone()
+    return r[0], r[1]
+
+
+def _insert(conn, company_id, actor_id, item_id, wh_id, movement_date, mtype, direction, qty, value, **kw):
+    cur = conn.execute(
+        "INSERT INTO stock_movements(company_id,item_id,warehouse_id,movement_date,movement_type,direction,qty_milli,value_base,"
+        "ref_movement_id,transfer_group,journal_entry_id,source_type,source_id,note,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (company_id, item_id, wh_id, movement_date, mtype, direction, qty, value, kw.get("ref"), kw.get("group"), kw.get("entry"),
+         kw.get("source_type"), kw.get("source_id"), kw.get("note", ""), actor_id))
+    return cur.lastrowid
+
+
+def _check_date_and_order(conn, company_id, item_id, wh_id, movement_date, mtype):
+    try:
+        _date.fromisoformat(movement_date)
+    except Exception:
+        raise AccountingError("تاريخ غير صالح")
+    per = period_engine.find_period(conn, company_id, movement_date)
+    je._assert_open(per)
+    last = conn.execute("SELECT MAX(movement_date) FROM stock_movements WHERE item_id=? AND warehouse_id=?", (item_id, wh_id)).fetchone()[0]
+    if last and movement_date < last:
+        raise AccountingError(f"لا يمكن تسجيل حركة بتاريخ أقدم من آخر حركة لهذا الصنف في المستودع ({last}): لا يُعاد احتساب التاريخ")
+    if mtype == "opening" and conn.execute("SELECT 1 FROM stock_movements WHERE item_id=? AND warehouse_id=? LIMIT 1", (item_id, wh_id)).fetchone():
+        raise AccountingError("الرصيد الافتتاحي يجب أن يكون أول حركة للصنف في المستودع")
+
+
+def _layered_out_value(conn, item_id, warehouse_id, q, vb, method):
+    """قيمة صادر بطريقة FIFO/LIFO بإعادة بناء طبقات الوارد المتبقية من حركات الصنف في المستودع (بترتيب التسجيل).
+    الحركات المسجَّلة لا تتغير أبدًا؛ هذه قراءة فقط. يرجع None إن لم تتطابق الطبقات مع رصيد القيمة (فيُستعمل المتوسط احتياطًا)."""
+    layers = []                                   # [qty, value, source_movement_id]
+
+    def take(qty, from_end):
+        got = 0
+        while qty > 0 and layers:
+            lay = layers[-1] if from_end else layers[0]
+            n = min(qty, lay[0])
+            v = lay[1] if n == lay[0] else _round(Decimal(lay[1]) * n / lay[0])
+            lay[0] -= n; lay[1] -= v; got += v; qty -= n
+            if lay[0] == 0:
+                layers.pop() if from_end else layers.pop(0)
+        return got
+
+    from_end = method == "lifo"
+    rows = conn.execute("SELECT id,movement_type,direction,qty_milli,value_base,ref_movement_id FROM stock_movements "
+                        "WHERE item_id=? AND warehouse_id=? ORDER BY id", (item_id, warehouse_id)).fetchall()
+    for r in rows:
+        if r["direction"] == "in":
+            layers.append([r["qty_milli"], r["value_base"], r["id"]])
+            continue
+        src = next((l for l in layers if l[2] == r["ref_movement_id"]), None) if r["movement_type"] in ("purchase_return", "reversal") else None
+        if src and src[0] >= r["qty_milli"] and src[1] >= r["value_base"]:      # إلغاء/مرتجع شراء: يخرج من طبقته الأصلية
+            src[0] -= r["qty_milli"]; src[1] -= r["value_base"]
+            if src[0] == 0:
+                layers.remove(src)
+        else:
+            take(r["qty_milli"], from_end)
+    if sum(l[1] for l in layers) != vb or sum(l[0] for l in layers) < q:
+        return None
+    return take(q, from_end)
+
+
+def _out_value(conn, item_id, warehouse_id, q, qb, vb):
+    """تكلفة صادر حسب الطريقة الفعلية للصنف (صنف ← تصنيف ← افتراضي). المتوسط المرجّح هو الأصل والاحتياط."""
+    if q == qb:
+        return vb
+    method = item_catalog.effective_cost_method(conn, item_id)
+    if method in ("fifo", "lifo"):
+        v = _layered_out_value(conn, item_id, warehouse_id, q, vb, method)
+        if v is not None:
+            return v
+    return _round(Decimal(vb) * q / qb)
+
+
+def _negative_stock_allowed(conn, company_id):
+    """خيار «السماح ببيع كمية سالبة» (يُضبط من الإعدادات بصلاحية stock.allow_negative)."""
+    r = conn.execute("SELECT allow_negative_stock FROM sales_settings WHERE company_id=?", (company_id,)).fetchone()
+    return bool(r and r[0])
+
+
+def _last_in_unit_cost(conn, item_id, warehouse_id):
+    """آخر تكلفة وحدة معروفة (للمخزن ثم لأي مخزن) من آخر حركة وارد حقيقية؛ 0 إن لم توجد."""
+    q = ("SELECT value_base,qty_milli FROM stock_movements WHERE item_id=? AND direction='in' AND qty_milli>0 "
+         "AND movement_type IN ('opening','purchase','adjustment_in','transfer_in') {} ORDER BY id DESC LIMIT 1")
+    r = conn.execute(q.format("AND warehouse_id=?"), (item_id, warehouse_id)).fetchone() or conn.execute(q.format(""), (item_id,)).fetchone()
+    return Decimal(r[0]) / Decimal(r[1]) if r else Decimal(0)
+
+
+def _provisional_unit_cost(conn, item_id, warehouse_id, qb, vb):
+    """تكلفة الوحدة المؤقتة لما يُباع فوق الرصيد: متوسط الرصيد الحالي (موجبًا أو سالبًا) وإلا آخر تكلفة معروفة."""
+    if qb != 0 and vb != 0:
+        return abs(Decimal(vb)) / abs(Decimal(qb))
+    return _last_in_unit_cost(conn, item_id, warehouse_id)
+
+
+def record_movement(conn, actor_id, company_id, item_id, warehouse_id, movement_date, movement_type, qty, *, unit_id=None,
+                    unit_cost=None, total_cost=None, ref_movement_id=None, journal_entry_id=None, source_type=None,
+                    source_id=None, note="", _group=None, _value=None, _perm=None, expiry_date=None, lot_no="", lot_id=None,
+                    allow_expired=False, _lots_from=None, lots=None):
+    """يسجّل حركة مخزنية ويرجع {movement_id, qty_milli, value_base, unit_cost}. الوارد يحتاج تكلفة (إلا المرتجعات: بتكلفة الأصل)،
+    والصادر يُقيَّم بطريقة الصنف الفعلية (متوسط مرجّح/FIFO/LIFO) وقت الحركة (المرتجعات بتكلفة المستند الأصلي).
+    للأصناف المتتبَّعة الصلاحية: الوارد (شراء/افتتاحي) يتطلب expiry_date وينشئ دفعة، والصادر يُصرف FEFO (أو lot_id محددة)،
+    ولا تُصرف دفعة منتهية في البيع/التحويل؛ الإتلاف (تسوية نقص) والمرتجع للمورد يصرفانها. _lots_from: حركة تحويل صادرة تُنسخ دفعاتها.
+    lots=[(qty, expiry_date, lot_no), ...]: وارد واحد يتوزع على عدة دفعات (مجموع كمياتها = qty) كرصيد افتتاحي لصنف بدفعتين."""
+    if movement_type not in IN_TYPES + OUT_TYPES:
+        raise AccountingError("نوع حركة غير معروف")
+    _req(conn, actor_id, company_id, _perm or PERM_BY_TYPE.get(movement_type, "inventory.move"), warehouse_id)
+    it, wh = _item(conn, item_id, company_id), _wh(conn, warehouse_id, company_id)
+    if it["item_type"] != "stock":
+        raise AccountingError("الأصناف الخدمية لا تدخل المخزون")
+    if not it["is_active"] or not wh["is_active"]:
+        raise AccountingError("الصنف أو المستودع غير نشط")
+    q = to_milli(conn, item_id, unit_id, qty)
+    track = bool(it["track_expiry"])
+    with transaction(conn):
+        _check_date_and_order(conn, company_id, item_id, warehouse_id, movement_date, movement_type)
+        qb, vb = _balance(conn, item_id, warehouse_id)
+        ref = None
+        if movement_type in ("sale_return", "purchase_return"):
+            if not ref_movement_id:
+                raise AccountingError("المرتجع يجب أن يرتبط بحركة البيع/الشراء الأصلية")
+            ref = conn.execute("SELECT * FROM stock_movements WHERE id=?", (ref_movement_id,)).fetchone()
+            want = "sale" if movement_type == "sale_return" else "purchase"
+            if not ref or ref["company_id"] != company_id or ref["item_id"] != item_id or ref["movement_type"] != want:
+                raise AccountingError("الحركة الأصلية غير صالحة لهذا المرتجع")
+            if conn.execute("SELECT 1 FROM stock_movements WHERE ref_movement_id=? AND movement_type='reversal'", (ref["id"],)).fetchone():
+                raise AccountingError("الحركة الأصلية ملغاة")
+            rq, rv = _returned(conn, ref["id"], ("sale_return", "purchase_return"))
+            if rq + q > ref["qty_milli"]:
+                raise AccountingError("كمية المرتجع تتجاوز الكمية الأصلية")
+            value = ref["value_base"] - rv if rq + q == ref["qty_milli"] else _round(Decimal(ref["value_base"]) * q / ref["qty_milli"])
+        elif movement_type in IN_TYPES:
+            if _value is not None:
+                value = int(_value)
+            elif total_cost is not None:
+                value = je._minor(total_cost)
+            elif unit_cost is not None:
+                value = je._minor(Decimal(str(unit_cost)) * Decimal(str(qty)))
+            else:
+                raise AccountingError("تكلفة الوارد مطلوبة")
+            if value < 0:
+                raise AccountingError("التكلفة لا تقبل قيمة سالبة")
+        else:
+            value = None
+        direction = "in" if movement_type in IN_TYPES else "out"
+        trueup = 0
+        gross_value = value
+        exp, plan = "", []
+        split = []
+        if track and direction == "in" and movement_type in ("purchase", "opening", "adjustment_in"):
+            if lots:
+                split = [(to_milli(conn, item_id, unit_id, lq), stock_lots._check_incoming(conn, item_id, movement_type, movement_date, le), ln)
+                         for lq, le, ln in lots]
+                if sum(x[0] for x in split) != q:
+                    raise AccountingError("مجموع كميات الدفعات لا يساوي كمية الحركة")
+            else:
+                exp = stock_lots._check_incoming(conn, item_id, movement_type, movement_date, expiry_date)
+        if track and direction == "out" and movement_type not in ("reversal",) and not ref:
+            plan_q = q
+            if q > qb and movement_type == "sale" and _negative_stock_allowed(conn, company_id):
+                plan_q = max(qb, 0)                      # بيع فوق الرصيد (رصيد سالب مسموح): الدفعات تغطي المتاح فقط
+            if plan_q > 0:
+                plan = stock_lots._plan_out(conn, item_id, warehouse_id, plan_q, movement_date, movement_type, lot_id=lot_id, allow_expired=allow_expired)
+        if direction == "out":
+            if q > qb and movement_type == "sale" and _negative_stock_allowed(conn, company_id):
+                # بيع فوق الرصيد (رصيد سالب مسموح): المغطّى من المخزون بتكلفته الفعلية والزائد بتكلفة مؤقتة (آخر تكلفة معروفة)
+                c = _provisional_unit_cost(conn, item_id, warehouse_id, qb, vb)
+                covered = max(qb, 0)
+                value = (vb if covered else 0) + _round(Decimal(q - covered) * c)
+            else:
+                if q > qb:
+                    raise AccountingError(f"الرصيد غير كافٍ: المتاح {Decimal(qb) / 1000} والمطلوب {Decimal(q) / 1000}")
+                if value is None:
+                    value = _out_value(conn, item_id, warehouse_id, q, qb, vb)
+                if value > vb:
+                    raise AccountingError("قيمة المخزون لا تكفي لهذه الحركة")
+        elif movement_type == "purchase" and qb < 0 and vb <= 0:
+            # موازنة تلقائية: الوارد يغطي الكمية السالبة أولًا، وفرق تكلفتها (الفعلية − المؤقتة) يُحمَّل على تكلفة المبيعات
+            c, u, after = abs(Decimal(vb)) / abs(Decimal(qb)), Decimal(value) / Decimal(q), qb + q
+            target = 0 if after == 0 else (_round(Decimal(after) * u) if after > 0 else -_round(Decimal(-after) * c))
+            mv_value = max(target - vb, 0)
+            trueup, value = value - mv_value, mv_value
+        mid = _insert(conn, company_id, actor_id, item_id, warehouse_id, movement_date, movement_type, direction, q, value,
+                      ref=ref["id"] if ref else None, group=_group, entry=journal_entry_id, source_type=source_type,
+                      source_id=source_id, note=note)
+        if track:
+            if direction == "in" and movement_type in ("purchase", "opening", "adjustment_in"):
+                for lq, le, ln in (split or [(q, exp, lot_no)]):
+                    stock_lots._add_lot(conn, company_id, item_id, warehouse_id, mid, lq, le, ln)
+            elif movement_type == "transfer_in" and _lots_from:
+                stock_lots._copy_for_transfer(conn, company_id, mid, warehouse_id, _lots_from)
+            elif ref:
+                stock_lots._follow(conn, mid, ref["id"], direction, q)
+            elif plan:
+                stock_lots._apply_plan(conn, mid, plan)
+    return {"movement_id": mid, "qty_milli": q, "value_base": value, "unit_cost": (Decimal(value) * 1000 / q) if q else Decimal(0),
+            "negative_settlement": trueup, "gross_value": gross_value if direction == "in" else value}
+
+
+def link_movements(conn, actor_id, company_id, entry_id, movement_ids):
+    """يربط حركات بقيد أنشأه المستند (فاتورة/…): مصدر الرقم المالي. مرة واحدة لكل حركة."""
+    e = conn.execute("SELECT company_id FROM journal_entries WHERE id=?", (entry_id,)).fetchone()
+    if not e or e[0] != company_id:
+        raise AccountingError("القيد غير موجود في هذه الشركة")
+    with transaction(conn):
+        for m in movement_ids:
+            r = conn.execute("SELECT company_id,journal_entry_id FROM stock_movements WHERE id=?", (m,)).fetchone()
+            if not r or r[0] != company_id or r[1] is not None:
+                raise AccountingError("حركة غير موجودة أو مرتبطة بقيد بالفعل")
+            conn.execute("UPDATE stock_movements SET journal_entry_id=? WHERE id=?", (entry_id, m))
+        audit.log(conn, actor_id, "link_movements", "journal_entries", entry_id, after={"movements": list(movement_ids)})
+
+
+def sale_cost_lines(conn, company_id, movement_ids):
+    """سطور قيد تكلفة المبيعات لحركات بيع (مدين تكلفة المبيعات / دائن المخزون) بقيمة الحركات المسجّلة — لتضمينها في قيد الفاتورة."""
+    agg = {}
+    for m in movement_ids:
+        r = conn.execute("SELECT * FROM stock_movements WHERE id=?", (m,)).fetchone()
+        if not r or r["company_id"] != company_id or r["movement_type"] != "sale":
+            raise AccountingError("الحركة ليست حركة بيع في هذه الشركة")
+        acc = item_accounts(conn, r["item_id"])
+        if not acc["inventory"] or not acc["cogs"]:
+            raise AccountingError("حسابات المخزون/تكلفة المبيعات غير مربوطة")
+        k = (acc["cogs"], acc["inventory"]); agg[k] = agg.get(k, 0) + r["value_base"]
+    lines = []
+    for (cogs, inv), v in agg.items():
+        if v:
+            lines += [{"account_id": cogs, "debit": _units(v), "credit": 0}, {"account_id": inv, "debit": 0, "credit": _units(v)}]
+    return lines
+
+
+def sale_return_cost_lines(conn, company_id, movement_ids):
+    """سطور قيد عكس تكلفة المبيعات لمرتجع بيع (مدين المخزون / دائن تكلفة المبيعات) بتكلفة الحركات الأصلية."""
+    agg = {}
+    for m in movement_ids:
+        r = conn.execute("SELECT * FROM stock_movements WHERE id=?", (m,)).fetchone()
+        if not r or r["company_id"] != company_id or r["movement_type"] != "sale_return":
+            raise AccountingError("الحركة ليست حركة مرتجع بيع في هذه الشركة")
+        acc = item_accounts(conn, r["item_id"])
+        if not acc["inventory"] or not acc["cogs"]:
+            raise AccountingError("حسابات المخزون/تكلفة المبيعات غير مربوطة")
+        k = (acc["inventory"], acc["cogs"]); agg[k] = agg.get(k, 0) + r["value_base"]
+    lines = []
+    for (invacc, cogs), v in agg.items():
+        if v:
+            lines += [{"account_id": invacc, "debit": _units(v), "credit": 0}, {"account_id": cogs, "debit": 0, "credit": _units(v)}]
+    return lines
+
+
+def transfer_stock(conn, actor_id, company_id, item_id, from_wh, to_wh, movement_date, qty, unit_id=None, note=""):
+    """تحويل بين مستودعين بتكلفة المتوسط في المصدر؛ لا قيد لأن حساب المخزون للصنف واحد."""
+    if from_wh == to_wh:
+        raise AccountingError("المستودع المصدر والهدف متطابقان")
+    _req(conn, actor_id, company_id, "inventory.transfer", from_wh, to_wh)
+    with transaction(conn):
+        grp = conn.execute("SELECT COALESCE(MAX(transfer_group),0)+1 FROM stock_movements").fetchone()[0]
+        out = record_movement(conn, actor_id, company_id, item_id, from_wh, movement_date, "transfer_out", qty, unit_id=unit_id,
+                              note=note, _group=grp)
+        inn = record_movement(conn, actor_id, company_id, item_id, to_wh, movement_date, "transfer_in", qty, unit_id=unit_id,
+                              note=note, _group=grp, _value=out["value_base"], _lots_from=out["movement_id"])
+        audit.log(conn, actor_id, "transfer_stock", "stock_movements", out["movement_id"],
+                  after={"to": inn["movement_id"], "qty_milli": out["qty_milli"], "value": out["value_base"]})
+    return {"out": out, "in": inn}
+
+
+def _avg_cost_anywhere(conn, item_id):
+    r = conn.execute("SELECT SUM(qty_milli),SUM(value_base) FROM stock_balances WHERE item_id=?", (item_id,)).fetchone()
+    return Decimal(r[1]) * 1000 / r[0] if r[0] else None
+
+
+def adjust_stock(conn, actor_id, company_id, item_id, warehouse_id, movement_date, direction, qty, reason, *, unit_id=None, unit_cost=None,
+                 expiry_date=None, lot_no="", lot_id=None):
+    """تسوية مخزنية (زيادة/نقص) بقيد آلي: مدين/دائن المخزون مقابل حساب تسويات المخزون (Account Mapping)."""
+    if direction not in ("in", "out"):
+        raise AccountingError("اتجاه غير صالح")
+    if not reason or not reason.strip():
+        raise AccountingError("التسوية تتطلب ذكر السبب")
+    _req(conn, actor_id, company_id, "inventory.adjust", warehouse_id)
+    permissions.require(conn, actor_id, company_id, "journal.create", check_branch=False)
+    permissions.require(conn, actor_id, company_id, "journal.post", check_branch=False)
+    acc = item_accounts(conn, item_id); adj = _mapping(conn, company_id, "inventory_adjustment")
+    if not acc["inventory"] or not adj:
+        raise AccountingError("اربط حساب المخزون وحساب تسويات المخزون (Account Mapping) أولا")
+    with transaction(conn):
+        kw = {}
+        if direction == "in" and unit_cost is None:
+            avg = _avg_cost_anywhere(conn, item_id)
+            if avg is None:
+                raise AccountingError("تكلفة الوحدة مطلوبة (لا رصيد سابق لاستنتاج التكلفة)")
+            kw["total_cost"] = _units(_round(avg * to_milli(conn, item_id, unit_id, qty) / 1000))
+        elif direction == "in":
+            kw["unit_cost"] = unit_cost
+        mv = record_movement(conn, actor_id, company_id, item_id, warehouse_id, movement_date, f"adjustment_{direction}", qty,
+                             unit_id=unit_id, note=reason, source_type="stock_adjustment", expiry_date=expiry_date, lot_no=lot_no,
+                             lot_id=lot_id, allow_expired=True, **kw)
+        if mv["value_base"] > 0:
+            v = _units(mv["value_base"])
+            lines = ([{"account_id": acc["inventory"], "debit": v, "credit": 0}, {"account_id": adj, "debit": 0, "credit": v}]
+                     if direction == "in" else
+                     [{"account_id": adj, "debit": v, "credit": 0}, {"account_id": acc["inventory"], "debit": 0, "credit": v}])
+            eid = je.create_draft(conn, company_id, actor_id, movement_date, lines, f"تسوية مخزون: {reason}",
+                                  entry_type="auto", source_type="stock_adjustment", source_id=mv["movement_id"])
+            je.post(conn, eid, actor_id)
+            conn.execute("UPDATE stock_movements SET journal_entry_id=? WHERE id=?", (eid, mv["movement_id"]))
+            mv["entry_id"] = eid
+        audit.log(conn, actor_id, "adjust_stock", "stock_movements", mv["movement_id"], after={"direction": direction, "reason": reason})
+    return mv
+
+
+def void_movement(conn, actor_id, movement_id, reason, movement_date=None, reverse_entry=False):
+    """عكس حركة بحركة معاكسة بنفس الكمية والقيمة الأصلية (لا حذف). لا تُعكس أرجل التحويل منفردة."""
+    m = conn.execute("SELECT * FROM stock_movements WHERE id=?", (movement_id,)).fetchone()
+    if not m:
+        raise AccountingError("الحركة غير موجودة")
+    _req(conn, actor_id, m["company_id"], "inventory.adjust", m["warehouse_id"])
+    if not reason or not reason.strip():
+        raise AccountingError("العكس يتطلب ذكر السبب")
+    if m["movement_type"] == "reversal":
+        raise AccountingError("لا يمكن عكس حركة عكسية")
+    if m["movement_type"] in ("transfer_in", "transfer_out"):
+        raise AccountingError("لا تُعكس أرجل التحويل منفردة: أنشئ تحويلا عكسيا")
+    if conn.execute("SELECT 1 FROM stock_movements WHERE ref_movement_id=? AND movement_type IN ('sale_return','purchase_return') "
+                    "AND NOT EXISTS(SELECT 1 FROM stock_movements v WHERE v.ref_movement_id=stock_movements.id AND v.movement_type='reversal')",
+                    (movement_id,)).fetchone():
+        raise AccountingError("توجد مرتجعات على هذه الحركة: اعكسها أولا")
+    if conn.execute("SELECT 1 FROM stock_movements WHERE ref_movement_id=? AND movement_type='reversal'", (movement_id,)).fetchone():
+        raise AccountingError("الحركة معكوسة بالفعل")
+    if reverse_entry and m["journal_entry_id"]:
+        n = conn.execute("SELECT COUNT(*) FROM stock_movements WHERE journal_entry_id=?", (m["journal_entry_id"],)).fetchone()[0]
+        if n != 1:
+            raise AccountingError("القيد المرتبط يخص أكثر من حركة (مستند متعدد): ألغِ المستند نفسه بدل عكس حركة واحدة")
+        permissions.require(conn, actor_id, m["company_id"], "journal.reverse", check_branch=False)
+    last = conn.execute("SELECT MAX(movement_date) FROM stock_movements WHERE item_id=? AND warehouse_id=?", (m["item_id"], m["warehouse_id"])).fetchone()[0]
+    d = movement_date or last
+    with transaction(conn):
+        _check_date_and_order(conn, m["company_id"], m["item_id"], m["warehouse_id"], d, "reversal")
+        qb, vb = _balance(conn, m["item_id"], m["warehouse_id"])
+        direction = "out" if m["direction"] == "in" else "in"
+        if direction == "out" and (m["qty_milli"] > qb or m["value_base"] > vb):
+            raise AccountingError("لا يمكن عكس الحركة: المخزون المتاح لا يكفي (تم استهلاكه)")
+        rid = _insert(conn, m["company_id"], actor_id, m["item_id"], m["warehouse_id"], d, "reversal", direction, m["qty_milli"],
+                      m["value_base"], ref=movement_id, note=reason)
+        stock_lots._follow(conn, rid, movement_id, direction, m["qty_milli"])
+        if reverse_entry and m["journal_entry_id"]:
+            e = conn.execute("SELECT status FROM journal_entries WHERE id=?", (m["journal_entry_id"],)).fetchone()
+            if e["status"] == "posted":
+                je.reverse(conn, m["journal_entry_id"], actor_id, d, reason)
+        audit.log(conn, actor_id, "void_movement", "stock_movements", movement_id, after={"reversal": rid}, reason=reason)
+    return rid
+
+
+# ---------------- الأرصدة والتقارير ----------------
+def _allowed_warehouses(conn, user_id):
+    r = [x[0] for x in conn.execute("SELECT warehouse_id FROM user_warehouse_access WHERE user_id=?", (user_id,))]
+    return r or None
+
+
+def stock_report(conn, user_id, company_id, *, warehouse_id=None, item_id=None, as_of=None, include_zero=False, branch_id=None):
+    _req(conn, user_id, company_id, "inventory.view", warehouse_id)
+    allowed = _allowed_warehouses(conn, user_id)
+    where, a = " WHERE i.company_id=?", [company_id]
+    if warehouse_id:
+        where += " AND w.id=?"; a.append(warehouse_id)
+    if branch_id is not None:
+        f, fa = branch_scope.txn_clause(conn, company_id, branch_id, col="w.branch_id")
+        where += f; a += fa
+    if item_id:
+        where += " AND i.id=?"; a.append(item_id)
+    if allowed:
+        where += " AND w.id IN (%s)" % ",".join("?" * len(allowed)); a += allowed
+    if as_of:
+        q = ("SELECT i.id item_id,i.code icode,i.name iname,w.id wid,w.code wcode,w.name wname,i.min_qty_milli mn,"
+             "SUM(CASE m.direction WHEN 'in' THEN m.qty_milli ELSE -m.qty_milli END) qty,"
+             "SUM(CASE m.direction WHEN 'in' THEN m.value_base ELSE -m.value_base END) val "
+             "FROM stock_movements m JOIN items i ON i.id=m.item_id JOIN warehouses w ON w.id=m.warehouse_id"
+             + where + " AND m.movement_date<=? GROUP BY i.id,w.id ORDER BY i.code,w.code")
+        a.append(as_of)
+    else:
+        q = ("SELECT i.id item_id,i.code icode,i.name iname,w.id wid,w.code wcode,w.name wname,i.min_qty_milli mn,b.qty_milli qty,b.value_base val "
+             "FROM stock_balances b JOIN items i ON i.id=b.item_id JOIN warehouses w ON w.id=b.warehouse_id" + where + " ORDER BY i.code,w.code")
+    rows = []
+    for r in conn.execute(q, a):
+        if not include_zero and not r["qty"] and not r["val"]:
+            continue
+        rows.append({"item_id": r["item_id"], "item_code": r["icode"], "item_name": r["iname"], "warehouse_id": r["wid"],
+                     "warehouse_code": r["wcode"], "warehouse_name": r["wname"], "qty_milli": r["qty"], "value_base": r["val"],
+                     "avg_cost_per_unit_minor": (Decimal(r["val"]) * 1000 / r["qty"]) if r["qty"] else Decimal(0)})
+    return rows
+
+
+def low_stock(conn, user_id, company_id):
+    """أصناف رصيدها الإجمالي ≤ الحد الأدنى (للإشعارات لاحقا)."""
+    _req(conn, user_id, company_id, "inventory.view")
+    return [dict(r) for r in conn.execute(
+        "SELECT i.id,i.code,i.name,i.min_qty_milli,COALESCE(SUM(b.qty_milli),0) qty FROM items i LEFT JOIN stock_balances b ON b.item_id=i.id "
+        "WHERE i.company_id=? AND i.item_type='stock' AND i.is_active=1 AND i.min_qty_milli>0 GROUP BY i.id "
+        "HAVING COALESCE(SUM(b.qty_milli),0)<=i.min_qty_milli ORDER BY i.code", (company_id,))]
+
+
+def item_card(conn, user_id, company_id, item_id, warehouse_id, date_from, date_to, *, limit=200, offset=0):
+    """كارت الصنف: حركات مع رصيد كمية وقيمة جارٍ من رصيد افتتاحي محسوب من الحركات السابقة."""
+    _req(conn, user_id, company_id, "inventory.view", warehouse_id)
+    _item(conn, item_id, company_id); _wh(conn, warehouse_id, company_id)
+    o = conn.execute("SELECT COALESCE(SUM(CASE direction WHEN 'in' THEN qty_milli ELSE -qty_milli END),0),"
+                     "COALESCE(SUM(CASE direction WHEN 'in' THEN value_base ELSE -value_base END),0) FROM stock_movements "
+                     "WHERE item_id=? AND warehouse_id=? AND movement_date<?", (item_id, warehouse_id, date_from)).fetchone()
+    rows = conn.execute(
+        "SELECT * FROM (SELECT m.id,m.movement_date,m.movement_type,m.direction,m.qty_milli,m.value_base,m.ref_movement_id,"
+        "m.journal_entry_id,m.source_type,m.source_id,m.note,m.created_by,"
+        ":oq+SUM(CASE m.direction WHEN 'in' THEN m.qty_milli ELSE -m.qty_milli END) OVER (ORDER BY m.movement_date,m.id) run_qty,"
+        ":ov+SUM(CASE m.direction WHEN 'in' THEN m.value_base ELSE -m.value_base END) OVER (ORDER BY m.movement_date,m.id) run_value "
+        "FROM stock_movements m WHERE m.item_id=:i AND m.warehouse_id=:w AND m.movement_date BETWEEN :f AND :t) "
+        "ORDER BY movement_date,id LIMIT :lim OFFSET :off",
+        {"oq": o[0], "ov": o[1], "i": item_id, "w": warehouse_id, "f": date_from, "t": date_to, "lim": min(int(limit), 1000), "off": int(offset)}).fetchall()
+    cnt = conn.execute("SELECT COUNT(*) FROM stock_movements WHERE item_id=? AND warehouse_id=? AND movement_date BETWEEN ? AND ?",
+                       (item_id, warehouse_id, date_from, date_to)).fetchone()[0]
+    return {"opening_qty_milli": o[0], "opening_value": o[1], "count": cnt, "rows": [dict(r) for r in rows]}
+
+
+def opening_stock_lines(conn, user_id, company_id):
+    """مجموع قيمة الأرصدة الافتتاحية غير المرتبطة بقيد، لكل حساب مخزون، كسطور مدينة تُضمَّن في قيد الافتتاح اليدوي (السنة الأولى)."""
+    _req(conn, user_id, company_id, "inventory.adjust")
+    agg = {}
+    for r in conn.execute("SELECT item_id,value_base FROM stock_movements WHERE company_id=? AND movement_type='opening' AND journal_entry_id IS NULL",
+                          (company_id,)):
+        acc = item_accounts(conn, r["item_id"])["inventory"]
+        if not acc:
+            raise AccountingError("حساب المخزون غير مربوط")
+        agg[acc] = agg.get(acc, 0) + r["value_base"]
+    return [{"account_id": a, "debit": _units(v), "credit": 0} for a, v in sorted(agg.items()) if v]
+
+
+def post_opening_stock(conn, actor_id, company_id, as_of, rows, *, note="", counter_account_id=None):
+    """counter_account_id: الحساب الدائن المقابل (يُختار من الشاشة؛ وإلا يُستخدم opening_suspense إن كان مربوطًا).
+    يسجّل أرصدة أول المدة لعدة أصناف دفعة واحدة، وكل سطر: {item_id, warehouse_id, qty, unit_cost [, unit_id]}.
+    لكل سطر حركة «opening» (الكمية × تكلفة الوحدة)، ثم قيد يومية مسودة واحد: مدين حساب المخزون لكل صنف /
+    دائن «الأرصدة الافتتاحية المعلّقة» (opening_suspense)، وتُربط الحركات بالقيد. الكل في معاملة واحدة (إما الكل أو لا شيء).
+    الترحيل النهائي للقيد من شاشة القيود كأي قيد آخر. يرجع {entry_id, count, total_value}."""
+    from alhisabat.business import chart_of_accounts as coa
+    _req(conn, actor_id, company_id, "inventory.adjust")
+    permissions.require(conn, actor_id, company_id, "opening.manage", check_branch=False)
+    if not rows:
+        raise AccountingError("لا توجد أصناف لتسجيل رصيدها الافتتاحي")
+    if counter_account_id:
+        a = conn.execute("SELECT company_id,is_group,is_active FROM accounts WHERE id=?", (int(counter_account_id),)).fetchone()
+        if not a or a[0] != company_id or a[1] or not a[2]:
+            raise AccountingError("الحساب المقابل غير صالح (يجب أن يكون حسابًا فرعيًا نشطًا)")
+        suspense = int(counter_account_id)
+    else:
+        try:
+            suspense = coa.get_mapping(conn, company_id, "opening_suspense")
+        except AccountingError:
+            raise AccountingError("اختر الحساب المقابل لرصيد المخزون (مثل: رأس المال أو الأرصدة الافتتاحية المعلّقة)")
+    groups = {}
+    for i, r in enumerate(rows, 1):
+        key = (int(r["item_id"]), int(r["warehouse_id"]))
+        if key in groups and not _item(conn, key[0], company_id)["track_expiry"]:
+            raise AccountingError(f"السطر {i}: الصنف مكرر لنفس المستودع (التكرار مسموح فقط للصنف المتتبَّع الصلاحية بدفعات مختلفة)")
+        groups.setdefault(key, []).append(r)
+        try:
+            q, c = Decimal(str(r["qty"])), Decimal(str(r.get("unit_cost", 0)))
+        except Exception:
+            raise AccountingError(f"السطر {i}: كمية أو تكلفة غير صالحة")
+        if q <= 0:
+            raise AccountingError(f"السطر {i}: الكمية يجب أن تكون أكبر من صفر")
+        if c < 0:
+            raise AccountingError(f"السطر {i}: التكلفة لا تقبل قيمة سالبة")
+    base = conn.execute("SELECT base_currency FROM companies WHERE id=?", (company_id,)).fetchone()[0]
+    with transaction(conn):
+        ids, per_acc = [], {}
+        for grp in groups.values():
+            r = grp[0]
+            acc = item_accounts(conn, int(r["item_id"]))["inventory"]
+            if not acc:
+                raise AccountingError(f"حساب المخزون غير مربوط للصنف «{_item(conn, int(r['item_id']), company_id)['name']}»")
+            uid = int(r["unit_id"]) if r.get("unit_id") else None
+            if len(grp) == 1:
+                cost_kw = ({"total_cost": Decimal(str(r["total_cost"]))} if r.get("total_cost") not in (None, "")
+                           else {"unit_cost": Decimal(str(r.get("unit_cost", 0)))})
+                split_kw = {"expiry_date": r.get("expiry_date"), "lot_no": r.get("lot_no") or ""}
+            else:                                              # عدة دفعات لنفس الصنف/المستودع: حركة افتتاح واحدة وقيمتها مجموع السطور
+                def _val(x):
+                    return (je._minor(Decimal(str(x["total_cost"]))) if x.get("total_cost") not in (None, "")
+                            else je._minor(Decimal(str(x.get("unit_cost", 0))) * Decimal(str(x["qty"]))))
+                cost_kw = {"_value": sum(_val(x) for x in grp)}
+                split_kw = {"lots": [(Decimal(str(x["qty"])), x.get("expiry_date"), x.get("lot_no") or "") for x in grp]}
+            mv = record_movement(conn, actor_id, company_id, int(r["item_id"]), int(r["warehouse_id"]), as_of, "opening",
+                                 sum(Decimal(str(x["qty"])) for x in grp), unit_id=uid, source_type="stock_opening",
+                                 note=note or "رصيد افتتاحي", **cost_kw, **split_kw)
+            ids.append(mv["movement_id"])
+            per_acc[acc] = per_acc.get(acc, 0) + mv["value_base"]
+        total = sum(per_acc.values())
+        entry_id = None
+        if total > 0:
+            lines = [{"account_id": a, "debit": _units(v), "credit": 0, "currency": base} for a, v in sorted(per_acc.items()) if v]
+            lines.append({"account_id": suspense, "debit": 0, "credit": _units(total), "currency": base})
+            entry_id = je.create_draft(conn, company_id, actor_id, as_of, lines, note or "أرصدة أول المدة للمخزون",
+                                       entry_type="adjustment", source_type="stock_opening", source_id=ids[0])
+            link_movements(conn, actor_id, company_id, entry_id, ids)
+        audit.log(conn, actor_id, "post_opening_stock", "stock_movements", ids[0], after={"count": len(ids), "total": total, "entry": entry_id})
+    return {"entry_id": entry_id, "count": len(ids), "total_value": _units(total)}
+
+
+def link_opening_movements(conn, actor_id, company_id, entry_id):
+    """بعد ترحيل قيد الافتتاح: يربط حركات الافتتاح به بعد التحقق أن مجموع كل حساب مخزون فيه = قيمة حركات الافتتاح."""
+    _req(conn, actor_id, company_id, "inventory.adjust")
+    e = conn.execute("SELECT company_id,entry_type FROM journal_entries WHERE id=?", (entry_id,)).fetchone()
+    if not e or e[0] != company_id or e[1] != "opening":
+        raise AccountingError("ليس قيد افتتاح في هذه الشركة")
+    want = {l["account_id"]: int(l["debit"] * 100) for l in opening_stock_lines(conn, actor_id, company_id)}
+    got = {r[0]: r[1] for r in conn.execute("SELECT account_id,SUM(debit_base-credit_base) FROM journal_lines WHERE entry_id=? GROUP BY account_id", (entry_id,))}
+    for acc, v in want.items():
+        if got.get(acc, 0) < v:
+            raise AccountingError("قيد الافتتاح لا يتضمن كامل قيمة المخزون الافتتاحي لأحد حسابات المخزون")
+    ids = [r[0] for r in conn.execute("SELECT id FROM stock_movements WHERE company_id=? AND movement_type='opening' AND journal_entry_id IS NULL", (company_id,))]
+    link_movements(conn, actor_id, company_id, entry_id, ids)
+    return len(ids)
+
+
+# ---------------- الجرد ----------------
+def create_count(conn, actor_id, company_id, warehouse_id, count_date, *, is_full=False, note=""):
+    _req(conn, actor_id, company_id, "inventory.count", warehouse_id)
+    _wh(conn, warehouse_id, company_id)
+    with transaction(conn):
+        cid = conn.execute("INSERT INTO stock_counts(company_id,warehouse_id,count_date,is_full,note,created_by) VALUES(?,?,?,?,?,?)",
+                           (company_id, warehouse_id, count_date, int(is_full), note, actor_id)).lastrowid
+        audit.log(conn, actor_id, "create_count", "stock_counts", cid, after={"warehouse": warehouse_id, "date": count_date})
+    return cid
+
+
+def _count(conn, count_id):
+    c = conn.execute("SELECT * FROM stock_counts WHERE id=?", (count_id,)).fetchone()
+    if not c:
+        raise AccountingError("الجرد غير موجود")
+    return c
+
+
+def set_count_line(conn, actor_id, count_id, item_id, counted_qty, *, unit_id=None, unit_cost=None):
+    c = _count(conn, count_id)
+    _req(conn, actor_id, c["company_id"], "inventory.count", c["warehouse_id"])
+    it = _item(conn, item_id, c["company_id"])
+    if it["item_type"] != "stock":
+        raise AccountingError("الصنف الخدمي لا يُجرد")
+    if c["status"] != "draft":
+        raise AccountingError("الجرد ليس مسودة")
+    q = Decimal(str(counted_qty))
+    if q < 0:
+        raise AccountingError("الكمية المعدودة لا تقبل قيمة سالبة")
+    f = conn.execute("SELECT factor_milli FROM item_units WHERE item_id=? AND unit_id=?", (item_id, unit_id or it["base_unit_id"])).fetchone()
+    if not f:
+        raise AccountingError("الوحدة غير معرّفة لهذا الصنف")
+    m = _round(q * f[0])
+    uc = None if unit_cost is None else je._minor(unit_cost)
+    with transaction(conn):
+        conn.execute("DELETE FROM stock_count_lines WHERE count_id=? AND item_id=?", (count_id, item_id))
+        conn.execute("INSERT INTO stock_count_lines(count_id,item_id,counted_qty_milli,unit_cost_minor) VALUES(?,?,?,?)", (count_id, item_id, m, uc))
+
+
+def cancel_count(conn, actor_id, count_id, reason=""):
+    c = _count(conn, count_id)
+    _req(conn, actor_id, c["company_id"], "inventory.count", c["warehouse_id"])
+    if c["status"] != "draft":
+        raise AccountingError("الجرد ليس مسودة")
+    with transaction(conn):
+        conn.execute("UPDATE stock_counts SET status='cancelled' WHERE id=?", (count_id,))
+        audit.log(conn, actor_id, "cancel_count", "stock_counts", count_id, reason=reason or None)
+
+
+def post_count(conn, actor_id, count_id):
+    """يرحّل الجرد: فروقات (معدود - رصيد النظام) تصير حركات تسوية بتاريخ الجرد وقيدا آليا واحدا. يُرفض إن وُجدت حركات بعد تاريخ الجرد."""
+    c = _count(conn, count_id)
+    cid, wh, d = c["company_id"], c["warehouse_id"], c["count_date"]
+    _req(conn, actor_id, cid, "inventory.count", wh)
+    permissions.require(conn, actor_id, cid, "journal.create", check_branch=False)
+    permissions.require(conn, actor_id, cid, "journal.post", check_branch=False)
+    if c["status"] != "draft":
+        raise AccountingError("الجرد ليس مسودة")
+    lines = conn.execute("SELECT * FROM stock_count_lines WHERE count_id=? ORDER BY item_id", (count_id,)).fetchall()
+    if not lines:
+        raise AccountingError("لا توجد بنود جرد")
+    if c["is_full"]:
+        listed = {l["item_id"] for l in lines}
+        missing = [r["code"] for r in conn.execute(
+            "SELECT i.code,i.id FROM stock_balances b JOIN items i ON i.id=b.item_id WHERE b.warehouse_id=? AND b.qty_milli>0", (wh,))
+            if r["id"] not in listed]
+        if missing:
+            raise AccountingError("جرد شامل: أصناف بلا جرد: " + "، ".join(missing))
+    adj = _mapping(conn, cid, "inventory_adjustment")
+    with transaction(conn):
+        entry_lines, movs = {}, []
+        for l in lines:
+            if conn.execute("SELECT 1 FROM stock_movements WHERE item_id=? AND warehouse_id=? AND movement_date>?", (l["item_id"], wh, d)).fetchone():
+                raise AccountingError("توجد حركات بعد تاريخ الجرد لأحد الأصناف: أعد الجرد بتاريخ حديث")
+            qb, _vb = _balance(conn, l["item_id"], wh)
+            diff = l["counted_qty_milli"] - qb
+            acc = item_accounts(conn, l["item_id"])["inventory"]
+            if diff == 0:
+                conn.execute("UPDATE stock_count_lines SET system_qty_milli=?,diff_qty_milli=0,diff_value_base=0 WHERE count_id=? AND item_id=?", (qb, count_id, l["item_id"]))
+                continue
+            if not acc or not adj:
+                raise AccountingError("اربط حساب المخزون وحساب تسويات المخزون (Account Mapping) أولا")
+            if diff > 0:
+                if qb > 0:
+                    cost = _round(Decimal(_balance(conn, l["item_id"], wh)[1]) * diff / qb)
+                elif l["unit_cost_minor"] is not None:
+                    cost = _round(Decimal(l["unit_cost_minor"]) * diff / 1000)
+                else:
+                    avg = _avg_cost_anywhere(conn, l["item_id"])
+                    if avg is None:
+                        raise AccountingError(f"الصنف {_item(conn, l['item_id'])['code']}: زيادة بلا رصيد سابق تتطلب تكلفة وحدة في بند الجرد")
+                    cost = _round(avg * diff / 1000)
+                mv = record_movement(conn, actor_id, cid, l["item_id"], wh, d, "adjustment_in", Decimal(diff) / 1000, _value=cost,
+                                     source_type="stock_count", source_id=count_id, note="جرد", _perm="inventory.count")
+            else:
+                mv = record_movement(conn, actor_id, cid, l["item_id"], wh, d, "adjustment_out", Decimal(-diff) / 1000,
+                                     source_type="stock_count", source_id=count_id, note="جرد", _perm="inventory.count")
+            sv = mv["value_base"] * (1 if diff > 0 else -1)
+            conn.execute("UPDATE stock_count_lines SET system_qty_milli=?,diff_qty_milli=?,diff_value_base=? WHERE count_id=? AND item_id=?",
+                         (qb, diff, sv, count_id, l["item_id"]))
+            movs.append(mv["movement_id"])
+            entry_lines[acc] = entry_lines.get(acc, 0) + sv
+        eid = None
+        net = sum(entry_lines.values())
+        if any(entry_lines.values()):
+            jl = []
+            for acc, v in entry_lines.items():
+                if v:
+                    jl.append({"account_id": acc, "debit": _units(v) if v > 0 else 0, "credit": _units(-v) if v < 0 else 0})
+            if net:
+                jl.append({"account_id": adj, "debit": _units(-net) if net < 0 else 0, "credit": _units(net) if net > 0 else 0})
+            eid = je.create_draft(conn, cid, actor_id, d, jl, f"تسوية جرد رقم {count_id}", entry_type="auto",
+                                  source_type="stock_count", source_id=count_id)
+            je.post(conn, eid, actor_id)
+            for m in movs:
+                conn.execute("UPDATE stock_movements SET journal_entry_id=? WHERE id=?", (eid, m))
+        conn.execute("UPDATE stock_counts SET status='posted',posted_by=?,posted_at=CURRENT_TIMESTAMP,journal_entry_id=? WHERE id=?", (actor_id, eid, count_id))
+        audit.log(conn, actor_id, "post_count", "stock_counts", count_id, after={"entry": eid, "movements": len(movs)})
+    return {"count_id": count_id, "entry_id": eid, "movements": movs}

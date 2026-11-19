@@ -1,0 +1,105 @@
+import sqlite3
+import shutil
+from datetime import datetime
+from pathlib import Path
+
+def _migrations_dir():
+    import sys
+    try:                                    # ترحيلات جديدة وصلت بتحديث تدريجي (مجلد كامل مكتمل بما في exe)
+        import update_bootstrap as ub
+        d = ub.current_dir() / "migrations"
+        if ub.read_state() and d.is_dir() and any(d.glob("*.sql")):
+            return d
+    except Exception:
+        pass
+    base = getattr(sys, "_MEIPASS", None)  # داخل exe المبني بـ PyInstaller
+    return (Path(base) if base else Path(__file__).resolve().parents[2]) / "migrations"
+
+
+MIGRATIONS_DIR = _migrations_dir()
+
+
+def connect(path=":memory:"):
+    conn = sqlite3.connect(path, isolation_level=None)  # transactions are explicit
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+_TOLERATED = ("already exists", "duplicate column name", "unique constraint failed")
+
+
+def _is_already_applied_error(exc):
+    return any(t in str(exc).lower() for t in _TOLERATED)
+
+
+def _split_statements(sql):
+    """يقسّم سكربت SQL إلى جمل كاملة (يراعي التريجرات عبر sqlite3.complete_statement)."""
+    buf, out = "", []
+    for line in sql.splitlines(keepends=True):
+        buf += line
+        if sqlite3.complete_statement(buf):
+            if buf.strip():
+                out.append(buf)
+            buf = ""
+    if buf.strip():
+        out.append(buf)
+    return out
+
+
+def _apply_tolerant(conn, path):
+    """يطبّق الترحيل جملة جملة ويتجاوز ما هو موجود مسبقاً (جدول/فهرس/عمود/بيانات أولية)،
+    ثم يسجّله في schema_migrations. يرفع أي خطأ آخر ويتراجع كاملاً."""
+    conn.execute("BEGIN")
+    try:
+        for stmt in _split_statements(path.read_text(encoding="utf-8")):
+            head = stmt.strip().upper()
+            if head.startswith(("BEGIN", "COMMIT", "END")):
+                continue
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError as e:
+                if not any(t in str(e).lower() for t in _TOLERATED[:2]):
+                    raise
+            except sqlite3.IntegrityError as e:
+                if _TOLERATED[2] not in str(e).lower():
+                    raise
+        conn.execute("INSERT INTO schema_migrations(version) VALUES(?)", (path.stem,))
+        conn.execute("COMMIT")
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+
+
+def migrate(conn, migrations_dir=MIGRATIONS_DIR, db_path=None, auto_backup=False):
+    """يطبّق الترحيلات المعلَّقة. إن auto_backup=True ومُرِّر db_path حقيقي (ليس ':memory:') ووُجدت ترحيلات معلَّقة،
+    يأخذ نسخة ملف احتياطية من القاعدة قبل التطبيق (§75: نسخة تلقائية قبل الترقية) في ملف مجاور بلاحقة
+    .pre_migrate_<الطابع الزمني>.bak، ويرجع مسارها ضمن النتيجة."""
+    conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations("
+                 "version TEXT PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+    done = {r[0] for r in conn.execute("SELECT version FROM schema_migrations")}
+    pending = [f for f in sorted(Path(migrations_dir).glob("*.sql")) if f.stem not in done]
+    backup_path = None
+    if auto_backup and pending and db_path and str(db_path) != ":memory:" and Path(db_path).exists():
+        backup_path = f"{db_path}.pre_migrate_{datetime.now():%Y%m%d%H%M%S}.bak"
+        conn.execute("COMMIT") if conn.in_transaction else None
+        shutil.copy2(db_path, backup_path)
+    applied = []
+    for f in pending:
+        try:
+            conn.executescript("BEGIN;\n" + f.read_text(encoding="utf-8") +
+                               f"\nINSERT INTO schema_migrations(version) VALUES('{f.stem}');\nCOMMIT;")
+        except (sqlite3.OperationalError, sqlite3.IntegrityError) as e:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            # قاعدة بيانات قديمة/ناقصة السجل: الكائنات موجودة فعلاً لكن الترحيل غير مسجَّل → إصلاح ذاتي
+            if not _is_already_applied_error(e):
+                raise
+            _apply_tolerant(conn, f)
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        applied.append(f.stem)
+    return {"applied": applied, "backup_path": backup_path} if auto_backup else applied

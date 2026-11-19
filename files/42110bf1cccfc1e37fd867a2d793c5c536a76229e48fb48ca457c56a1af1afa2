@@ -1,0 +1,335 @@
+"""صفحة أعمار الديون: أعمار ديون العملاء والموردين بشرائح زمنية مع تفاصيل الفواتير المستحقة."""
+import os
+
+from PySide6.QtCore import Qt, QDate
+from PySide6.QtWidgets import (
+    QComboBox, QDateEdit, QFileDialog, QHBoxLayout,
+    QLabel, QMessageBox, QPushButton, QSplitter, QVBoxLayout, QWidget
+)
+
+from alhisabat.ui.components.datagrid import DataGrid
+from alhisabat.ui.components.grid_logic import Column
+from alhisabat.ui.core.actions import Action, ActionGroup
+from alhisabat.ui.core.base_page import BasePage
+from alhisabat.ui.core.permissions import ActionState
+from alhisabat.ui.core.reports_service import ReportsService
+
+
+class AgingPage(BasePage):
+    """صفحة أعمار الديون: أعمار ديون العملاء والموردين بشرائح زمنية مع تفاصيل الفواتير المستحقة."""
+    key = 'aging'
+    title = 'أعمار الديون'
+    icon = 'calendar'
+    required_permission = 'report.view'
+
+    def build(self):
+        self._built = True
+        self.svc = ReportsService(self.session)
+        self.spec = None
+        self._sel = None
+        self._docs = []
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(6, 6, 6, 6)
+
+        # شريط الترشيح
+        bar = QHBoxLayout()
+        bar.addWidget(QLabel("نوع الأطراف:"))
+        self.kind_combo = QComboBox()
+        self.kind_combo.addItem("العملاء (ذمم مدينة)", "customer")
+        self.kind_combo.addItem("الموردون (ذمم دائنة)", "supplier")
+        self.kind_combo.currentIndexChanged.connect(self.run)
+        bar.addWidget(self.kind_combo)
+
+        bar.addWidget(QLabel("العملة:"))
+        self.cur_combo = QComboBox()
+        self.cur_combo.addItem("كل العملات", None)           # كل عملة في سطر وإجمالي مستقل؛ لا يُجمع يمني مع سعودي
+        self.cur_combo.currentIndexChanged.connect(self.run)
+        bar.addWidget(self.cur_combo)
+
+        bar.addWidget(QLabel("الرصيد:"))
+        self.side_combo = QComboBox()
+        for lab, v in (("دائن ومدين (الكل)", "all"), ("مدينون فقط", "debit"), ("دائنون فقط", "credit")):
+            self.side_combo.addItem(lab, v)
+        self.side_combo.currentIndexChanged.connect(self.run)
+        bar.addWidget(self.side_combo)
+
+        bar.addWidget(QLabel("حتى تاريخ:"))
+        self.as_of = QDateEdit(QDate.currentDate())
+        self.as_of.setCalendarPopup(True)
+        self.as_of.setDisplayFormat('yyyy-MM-dd')
+        self.as_of.dateChanged.connect(self.run)
+        bar.addWidget(self.as_of)
+
+        btn_go = QPushButton("تحديث الأعمار")
+        btn_go.setProperty('primary', True)
+        btn_go.clicked.connect(self.run)
+        bar.addWidget(btn_go)
+        self.btn_print = QPushButton("طباعة")
+        self.btn_print.clicked.connect(self._print)
+        bar.addWidget(self.btn_print)
+        self.btn_pdf = QPushButton("PDF")
+        self.btn_pdf.clicked.connect(self._save_pdf)
+        bar.addWidget(self.btn_pdf)
+        self.btn_wa = QPushButton("تذكير واتساب")
+        self.btn_wa.clicked.connect(self._remind_whatsapp)
+        bar.addWidget(self.btn_wa)
+        bar.addStretch(1)
+        lay.addLayout(bar)
+
+        # تقسيم رأسي: جدول الأعمار في الأعلى، وتفاصيل الفواتير المستحقة للطرف المحدد في الأسفل
+        split = QSplitter(Qt.Vertical)
+
+        # الجدول العلوي: أطراف وأعمار
+        top_box = QWidget()
+        tl = QVBoxLayout(top_box)
+        tl.setContentsMargins(0, 0, 0, 0)
+        self.lbl_aging_title = QLabel("أعمار الديون حسب الشريحة الزمنية:")
+        self.lbl_aging_title.setStyleSheet("font-weight: bold;")
+        tl.addWidget(self.lbl_aging_title)
+
+        cols = [
+            Column('code', 'الرقم', width=80),
+            Column('name', 'الاسم', width=180),
+            Column('currency', 'العملة', width=70),
+            Column('b0', 'غير مستحق', 'money', 110, minor=True),        # تطابق شرائح المحرك: غير مستحق | 1-30 | 31-60 | 61-90 | أكثر من 90
+            Column('b1', '1-30 يوم', 'money', 110, minor=True),
+            Column('b2', '31-60 يوم', 'money', 110, minor=True),
+            Column('b3', '61-90 يوم', 'money', 110, minor=True),
+            Column('b4', 'أكثر من 90 يوم', 'money', 110, minor=True),
+            Column('on_account', 'على الحساب', 'money', 100, minor=True),
+            Column('balance', 'إجمالي الرصيد', 'money', 120, minor=True),
+        ]
+        self.grid = DataGrid(cols, grid_id='aging_summary_grid')
+        self.grid.selectionChangedRows.connect(self._on_party_select)
+        tl.addWidget(self.grid, 1)
+        split.addWidget(top_box)
+
+        # الجزء السفلي: تفاصيل المستندات المستحقة للطرف المحدد (Drill-down)
+        bot_box = QWidget()
+        bl = QVBoxLayout(bot_box)
+        bl.setContentsMargins(0, 0, 0, 0)
+        self.lbl_detail_title = QLabel("تفاصيل فواتير الطرف المحدد:")
+        self.lbl_detail_title.setStyleSheet("font-weight: bold;")
+        bl.addWidget(self.lbl_detail_title)
+
+        doc_cols = [
+            Column('invoice_no', 'رقم الفاتورة', width=110),
+            Column('invoice_date', 'تاريخ الفاتورة', 'date', 95),
+            Column('due_date', 'تاريخ الاستحقاق', 'date', 95),
+            Column('days_overdue', 'أيام التأخير', 'int', 90),
+            Column('total_minor', 'قيمة الفاتورة', 'money', 110, minor=True),
+            Column('paid_minor', 'المدفوع', 'money', 110, minor=True),
+            Column('due_minor', 'المتبقي المستحق', 'money', 110, minor=True),
+        ]
+        self.doc_grid = DataGrid(doc_cols, grid_id='aging_docs_grid')
+        self.doc_grid.rowActivated.connect(self._open_invoice)
+        bl.addWidget(self.doc_grid, 1)
+
+        doc_bar = QHBoxLayout()
+        self.btn_open_inv = QPushButton("عرض الفاتورة")
+        self.btn_open_inv.setEnabled(False)
+        self.btn_open_inv.clicked.connect(self._open_selected_invoice)
+        doc_bar.addWidget(self.btn_open_inv)
+        doc_bar.addStretch(1)
+        bl.addLayout(doc_bar)
+
+        split.addWidget(bot_box)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        lay.addWidget(split, 1)
+
+        self.run()
+
+    def refresh(self):
+        if getattr(self, '_built', False):
+            self.run()
+
+    def run(self):
+        kind = self.kind_combo.currentData()
+        as_of_str = self.as_of.date().toPython().isoformat()
+        cur = self.cur_combo.currentData()
+        if self.cur_combo.count() <= 1:                      # تعبئة العملات مرة واحدة (الأساسية + المفعّلة)
+            try:
+                self.cur_combo.blockSignals(True)
+                for code, lab in [(self.svc.base_currency(), 'الأساسية')] + [(c, l) for c, l in self.svc.lookup_currencies()]:
+                    self.cur_combo.addItem(code if lab == 'الأساسية' else lab, code)
+            except Exception:  # noqa: BLE001 — الترشيح مساعد؛ يبقى «كل العملات»
+                pass
+            finally:
+                self.cur_combo.blockSignals(False)
+        try:
+            raw = self.svc.aging_documents(kind, as_of_str)
+            self.spec = self.svc.report_spec('أعمار ديون العملاء' if kind == 'customer' else 'أعمار ديون الموردين',
+                                             as_of_str, as_of_str, currency=cur, balance_side=self.side_combo.currentData())
+        except Exception as exc:
+            return self.show_error(exc)
+
+        self._raw_data = raw
+        rows = []
+        for r in raw.get('rows', []):
+            if cur and r.get('currency') != cur:
+                continue
+            side = self.side_combo.currentData()
+            if side != 'all':                                  # الرصيد بالاتجاه الطبيعي: مدين للعميل ودائن للمورد
+                net = (r.get('balance') or 0) * (1 if kind == 'customer' else -1)
+                if (side == 'debit' and net <= 0) or (side == 'credit' and net >= 0):
+                    continue
+            item = {
+                'party_id': r.get('party_id'),
+                'code': r.get('code'),
+                'name': r.get('name'),
+                'currency': r.get('currency'),
+                'on_account': r.get('on_account'),
+                'balance': r.get('balance'),
+                'docs': r.get('docs', []),
+            }
+            for i, bval in enumerate(r.get('buckets', [])):
+                item[f'b{i}'] = bval
+            rows.append(item)
+        self.grid.set_rows(rows)
+        self.actions_changed.emit()
+
+    def _on_party_select(self, rows):
+        self._sel = rows[0] if len(rows) == 1 else None
+        if not self._sel:
+            self.lbl_detail_title.setText("تفاصيل فواتير الطرف المحدد:")
+            self.doc_grid.set_rows([])
+            self.btn_open_inv.setEnabled(False)
+            return
+
+        name = self._sel.get('name', '')
+        self.lbl_detail_title.setText(f"فواتير الطرف المستحقة: {name}")
+        docs = self._sel.get('docs', [])
+        self._docs = docs
+        self.doc_grid.set_rows(docs)
+        self.btn_open_inv.setEnabled(bool(docs))
+
+    def _open_selected_invoice(self):
+        sel_docs = self.doc_grid.table.selectionModel().selectedRows() if hasattr(self.doc_grid, 'table') else []
+        if sel_docs:
+            row_idx = self.doc_grid.model.row_index(sel_docs[0].row())
+            if row_idx is not None:
+                doc = self._docs[row_idx]
+                self._open_invoice(doc)
+
+    def _open_invoice(self, doc):
+        if not doc or not doc.get('invoice_id'):
+            return
+        kind = self.kind_combo.currentData()
+        target_page = 'sales' if kind == 'customer' else 'purchases'
+        self.open_page_requested.emit(target_page, {'id': doc['invoice_id']})
+
+    def ribbon_groups(self):
+        has_spec = bool(self.spec)
+        return [
+            ActionGroup('تصدير', [
+                Action('xlsx', 'Excel', 'export', state_fn=lambda: ActionState(has_spec, 'اعرض التقرير أولًا'),
+                       handler=lambda: self._export('xlsx')),
+                Action('csv', 'CSV', 'export', state_fn=lambda: ActionState(has_spec, 'اعرض التقرير أولًا'),
+                       handler=lambda: self._export('csv')),
+                Action('html', 'HTML', 'export', state_fn=lambda: ActionState(has_spec, 'اعرض التقرير أولًا'),
+                       handler=lambda: self._export('html')),
+            ]),
+            ActionGroup('طباعة', [
+                Action('print', 'طباعة', 'print', state_fn=lambda: ActionState(has_spec, 'اعرض التقرير أولًا'),
+                       handler=self._print),
+                Action('pdf', 'PDF', 'export', state_fn=lambda: ActionState(has_spec, 'اعرض التقرير أولًا'),
+                       handler=self._save_pdf),
+            ]),
+            ActionGroup('عرض', [
+                Action('refresh', 'تحديث', 'refresh', handler=self.run),
+                Action('wa_remind', 'تذكير واتساب', 'mail',
+                       state_fn=lambda: ActionState(bool(self._sel), 'حدد طرفًا أولًا') if self.access.has('message.send') else ActionState(False, 'تتطلب صلاحية «إرسال رسائل واتساب»'),
+                       handler=self._remind_whatsapp),
+            ]),
+        ]
+
+    def _remind_whatsapp(self):
+        if not self.access.has('message.send'):
+            return QMessageBox.information(self, self.title, 'تتطلب صلاحية «إرسال رسائل واتساب»')
+        selected_rows = [self._sel] if self._sel else []
+        if not selected_rows:
+            return QMessageBox.information(self, self.title, 'حدد طرفًا أولًا.')
+        from alhisabat.ui.core import format as fmt
+        from alhisabat.ui.components.whatsapp_preview import WhatsAppPreviewDialog
+        for r in selected_rows:
+            party_id = r.get('party_id')
+            name = r.get('name', '')
+            phone = ''
+            if party_id:
+                try:
+                    p = self.session.party(party_id)
+                    if p:
+                        phone = (p.get('phone') or '').strip()
+                        name = (p.get('name') or name).strip()
+                except Exception:
+                    pass
+            bal = r.get('balance', 0)
+            cur = r.get('currency', '')
+            bal_str = fmt.fmt_money(bal, minor=True)
+            msg_text = f"مرحبًا {name}، نود تذكيركم بمبلغ مستحق قدره {bal_str} {cur}، يُرجى التكرم بالسداد في أقرب وقت. شاكرين تعاونكم."
+            dlg = WhatsAppPreviewDialog(
+                self,
+                db_path=self.session.db_path,
+                phone=phone,
+                party_name=name,
+                message_text=msg_text,
+                party_id=party_id,
+                ref_type='debt_reminder',
+                ref_id=party_id,
+                branch_id=getattr(self.session, 'branch_id', None),
+                user_id=getattr(self.session, 'user_id', None),
+            )
+            self.exec_form(dlg)
+
+    def _document(self):
+        """مستند الطباعة من مواصفة التقرير الحالية (نفس ما يُصدَّر إلى Excel/CSV): أعمار العملاء/الموردين بالعملة والتاريخ المختارين."""
+        if not self.spec:
+            QMessageBox.information(self, self.title, 'اعرض التقرير أولًا')
+            return None, None
+        from alhisabat.ui.components import document_model as DM
+        paper = 'A4'
+        try:
+            paper = self.window_.prefs.get('paper') or 'A4'
+            if paper == 'RECEIPT80':               # جدول عريض (10 أعمدة): لا يصلح لورق الإيصال
+                paper = 'A4'
+        except Exception:  # noqa: BLE001
+            pass
+        return DM.from_print_spec(self.spec, 'report'), paper
+
+    def _print(self):
+        doc, paper = self._document()
+        if doc is None:
+            return
+        try:
+            from alhisabat.ui.components import print_service as PS
+            PS.print_dialog(self, doc, paper)
+        except Exception as e:  # noqa: BLE001
+            self.show_error(e)
+
+    def _save_pdf(self):
+        doc, paper = self._document()
+        if doc is None:
+            return
+        kind = self.kind_combo.currentData()
+        name = f"أعمار_ديون_{'العملاء' if kind == 'customer' else 'الموردين'}_{self.as_of.date().toString('yyyy-MM-dd')}.pdf"
+        from alhisabat.ui.components.pdf_preview import show_pdf_preview
+        path = show_pdf_preview(self, doc, paper, default_name=name)
+        if path:
+            self.notify(f'تم حفظ PDF: {os.path.basename(path)}')
+
+    def _export(self, fmt_code):
+        if not self.spec:
+            return
+        kind = self.kind_combo.currentData()
+        title = f"أعمار_ديون_{'العملاء' if kind == 'customer' else 'الموردين'}"
+        path, _ = QFileDialog.getSaveFileName(self, 'تصدير أعمار الديون', f"{title}.{fmt_code}", f"*.{fmt_code}")
+        if path:
+            if not path.lower().endswith('.' + fmt_code):
+                path += '.' + fmt_code
+            try:
+                self.svc.export_report(self.spec, fmt_code, path)
+                self.notify(f'تم التصدير: {os.path.basename(path)}')
+            except Exception as e:
+                self.show_error(e)

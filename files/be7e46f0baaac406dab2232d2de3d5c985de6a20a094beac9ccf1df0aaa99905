@@ -1,0 +1,47 @@
+"""الواجهة المجرّدة لنواقل إرسال رسائل واتساب (MessageTransport).
+
+تسمح بتعدد وسائل النقل: WebTransport (أتمتة ويب)، DeepLinkTransport (يدوي مساعد)، FakeTransport (للاختبارات)،
+ومستقبلاً Cloud API دون أي تعديل في بقية أجزاء النظام.
+"""
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass(frozen=True)
+class SendResult:
+    success: bool
+    status: str                         # 'sent', 'handed', 'failed', 'blocked'
+    error_code: str = ""                # 'not_on_whatsapp', 'timeout', 'blocked_alert', 'selector_failure', etc.
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class ConnectionStatus:
+    state: str                          # 'disconnected', 'qr_ready', 'connected', 'error'
+    message: str = ""
+    qr_data: Optional[str] = None
+
+
+class MessageTransport:
+    """واجهة مجرّدة لناقل رسائل واتساب."""
+
+    def is_available(self) -> bool:
+        """هل الناقل متاح ومدعوم في بيئة التشغيل الحالية؟"""
+        return True
+
+    def check_connection(self) -> ConnectionStatus:
+        """فحص حالة الاتصال الحالية."""
+        raise NotImplementedError
+
+    def send_message(
+        self,
+        phone: str,
+        text: str,
+        attachment_path: Optional[str] = None,
+    ) -> SendResult:
+        """إرسال رسالة نصية أو مع مرفق."""
+        raise NotImplementedError
+
+    def close(self) -> None:
+        """إغلاق الموارد إن وجدت."""
+        pass

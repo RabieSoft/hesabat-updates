@@ -1,0 +1,1 @@
+"""التحديث التدريجي (تنزيل الملفات المتغيرة فقط). انظر update_bootstrap.py وclient.py وtools/publish_update.py."""

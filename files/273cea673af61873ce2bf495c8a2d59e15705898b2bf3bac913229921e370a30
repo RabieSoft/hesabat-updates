@@ -1,0 +1,109 @@
+"""جلسة التطبيق الموحّدة للواجهة الجديدة: تمتد `AppSession` الحالية (services.py) وتضيف سياقًا وإشعارات وعزل خيوط.
+
+المرحلة 3 ستقسّم services.py حسب المجال؛ إلى ذلك الحين هذه الطبقة هي الواجهة الوحيدة التي تتعامل معها الصفحات الجديدة،
+فلا تستورد الصفحات محرك المحاسبة ولا sqlite3 مباشرة. لا منطق محاسبي هنا.
+"""
+from datetime import date, datetime
+
+from alhisabat.accounting import journal_engine as je, period_engine
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.database.connection import connect
+from alhisabat.ui.services import AppSession
+
+from . import notifications, readmodel
+from .workflow import WorkflowSettings
+
+
+class CoreSession(AppSession):
+    # ------------------------------------------------------------ عزل الخيوط
+    def clone(self):
+        """نسخة بجلسة قاعدة بيانات مستقلة (لمهام الخلفية): اتصال SQLite لا يُشارَك بين الخيوط."""
+        obj = object.__new__(type(self))
+        obj.db_path = self.db_path
+        obj.conn = connect(self.db_path)
+        obj.user_id, obj.company_id, obj.branch_id = self.user_id, self.company_id, self.branch_id
+        return obj
+
+    # ------------------------------------------------------------ سياق
+    def workflow_settings(self):
+        return WorkflowSettings.from_row(je.get_settings(self.conn, self.company_id))
+
+    def fiscal_overview(self):
+        self.require('report.view')
+        return readmodel.fiscal_overview(self.conn, self.company_id)
+
+    def period_info(self, iso_date):
+        """بنية الفترة لتاريخ (pid,yid,ps,ys) أو None إن كان خارج السنوات المعرّفة (عبر محرك الفترات)."""
+        try:
+            r = period_engine.find_period(self.conn, self.company_id, iso_date)
+        except AccountingError:
+            return None
+        return {'pid': r['pid'], 'yid': r['yid'], 'ps': r['ps'], 'ys': r['ys']}
+
+    def load_context(self, state, today=None):
+        """يملأ AppState من الجلسة الحالية (الشركة/الفروع/السنة/الفترة/المستخدم)."""
+        comp = self.company()
+        branches = self.branches_for_user(self.user_id, self.company_id)
+        cur = next((b for b in branches if b['id'] == self.branch_id), branches[0] if branches else None)
+        if cur:
+            self.branch_id = cur['id']
+        try:                                  # تاريخ الجهاز بعد آخر سنة معرّفة: تُنشأ السنة اللازمة تلقائيًا (بصلاحية إنشاء السنوات فقط)
+            from datetime import date as _date
+            from alhisabat.accounting import period_engine
+            from alhisabat.system import year_archive
+            if self.can('fiscalyear.create') and not year_archive.archive_label():
+                period_engine.ensure_year_covering(self.conn, self.company_id, self.user_id, today or _date.today())
+        except Exception:  # noqa: BLE001 — لا يمنع فتح البرنامج
+            pass
+        year, period = readmodel.current_fiscal_context(self.conn, self.company_id, today)
+        state.update(company={'id': comp.get('id'), 'name': comp.get('name', ''), 'base_currency': comp.get('base_currency', '')},
+                     branches=branches, branch=cur, year=year, period=period,
+                     user={'id': self.user_id, 'name': self.username()})
+        return state
+
+    def switch_branch(self, state, branch_id):
+        allowed = {b['id']: b for b in self.branches_for_user(self.user_id, self.company_id)}
+        if branch_id not in allowed:
+            raise AccountingError('ليس لديك صلاحية العمل على هذا الفرع')
+        self.branch_id = branch_id
+        state.update(branch=allowed[branch_id])
+
+    def multi_currency_enabled(self):
+        return readmodel.has_foreign_currency(self.conn, self.company_id)
+
+    # ------------------------------------------------------------ إشعارات
+    def notifications(self, state=None):
+        """قائمة الإشعارات الحالية. كل مصدر يُجلب بحسب الصلاحية ويُتجاوز عند الرفض (لا يوقف الباقي)."""
+        wf = self.workflow_settings()
+        pend = readmodel.pending_journal_counts(self.conn, self.company_id, self.branch_id) if self.can('journal.view') else {}
+        drafts = readmodel.draft_document_counts(self.conn, self.company_id, self.branch_id)
+        low, exp = 0, {}
+        if self.can('inventory.view'):
+            try:
+                low = len(self.low_stock())
+                exp = self.expiry_summary()
+            except AccountingError:
+                low = 0
+        bank = readmodel.unmatched_bank_lines(self.conn, self.company_id) if self.can('cash.reconcile') else 0
+        age = None
+        if self.can('backup.manage'):
+            try:
+                rows = self.backups()
+                if rows:
+                    last = str(rows[0].get('created_at') or rows[0].get('at') or '')[:10]
+                    age = (date.today() - date.fromisoformat(last)).days if last else None
+            except (AccountingError, ValueError, KeyError):
+                age = None
+        ro = state.read_only_reason if state is not None else ''
+        return notifications.build(pend, drafts, low, bank, wf, ro, age if self.can('backup.manage') else 0, expiry=exp)
+
+    def integrity_failed_count(self):
+        """عدد ضوابط السلامة الفاشلة (عملية ثقيلة: تُشغَّل في مهمة خلفية لا في خيط الواجهة)."""
+        from alhisabat.accounting import integrity
+        r = integrity.financial_integrity_check(self.conn, self.user_id, self.company_id)
+        return sum(1 for c in r.get('checks', []) if c.get('status') == 'fail')
+
+    def missing_mappings(self, keys):
+        """مفاتيح الربط المطلوبة وغير المربوطة (للتنبيه المسبق قبل فتح شاشة تعتمد عليها)."""
+        linked = {m['key'] for m in self.mappings() if m['account_id']}
+        return [k for k in keys if k not in linked]

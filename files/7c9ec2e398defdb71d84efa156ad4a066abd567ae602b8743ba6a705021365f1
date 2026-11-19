@@ -1,0 +1,238 @@
+"""تنسيق المبالغ والتواريخ والكميات (مصدر وحيد) + المبلغ كتابةً بالعربية.
+
+قاعدة: `Decimal` فقط لكل مبلغ. لا `float` في هذه الحزمة. التنسيق للعرض فقط ولا يغيّر القيمة المخزنة.
+يعتمد على logic.py الحالي للتحليل (parse_money) حتى لا يتكرر المنطق.
+"""
+from datetime import date, datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+
+from alhisabat.ui.core.logic import parse_money, to_ascii_digits, strip_bidi  # noqa: F401
+
+_TO_ARABIC = str.maketrans('0123456789.,', '٠١٢٣٤٥٦٧٨٩٫٬')
+_CFG = {'digits': 'latin', 'neg': 'parens'}   # digits: latin|arabic ، neg: parens|minus
+
+
+def configure(digits=None, neg=None):
+    if digits in ('latin', 'arabic'):
+        _CFG['digits'] = digits
+    if neg in ('parens', 'minus'):
+        _CFG['neg'] = neg
+
+
+def _digits(s):
+    return s.translate(_TO_ARABIC) if _CFG['digits'] == 'arabic' else s
+
+
+def to_decimal(v):
+    if v is None or v == '':
+        return None
+    if isinstance(v, Decimal):
+        return v
+    if isinstance(v, float):
+        raise TypeError('ممنوع استخدام float للمبالغ: مرّر Decimal أو نصًا')
+    try:
+        return Decimal(str(v))
+    except InvalidOperation:
+        return None
+
+
+def minor_to_decimal(m):
+    """وحدات صغرى (÷100) → Decimal."""
+    return None if m is None else Decimal(int(m)) / 100
+
+
+def decimal_to_minor(d):
+    """Decimal → وحدات صغرى بتقريب نصف-لأعلى."""
+    return int((Decimal(d) * 100).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+
+
+def fmt_money(v, places=2, currency=None, neg=None, zero_dash=False, minor=False):
+    """نص المبلغ بفواصل الآلاف. السالب بين أقواس أو بعلامة (لا باللون وحده). None ← «—»."""
+    d = to_decimal(v)
+    if d is None:
+        return '—'
+    if minor:
+        d = d / 100
+    if zero_dash and d == 0:
+        return '—'
+    q = Decimal(1).scaleb(-places)
+    d = d.quantize(q, rounding=ROUND_HALF_UP)
+    body = _digits(f'{abs(d):,.{places}f}')
+    if currency:
+        body = f'{body} {currency}'
+    if d < 0:
+        return f'({body})' if (neg or _CFG['neg']) == 'parens' else f'-{body}'
+    return body
+
+
+def fmt_qty(milli, places=3):
+    """كمية بوحدات ×1000 (qty_milli) ← نص بلا أصفار زائدة."""
+    if milli is None:
+        return '—'
+    d = Decimal(int(milli)) / 1000
+    s = f'{d:,.{places}f}'.rstrip('0').rstrip('.')
+    return _digits(s or '0')
+
+
+def fmt_date(v, style='iso'):
+    """نص التاريخ. style: iso (2026-09-30) | dmy (30/09/2026)."""
+    if v in (None, ''):
+        return '—'
+    if isinstance(v, datetime):
+        v = v.date()
+    if not isinstance(v, date):
+        try:
+            v = date.fromisoformat(str(v)[:10])
+        except ValueError:
+            return str(v)
+    s = v.strftime('%d/%m/%Y') if style == 'dmy' else v.isoformat()
+    return _digits(s)
+
+
+def is_negative(v):
+    d = to_decimal(v)
+    return d is not None and d < 0
+
+
+# ---------------------------------------------------------------- المبلغ كتابةً
+_ONES_M = ['', 'واحد', 'اثنان', 'ثلاثة', 'أربعة', 'خمسة', 'ستة', 'سبعة', 'ثمانية', 'تسعة', 'عشرة',
+           'أحد عشر', 'اثنا عشر', 'ثلاثة عشر', 'أربعة عشر', 'خمسة عشر', 'ستة عشر', 'سبعة عشر', 'ثمانية عشر', 'تسعة عشر']
+_ONES_F = ['', 'واحدة', 'اثنتان', 'ثلاث', 'أربع', 'خمس', 'ست', 'سبع', 'ثماني', 'تسع', 'عشر',
+           'إحدى عشرة', 'اثنتا عشرة', 'ثلاث عشرة', 'أربع عشرة', 'خمس عشرة', 'ست عشرة', 'سبع عشرة', 'ثماني عشرة', 'تسع عشرة']
+_TENS = ['', '', 'عشرون', 'ثلاثون', 'أربعون', 'خمسون', 'ستون', 'سبعون', 'ثمانون', 'تسعون']
+_HUNDREDS = ['', 'مائة', 'مائتان', 'ثلاثمائة', 'أربعمائة', 'خمسمائة', 'ستمائة', 'سبعمائة', 'ثمانمائة', 'تسعمائة']
+# (مفرد، مثنى، جمع 3–10، مفرد منصوب 11–99)
+_SCALES = [None, ('ألف', 'ألفان', 'آلاف', 'ألفًا'), ('مليون', 'مليونان', 'ملايين', 'مليونًا'),
+           ('مليار', 'ملياران', 'مليارات', 'مليارًا'), ('تريليون', 'تريليونان', 'تريليونات', 'تريليونًا')]
+
+# كود العملة ← (الأساسية: مفرد، مثنى، جمع، منصوب، مذكر) ، (الفرعية: ...)
+_CUR = {
+    'SAR': (('ريال', 'ريالان', 'ريالات', 'ريالًا', True), ('هللة', 'هللتان', 'هللات', 'هللةً', False)),
+    'YER': (('ريال', 'ريالان', 'ريالات', 'ريالًا', True), ('فلس', 'فلسان', 'فلوس', 'فلسًا', True)),
+    'AED': (('درهم', 'درهمان', 'دراهم', 'درهمًا', True), ('فلس', 'فلسان', 'فلوس', 'فلسًا', True)),
+    'QAR': (('ريال', 'ريالان', 'ريالات', 'ريالًا', True), ('درهم', 'درهمان', 'دراهم', 'درهمًا', True)),
+    'OMR': (('ريال', 'ريالان', 'ريالات', 'ريالًا', True), ('بيسة', 'بيستان', 'بيسات', 'بيسةً', False)),
+    'KWD': (('دينار', 'ديناران', 'دنانير', 'دينارًا', True), ('فلس', 'فلسان', 'فلوس', 'فلسًا', True)),
+    'BHD': (('دينار', 'ديناران', 'دنانير', 'دينارًا', True), ('فلس', 'فلسان', 'فلوس', 'فلسًا', True)),
+    'JOD': (('دينار', 'ديناران', 'دنانير', 'دينارًا', True), ('قرش', 'قرشان', 'قروش', 'قرشًا', True)),
+    'IQD': (('دينار', 'ديناران', 'دنانير', 'دينارًا', True), ('فلس', 'فلسان', 'فلوس', 'فلسًا', True)),
+    'EGP': (('جنيه', 'جنيهان', 'جنيهات', 'جنيهًا', True), ('قرش', 'قرشان', 'قروش', 'قرشًا', True)),
+    'USD': (('دولار', 'دولاران', 'دولارات', 'دولارًا', True), ('سنت', 'سنتان', 'سنتات', 'سنتًا', True)),
+    'EUR': (('يورو', 'يورو', 'يورو', 'يورو', True), ('سنت', 'سنتان', 'سنتات', 'سنتًا', True)),
+    'GBP': (('جنيه إسترليني', 'جنيهان إسترلينيان', 'جنيهات إسترلينية', 'جنيهًا إسترلينيًا', True),
+            ('بنس', 'بنسان', 'بنسات', 'بنسًا', True)),
+}
+
+
+# نسبة العملة (تُضاف بعد اسم الوحدة): «ريال سعودي» / «ريال يمني» / «دولار أمريكي» …
+_CUR_ADJ = {'SAR': 'سعودي', 'YER': 'يمني', 'AED': 'إماراتي', 'QAR': 'قطري', 'OMR': 'عماني', 'KWD': 'كويتي',
+            'BHD': 'بحريني', 'JOD': 'أردني', 'IQD': 'عراقي', 'EGP': 'مصري', 'USD': 'أمريكي'}
+
+
+def _below_1000(n, masc):
+    """1..999 بالكلمات (n>0). masc = جنس المعدود في خانة الآحاد."""
+    ones = _ONES_M if masc else _ONES_F
+    parts = []
+    h, r = divmod(n, 100)
+    if h:
+        parts.append(_HUNDREDS[h])
+    if r:
+        if r < 20:
+            parts.append(ones[r])
+        else:
+            t, u = divmod(r, 10)
+            parts.append(f'{ones[u]} و{_TENS[t]}' if u else _TENS[t])
+    return ' و'.join(parts)
+
+
+_CONSTRUCT = (('ألفان', 'ألفا'), ('مليونان', 'مليونا'), ('ملياران', 'مليارا'), ('تريليونان', 'تريليونا'), ('مائتان', 'مائتا'))
+
+
+def _to_construct(words):
+    """حالة الإضافة حين يلي العددَ المعدودُ مباشرة: «مائتا ريال» و«ألفا ريال» لا «مائتان ريال»."""
+    for full, short in _CONSTRUCT:
+        if words.endswith(full):
+            return words[:-len(full)] + short
+    return words
+
+
+def int_to_words(n, masc=True, construct=False):
+    """عدد صحيح ≥ 0 بالعربية. المجموعات الكبيرة (آلاف فأكثر) مذكّرة دائمًا؛ masc يخص خانة الآحاد.
+    construct=True: يليه معدود مباشرة (عملة) فيُستعمل المفرد بدل المنصوب ويُضاف المثنى."""
+    n = int(n)
+    if n == 0:
+        return 'صفر'
+    if n >= 10 ** 15:
+        raise ValueError('المبلغ أكبر من المدى المدعوم للكتابة بالحروف')
+    groups = []
+    k = 0
+    while n:
+        n, g = divmod(n, 1000)
+        groups.append((k, g))
+        k += 1
+    out = []
+    for k, g in reversed(groups):
+        if g == 0:
+            continue
+        if k == 0:
+            out.append(_below_1000(g, masc))
+            continue
+        one, dual, plur, acc = _SCALES[k]
+        last2 = g % 100
+        if g == 1:
+            out.append(one)
+        elif g == 2:
+            out.append(dual)
+        elif 3 <= last2 <= 10 or (3 <= g <= 10):
+            out.append(f'{_below_1000(g, True)} {plur}')
+        elif 11 <= last2 <= 99:
+            is_last = all(x[1] == 0 for x in groups if x[0] < k)
+            out.append(f'{_below_1000(g, True)} {one if (construct and is_last) else acc}')
+        else:  # تنتهي بـ 00 أو 01 أو 02 (مع مئات)
+            w = _below_1000(g, True)
+            out.append(f'{_to_construct(w) if g % 100 == 0 else w} {one}')
+    text = ' و'.join(out)
+    return _to_construct(text) if construct else text
+
+
+def _unit_phrase(n, unit, adj=''):
+    """عدد + معدود (+ نسبة العملة بمطابقتها): «ريال سعودي واحد» «ريالان سعوديان» «ثلاثة ريالات سعودية» «أحد عشر ريالًا سعوديًا»."""
+    one, dual, plur, acc, masc = unit
+    if n == 0:
+        return ''
+    if n == 1:
+        return f'{one} {adj} {_ONES_M[1] if masc else _ONES_F[1]}' if adj else f'{one} {_ONES_M[1] if masc else _ONES_F[1]}'
+    if n == 2:
+        return f'{dual} {adj}ان' if adj else dual
+    words = int_to_words(n, masc, construct=(n % 100 == 0 or n % 100 > 10) and not (11 <= n % 100 <= 99))
+    last2 = n % 100
+    if 3 <= last2 <= 10:
+        noun, a = plur, (adj + 'ة' if adj else '')
+    elif 11 <= last2 <= 99:
+        noun, a = acc, (adj + 'ًا' if adj else '')
+    else:
+        noun, a = one, adj
+    return f'{words} {noun} {a}'.strip().replace('  ', ' ')
+
+
+def amount_in_words(amount, currency='SAR', prefix='فقط', suffix='لا غير'):
+    """المبلغ كتابةً: «فقط ألف ومائتان وخمسون ريالًا وخمسون هللة لا غير». 2 خانة عشرية كحد أقصى."""
+    d = to_decimal(amount)
+    if d is None:
+        return ''
+    neg = d < 0
+    d = abs(d).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    whole = int(d)
+    frac = int((d - whole) * 100)
+    adj = _CUR_ADJ.get(str(currency).upper(), '')
+    major, minor = _CUR.get(str(currency).upper(), ((str(currency), str(currency), str(currency), str(currency), True),
+                                                     ('جزء', 'جزءان', 'أجزاء', 'جزءًا', True)))
+    parts = []
+    if whole or not frac:
+        parts.append(_unit_phrase(whole, major, adj) if whole else f'صفر {major[0]}' + (f' {adj}' if adj else ''))
+    if frac:
+        parts.append(_unit_phrase(frac, minor))
+    text = ' و'.join(parts)
+    if neg:
+        text = 'سالب ' + text
+    return ' '.join(x for x in (prefix, text, suffix) if x)

@@ -1,0 +1,648 @@
+"""صفحة نهاية الفترة والسنة (المرحلة 4 — القسم 6.9): معالج الإقفال المحاسبي المتكامل.
+
+الخطوات: السنوات والفترات ← التسويات والمطابقة ← فحوصات ما قبل الإقفال مع روابط الإصلاح ←
+إقفال/إعادة فتح السنة ← الأرصدة الافتتاحية ← فحص السلامة المالية وتصدير التقرير.
+كل كتابة عبر PeriodEndService والمحرك المحاسبي. كل زر مرتبط بصلاحيته ويعطّل مع ذكر السبب.
+"""
+from datetime import datetime
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QCheckBox, QComboBox, QDialog, QHBoxLayout, QLabel, QMessageBox,
+    QPushButton, QTabWidget, QVBoxLayout, QWidget,
+)
+
+from alhisabat.ui.components.basic import ConfirmDangerDialog, ask_reason
+from alhisabat.ui.components.datagrid import DataGrid
+from alhisabat.ui.components.document_sheet import DocumentSheet
+from alhisabat.ui.components.grid_logic import Column
+from alhisabat.ui.components import document_model as DM
+from alhisabat.ui.core.actions import Action, ActionGroup
+from alhisabat.ui.core.base_page import BasePage
+from alhisabat.ui.core.period_end_service import PeriodEndService
+from alhisabat.ui.core.permissions import ActionState
+from alhisabat.ui.app_dialogs.period_end import (
+    ManualOpeningDialog, prompt_close_period_dialog, prompt_new_year_dialog,
+)
+
+
+class PeriodEndPage(BasePage):
+    key = 'period_end'
+    title = 'نهاية الفترة والسنة'
+    icon = 'lock'
+    required_permission = 'report.view'
+
+    def build(self):
+        self.svc = PeriodEndService(self.session)
+        self._overview = []
+        self._sel_year_id = self._sel_period_id = None
+        self._preclose_ok = False
+        self._preclose_data = None
+        self._selected_check_row = None
+        self._last_integ_time = None
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(6)
+
+        self._closed_alert = QLabel('')
+        self._closed_alert.setWordWrap(True)
+        self._closed_alert.setObjectName('closedAlert')
+        self._closed_alert.hide()
+        lay.addWidget(self._closed_alert)
+
+        bar_top = QHBoxLayout()
+        bar_top.addWidget(QLabel("السنة المالية الحالية:"))
+        self.cb_year = QComboBox()
+        self.cb_year.currentIndexChanged.connect(self._on_year_changed)
+        bar_top.addWidget(self.cb_year, 1)
+
+        self.btn_new_year = QPushButton("سنة مالية جديدة")
+        self.btn_new_year.clicked.connect(self._new_year)
+        bar_top.addWidget(self.btn_new_year)
+        bar_top.addStretch(1)
+        lay.addLayout(bar_top)
+
+        self.tabs = QTabWidget()
+        self.tabs.setObjectName('dlgTabs')
+        self.tabs.setLayoutDirection(Qt.RightToLeft)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+
+        self.tabs.addTab(self._tab_overview(), "1. السنوات والفترات")
+        self.tabs.addTab(self._tab_adjustments(), "2. التسويات والمطابقة")
+        self.tabs.addTab(self._tab_preclose(), "3. فحوصات ما قبل الإقفال")
+        self.tabs.addTab(self._tab_year(), "4. إقفال السنة وإعادة الفتح")
+        self.tabs.addTab(self._tab_opening(), "5. الأرصدة الافتتاحية")
+        self.tabs.addTab(self._tab_integrity(), "6. السلامة والتقارير")
+        lay.addWidget(self.tabs, 1)
+
+        bar_nav = QHBoxLayout()
+        self.btn_prev_step = QPushButton("السابق")
+        self.btn_next_step = QPushButton("التالي")
+        self.btn_prev_step.clicked.connect(self._prev_step)
+        self.btn_next_step.clicked.connect(self._next_step)
+        bar_nav.addWidget(self.btn_prev_step)
+        bar_nav.addWidget(self.btn_next_step)
+        bar_nav.addStretch(1)
+        lay.addLayout(bar_nav)
+
+        self._update_step_buttons()
+
+    def _tab_overview(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(8, 8, 8, 8)
+        self.grid_periods = DataGrid([
+            Column('period_no', 'م', 'int', 40),
+            Column('name', 'الفترة', width=120),
+            Column('start', 'من تاريخ', 'date', 100),
+            Column('end', 'إلى تاريخ', 'date', 100),
+            Column('status', 'الحالة', 'status', 95),
+        ], grid_id='period_end_periods')
+        self.grid_periods.selectionChangedRows.connect(self._on_period_select)
+        lay.addWidget(self.grid_periods, 1)
+
+        row = QHBoxLayout()
+        self.btn_close_p = QPushButton("إقفال الفترة المحددة")
+        self.btn_reopen_p = QPushButton("إعادة فتح الفترة")
+        self.btn_close_p.clicked.connect(self._close_period)
+        self.btn_reopen_p.clicked.connect(self._reopen_period)
+        row.addWidget(self.btn_close_p)
+        row.addWidget(self.btn_reopen_p)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+        hint = QLabel("ملاحظة: إقفال الفترة يمنع الترحيل فيها مستقبلاً ما لم يُعد فتحها بقرار رسمي وسبب مسجل.")
+        hint.setObjectName('hint')
+        lay.addWidget(hint)
+        return w
+
+    def _tab_adjustments(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(8, 8, 8, 8)
+        self.adj_tabs = QTabWidget()
+        self.adj_tabs.setObjectName('dlgTabs')
+        from alhisabat.ui.pages.period_end_checks import build_fx_tab, build_recon_tab
+        self.adj_tabs.addTab(build_fx_tab(self), "إعادة تقييم العملات الأجنبية")
+        self.adj_tabs.addTab(build_recon_tab(self), "مطابقة المخزون مع الأستاذ")
+        lay.addWidget(self.adj_tabs, 1)
+        return w
+
+    def _tab_preclose(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+
+        top = QHBoxLayout()
+        self.btn_run_checks = QPushButton("تشغيل فحوصات ما قبل الإقفال")
+        self.btn_run_checks.clicked.connect(self._run_preclose)
+        top.addWidget(self.btn_run_checks)
+
+        self.btn_fix_action = QPushButton("🔧 إصلاح المشكلة مباشرة")
+        self.btn_fix_action.setEnabled(False)
+        self.btn_fix_action.clicked.connect(self._handle_fix_action)
+        top.addWidget(self.btn_fix_action)
+        top.addStretch(1)
+        lay.addLayout(top)
+
+        self.grid_checks = DataGrid([
+            Column('name', 'بند الفحص الإلزامي', width=280),
+            Column('status', 'النتيجة', 'status', 95),
+            Column('detail', 'التفاصيل وسبب الفشل', width=380),
+        ], grid_id='period_end_checks')
+        self.grid_checks.selectionChangedRows.connect(self._on_check_row_select)
+        lay.addWidget(self.grid_checks, 1)
+
+        self.lbl_pre_ok = QLabel("اضغط «تشغيل فحوصات ما قبل الإقفال» لفحص جاهزية السنة.")
+        self.lbl_pre_ok.setObjectName('ctxKey')
+        self.lbl_pre_ok.setWordWrap(True)
+        lay.addWidget(self.lbl_pre_ok)
+        return w
+
+    def _tab_year(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+
+        box = QHBoxLayout()
+        box.addWidget(QLabel("نتيجة السنة المالية:"))
+        self.lbl_result = QLabel("—")
+        box.addWidget(self.lbl_result)
+        box.addStretch(1)
+        lay.addLayout(box)
+
+        box2 = QHBoxLayout()
+        self.chk_retained = QCheckBox("ترحيل صافي النتيجة إلى حساب الأرباح المحتجزة")
+        btn_save = QPushButton("حفظ إعداد الترحيل")
+        btn_save.clicked.connect(self._save_closing_settings)
+        box2.addWidget(self.chk_retained)
+        box2.addWidget(btn_save)
+        box2.addStretch(1)
+        lay.addLayout(box2)
+
+        row = QHBoxLayout()
+        self.btn_close_y = QPushButton("إقفال السنة المالية نهائيًا")
+        self.btn_reopen_y = QPushButton("إعادة فتح السنة المالية")
+        self.btn_close_y.clicked.connect(self._close_year)
+        self.btn_reopen_y.clicked.connect(self._reopen_year)
+        row.addWidget(self.btn_close_y)
+        row.addWidget(self.btn_reopen_y)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+        self.lbl_year_info = QLabel("«إقفال السنة» ينفّذ كل الخطوات تلقائياً ويفحص الشروط بنفسه (فحوصات ما قبل الإقفال اختيارية للاطلاع).")
+        self.lbl_year_info.setObjectName('hint')
+        lay.addWidget(self.lbl_year_info)
+
+        self.sheet_year = DocumentSheet(self.window_.prefs.get('paper') if hasattr(self, 'window_') and hasattr(self.window_, 'prefs') else 'A4')
+        self.sheet_year.setMaximumHeight(340)
+        lay.addWidget(self.sheet_year, 1)
+        return w
+
+    def _tab_opening(self):
+        from alhisabat.ui.pages.period_end_opening import build_opening_tab
+        return build_opening_tab(self)
+
+    def _tab_integrity(self):
+        from alhisabat.ui.pages.period_end_checks import build_integrity_tab
+        return build_integrity_tab(self)
+
+    def _on_tab_changed(self, idx):
+        self._update_step_buttons()
+
+    def _update_step_buttons(self):
+        if not hasattr(self, 'btn_prev_step') or not hasattr(self, 'btn_next_step'):
+            return
+        cur = self.tabs.currentIndex()
+        tot = self.tabs.count()
+        self.btn_prev_step.setEnabled(cur > 0)
+        self.btn_next_step.setEnabled(cur < tot - 1)
+        prev_title = self.tabs.tabText(cur - 1) if cur > 0 else ""
+        next_title = self.tabs.tabText(cur + 1) if cur < tot - 1 else ""
+        self.btn_prev_step.setText(f"السابق: {prev_title}" if prev_title else "السابق")
+        self.btn_next_step.setText(f"التالي: {next_title}" if next_title else "التالي")
+
+    def _prev_step(self):
+        idx = self.tabs.currentIndex()
+        if idx > 0:
+            self.tabs.setCurrentIndex(idx - 1)
+
+    def _next_step(self):
+        idx = self.tabs.currentIndex()
+        if idx < self.tabs.count() - 1:
+            self.tabs.setCurrentIndex(idx + 1)
+
+    def _refresh_closed_banner(self):
+        y = next((x for x in self._overview if x['id'] == self._sel_year_id), None)
+        if not y:
+            self._closed_alert.hide()
+            return
+        is_closed = y['status'] == 'closed'
+        p = next((pp for pp in y.get('periods', []) if pp['id'] == self._sel_period_id), None)
+        p_closed = p and p['status'] == 'closed'
+        if is_closed:
+            self._closed_alert.setText(f"⚠️ السنة المالية «{y['name']}» مقفلة (قراءة فقط) — جميع الإجراءات المحررة معطلة طبقاً لقواعد المحرك المحاسبي.")
+            self._closed_alert.show()
+        elif p_closed:
+            self._closed_alert.setText(f"⚠️ الفترة «{p['name']}» مقفلة — الترحيل في هذه الفترة ممنوع.")
+            self._closed_alert.show()
+        else:
+            self._closed_alert.hide()
+
+    def _can(self, perm):
+        if hasattr(self, 'access') and hasattr(self.access, 'has'):
+            return self.access.has(perm)
+        return self.session.can(perm) if hasattr(self.session, "can") else True
+
+    def refresh(self):
+        if not getattr(self, '_built', False):
+            return
+        try:
+            self._overview = self.svc.overview()
+        except Exception as exc:
+            self.show_error(exc)
+            self._overview = []
+
+        cur = self._sel_year_id
+        for cb in (self.cb_year, self.cb_from, self.cb_to):
+            cb.blockSignals(True)
+            cb.clear()
+
+        for y in self._overview:
+            label = f"{y['name']} — ({'مقفلة' if y['status'] == 'closed' else 'مفتوحة'})"
+            self.cb_year.addItem(label, y['id'])
+            self.cb_from.addItem(y['name'], y['id'])
+            self.cb_to.addItem(y['name'], y['id'])
+
+        if cur is not None:
+            idx = self.cb_year.findData(cur)
+            if idx >= 0:
+                self.cb_year.setCurrentIndex(idx)
+        elif self._overview:
+            self._sel_year_id = self._overview[0]['id']
+            self.cb_year.setCurrentIndex(0)
+
+        if len(self._overview) >= 2:
+            self.cb_from.setCurrentIndex(len(self._overview) - 2)
+            self.cb_to.setCurrentIndex(len(self._overview) - 1)
+
+        for cb in (self.cb_year, self.cb_from, self.cb_to):
+            cb.blockSignals(False)
+
+        self._on_year_changed()
+        self._refresh_allowed()
+        self.actions_changed.emit()
+
+    def _on_year_changed(self, _idx=None):
+        if self.cb_year.count() == 0:
+            self.grid_periods.set_rows([])
+            return
+        yid = self.cb_year.currentData()
+        self._sel_year_id = yid
+        y = next((x for x in self._overview if x['id'] == yid), None)
+        if not y:
+            self.grid_periods.set_rows([])
+            return
+        self.grid_periods.set_rows(y.get('periods', []))
+
+        end_date = y.get('end', '')
+        if hasattr(self, 'fx_as_of') and not self.fx_as_of.text().strip():
+            self.fx_as_of.setText(end_date)
+        if hasattr(self, 'recon_as_of') and not self.recon_as_of.text().strip():
+            self.recon_as_of.setText(end_date)
+        if hasattr(self, 'integ_as_of') and not self.integ_as_of.text().strip():
+            self.integ_as_of.setText(end_date)
+
+        base_cur = getattr(self.session, 'base_currency', 'SAR')
+        has_fx = self.session.multi_currency_enabled() if hasattr(self.session, 'multi_currency_enabled') else False
+        if hasattr(self, 'lbl_fx_notice'):
+            if not has_fx:
+                self.lbl_fx_notice.setText(f"العملة المعتمدة هي الأساسية ({base_cur}) فقط — لا توجد عملات أجنبية مفعلة تتطلب إعادة تقييم.")
+            else:
+                self.lbl_fx_notice.setText(f"توجد عملات أجنبية تتطلب إعادة تقييم بسعر نهاية السنة ({end_date}).")
+        if hasattr(self, 'adj_tabs') and hasattr(self.adj_tabs, 'setTabVisible'):
+            self.adj_tabs.setTabVisible(0, bool(has_fx))
+
+        self._preclose_ok = False
+        self._preclose_data = None
+        self._refresh_closed_banner()
+        self._load_year_result()
+        self._refresh_allowed()
+
+    def _on_period_select(self, rows):
+        self._sel_period_id = rows[0]['id'] if rows else None
+        self._refresh_closed_banner()
+        self._refresh_allowed()
+
+    def _refresh_allowed(self):
+        y = next((x for x in self._overview if x['id'] == self._sel_year_id), None)
+        y_status = y['status'] if y else None
+        p_rows = self.grid_periods.selected_rows() if hasattr(self.grid_periods, 'selected_rows') else []
+        p = p_rows[0] if p_rows else None
+        if not p and self._sel_period_id is not None:
+            p = next((pp for pp in (y.get('periods', []) if y else []) if pp['id'] == self._sel_period_id), None)
+
+        has_p_close = self._can('period.close')
+        can_close_p = has_p_close and p and p['status'] == 'open'
+        self.btn_close_p.setEnabled(bool(can_close_p))
+        if not has_p_close:
+            self.btn_close_p.setToolTip("تتطلب صلاحية period.close")
+        elif not p:
+            self.btn_close_p.setToolTip("اختر فترة من الجدول لإقفالها")
+        elif p['status'] == 'closed':
+            self.btn_close_p.setToolTip("الفترة مقفلة بالفعل")
+        else:
+            self.btn_close_p.setToolTip("إقفال الفترة المحددة")
+
+        has_p_reopen = self._can('period.reopen')
+        can_reopen_p = has_p_reopen and p and p['status'] == 'closed'
+        self.btn_reopen_p.setEnabled(bool(can_reopen_p))
+        if not has_p_reopen:
+            self.btn_reopen_p.setToolTip("تتطلب صلاحية period.reopen")
+        elif not p:
+            self.btn_reopen_p.setToolTip("اختر فترة من الجدول لإعادة فتحها")
+        elif p['status'] == 'open':
+            self.btn_reopen_p.setToolTip("الفترة مفتوحة بالفعل")
+        else:
+            self.btn_reopen_p.setToolTip("إعادة فتح الفترة المحددة")
+
+        has_y_create = self._can('fiscalyear.create')
+        self.btn_new_year.setEnabled(has_y_create)
+        self.btn_new_year.setToolTip("إنشاء سنة مالية جديدة" if has_y_create else "تتطلب صلاحية fiscalyear.create")
+
+        has_y_reopen = self._can('fiscalyear.reopen')
+        can_reopen_y = has_y_reopen and y and y_status == 'closed'
+        self.btn_reopen_y.setEnabled(bool(can_reopen_y))
+        if not has_y_reopen:
+            self.btn_reopen_y.setToolTip("تتطلب صلاحية fiscalyear.reopen")
+        elif not y:
+            self.btn_reopen_y.setToolTip("اختر سنة مالية أولاً")
+        elif y_status != 'closed':
+            self.btn_reopen_y.setToolTip("السنة المالية مفتوحة بالفعل ولا تحتاج لإعادة فتح")
+        else:
+            self.btn_reopen_y.setToolTip("إعادة فتح السنة المالية (تتطلب سبباً إلزامياً)")
+
+        has_y_close = self._can('fiscalyear.close')
+        is_year_open = (y and y_status == 'open')
+        can_close_y = has_y_close and is_year_open
+        self.btn_close_y.setEnabled(bool(can_close_y))
+
+        if not has_y_close:
+            self.btn_close_y.setToolTip("تتطلب صلاحية fiscalyear.close")
+        elif not is_year_open:
+            self.btn_close_y.setToolTip("السنة المالية مقفلة بالفعل")
+        else:
+            self.btn_close_y.setToolTip("إقفال السنة بخطوة واحدة (فترات + قيود الإقفال + السنة التالية + الافتتاح)")
+
+        has_rep = self._can('report.view')
+        self.btn_run_checks.setEnabled(bool(y) and has_rep)
+        self.btn_run_checks.setToolTip("تشغيل فحوصات الجاهزية للإقفال" if has_rep else "تتطلب صلاحية report.view")
+
+        has_open = self._can('opening.manage')
+        self.btn_open_gen.setEnabled(bool(y) and has_open)
+        self.btn_open_gen.setToolTip("توليد قيد الافتتاح من أرصدة السنة السابقة" if has_open else "تتطلب صلاحية opening.manage")
+
+        has_two_y = bool(self.cb_from.count() and self.cb_to.count())
+        self.btn_open_prev.setEnabled(has_two_y and has_open)
+        self.btn_open_prev.setToolTip("معاينة أرصدة الإقفال والافتتاح" if has_open else "تتطلب صلاحية opening.manage")
+        self.btn_open_cmp.setEnabled(has_two_y and has_open)
+        self.btn_open_cmp.setToolTip("مقارنة قيد الافتتاح بأرصدة ختام السنة السابقة" if has_open else "تتطلب صلاحية opening.manage")
+
+        self.btn_manual_open.setEnabled(bool(self.cb_to.count()) and has_open)
+        self.btn_manual_open.setToolTip("إدخال يدوي للأرصدة الافتتاحية (للسنة الأولى)" if has_open else "تتطلب صلاحية opening.manage")
+
+        has_fx_perm = self._can('fx.revalue')
+        has_fx = self.session.multi_currency_enabled() if hasattr(self.session, 'multi_currency_enabled') else False
+        can_fx_prev = has_fx_perm and has_fx
+        can_fx_post = has_fx_perm and has_fx and is_year_open
+        self.btn_fx_prev.setEnabled(can_fx_prev)
+        self.btn_fx_post.setEnabled(bool(can_fx_post))
+        if not has_fx_perm:
+            self.btn_fx_prev.setToolTip("تتطلب صلاحية fx.revalue")
+            self.btn_fx_post.setToolTip("تتطلب صلاحية fx.revalue")
+        elif not is_year_open:
+            self.btn_fx_post.setToolTip("لا يمكن ترحيل قيد التقييم في سنة مالية مقفلة")
+            if not has_fx:
+                self.btn_fx_prev.setToolTip("لا توجد عملات أجنبية مفعلة")
+            else:
+                self.btn_fx_prev.setToolTip("معاينة فروقات تقييم العملات الأجنبية")
+        elif not has_fx:
+            self.btn_fx_prev.setToolTip("لا توجد عملات أجنبية مفعلة")
+            self.btn_fx_post.setToolTip("لا توجد عملات أجنبية مفعلة")
+        else:
+            self.btn_fx_prev.setToolTip("معاينة فروقات تقييم العملات الأجنبية")
+            self.btn_fx_post.setToolTip("ترحيل قيد فروقات العملات الأجنبية")
+
+        self.chk_retained.setEnabled(self._can('settings.manage') and is_year_open)
+        self.actions_changed.emit()
+
+    def _load_year_result(self):
+        from .period_end_checks import load_year_result
+        return load_year_result(self)
+
+    def _run_preclose(self):
+        if not self._sel_year_id:
+            return QMessageBox.information(self, self.title, "اختر سنة مالية أولاً.")
+        self.lbl_pre_ok.setText("جارٍ تشغيل الفحوصات...")
+
+        def _fail(exc):
+            self._preclose_ok = False
+            self._refresh_allowed()
+            self.show_error(exc)
+        def _apply(data):
+            rows = data.get('checks', []) if isinstance(data, dict) else []
+            self.grid_checks.set_rows(rows)
+            self._preclose_data = data
+            self._preclose_ok = bool(data.get('ok', False))
+            if self._preclose_ok:
+                self.lbl_pre_ok.setText("✔ جميع الفحوصات الإلزامية ناجحة — السنة جاهزة للإقفال.")
+            else:
+                self.lbl_pre_ok.setText("✖ توجد بنود فاشلة تمنع الإقفال — حدد البند الفاشل واضغط زر «إصلاح المشكلة مباشرة» لمعالجته.")
+            self._refresh_allowed()
+
+        from alhisabat.ui.core.period_end_service import PeriodEndService
+        self.run_service(PeriodEndService, 'pre_close', self._sel_year_id, on_done=_apply, on_error=_fail)
+
+    def _on_check_row_select(self, rows):
+        self._selected_check_row = rows[0] if rows else None
+        if not rows:
+            self.btn_fix_action.setEnabled(False)
+            self.btn_fix_action.setText("🔧 إصلاح المشكلة مباشرة")
+            return
+        row = rows[0]
+        status, name = row.get('status'), row.get('name', '')
+        if status == 'pass':
+            self.btn_fix_action.setEnabled(False)
+            self.btn_fix_action.setText("✔ هذا البند سليم")
+        else:
+            self.btn_fix_action.setEnabled(True)
+            self.btn_fix_action.setText(f"🔧 إصلاح: {name[:24]}...")
+
+    def _handle_fix_action(self):
+        from .period_end_checks import handle_fix_action
+        return handle_fix_action(self)
+
+    def _new_year(self):
+        if not self._can('fiscalyear.create'):
+            return QMessageBox.information(self, self.title, "تتطلب صلاحية fiscalyear.create.")
+        res = prompt_new_year_dialog(self)
+        if not res:
+            return
+        name, s, e = res
+        ok, _ = self.guarded(self.svc.create_year, name, s, e, reload=False)
+        if ok:
+            self.notify(f"تم إنشاء السنة المالية {name} بنجاح.")
+            self.refresh()
+            self.window_.data_changed(self.key)
+
+    def _close_period(self):
+        if self._sel_period_id is None:
+            return QMessageBox.information(self, self.title, "اختر فترة أولاً.")
+        allow_drafts = prompt_close_period_dialog(self)
+        if allow_drafts is None:
+            return
+        ok, _ = self.guarded(self.svc.close_period, self._sel_period_id, allow_drafts, reload=False)
+        if ok:
+            self.notify("تم إقفال الفترة بنجاح.")
+            self.refresh()
+            self.window_.data_changed(self.key)
+
+    def _reopen_period(self):
+        if self._sel_period_id is None:
+            return QMessageBox.information(self, self.title, "اختر فترة أولاً.")
+        r = ask_reason(self, "إعادة فتح الفترة", ["إعادة فتح الفترة تتطلب تسجيل سبب إلزامي."], True, "إعادة فتح")
+        if r is None:
+            return
+        ok, _ = self.guarded(self.svc.reopen_period, self._sel_period_id, r, reload=False)
+        if ok:
+            self.notify("تمت إعادة فتح الفترة بنجاح.")
+            self.refresh()
+            self.window_.data_changed(self.key)
+
+    def _save_closing_settings(self):
+        ok, _ = self.guarded(self.svc.set_closing_settings, self.chk_retained.isChecked(), reload=False)
+        if ok:
+            self.notify("تم حفظ إعداد ترحيل النتيجة.")
+            self.window_.data_changed(self.key)
+
+    def _close_year(self):
+        if not self._sel_year_id:
+            return QMessageBox.warning(self, self.title, "اختر سنة مالية أولاً.")
+        y = next((x for x in self._overview if x['id'] == self._sel_year_id), None)
+        name = y['name'] if y else str(self._sel_year_id)
+        try:
+            rr = self.svc.year_result(self._sel_year_id, include_closing=False)
+        except Exception as exc:
+            return self.show_error(exc)
+        impact = [
+            f"سيتم إقفال السنة المالية «{name}» إقفالاً نهائياً.",
+            f"صافي النتيجة: {rr.get('net_result', 0)} (إيرادات {rr.get('revenue',0)} — تكلفة {rr.get('cogs',0)} — مصروفات {rr.get('expenses',0)}).",
+            "ستُنفَّذ الخطوات تلقائياً: إقفال الفترات المفتوحة ← إعادة تقييم العملات (إن لزم) ← قيد الإقفال وترحيل النتيجة ← إنشاء السنة التالية ← قيد الافتتاح.",
+            "تُفحص الشروط داخل العملية؛ أي مانع (مسودات، فروق سلامة...) يوقف الإقفال برسالة واضحة، وأي خطأ يتراجع بالكامل دون المساس بالبيانات.",
+        ]
+        dlg = ConfirmDangerDialog(self, "تأكيد إقفال السنة المالية", impact, need_reason=False, confirm_text="إقفال السنة الآن", danger=True)
+        if self.exec_form(dlg) != QDialog.Accepted:
+            return
+        from alhisabat.ui.core.period_end_service import PeriodEndService
+        def _closed(r):
+            extra = "؛ ".join((r or {}).get('notes') or [])
+            self.notify(f"تم إقفال السنة المالية «{name}» بنجاح." + (f" ({extra})" if extra else ""))
+            self.refresh()
+            self.window_.data_changed(self.key)
+
+        self.run_service(PeriodEndService, 'close_year_simple', self._sel_year_id, on_done=_closed)
+
+    def _reopen_year(self):
+        if not self._sel_year_id:
+            return
+        y = next((x for x in self._overview if x['id'] == self._sel_year_id), None)
+        name = y['name'] if y else str(self._sel_year_id)
+        r = ask_reason(self, "إعادة فتح السنة المالية", [
+            f"ستتم إعادة فتح سنة «{name}».",
+            "يتطلب ذلك سبباً إلزامياً يُسجّل في سجل التدقيق.",
+            "إذا كانت هناك سنة لاحقة، يجب عكس قيد افتتاحها أولاً.",
+        ], True, "إعادة فتح السنة")
+        if r is None:
+            return
+        ok, _ = self.guarded(self.svc.reopen_year, self._sel_year_id, r, reload=False)
+        if ok:
+            self.notify(f"تمت إعادة فتح سنة «{name}».")
+            self.refresh()
+            self.window_.data_changed(self.key)
+
+    def _opening_preview(self):
+        fid, tid = self.cb_from.currentData(), self.cb_to.currentData()
+        if fid is None or tid is None:
+            return QMessageBox.information(self, self.title, "اختر سنتين للمعاينة.")
+        ok, data = self.guarded(self.svc.opening_preview, fid, tid, reload=False)
+        if not ok:
+            return
+        rows = data.get('rows', []) if isinstance(data, dict) else []
+        self.grid_open.set_rows(rows)
+        matches = data.get('matches') if isinstance(data, dict) else None
+        self.lbl_open.setText("مطابق تماماً." if matches else "توجد فروقات — راجع التفاصيل.")
+
+    def _opening_generate(self):
+        fid, tid = self.cb_from.currentData(), self.cb_to.currentData()
+        if fid is None or tid is None:
+            return QMessageBox.information(self, self.title, "اختر سنتين.")
+        if ask_reason(self, "توليد قيد الافتتاح", ["سيتم توليد قيد افتتاح مسودة من أرصدة ختام السنة السابقة."], False, "توليد") is None:
+            return
+        ok, eid = self.guarded(self.svc.generate_opening, fid, tid, reload=False)
+        if ok:
+            self.notify(f"تم توليد قيد الافتتاح #{eid} (مسودة).")
+            self.refresh()
+            self.window_.data_changed(self.key)
+
+    def _opening_compare(self):
+        fid, tid = self.cb_from.currentData(), self.cb_to.currentData()
+        if fid is None:
+            return QMessageBox.information(self, self.title, "اختر سنة المصدر.")
+        ok, data = self.guarded(self.svc.opening_preview, fid, tid, reload=False)
+        if not ok:
+            return
+        eid = data.get('opening_entry_id') if isinstance(data, dict) else None
+        if not eid:
+            return QMessageBox.information(self, self.title, "لا يوجد قيد افتتاح فعال للمقارنة.")
+        ok2, rows = self.guarded(self.svc.opening_compare, fid, eid, reload=False)
+        if ok2:
+            self.grid_open.set_rows(rows if isinstance(rows, list) else rows.get('rows', []))
+
+    def _manual_opening(self):
+        yid = self.cb_to.currentData()
+        if yid is None:
+            return QMessageBox.information(self, self.title, "اختر السنة المستهدفة.")
+        y = next((x for x in self._overview if x['id'] == yid), None)
+        name = y['name'] if y else str(yid)
+        dlg = ManualOpeningDialog(self, self.session, name)
+        if self.exec_form(dlg) != QDialog.Accepted:
+            return
+        lines, desc = dlg.get_result()
+        ok, eid = self.guarded(self.svc.manual_opening, yid, lines, desc, reload=False)
+        if ok:
+            self.notify(f"تم إنشاء قيد افتتاح يدوي متوازن #{eid} (مسودة).")
+            self.refresh()
+            self.window_.data_changed(self.key)
+
+    def _fx(self, post):
+        from .period_end_checks import run_fx
+        return run_fx(self, post)
+
+    def _recon(self):
+        from .period_end_checks import run_recon
+        return run_recon(self)
+
+    def _run_integrity(self):
+        from .period_end_checks import run_integrity
+        return run_integrity(self)
+
+    def on_context_changed(self, keys):
+        super().on_context_changed(keys)
+        self.refresh()
+
+    def ribbon_groups(self):
+        from .period_end_checks import build_ribbon_groups
+        return build_ribbon_groups(self)
+

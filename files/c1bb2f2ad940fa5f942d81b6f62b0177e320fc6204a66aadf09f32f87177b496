@@ -1,0 +1,143 @@
+"""حساب الإجراءات المتاحة للقيد المحاسبي (WorkflowBar) — مطابق لمنطق journal_engine حرفيًا.
+
+القاعدة (القسم 7 بند 6 في prompt.md): لا تُظهر زرًا سيرفضه المحرك؛ اشتق التفعيل من حالة السجل + الصلاحية +
+إعدادات سير العمل + هل المستخدم هو المنشئ + حالة الفترة، وأعطِ سبب التعطيل. المحرك هو الحَكَم النهائي.
+المرجع: accounting/journal_engine.py (review/approve/return_to_draft/post/reverse/_editable_draft).
+بلا PySide6.
+"""
+from dataclasses import dataclass
+
+from .permissions import Access, label
+
+# يجب أن تطابق journal_engine.WORKFLOW_EXEMPT_TYPES (يتحقق منه اختبار)
+EXEMPT_TYPES = ('auto', 'reversal', 'closing')
+
+
+@dataclass(frozen=True)
+class WorkflowSettings:
+    require_review: bool = False
+    require_approval: bool = False
+    enforce_separation: bool = False
+    allow_edit_posted: bool = False
+    allow_delete_posted: bool = False
+
+    @classmethod
+    def from_row(cls, row):
+        get = (lambda k: row[k]) if row is not None else (lambda k: 0)
+        opt = lambda k: bool(row.get(k)) if isinstance(row, dict) else (bool(row[k]) if row is not None and k in row.keys() else False)
+        return cls(bool(get('require_review')), bool(get('require_approval')), bool(get('enforce_separation')),
+                   opt('allow_edit_posted_entries'), opt('allow_delete_posted_entries'))
+
+
+@dataclass(frozen=True)
+class JournalAction:
+    key: str
+    label: str
+    icon: str
+    enabled: bool = True
+    reason: str = ''
+    danger: bool = False
+    primary: bool = False
+    needs_reason: bool = False     # يجب جمع سبب نصي قبل الاستدعاء
+    needs_date: bool = False       # يجب جمع تاريخ (العكس)
+
+
+# الإجراءات التي يرفضها المحرك فعلًا في فترة/سنة مقفلة (journal_engine._assert_open في update_draft وreverse).
+# الترحيل والمراجعة والاعتماد والحذف لا تفحص الفترة في المحرك، فلا تُعطَّل هنا.
+READ_ONLY_BLOCKS = ('edit', 'reverse', 'edit_posted', 'delete_posted')
+
+STAGES = ('draft', 'reviewed', 'approved', 'posted')
+STAGE_LABELS = {'draft': 'مسودة', 'reviewed': 'مراجعة', 'approved': 'اعتماد', 'posted': 'ترحيل'}
+
+
+def stage_of(entry):
+    """المرحلة الحالية على شريط المراحل: مسودة ← مراجعة ← اعتماد ← ترحيل (المعكوس يُعامل كمرحّل)."""
+    if entry.get('status') in ('posted', 'reversed'):
+        return 'posted'
+    ws = entry.get('workflow_state') or 'draft'
+    return ws if ws in STAGES else 'draft'
+
+
+def needs_direct_post(entry, st):
+    """هل الترحيل يتجاوز سير العمل؟ (يتطلب journal.post_direct)."""
+    if entry.get('entry_type') in EXEMPT_TYPES:
+        return False
+    ws = entry.get('workflow_state') or 'draft'
+    need_approved = st.require_approval and ws != 'approved'
+    need_reviewed = st.require_review and ws == 'draft'
+    return bool(need_approved or need_reviewed)
+
+
+def _perm_reason(perm):
+    return f'تتطلب صلاحية «{label(perm)}»'
+
+
+def journal_actions(entry, st, access: Access, user_id, read_only_reason=''):
+    """قائمة JournalAction مرتبة. entry: dict فيه status, workflow_state, entry_type, created_by."""
+    status = entry.get('status')
+    ws = entry.get('workflow_state') or 'draft'
+    is_creator = entry.get('created_by') == user_id
+    sep = st.enforce_separation and is_creator
+    out = []
+
+    def add(key, lbl, icon, perm, checks=(), **kw):
+        enabled, reason = True, ''
+        if perm and not access.has(perm):
+            enabled, reason = False, _perm_reason(perm)
+        elif read_only_reason and key in READ_ONLY_BLOCKS:
+            enabled, reason = False, read_only_reason
+        else:
+            for ok, why in checks:
+                if not ok:
+                    enabled, reason = False, why
+                    break
+        out.append(JournalAction(key, lbl, icon, enabled, reason, **kw))
+
+    if status == 'draft':
+        can_edit_others = access.has('journal.approve')
+        edit_checks = (
+            (ws == 'draft', 'القيد تحت المراجعة أو معتمد: أعده إلى المسودة قبل التعديل'),
+            (is_creator or can_edit_others, 'لا يمكنك تعديل مسودة أنشأها مستخدم آخر'),
+        )
+        add('edit', 'تعديل', 'edit', 'journal.create', edit_checks)
+        add('delete', 'حذف المسودة', 'delete', 'journal.create', edit_checks, danger=True)
+        add('review', 'مراجعة', 'review', 'journal.review', (
+            (ws == 'draft', 'القيد ليس مسودة بانتظار المراجعة'),
+            (not sep, 'فصل المهام: لا يمكنك مراجعة قيد أنشأته أنت')))
+        add('approve', 'اعتماد', 'approve', 'journal.approve', (
+            (ws != 'approved', 'القيد معتمد بالفعل'),
+            (not (st.require_review and ws != 'reviewed'), 'يجب مراجعة القيد أولًا'),
+            (not sep, 'فصل المهام: لا يمكنك اعتماد قيد أنشأته أنت')))
+        # إعادة إلى مسودة: يكفي أي من الصلاحيتين
+        rtd_perm_ok = access.any_of('journal.approve', 'journal.review')
+        out.append(JournalAction(
+            'return_to_draft', 'إعادة إلى مسودة', 'return',
+            rtd_perm_ok and ws != 'draft',
+            '' if (rtd_perm_ok and ws != 'draft') else (_perm_reason('journal.review') if not rtd_perm_ok else 'القيد ليس تحت المراجعة أو الاعتماد'),
+            needs_reason=True))
+        direct = needs_direct_post(entry, st)
+        if direct:
+            add('post', 'ترحيل مباشر', 'post', 'journal.post', (
+                (access.has('journal.post_direct'), 'الترحيل يتطلب مراجعة واعتمادًا أولًا، أو صلاحية «ترحيل مباشر»'),
+                (not sep, 'فصل المهام: لا يمكنك الترحيل المباشر لقيد أنشأته أنت')), primary=True)
+        else:
+            add('post', 'ترحيل', 'post', 'journal.post', primary=True)
+    elif status == 'posted':
+        add('reverse', 'عكس القيد', 'reverse', 'journal.reverse', (
+            (entry.get('entry_type') != 'reversal', 'لا يمكن عكس قيد عكسي: أنشئ قيد تصحيح'),),
+            danger=True, needs_reason=True, needs_date=True)
+    # تعديل/حذف المرحّل (مدير النظام + إعداد مفعّل): قيود يدوية فقط، والمحرك هو الحَكَم النهائي
+    if status in ('posted', 'reversed'):
+        manual = entry.get('entry_type') in ('general', 'adjustment', 'reversal') and not entry.get('source_type')
+        src_why = 'القيد مولَّد من مستند أو من النظام: عدّل/ألغِ المستند من شاشته'
+        if status == 'posted':
+            add('edit_posted', 'تعديل مرحّل', 'edit', 'journal.edit_posted', (
+                (st.allow_edit_posted, 'فعّل «السماح بتعديل القيود المرحّلة» من الإعدادات'),
+                (manual and entry.get('entry_type') != 'reversal', src_why if not manual else 'لا يُعدَّل قيد عكسي')),
+                needs_reason=True)
+        add('delete_posted', 'حذف مرحّل', 'delete', 'journal.delete_posted', (
+            (st.allow_delete_posted, 'فعّل «السماح بحذف القيود المرحّلة» من الإعدادات'),
+            (manual, src_why)), danger=True, needs_reason=True)
+    if access.has('journal.view'):
+        out.append(JournalAction('print', 'طباعة', 'print'))
+    return out

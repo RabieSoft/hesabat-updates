@@ -1,0 +1,37 @@
+"""خدمات العملات وأسعار الصرف (CurrenciesService)."""
+from alhisabat.accounting import rates
+from alhisabat.ui.core import readmodel
+
+
+class CurrenciesService:
+    def __init__(self, session):
+        self.s = session
+
+    def base_currency(self):
+        return rates.base_currency(self.s.conn, self.s.company_id)
+
+    def default_currency(self):
+        return rates.default_currency(self.s.conn, self.s.company_id)
+
+    def set_default_currency(self, code):
+        self.s.require('currency.manage')
+        return rates.set_default_currency(self.s.conn, self.s.user_id, self.s.company_id, code)
+
+    def currencies(self):
+        return readmodel.currencies_list(self.s.conn, self.s.company_id)
+
+    def add_currency(self, code, name_ar, symbol, minor_digits=2):
+        self.s.require('currency.manage')
+        return rates.add_currency(self.s.conn, self.s.user_id, self.s.company_id, code, name_ar, symbol, minor_digits)
+
+    def set_currency_enabled(self, code, enabled: bool):
+        self.s.require('currency.manage')
+        return rates.set_currency_enabled(self.s.conn, self.s.user_id, self.s.company_id, code, enabled)
+
+    def set_rate(self, currency, rate_date, rate, reason="", force=False):
+        self.s.require('currency.rates')
+        return rates.set_rate(self.s.conn, self.s.user_id, self.s.company_id, currency, rate_date, rate, reason=reason, force=force)
+
+    def list_rates(self, currency=None, date_from=None, date_to=None, limit=100, offset=0):
+        return rates.list_rates(self.s.conn, self.s.user_id, self.s.company_id,
+                                currency=currency, date_from=date_from, date_to=date_to, limit=limit, offset=offset)

@@ -1,0 +1,86 @@
+"""ترجمة أخطاء المحرك إلى رسائل مفهومة مع إجراء مقترح (لا traceback للمستخدم أبدًا).
+
+المرجع: docs/ENGINE_CAPABILITIES.md §8 (كتالوج الرسائل). الرسالة الأصلية عربية دائمًا فتُعرض كما هي،
+ويُضاف لها `hint` (ماذا أفعل الآن؟) و`action` (صفحة أو وجهة للانتقال إليها). بلا PySide6.
+"""
+import re
+import sqlite3
+import traceback
+from dataclasses import dataclass
+from datetime import datetime
+
+from alhisabat.ui.core.logic import MAP_KEYS_AR, friendly_error
+
+
+@dataclass(frozen=True)
+class UserMessage:
+    title: str
+    text: str
+    hint: str = ''
+    severity: str = 'error'          # error | warning | info
+    kind: str = 'rule'               # permission | validation | rule | data | system
+    action: tuple = ()               # ('open_page', 'mappings') مثلًا
+    detail: str = ''                 # للسجل المحلي فقط، لا يُعرض للمستخدم
+
+    def full_text(self):
+        return self.text + (f'\n\n{self.hint}' if self.hint else '')
+
+
+# (نمط، عنوان، نصيحة، إجراء)
+_RULES = [
+    (r'الفترة التجريبية|بلغ الترخيص|انتهت صلاحية الترخيص', 'التفعيل مطلوب',
+     'افتح «المساعدة ← تفعيل البرنامج»، أرسل بصمة الجهاز إلى المطوّر، ثم الصق كود التفعيل. بياناتك سليمة ومتاحة للعرض والتصدير.', ()),
+    (r'فصل المهام', 'فصل المهام', 'يجب أن ينفّذ هذا الإجراء مستخدم آخر غير منشئ القيد.', ()),
+    (r'اربط حساب', 'حساب غير مربوط', 'افتح «ربط الحسابات» وحدّد الحساب المطلوب ثم أعد المحاولة.', ('open_page', 'mappings')),
+    (r'الفترة أو السنة المالية مغلقة|الفترة مقفلة|الفترة مغلقة', 'فترة مقفلة',
+     'اختر تاريخًا داخل فترة مفتوحة، أو أعد فتح الفترة (بصلاحية «إعادة فتح فترة») من «نهاية الفترة والسنة».', ('open_page', 'period_end')),
+    (r'التاريخ خارج', 'تاريخ خارج السنوات المالية', 'اختر تاريخًا داخل سنة مالية معرّفة، أو أنشئ السنة من «نهاية الفترة والسنة».', ('open_page', 'period_end')),
+    (r'لا يوجد سعر صرف', 'سعر الصرف غير متوفر', 'أضف سعر صرف هذه العملة بتاريخ المستند من شاشة «العملات وأسعار الصرف».', ('open_page', 'currencies')),
+    (r'الرصيد غير كافٍ', 'رصيد غير كافٍ', 'راجع رصيد الصنف في هذا المخزن، أو حوّل كمية من مخزن آخر أولًا.', ('open_page', 'stock')),
+    (r'رصيد الصندوق.*سالب', 'رصيد نقدي سالب', 'راجع رصيد الصندوق أو البنك قبل تنفيذ العملية.', ('open_page', 'cash')),
+    (r'تجاوز الحد الائتماني', 'تجاوز الحد الائتماني', 'اطلب سدادًا من العميل أو ارفع حده الائتماني من شاشة العملاء.', ('open_page', 'parties')),
+    (r'يتطلب ذكر السبب|تتطلب ذكر السبب', 'السبب مطلوب', 'اكتب السبب في الحقل المخصص ثم أعد المحاولة.', ()),
+    (r'طُوبق مع كشف البنك', 'مطابَق مع كشف البنك', 'ألغِ المطابقة البنكية أولًا (بسبب) ثم أعد المحاولة.', ('open_page', 'bank_recon')),
+    (r'غير نشط', 'سجل غير نشط', 'فعّل السجل أو اختر سجلًا نشطًا.', ()),
+    (r'غير متوازن|غير متوازنة', 'عدم توازن', 'راجع المدين والدائن حتى يتساويا.', ()),
+    (r'مقفل|أقفل|مقفلة', 'قيد السنة المالية', 'راجع حالة السنة في «نهاية الفترة والسنة».', ('open_page', 'period_end')),
+    (r'مرحّل|مرحلة', 'حالة المستند لا تسمح', 'المستند المرحّل لا يُعدَّل ولا يُحذف: استخدم المرتجع أو العكس أو الإلغاء بحسب نوعه.', ()),
+]
+
+
+def _mapping_hint(text):
+    m = re.search(r'Account Mapping:\s*([a-z_]+)', text)
+    if m and m.group(1) in MAP_KEYS_AR:
+        return f'المفتاح المطلوب: «{MAP_KEYS_AR[m.group(1)]}». '
+    return ''
+
+
+def translate(exc):
+    """أي استثناء ← UserMessage."""
+    from alhisabat.accounting.errors import AccountingError
+    from alhisabat.security.permissions import PermissionDenied
+    detail = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    text = str(exc)
+    if isinstance(exc, PermissionDenied):
+        hint = ('اطلب من مدير النظام إسناد الفرع إليك.' if 'الفرع' in text
+                else 'اطلب من مدير النظام صلاحية هذا الإجراء.')
+        return UserMessage('لا صلاحية', text, hint, 'warning', 'permission', detail=detail)
+    if isinstance(exc, AccountingError):
+        for pat, title, hint, action in _RULES:
+            if re.search(pat, text):
+                if pat == r'اربط حساب':
+                    hint = _mapping_hint(text) + hint
+                return UserMessage(title, text, hint, 'error', 'rule', action, detail)
+        return UserMessage('العملية مرفوضة', text, '', 'error', 'rule', (), detail)
+    if isinstance(exc, ValueError):
+        return UserMessage('قيمة غير صالحة', text, 'صحّح القيمة المدخلة ثم أعد المحاولة.', 'warning', 'validation', (), detail)
+    if isinstance(exc, (sqlite3.IntegrityError, sqlite3.OperationalError)):
+        return UserMessage('تعذر تنفيذ العملية', friendly_error(exc), '', 'error', 'data', (), detail)
+    return UserMessage('خطأ غير متوقع', 'حدث خطأ غير متوقع. تم تسجيل التفاصيل في ملف السجل.',
+                       'إن تكرر الخطأ فأرسل ملف السجل للدعم الفني.', 'error', 'system', (), detail)
+
+
+def log_entry(msg, where=''):
+    """سطر سجل نصي لرسالة (يُكتب في ملف محلي، لا يُعرض)."""
+    stamp = datetime.now().isoformat(timespec='seconds')
+    return f'[{stamp}] {where} {msg.kind}: {msg.text}\n{msg.detail}'.rstrip() + '\n'

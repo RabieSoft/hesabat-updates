@@ -1,0 +1,488 @@
+"""النقدية والبنوك + المطابقة: ملخص أرصدة بالأرقام، حسابات، سندات، تحويل، ومطابقة بنكية.
+
+كل الكتابة عبر CashService (المحرك هو الحكم). السند يُحفظ مسودة ثم يُرحّل.
+"""
+import os, tempfile
+from datetime import date
+from decimal import Decimal
+
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtWidgets import (
+    QComboBox, QDateEdit, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QSizePolicy, QSplitter, QTabWidget, QVBoxLayout, QWidget
+)
+
+from alhisabat.ui.components.basic import DateField, KpiCard, ask_reason
+from alhisabat.ui.components.datagrid import DataGrid
+from alhisabat.ui.components.document_sheet import DocumentSheet
+from alhisabat.ui.components.grid_logic import Column
+from alhisabat.ui.components.panels import RelatedPanel
+from alhisabat.ui.components import document_model as DM
+from alhisabat.ui.core.actions import Action, ActionGroup
+from alhisabat.ui.core.base_page import BasePage
+from alhisabat.ui.core.cash_service import CashService
+from alhisabat.ui.core.permissions import ActionState
+
+class CashPage(BasePage):
+    focus_grid = 'acc_grid'
+    source_targets = {'cash_voucher': ('v_grid', 'tabs', 1), 'cash_transfer': ('t_grid', 'tabs', 2), 'cash_count': ('c_grid', 'tabs', 3)}
+    key='cash'; title='الصناديق والبنوك'; icon='cash'; required_permission='cash.view'
+    def build(self):
+        self.svc=CashService(self.session); self._acc=None; self._voucher=None; self._transfer_sel=None; self._count_sel=None
+        lay=QVBoxLayout(self); lay.setContentsMargins(6,6,6,6); lay.setSpacing(6)
+        # ملخص: بطاقات مدمجة في صف واحد (ارتفاعها مقيّد لتُعطي الجدول أكبر مساحة)
+        kr=QHBoxLayout(); kr.setSpacing(8)
+        self.k_total=KpiCard('إجمالي النقدية والبنوك','0.00','لكل عملة على حدة حسب ما أُدخل')
+        self.k_box=KpiCard('الصناديق','0','عدد الصناديق النشطة'); self.k_bank=KpiCard('الحسابات البنكية','0','عدد الحسابات النشطة'); self.k_draft=KpiCard('سندات بانتظار الترحيل','0','لا تؤثر على الرصيد حتى تُرحّل')
+        for k in (self.k_total,self.k_box,self.k_bank,self.k_draft):
+            k.setMaximumHeight(84); kr.addWidget(k,1)
+        lay.addLayout(kr)
+        fb=QHBoxLayout()                              # تصفية الصناديق والسندات بالعملة (عملة السند = عملة صندوقه/بنكه)
+        self.f_cur=QComboBox(); self.f_cur.addItem('كل العملات', None)
+        try:
+            for c in self.svc.currency_options(): self.f_cur.addItem(f"{c.get('name_ar') or c['code']} ({c['code']})", c['code'])
+        except Exception: pass
+        self.f_cur.currentIndexChanged.connect(lambda _i: self.refresh())
+        fb.addWidget(QLabel('العملة:')); fb.addWidget(self.f_cur); fb.addStretch(1); lay.addLayout(fb)
+        self.tabs=QTabWidget(); self.tabs.setLayoutDirection(Qt.RightToLeft)
+        # أعمدة بعروض معقولة + عمود النص (الاسم/البيان) يتمدد ليملأ العرض؛ معرّفات الشبكات v2 لتجاهل أي حالة أعمدة قديمة محفوظة بشكل خاطئ
+        self.acc_grid=DataGrid([Column('code','الكود',width=90), Column('name','الاسم',width=240), Column('kind','النوع',width=100), Column('currency','العملة',width=90), Column('balance_minor','الرصيد','money',140,minor=True), Column('is_active','نشط','status',80)], grid_id='cash_acc_v3')
+        self.acc_grid.set_dense(22, 8.5); self.acc_grid.set_free_resize()
+        self.acc_grid.selectionChangedRows.connect(self._on_acc); self.tabs.addTab(self._wrap(self.acc_grid),'الحسابات')
+        # سندات
+        self.v_grid=DataGrid([Column('voucher_no','رقم السند',width=120), Column('voucher_date','التاريخ','date',100), Column('type_ar','النوع',width=72), Column('cash_name','الصندوق/البنك',width=110), Column('counter_label','من / إلى (الطرف المقابل)',width=190), Column('currency','العملة',width=70), Column('amount_minor','المبلغ','money',110,minor=True), Column('status','الحالة','status',80)], grid_id='cash_vouchers_v4')
+        self.v_grid.set_dense(22, 8.5); self.v_grid.set_free_resize()
+        self.v_grid.selectionChangedRows.connect(self._on_v); self.tabs.addTab(self._wrap(self.v_grid),'السندات')
+        # تحويلات
+        self.t_grid=DataGrid([Column('transfer_no','رقم التحويل',width=120), Column('transfer_date','التاريخ','date',100), Column('from_cash_name','من',width=200), Column('to_cash_name','إلى',width=200), Column('from_amount_minor','المبلغ','money',140,minor=True), Column('status','الحالة','status',100)], grid_id='cash_transfers_v3')
+        self.t_grid.set_dense(22, 8.5); self.t_grid.set_free_resize()
+        self.t_grid.selectionChangedRows.connect(self._on_t); self.tabs.addTab(self._wrap(self.t_grid),'التحويلات')
+        # جرد الصندوق
+        self.c_grid=DataGrid([Column('id','المعرف','int',70), Column('cash_name','الصندوق',width=220), Column('count_date','تاريخ الجرد','date',110), Column('book_minor','الرصيد الدفتري','money',140,minor=True), Column('counted_minor','الرصيد الفعلي','money',140,minor=True), Column('diff_minor','الفارق','money',130,minor=True)], grid_id='cash_counts_v3')
+        self.c_grid.set_dense(22, 8.5); self.c_grid.set_free_resize()
+        self.c_grid.selectionChangedRows.connect(self._on_c); self.tabs.addTab(self._wrap(self.c_grid),'جرد الصندوق')
+        # معاينة الورقة + المرتبطات في لوحة سفلية قابلة للسحب/الطي؛ الجدول يأخذ الأغلبية افتراضيًا
+        # المعاينة بالجانب (مثل شاشة القيود المحاسبية): الجدول + ورقة المعاينة جنبًا إلى جنب
+        self.sheet=DocumentSheet(self.window_.prefs.get('paper'))
+        self.sheet.paperChanged.connect(lambda p: self.window_.prefs.set('paper', p))
+        self.related=RelatedPanel(); self.related.setMaximumHeight(130)
+        self.related.openRequested.connect(lambda page, params: self.open_page_requested.emit(page, params))
+        prev=QWidget(); pl=QVBoxLayout(prev); pl.setContentsMargins(0,0,0,0); pl.setSpacing(4)
+        pl.addWidget(self.sheet,1); pl.addWidget(self.related)
+        self.sheet.set_compact(True)
+        self.split=QSplitter(Qt.Horizontal); self.split.setChildrenCollapsible(True)
+        self.split.addWidget(self.tabs); self.split.addWidget(prev)
+        self.split.setStretchFactor(0,3); self.split.setStretchFactor(1,2)
+        prev.setMinimumWidth(340); prev.setMaximumWidth(780)
+        prev.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        self.sheet.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        QTimer.singleShot(0, lambda: self.split.setSizes([max(480,int(self.split.width()*0.56)), max(380,int(self.split.width()*0.44))]))
+        self.tabs.setMinimumWidth(320)
+        lay.addWidget(self.split,1)
+
+    @staticmethod
+    def _wrap(grid):
+        w=QWidget(); l=QVBoxLayout(w); l.setContentsMargins(0,4,0,0); l.addWidget(grid,1)
+        return w
+
+    def refresh(self):
+        if not getattr(self,'_built',False): return
+        keep_acc=self._acc['id'] if self._acc else None; keep_v=self._voucher['id'] if self._voucher else None
+        keep_t=self._transfer_sel['id'] if self._transfer_sel else None
+        try:
+            accs=self.svc.list_accounts(); vs=self.svc.vouchers()
+            trans=self.svc.transfers(); counts=self.svc.cash_counts()
+        except Exception as exc:
+            self.show_error(exc); accs=[]; vs=[]; trans=[]; counts=[]
+        cf=self.f_cur.currentData()
+        if cf:
+            accs=[a for a in accs if (a.get('currency') or '')==cf]
+            vs=[v for v in vs if (v.get('currency') or '')==cf]
+        self.acc_grid.set_rows(accs); self.v_grid.set_rows(vs); self.t_grid.set_rows(trans); self.c_grid.set_rows(counts)
+        act=[a for a in act if a.get('is_active')] if (act:=[a for a in accs if a.get('is_active')]) else []
+        try:
+            from alhisabat.ui.core import format as fmt
+            by={}
+            for a_ in act:
+                for cur,v in (a_.get('balances') or {}).items(): by[cur]=by.get(cur,0)+int(v or 0)
+            txt=' | '.join(f"{fmt.fmt_money(Decimal(v)/Decimal(100))} {cur}" for cur,v in sorted(by.items())) or '0.00'
+            self.k_total.set_value(txt,'لكل عملة على حدة حسب ما أُدخل')
+        except Exception: pass
+        self.k_box.set_value(str(sum(1 for a in act if a['kind']=='cashbox')))
+        self.k_bank.set_value(str(sum(1 for a in act if a['kind']=='bank')))
+        self.k_draft.set_value(str(sum(1 for v in vs if v['status']=='draft')))
+        if keep_acc is not None: self.acc_grid.select_where(lambda r: r['id']==keep_acc)
+        if keep_v is not None: self.v_grid.select_where(lambda r: r['id']==keep_v)
+        if keep_t is not None: self.t_grid.select_where(lambda r: r['id']==keep_t)
+        if not self._acc and not self._voucher: self.sheet.set_document(None); self.related.set_items([])
+        self.actions_changed.emit()
+
+    def _on_acc(self, rows):
+        self._acc=rows[0] if len(rows)==1 else None
+        if self._acc:
+            try: self.sheet.set_document(DM.from_print_spec({'title':'كشف حساب صندوق','company':self.state.get('company',{}).get('name',''),'extra':[('الاسم',self._acc['name'])],'columns':[],'rows':[],'totals':[]}, 'statement'))
+            except Exception: pass
+            items = []
+            if self._acc.get('account_id'):
+                items.append(('شجرة الحسابات', f"الحساب: {self._acc['name']}", 'accounts', {'id': self._acc['account_id']}))
+                items.append(('كشف الحساب', f"دفتر أستاذ {self._acc['name']}", 'ledger', {'account_id': self._acc['account_id']}))
+            self.related.set_items(items)
+        else:
+            self.related.set_items([])
+        self.actions_changed.emit()
+
+    def _on_v(self, rows):
+        self._voucher=rows[0] if len(rows)==1 else None
+        if self._voucher:
+            try:
+                spec=self.svc.voucher_print(int(self._voucher['id']))
+                doc=DM.from_print_spec(spec,'voucher',status=self._voucher.get('status') or '')
+                self.sheet.set_document(doc)
+            except Exception as e: self.sheet.set_document(None)
+            items = []
+            if self._voucher.get('journal_entry_id'):
+                items.append(('قيد اليومية', f"القيد المحاسبي #{self._voucher['journal_entry_id']}", 'journal', {'id': self._voucher['journal_entry_id']}))
+            if self._voucher.get('party_id'):
+                items.append(('الطرف', f"الطرف #{self._voucher['party_id']}", 'parties', {'id': self._voucher['party_id']}))
+            self.related.set_items(items)
+        else:
+            self.related.set_items([])
+        self.actions_changed.emit()
+
+    def _on_t(self, rows):
+        self._transfer_sel=rows[0] if len(rows)==1 else None
+        if self._transfer_sel:
+            items = []
+            if self._transfer_sel.get('journal_entry_id'):
+                items.append(('قيد اليومية', f"القيد المحاسبي #{self._transfer_sel['journal_entry_id']}", 'journal', {'id': self._transfer_sel['journal_entry_id']}))
+            self.related.set_items(items)
+        else:
+            self.related.set_items([])
+        self.actions_changed.emit()
+
+    def _on_c(self, rows):
+        self._count_sel=rows[0] if len(rows)==1 else None
+        self.actions_changed.emit()
+
+    def _state(self,key):
+        if key in ('add_cashbox','add_bank','cash_count'): return self.access.state('cash.manage')
+        if key=='allow_neg':
+            if not self._acc: return ActionState(False,'حدد حسابًا')
+            return self.access.state('cash.manage')
+        if key=='v_new': return self.access.state('cash.voucher')
+        if key=='v_edit':
+            if not self._voucher: return ActionState(False,'حدد سندًا')
+            st=self._voucher['status']
+            if st=='cancelled': return ActionState(False,'السند الملغى لا يُعدَّل')
+            base=self.access.state('cash.voucher')
+            if not base.enabled or st=='draft': return base
+            for code in ('cash.cancel','journal.reverse'):       # المرحَّل يُعدَّل بإلغائه وإنشاء بديل: يحتاج صلاحيتي الإلغاء والعكس
+                c=self.access.state(code)
+                if not c.enabled: return c
+            return base
+        if key in ('v_post','v_delete'):
+            if not self._voucher: return ActionState(False,'حدد سندًا')
+            if key=='v_post': return ActionState(self._voucher['status']=='draft','الترحيل للمسودة فقط')
+            return ActionState(self._voucher['status']=='draft','الحذف للمسودة فقط')
+        if key=='v_cancel':
+            if not self._voucher: return ActionState(False,'حدد سندًا')
+            return ActionState(self._voucher['status']=='posted','الإلغاء للمرحل فقط')
+        if key=='transfer':
+            if len(self.acc_grid.rows if hasattr(self.acc_grid,'rows') else [])<2: return ActionState(True)
+            return self.access.state('cash.voucher')
+        if key=='cancel_transfer':
+            if not self._transfer_sel: return ActionState(False,'حدد تحويلًا أولًا')
+            if self._transfer_sel.get('status') != 'posted': return ActionState(False,'الإلغاء للتحويل المرحل فقط')
+            c_st = self.access.state('cash.cancel')
+            if not c_st.enabled: return c_st
+            return self.access.state('journal.reverse')
+        if key=='statement':
+            if not self._acc: return ActionState(False,'حدد حسابًا')
+            return self.access.state('cash.view')
+        if key=='toggle':
+            if not self._acc: return ActionState(False,'حدد حسابًا')
+            return self.access.state('cash.manage')
+        if key=='v_whatsapp':
+            if not self._voucher: return ActionState(False,'حدد سندًا')
+            if self._voucher.get('voucher_type') != 'receipt': return ActionState(False,'متاح لسندات القبض فقط')
+            if self._voucher.get('status') != 'posted': return ActionState(False,'متاح للسند المرحل فقط')
+            if not self.access.has('message.send'): return ActionState(False,'تتطلب صلاحية «إرسال رسائل واتساب»')
+            return ActionState(True)
+        return ActionState(True)
+
+    def ribbon_groups(self):
+        def a(k,lab,icon,**kw): return Action(k,lab,icon,state_fn=lambda kk=k: self._state(kk), handler=lambda kk=k: self.do(kk), **kw)
+        return [
+            ActionGroup('حساب',[a('add_cashbox','+ صندوق','new',primary=True), a('add_bank','+ حساب بنكي','new'), a('toggle','تفعيل/تعطيل','refresh'), a('allow_neg','السماح بالرصيد السالب','refresh'), a('statement','كشف حساب','book')]),
+            ActionGroup('سندات وعمليات',[a('v_new','سند قبض/صرف','new'), a('v_edit','تعديل السند','edit'), a('v_post','ترحيل السند','post',primary=True), a('v_delete','حذف المسودة','delete',danger=True), a('v_cancel','إلغاء السند','delete',danger=True), a('transfer','تحويل بين الحسابات','transfer'), a('cancel_transfer','إلغاء التحويل','delete',danger=True), a('cash_count','جرد صندوق','coins')]),
+            ActionGroup('عرض',[Action('print','طباعة','print',state_fn=lambda: ActionState(bool(self._voucher or self._acc),'اختر سندًا أو حسابًا'), handler=lambda: self.sheet.print_()), a('v_whatsapp','إرسال واتساب','mail'), Action('refresh','تحديث','refresh',handler=self.refresh)])
+        ]
+
+    def _send_whatsapp(self):
+        if not self._voucher: return
+        party_id = self._voucher.get('party_id')
+        party_name = self._voucher.get('party_name', '')
+        phone = ''
+        if party_id:
+            try:
+                p = self.session.party(party_id)
+                if p:
+                    phone = (p.get('phone') or '').strip()
+                    party_name = (p.get('name') or party_name).strip()
+            except Exception:
+                pass
+        v_no = self._voucher.get('voucher_no') or str(self._voucher.get('id', ''))
+        amt = self._voucher.get('amount_minor', 0)
+        from alhisabat.ui.core import format as fmt
+        amt_str = fmt.fmt_money(amt, minor=True)
+        cur = self._voucher.get('currency') or ''
+        bal_str = ''
+        try:
+            if party_id:
+                bal = self.session.party_balance(party_id)
+                bal_str = fmt.fmt_money(bal, minor=False)
+        except Exception:
+            pass
+        bal_part = f" رصيدكم الحالي: {bal_str} {cur}." if bal_str else ""
+        msg_text = f"مرحبًا {party_name}، تم استلام مبلغ {amt_str} {cur} بموجب سند القبض رقم {v_no}.{bal_part}"
+        from alhisabat.ui.components.whatsapp_preview import WhatsAppPreviewDialog
+        dlg = WhatsAppPreviewDialog(
+            self,
+            db_path=self.session.db_path,
+            phone=phone,
+            party_name=party_name,
+            message_text=msg_text,
+            party_id=party_id,
+            ref_type='cash_receipt',
+            ref_id=self._voucher.get('id'),
+            branch_id=getattr(self.session, 'branch_id', None),
+            user_id=getattr(self.session, 'user_id', None),
+        )
+        self.exec_form(dlg)
+
+    def do(self,key):
+        st=self._state(key)
+        if not st.enabled: return QMessageBox.information(self,self.title,st.reason)
+        if key=='v_whatsapp': return self._send_whatsapp()
+        if key=='add_cashbox': return self._add('cashbox')
+        if key=='add_bank': return self._add('bank')
+        if key=='allow_neg':
+            cur=bool(self._acc.get('allow_negative'))
+            r=ask_reason(self,'الرصيد السالب',[('سيُمنع' if cur else 'سيُسمح')+' بأن يصبح رصيد «'+str(self._acc.get('name',''))+'» سالبًا.'],need_reason=False,confirm_text='تأكيد')
+            if r is None: return
+            ok,_=self.guarded(self.svc.set_allow_negative,self._acc['id'],not cur,reload=False)
+            if ok: self.notify('تم تحديث إعداد الرصيد السالب'); self.refresh(); self.window_.data_changed(self.key)
+            return
+        if key=='v_new': return self._new_voucher()
+        if key=='v_edit': return self._edit_voucher()
+        if key=='v_post':
+            if ask_reason(self,'ترحيل السند',['سيُنشأ القيد المحاسبي ويتأثر الرصيد.'],need_reason=False,confirm_text='ترحيل') is None: return
+            ok,_=self.guarded(self.svc.post,self._voucher['id'],reload=False)
+            if ok: self.notify('تم ترحيل السند'); self.refresh(); self.window_.data_changed(self.key)
+        if key=='v_delete':
+            if ask_reason(self,'حذف المسودة',['سيُحذف السند نهائيًا.'],need_reason=False,confirm_text='حذف',danger=True) is None: return
+            ok,_=self.guarded(self.svc.delete_draft,self._voucher['id'],reload=False)
+            if ok: self.notify('حُذفت المسودة'); self.refresh(); self.window_.data_changed(self.key)
+        if key=='v_cancel':
+            r=ask_reason(self,'إلغاء السند',['سيُنشأ قيد عكسي.'],True,'إلغاء السند')
+            if r is None: return
+            from datetime import date as _d
+            ok,_=self.guarded(self.svc.cancel,self._voucher['id'], _d.today().isoformat(), r, reload=False)
+            if ok: self.notify('تم إلغاء السند'); self.refresh(); self.window_.data_changed(self.key)
+        if key=='transfer': return self._transfer()
+        if key=='cancel_transfer': return self._cancel_transfer()
+        if key=='cash_count': return self._cash_count()
+        if key=='statement': return self._statement()
+        if key=='toggle':
+            verb='تعطيل' if self._acc.get('is_active') else 'تفعيل'
+            if ask_reason(self,verb,[f"هل تريد {verb} «{self._acc.get('name','')}»؟"],need_reason=False,confirm_text=verb) is None: return
+            ok,_=self.guarded(self.svc.set_active,self._acc['id'], not bool(self._acc.get('is_active')), reload=False)
+            if ok: self.refresh(); self.window_.data_changed(self.key)
+
+    def _add(self,kind):
+        from alhisabat.ui.app_dialogs.cash import CashAccountDialog
+        d=CashAccountDialog(self,kind)
+        if self.exec_form(d):
+            v=d.values(); v['kind']=kind
+            ok,_=self.guarded(self.svc.create,v,reload=False)
+            if ok: self.notify('تم إنشاء الحساب'); self.refresh(); self.window_.data_changed(self.key)
+
+    def _new_voucher(self):
+        from alhisabat.ui.app_dialogs.cash import VoucherDialog
+        d=VoucherDialog(self)
+        if self.exec_form(d):
+            v=d.values(); ok,_=self.guarded(self.svc.create_voucher, v['kind'], v, reload=False)
+            if ok: self.notify('تم حفظ السند كمسودة'); self.refresh(); self.window_.data_changed(self.key)
+
+    def _edit_voucher(self):
+        """تعديل السند المحدد: المسودة تُحدَّث في مكانها، والمرحَّل يُلغى بقيد عكسي ويُنشأ بديله مرحَّلاً (بسبب إلزامي)."""
+        if not self._voucher: return
+        try: det=self.svc.voucher_detail(self._voucher['id'])
+        except Exception as exc: return self.show_error(exc)
+        if len(det.get('lines') or [])>1:
+            return QMessageBox.information(self,self.title,'هذا السند متعدد البنود ولا يدعمه التعديل المبسّط: ألغِه وأنشئ سندًا جديدًا.')
+        from alhisabat.ui.app_dialogs.cash import VoucherDialog
+        d=VoucherDialog(self, det)
+        if not self.exec_form(d): return
+        v=d.values(); posted=det['status']=='posted'; reason=None
+        if posted:
+            reason=ask_reason(self,'تعديل سند مرحّل',[f"سيُلغى السند رقم {det.get('voucher_no') or det['id']} بقيد عكسي ويُنشأ بديله مرحّلاً بالقيم الجديدة (برقم جديد).",
+                              'يبقى السند القديم ظاهرًا بحالة «ملغى» مع السبب، وتبقى تخصيصات الفواتير إن لم يتغيّر الطرف.'],True,'تعديل السند')
+            if not reason: return
+        ok,res=self.guarded(self.svc.update_voucher, det['id'], v['kind'], v, reason, reload=False)
+        if ok:
+            if posted and isinstance(res,dict): self._voucher={'id':res['voucher_id']}        # حدّد السند الجديد بعد التحديث
+            self.notify(f"تم تعديل السند وترحيله برقم {res.get('voucher_no')}" if posted and isinstance(res,dict) else 'تم تعديل السند')
+            self.refresh(); self.window_.data_changed(self.key)
+
+    def _transfer(self):
+        from alhisabat.ui.app_dialogs.cash import TransferDialog
+        d=TransferDialog(self)
+        if self.exec_form(d):
+            v=d.values(); ok,_=self.guarded(self.svc.transfer,v,reload=False)
+            if ok: self.notify('تم التحويل'); self.refresh(); self.window_.data_changed(self.key)
+
+    def _cancel_transfer(self):
+        if not self._transfer_sel: return
+        tid = self._transfer_sel['id']
+        t_no = self._transfer_sel.get('transfer_no', tid)
+        r = ask_reason(self, 'إلغاء التحويل', [f"هل تريد إلغاء التحويل رقم {t_no}؟", "سيتم إنشاء قيد عكسي."], need_reason=True, confirm_text='إلغاء التحويل', danger=True)
+        if not r: return
+        from datetime import date as _d
+        ok, _ = self.guarded(self.svc.cancel_transfer, tid, _d.today().isoformat(), r, reload=False)
+        if ok: self.notify('تم إلغاء التحويل بنجاح'); self.refresh(); self.window_.data_changed(self.key)
+
+    def _cash_count(self):
+        from alhisabat.ui.app_dialogs.cash import CashCountDialog
+        d = CashCountDialog(self)
+        if self.exec_form(d):
+            vals = d.values()
+            ok, res = self.guarded(self.svc.cash_count, vals['cash_id'], vals['date'], vals['amount'], note=vals.get('note', ''), reload=False)
+            if ok:
+                from alhisabat.ui.components.datagrid import format_minor
+                diff = res.get('diff', 0) if isinstance(res, dict) else 0
+                msg = f"تم تسجيل جرد الصندوق. الفارق: {format_minor(diff)}"
+                self.notify(msg)
+                self.refresh()
+                self.window_.data_changed(self.key)
+
+    def _statement(self):
+        from alhisabat.ui.app_dialogs.cash import StatementDialog
+        d=StatementDialog(self, self._acc)
+        self.exec_form(d)
+
+
+class BankReconPage(BasePage):
+    key='bank_recon'; title='المطابقة البنكية'; icon='bank'; required_permission='cash.reconcile'
+    def build(self):
+        self.svc=CashService(self.session); self._sel=None
+        lay=QVBoxLayout(self); lay.setContentsMargins(6,6,6,6)
+        self.grid=DataGrid([Column('bank','البنك',width=120), Column('txn_date','التاريخ','date',95), Column('description','البيان',width=220), Column('amount_minor','المبلغ','money',110,minor=True), Column('status','الحالة','status',90)], grid_id='bank_recon')
+        self.grid.selectionChangedRows.connect(self._on_select)
+        lay.addWidget(self.grid,1)
+        self.info=QLabel(''); self.info.setObjectName('ctxKey'); lay.addWidget(self.info)
+
+    def refresh(self):
+        if not getattr(self,'_built',False): return
+        keep=self._sel['id'] if self._sel else None
+        try: rows=self.svc.unmatched()
+        except Exception as exc: self.show_error(exc); rows=[]
+        self.grid.set_rows(rows); self.info.setText(f'{len(rows)} بند غير مطابق')
+        if keep is not None: self.grid.select_where(lambda r: r['id']==keep)
+        else: self._on_select([])
+        self.actions_changed.emit()
+
+    def _on_select(self, rows): self._sel=rows[0] if len(rows)==1 else None; self.actions_changed.emit()
+
+    def _state(self,key):
+        if key in ('import','auto','recon_report'): return self.access.state('cash.reconcile')
+        if not self._sel: return ActionState(False,'حدد بندًا')
+        if key in ('manual','book','ignore'): return self.access.state('cash.reconcile')
+        if key=='unmatch': return ActionState(self._sel.get('status')=='matched','فك المطابقة للمطابق فقط')
+        return ActionState(True)
+
+    def ribbon_groups(self):
+        def a(k,lab,icon,**kw): return Action(k,lab,icon,state_fn=lambda kk=k: self._state(kk), handler=lambda kk=k: self.do(kk), **kw)
+        return [
+            ActionGroup('مطابقة',[a('import','استيراد كشف','new',primary=True), a('auto','مطابقة تلقائية','refresh'), a('manual','مطابقة يدوية','link'), a('book','تسجيل كبند محاسبي','post'), a('ignore','استبعاد','delete'), a('unmatch','فك المطابقة','return'), a('recon_report','تقرير المطابقة','print')]),
+            ActionGroup('عرض',[Action('refresh','تحديث','refresh',handler=self.refresh)])
+        ]
+
+    def do(self,key):
+        st=self._state(key)
+        if not st.enabled: return QMessageBox.information(self,self.title,st.reason)
+        if key=='import': return self._import()
+        if key=='auto':
+            if ask_reason(self,'مطابقة تلقائية',['ستُطابق البنود المتساوية في المبلغ ضمن ±3 أيام.'],need_reason=False) is None: return
+            ok,n=self.guarded(self.svc.auto_match, reload=False)
+            if ok: self.notify(f'تمت مطابقة {n} بندًا'); self.refresh(); self.window_.data_changed(self.key)
+        if key=='recon_report': return self._recon_report()
+        if key=='manual': return self._manual()
+        if key=='book': return self._book()
+        if key=='ignore': return self._ignore()
+        if key=='unmatch': return self._unmatch()
+    def _import(self):
+        path,_=QFileDialog.getOpenFileName(self,'استيراد كشف بنكي','','CSV (*.csv)')
+        if not path: return
+        rows=CashService.read_csv_static(path) if hasattr(CashService,'read_csv_static') else self._read_csv(path)
+        # تطبيع
+        norm=[]
+        for r in rows: norm.append({'date':(r.get('date') or r.get('txn_date') or '').strip(),'amount':r.get('amount') or r.get('amount_minor') or '0','description':r.get('description') or r.get('memo') or '','reference':r.get('reference') or r.get('ref') or '','balance':r.get('balance') or None})
+        from alhisabat.ui.components.basic import ask_reason as _ask
+        # اختيار البنك
+        try: banks=self.session.lookup_cash('bank')
+        except Exception: banks=[]
+        if not banks: return QMessageBox.warning(self,self.title,'أنشئ حسابًا بنكيًا أولًا.')
+        from PySide6.QtWidgets import QDialog, QFormLayout, QComboBox
+        dlg=QDialog(self); dlg.setWindowTitle('استيراد كشف بنكي'); dlg.setLayoutDirection(Qt.RightToLeft); f=QFormLayout(dlg); cb=QComboBox()
+        for bid,lab in banks: cb.addItem(lab,bid)
+        f.addRow('الحساب البنكي',cb)
+        bb=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel); bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject); f.addRow(bb)
+        if self.exec_form(dlg)!=QDialog.Accepted: return
+        ok,n=self.guarded(self.svc.import_statement, cb.currentData(), norm, reload=False)
+        if ok: self.notify(f'تم استيراد {n} بندًا'); self.refresh(); self.window_.data_changed(self.key)
+    def _read_csv(self, path):
+        import csv
+        with open(path,'r',encoding='utf-8-sig',newline='') as f: return list(csv.DictReader(f))
+    def _manual(self):
+        if not self._sel: return
+        try: opts=self.svc.unmatched_gl(int(self._sel.get('cash_id') or 0), self._sel.get('txn_date'))
+        except Exception as e: return self.show_error(e)
+        if not opts: return QMessageBox.information(self,self.title,'لا توجد سطور أستاذ مطابقة للمبلغ في الفترة.')
+        from PySide6.QtWidgets import QDialog, QFormLayout, QComboBox, QDialogButtonBox
+        dlg=QDialog(self); dlg.setWindowTitle('مطابقة يدوية'); dlg.setLayoutDirection(Qt.RightToLeft); form=QFormLayout(dlg)
+        cb=QComboBox()
+        for x in opts: cb.addItem(f"{x['entry_date']} — {x['description']} — {Decimal(x['amt'])/100:.2f}", int(x['id']))
+        form.addRow('سطر الأستاذ',cb)
+        bb=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel); bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject); form.addRow(bb)
+        if self.exec_form(dlg)!=QDialog.Accepted: return
+        ok,_=self.guarded(self.svc.match, int(self._sel['id']), int(cb.currentData()), reload=False)
+        if ok: self.notify('تمت المطابقة'); self.refresh(); self.window_.data_changed(self.key)
+    def _book(self):
+        if not self._sel: return
+        from PySide6.QtWidgets import QDialog, QFormLayout, QComboBox, QLineEdit, QDialogButtonBox
+        dlg=QDialog(self); dlg.setWindowTitle('تسجيل بند كشف كبند محاسبي'); dlg.setLayoutDirection(Qt.RightToLeft); form=QFormLayout(dlg)
+        cb=QComboBox()
+        try: opts=self.session.lookup_accounts(groups=False)
+        except Exception: opts=[]
+        for aid,lab in opts: cb.addItem(lab,aid)
+        desc=QLineEdit(self._sel.get('description',''))
+        form.addRow('الحساب المقابل',cb); form.addRow('البيان',desc)
+        bb=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel); bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject); form.addRow(bb)
+        if self.exec_form(dlg)!=QDialog.Accepted: return
+        ok,_=self.guarded(self.svc.book, int(self._sel['id']), int(cb.currentData()), desc.text().strip(), reload=False)
+        if ok: self.notify('تم إنشاء القيد'); self.refresh(); self.window_.data_changed(self.key)
+    def _ignore(self):
+        r=ask_reason(self,'استبعاد بند كشف',['سيُستبعد البند مع ذكر السبب.'],True,'استبعاد')
+        if r is None: return
+        ok,_=self.guarded(self.svc.ignore, int(self._sel['id']), r, reload=False)
+        if ok: self.notify('تم الاستبعاد'); self.refresh(); self.window_.data_changed(self.key)
+    def _unmatch(self):
+        r=ask_reason(self,'فك المطابقة',['سيُفك ارتباط البند.'],True,'فك المطابقة')
+        if r is None: return
+        ok,_=self.guarded(self.svc.unmatch, int(self._sel['id']), r, reload=False)
+        if ok: self.notify('تم فك المطابقة'); self.refresh(); self.window_.data_changed(self.key)
+
+    def _recon_report(self):
+        from alhisabat.ui.app_dialogs.cash import BankReconReportDialog
+        BankReconReportDialog(self).exec()
+

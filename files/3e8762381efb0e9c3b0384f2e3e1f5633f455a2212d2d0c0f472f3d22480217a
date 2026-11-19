@@ -1,0 +1,154 @@
+"""بحث السجلات للتشغيل السريع (قراءة فقط). يعيد قواميس {title, group, detail, page, params, score} جاهزة للعرض.
+
+كل مصدر يُفحص بصلاحيته وبنطاق الفرع الحالي (نفس شروط lookup_* وقوائم الصفحات)؛ مصدر بلا صلاحية يُتجاوز، ومصدر فاشل لا يوقف
+البقية. المطابقة بالعربية الموحَّدة (تجاهل التشكيل والهمزات والأرقام العربية). الفحص لأحدث MAX_SCAN صف لكل مصدر ثم تصفية في الذاكرة.
+"""
+from decimal import Decimal
+
+from alhisabat.business import branch_scope
+from alhisabat.ui.core.logic import matches, numeric_query, relevance
+
+PER_KIND = 6
+MAX_SCAN = 4000
+_STATUS = {'draft': 'مسودة', 'posted': 'مرحّل', 'cancelled': 'ملغى', 'reversed': 'معكوس'}
+
+
+def _money(minor, digits):
+    try:
+        return f'{Decimal(int(minor)) / (Decimal(10) ** int(digits)):,.{int(digits)}f}'
+    except (TypeError, ValueError, ArithmeticError):
+        return ''
+
+
+def _hit(title, group, detail, page, params, score):
+    return {'title': title, 'group': group, 'detail': detail, 'page': page, 'params': params, 'score': score}
+
+
+class SearchMixin:
+    def search_records(self, query, access):
+        """بحث عميق في السجلات. استعلام حرف واحد يُقبل إن كان رقمًا (رقم فاتورة/قيد/مبلغ)، وإلا يلزم حرفان."""
+        q = (query or '').strip()
+        if len(q) < 2 and numeric_query(q) is None:
+            return []
+        out = []
+        for fn in (self._sr_parties, self._sr_items, self._sr_accounts, lambda a, b: self._sr_invoices(a, b, 'sales'),
+                   lambda a, b: self._sr_invoices(a, b, 'purchases'), self._sr_journal, self._sr_others):
+            try:
+                rows = fn(q, access)
+            except Exception:  # noqa: BLE001 — مصدر فاشل/بلا صلاحية يُتجاوز ولا يوقف بقية المصادر
+                continue
+            rows.sort(key=lambda h: -h['score'])
+            out += rows[:PER_KIND]
+        return out
+
+    def _sr_parties(self, q, access):
+        if not access.has('party.view'):
+            return []
+        f, fa = branch_scope.master_clause(self.conn, self.company_id, self.branch_id)
+        out = []
+        for r in self.conn.execute("SELECT id,kind,code,name,phone,tax_no,email FROM parties WHERE company_id=? AND is_active=1" + f +
+                                   " ORDER BY name LIMIT ?", (self.company_id, *fa, MAX_SCAN)):
+            if matches(q, r['code'], r['name'], r['phone'], r['tax_no'], r['email']):
+                out.append(_hit(f"{r['code']} — {r['name']}", 'عميل' if r['kind'] == 'customer' else 'مورد', r['phone'] or '',
+                                'parties', {'id': r['id']}, relevance(q, r['name'], r['code'], r['phone'], r['tax_no'])))
+        return out
+
+    def _sr_items(self, q, access):
+        if not access.has('inventory.view'):
+            return []
+        f, fa = branch_scope.master_clause(self.conn, self.company_id, self.branch_id)
+        out = []
+        for r in self.conn.execute("SELECT id,code,name,barcode FROM items WHERE company_id=? AND is_active=1" + f +
+                                   " ORDER BY name LIMIT ?", (self.company_id, *fa, MAX_SCAN)):
+            if matches(q, r['code'], r['name'], r['barcode']):
+                out.append(_hit(f"{r['code']} — {r['name']}", 'صنف', ('باركود ' + r['barcode']) if r['barcode'] else '',
+                                'stock', {'id': r['id']}, relevance(q, r['name'], r['code'], r['barcode'])))
+        return out
+
+    def _sr_accounts(self, q, access):
+        if not access.has('account.view'):
+            return []
+        hide = branch_scope.foreign_account_ids(self.conn, self.company_id, self.branch_id)
+        out = []
+        # حسابات العملاء/الموردين تظهر كسجلات أطراف (بصلاحية party.view) فلا تُكرَّر هنا
+        for r in self.conn.execute("SELECT id,code,name FROM accounts WHERE company_id=? AND is_active=1"
+                                   " AND id NOT IN (SELECT account_id FROM parties WHERE company_id=?) ORDER BY code LIMIT ?",
+                                   (self.company_id, self.company_id, MAX_SCAN)):
+            if r['id'] not in hide and matches(q, r['code'], r['name']):
+                out.append(_hit(f"{r['code']} — {r['name']}", 'حساب', 'فتح كشف الحساب', 'ledger',
+                                {'account_id': r['id']}, relevance(q, r['name'], r['code'])))
+        return out
+
+    def _sr_invoices(self, q, access, kind):
+        perm, table, party_col, page, label = (
+            ('sales.view', 'sales_invoices', 'customer_id', 'sales', 'بيع'),
+            ('purchases.view', 'purchase_invoices', 'supplier_id', 'purchases', 'شراء'))[0 if kind == 'sales' else 1]
+        if not access.has(perm):
+            return []
+        f, fa = branch_scope.txn_clause(self.conn, self.company_id, self.branch_id, 'i.branch_id')
+        sref = 'i.supplier_ref' if kind == 'purchases' else "''"
+        num = numeric_query(q)
+        out = []
+        for r in self.conn.execute(
+                f"SELECT i.id,i.doc_type,i.invoice_no,i.invoice_date,i.status,i.grand_total,i.notes,i.currency,{sref} AS sref,"
+                f" p.name AS pname, c.minor_digits AS digits FROM {table} i LEFT JOIN parties p ON p.id=i.{party_col}"
+                f" LEFT JOIN currencies c ON c.code=i.currency WHERE i.company_id=?" + f +
+                " ORDER BY i.invoice_date DESC, i.id DESC LIMIT ?", (self.company_id, *fa, MAX_SCAN)):
+            digits = 2 if r['digits'] is None else r['digits']
+            by_amount = num is not None and int(r['grand_total']) == int(num * (Decimal(10) ** digits))
+            if not (by_amount or matches(q, r['invoice_no'], r['sref'], r['pname'], r['notes'])):
+                continue
+            grp = ('مرتجع ' if r['doc_type'] == 'return' else 'فاتورة ') + label
+            out.append(_hit(f"{r['invoice_no'] or '(بلا رقم)'} — {r['pname'] or 'بدون طرف'}", grp,
+                            f"{r['invoice_date']} · {_money(r['grand_total'], digits)} {r['currency']} · {_STATUS.get(r['status'], r['status'])}",
+                            page, {'id': r['id']},
+                            90 if by_amount else relevance(q, r['invoice_no'] or '', r['pname'], r['sref'], r['notes'])))
+        return out
+
+    def _sr_journal(self, q, access):
+        if not access.has('journal.view'):
+            return []
+        f, fa = branch_scope.txn_clause(self.conn, self.company_id, self.branch_id, 'je.branch_id')
+        out = []
+        for r in self.conn.execute(
+                "SELECT je.id,je.entry_no,je.entry_date,je.description,je.status,fy.name AS fy,"
+                " (SELECT GROUP_CONCAT(memo,' ') FROM journal_lines WHERE entry_id=je.id) AS memos"
+                " FROM journal_entries je JOIN fiscal_years fy ON fy.id=je.fiscal_year_id WHERE je.company_id=?" + f +
+                " ORDER BY je.entry_date DESC, je.id DESC LIMIT ?", (self.company_id, *fa, MAX_SCAN)):
+            if matches(q, r['entry_no'], r['description'], r['memos']):
+                out.append(_hit(f"قيد {r['entry_no']} — {r['description'] or 'بدون بيان'}", 'قيد يومية',
+                                f"{r['entry_date']} · سنة {r['fy']} · {_STATUS.get(r['status'], r['status'])}",
+                                'journal', {'id': r['id']}, relevance(q, str(r['entry_no']), r['description'], r['memos'])))
+        return out
+
+    def _sr_simple(self, q, access, perm, sql, args, label, page, fmt):
+        if perm and not access.has(perm):
+            return []
+        out = []
+        for r in self.conn.execute(sql, args):
+            title, hay, detail, rid = fmt(r)
+            if matches(q, *hay):
+                out.append(_hit(title, label, detail, page, {'id': rid} if rid is not None else None, relevance(q, title, *hay)))
+        return out
+
+    def _sr_others(self, q, access):
+        cid = self.company_id
+        f, fa = branch_scope.txn_clause(self.conn, cid, self.branch_id)
+        gw, gwa = self._access_clause('user_warehouse_access', 'warehouse_id')      # تقييد المستخدم بمخازن/صناديق محددة
+        gc, gca = self._access_clause('user_cash_access', 'cash_account_id')
+        out = []
+        out += self._sr_simple(q, access, 'inventory.view', "SELECT id,code,name FROM warehouses WHERE company_id=? AND is_active=1" + f + gw,
+                               (cid, *fa, *gwa), 'مستودع', 'warehouses',
+                               lambda r: (f"{r['code']} — {r['name']}", (r['code'], r['name']), '', r['id']))
+        out += self._sr_simple(q, access, 'cash.view',
+                               "SELECT id,code,name,kind,currency FROM cash_accounts WHERE company_id=? AND is_active=1" + f + gc, (cid, *fa, *gca),
+                               'صندوق / بنك', 'cash',
+                               lambda r: (r['name'], (r['code'], r['name'], r['currency']),
+                                          f"{'بنك' if r['kind'] == 'bank' else 'صندوق'} · {r['currency']}", r['id']))
+        out += self._sr_simple(q, access, 'settings.manage', "SELECT id,name,phone FROM branches WHERE company_id=? AND is_active=1", (cid,),
+                               'فرع', 'branches', lambda r: (r['name'], (r['name'], r['phone']), r['phone'] or '', r['id']))
+        out += self._sr_simple(q, access, None, "SELECT code,name_ar,symbol FROM currencies WHERE is_active=1", (), 'عملة', 'currencies',
+                               lambda r: (f"{r['name_ar']} ({r['code']})", (r['code'], r['name_ar'], r['symbol']), r['symbol'], None))
+        out += self._sr_simple(q, access, 'user.manage', "SELECT username,full_name FROM users WHERE is_active=1", (), 'مستخدم', 'users',
+                               lambda r: (r['full_name'], (r['username'], r['full_name']), r['username'], None))
+        return out

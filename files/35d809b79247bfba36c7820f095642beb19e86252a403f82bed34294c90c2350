@@ -1,0 +1,156 @@
+"""نافذة تنظيف الأصناف: حذف ما لا حركة له، وكشف الأصناف المكررة اسمًا لحذف النسخ الزائدة.
+
+الحذف مسموح فقط لصنف بلا رصيد افتتاحي ولا حركات ولا مستندات (يتحقق المحرك لحظة التنفيذ)، وفي المكررات يبقى
+صنف واحد على الأقل من كل اسم. تستخدم InventoryService فقط (لا SQL ولا استيراد محركات).
+"""
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (QAbstractItemView, QDialog, QHBoxLayout, QHeaderView, QLabel, QMessageBox, QPushButton,
+                               QTableWidget, QTableWidgetItem, QVBoxLayout)
+
+from alhisabat.ui.components.basic import ask_reason, make_resizable
+from alhisabat.ui.core import item_cleanup_logic as L
+
+MODES = {
+    'unused': {
+        'title': 'حذف الأصناف بدون حركات',
+        'hint': 'أصناف لا رصيد افتتاحي لها ولا حركات ولا مستندات. حدّد ما تريد حذفه نهائيًا.',
+        'load': 'unused_items', 'delete': 'delete_unused_items', 'empty': 'لا توجد أصناف بدون حركات.',
+    },
+    'duplicates': {
+        'title': 'الأصناف المكررة',
+        'hint': 'أصناف متشابهة الاسم (الفرق في همزة أو تاء مربوطة أو مسافة…). المحدد مسبقًا النسخ الزائدة التي ليس لها '
+                'رصيد افتتاحي ولا حركة؛ النسخ ذات الحركات لا تُحذف. تبقى نسخة واحدة على الأقل من كل اسم.',
+        'load': 'duplicate_items', 'delete': 'delete_duplicate_items', 'empty': 'لا توجد أصناف مكررة.',
+    },
+}
+COLS = ['', 'المجموعة', 'الكود', 'اسم الصنف', 'التصنيف', 'الوحدة', 'الحالة']
+
+
+class ItemCleanupDialog(QDialog):
+    def __init__(self, page, mode):
+        super().__init__(page)
+        self.page, self.mode, self.cfg = page, mode, MODES[mode]
+        self.svc = page.svc
+        self.setWindowTitle(self.cfg['title'])
+        self.setLayoutDirection(Qt.RightToLeft)
+        make_resizable(self, 860, 560, min_size=(640, 360))
+        root = QVBoxLayout(self)
+        self.hint = QLabel(self.cfg['hint'])
+        self.hint.setWordWrap(True)
+        root.addWidget(self.hint)
+        self.table = QTableWidget(0, len(COLS))
+        self.table.setHorizontalHeaderLabels(COLS)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(QHeaderView.Interactive)
+        hh.setStretchLastSection(True)
+        for i, w in enumerate((34, 70, 90, 220, 130, 80)):
+            self.table.setColumnWidth(i, w)
+        self.table.setColumnHidden(1, mode == 'unused')
+        self.table.itemChanged.connect(lambda _it: self._sync())
+        root.addWidget(self.table, 1)
+        bar = QHBoxLayout()
+        self.count = QLabel('')
+        bar.addWidget(self.count, 1)
+        for text, fn in (('تحديد الكل', lambda: self._check_all(True)), ('إلغاء التحديد', lambda: self._check_all(False))):
+            b = QPushButton(text)
+            b.setAutoDefault(False)
+            b.clicked.connect(fn)
+            bar.addWidget(b)
+        self.btn_delete = QPushButton('حذف المحدد')
+        self.btn_delete.setAutoDefault(False)
+        self.btn_delete.clicked.connect(self._delete)
+        bar.addWidget(self.btn_delete)
+        close = QPushButton('إغلاق')
+        close.setAutoDefault(False)
+        close.clicked.connect(self.accept)
+        bar.addWidget(close)
+        root.addLayout(bar)
+        self.empty = not self._load()
+
+    # ------------------------------------------------------------------ تحميل وعرض
+    def _load(self):
+        try:
+            data = getattr(self.svc, self.cfg['load'])()
+        except Exception as exc:  # noqa: BLE001
+            self.page.show_error(exc)
+            data = []
+        self._rows = L.build_rows(self.mode, data)
+        self.table.blockSignals(True)
+        self.table.setRowCount(len(self._rows))
+        for r, row in enumerate(self._rows):
+            it, used = row['item'], row['item']['used']
+            chk = QTableWidgetItem()
+            chk.setData(Qt.UserRole, it['id'])
+            if used:
+                chk.setFlags(Qt.ItemIsSelectable)                   # لا يُحذف: له حركات أو مستندات
+            else:
+                chk.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                chk.setCheckState(Qt.Checked if row['checked'] else Qt.Unchecked)
+            self.table.setItem(r, 0, chk)
+            status = L.status_text(it)
+            texts = (str(row['group']) if row['group'] else '', it['code'], it['name'], it['category'], it['unit'], status)
+            for c, text in enumerate(texts, 1):
+                cell = QTableWidgetItem(text)
+                cell.setFlags(Qt.ItemIsSelectable if used else (Qt.ItemIsEnabled | Qt.ItemIsSelectable))
+                if used:
+                    cell.setToolTip('لا يمكن حذفه: ' + status)
+                self.table.setItem(r, c, cell)
+        self.table.blockSignals(False)
+        if self.mode == 'duplicates':
+            self.hint.setText(f"{self.cfg['hint']}\nالمجموعات: {len(data)} — الأصناف: {len(self._rows)}")
+        self._sync()
+        return bool(self._rows)
+
+    def _selection(self):
+        ids = []
+        for r in range(self.table.rowCount()):
+            cell = self.table.item(r, 0)
+            if cell.flags() & Qt.ItemIsUserCheckable and cell.checkState() == Qt.Checked:
+                ids.append(cell.data(Qt.UserRole))
+        return L.selection(self._rows, ids)
+
+    def _sync(self):
+        n = len(self._selection())
+        self.count.setText(f'المحدد للحذف: {n}')
+        self.btn_delete.setText(f'حذف المحدد ({n})' if n else 'حذف المحدد')
+        self.btn_delete.setEnabled(n > 0)
+
+    def _check_all(self, on):
+        self.table.blockSignals(True)
+        for r in range(self.table.rowCount()):
+            cell = self.table.item(r, 0)
+            if cell.flags() & Qt.ItemIsUserCheckable:
+                cell.setCheckState(Qt.Checked if on else Qt.Unchecked)
+        self.table.blockSignals(False)
+        self._sync()
+
+    # ------------------------------------------------------------------ الحذف
+    def _delete(self):
+        sel = self._selection()
+        if not sel:
+            return
+        blocked = L.fully_selected_group_name(self.mode, self._rows, sel)      # تنبيه ودّي قبل رفض المحرك
+        if blocked:
+            return QMessageBox.warning(self, self.windowTitle(), f'أبقِ نسخة واحدة على الأقل من «{blocked}».')
+        if ask_reason(self, 'حذف نهائي للأصناف', L.confirm_lines(sel), need_reason=False, confirm_text='حذف') is None:
+            return
+        ids = [r['item']['id'] for r in sel]
+        ok, _res = self.page.guarded(getattr(self.svc, self.cfg['delete']), ids, reload=False)
+        if not ok:
+            return
+        self.page.refresh()
+        self.page.window_.data_changed(self.page.key)
+        QMessageBox.information(self, self.windowTitle(), f'تم حذف {len(ids)} صنف.')
+        if not self._load():
+            self.accept()
+
+
+def run_item_cleanup(page, mode):
+    """يفتح النافذة؛ إن لم يوجد شيء يعرض رسالة بدل نافذة فارغة."""
+    dlg = ItemCleanupDialog(page, mode)
+    if dlg.empty:
+        return QMessageBox.information(page, MODES[mode]['title'], MODES[mode]['empty'])
+    dlg.exec()

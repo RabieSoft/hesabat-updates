@@ -1,0 +1,78 @@
+"""خدمات الموارد البشرية والرواتب والأصول الثابتة ومراكز التكلفة."""
+from datetime import date
+from decimal import Decimal
+
+from alhisabat.business import cost_centers, fixed_assets, payroll
+
+
+class HrMixin:
+    def employees(self):
+        self.require('employee.view')
+        return [dict(r) for r in self.conn.execute(
+            "SELECT e.party_id id,p.code,p.name,e.job_title,e.base_salary_minor,e.hire_date,e.is_active "
+            "FROM employees e JOIN parties p ON p.id=e.party_id WHERE p.company_id=? ORDER BY p.name", (self.company_id,))]
+
+    def hire_employee(self, v):
+        self.require('employee.manage')
+        return payroll.hire_employee(self.conn, self.user_id, self.company_id, v['name'], v.get('date') or str(date.today()),
+                                     Decimal(str(v.get('salary') or 0)), job_title=v.get('job', ''), phone=v.get('phone', ''))
+
+    def edit_employee(self, employee_id, v):
+        return payroll.edit_employee(self.conn, self.user_id, int(employee_id), name=v.get('name'), job_title=v.get('job'),
+                                     base_salary=Decimal(str(v['salary'])) if v.get('salary') not in (None, '') else None)
+
+    def terminate_employee(self, employee_id, reason=''):
+        return payroll.terminate_employee(self.conn, self.user_id, int(employee_id), reason)
+
+    def payroll_runs(self):
+        self.require('payroll.run')
+        return [dict(r) for r in self.conn.execute(
+            "SELECT r.id,r.period_month,r.pay_date,r.status,COUNT(l.id) employees,COALESCE(SUM(l.net_minor),0) total_minor "
+            "FROM payroll_runs r LEFT JOIN payroll_lines l ON l.run_id=r.id WHERE r.company_id=? GROUP BY r.id ORDER BY r.id DESC",
+            (self.company_id,))]
+
+    def create_payroll_run(self, v):
+        emps = self.conn.execute(
+            "SELECT e.party_id,e.base_salary_minor FROM employees e JOIN parties p ON p.id=e.party_id "
+            "WHERE p.company_id=? AND e.is_active=1 ORDER BY e.party_id", (self.company_id,)).fetchall()
+        lines = [{'employee_id': r['party_id'], 'basic': Decimal(r['base_salary_minor']) / 100} for r in emps]
+        return payroll.create_run(self.conn, self.user_id, self.company_id, v['period'], v['date'], lines)
+
+    def post_payroll(self, run_id):
+        return payroll.post_run(self.conn, self.user_id, int(run_id))
+
+    def cost_centers(self):
+        self.require('costcenter.view')
+        return cost_centers.list_flat(self.conn, self.user_id, self.company_id)
+
+    def create_cost_center(self, v):
+        self.require('costcenter.manage')
+        return cost_centers.create(self.conn, self.user_id, self.company_id, v['name'], code=v.get('code') or None)
+
+    def edit_cost_center(self, cc_id, v):
+        return cost_centers.edit(self.conn, self.user_id, int(cc_id), name=v.get('name'))
+
+    def set_cost_center_active(self, cc_id, active):
+        return cost_centers.set_active(self.conn, self.user_id, int(cc_id), bool(active))
+
+    def delete_cost_center(self, cc_id):
+        return cost_centers.delete(self.conn, self.user_id, int(cc_id))
+
+    def assets(self):
+        self.require('asset.view')
+        return fixed_assets.list_assets(self.conn, self.user_id, self.company_id)
+
+    def record_acquisition(self, asset_id, counter_account_id, description=''):
+        self.require('asset.manage')
+        return fixed_assets.record_acquisition(self.conn, self.user_id, int(asset_id), int(counter_account_id), description)
+
+    def create_asset(self, v):
+        self.require('asset.manage')
+        return fixed_assets.register_asset(self.conn, self.user_id, self.company_id, v['name'], int(v['account_id']), v['date'],
+                                           Decimal(str(v['cost'])), int(v['life']))
+
+    def depreciation_preview(self, d):
+        return fixed_assets.depreciation_preview(self.conn, self.user_id, self.company_id, d)
+
+    def run_depreciation(self, d, post=False):
+        return fixed_assets.run_depreciation(self.conn, self.user_id, self.company_id, d, post=post)

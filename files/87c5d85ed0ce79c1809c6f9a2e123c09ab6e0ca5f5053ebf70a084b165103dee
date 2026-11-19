@@ -1,0 +1,214 @@
+"""خدمات النظام: ضرائب، تقارير، نسخ، تدقيق، مستخدمون، إعدادات، استيراد. بلا PySide6.
+"""
+from datetime import date
+from decimal import Decimal
+from pathlib import Path
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.business import tax, aging, importer, doc_reader
+from alhisabat.security import auth, permissions
+from alhisabat.system import backup, audit_query
+from alhisabat.reporting import printing
+
+REPORTS=['ميزان المراجعة','قائمة الدخل','المركز المالي','التدفقات النقدية','كشف حساب','أعمار ديون العملاء','أعمار ديون الموردين','تقرير المخزون']
+IMPORT_TARGETS={'عملاء':'customer','موردون':'supplier','أصناف':'item','أرصدة افتتاحية عملاء':'customer_opening','أرصدة افتتاحية موردين':'supplier_opening',
+                'تنظيف هواتف العملاء (VCF)':'customer_vcf','تنظيف هواتف الموردين (VCF)':'supplier_vcf'}
+_SETTINGS_TABLES={'numbering_settings':('الترقيم',{'mode':'النمط','segment_lengths':'أطوال المقاطع','prefix':'البادئة'}),'journal_settings':('القيود',{'require_review':'المراجعة إلزامية','require_approval':'الاعتماد إلزامي','enforce_separation':'فصل المهام','allow_manual_party_entries':'السماح بقيد يدوي على العملاء والموردين', 'allow_edit_posted_entries':'السماح بتعديل القيود المرحّلة', 'allow_delete_posted_entries':'السماح بحذف القيود المرحّلة'}),'closing_settings':('الإقفال',{'transfer_to_retained':'ترحيل النتيجة إلى الأرباح المبقاة'}),'sales_settings':('المبيعات',{'credit_limit_mode':'وضع الحد الائتماني','allow_edit_posted_invoice':'السماح بتعديل الفاتورة المرحّلة (أصنافها/أسعارها)','allow_negative_stock':'السماح ببيع كمية سالبة من المخزون'})}
+
+class SystemService:
+    def __init__(self, session):
+        self.s=session
+    # ضرائب
+    def tax_rates(self, kind=None, active_only=False): return tax.list_tax_rates(self.s.conn, self.s.user_id, self.s.company_id, kind=kind, active_only=active_only)
+    def create_tax(self, v): return tax.create_tax_rate(self.s.conn, self.s.user_id, self.s.company_id, v.get('code',''), v['name'], v['rate'], int(v['account_id']), v.get('kind','output'))
+    def set_tax_active(self, tid, active): return tax.set_tax_active(self.s.conn, self.s.user_id, int(tid), bool(active))
+    # أعمار
+    def aging(self, kind, as_of=None): return aging.aging(self.s.conn, self.s.user_id, self.s.company_id, kind, as_of or str(date.today()), include_zero=False)
+    def aging_docs(self, kind, as_of=None): return aging.aging_documents(self.s.conn, self.s.user_id, self.s.company_id, kind, as_of or str(date.today()))
+    # مستخدمون
+    def users(self):
+        self.s.require('user.manage')
+        from alhisabat.ui.core import readmodel
+        return readmodel.users(self.s.conn, self.s.company_id)
+    def create_user(self, v): return auth.create_user(self.s.conn, self.s.user_id, self.s.company_id, v['username'], v['name'], v['password'], int(v['role']))
+    def update_user(self, uid, v):
+        return auth.update_user(self.s.conn, self.s.user_id, self.s.company_id, int(uid), v['username'], v['name'], v.get('password') or None)
+
+    def my_profile(self):
+        from alhisabat.ui.core import readmodel
+        return readmodel.my_profile(self.s.conn, self.s.user_id)
+
+    def update_my_profile(self, v):
+        return auth.update_own_profile(self.s.conn, self.s.user_id, v['name'], v['current_password'], v.get('new_password') or None)
+
+    def set_user_active(self, tid, active): return auth.set_active(self.s.conn, self.s.user_id, self.s.company_id, int(tid), bool(active))
+    # ---- مجموعات الصلاحيات (الأدوار): يتحكم المدير بما يُمنح للمستخدمين
+    def permissions_catalog(self):
+        self.s.require('user.manage')
+        from alhisabat.security import roles
+        return roles.list_permissions(self.s.conn)
+    def roles(self):
+        self.s.require('user.manage')
+        from alhisabat.security import roles
+        return roles.list_roles(self.s.conn, self.s.company_id)
+    def role_permissions(self, rid):
+        self.s.require('user.manage')
+        from alhisabat.security import roles
+        return sorted(roles.role_permissions(self.s.conn, int(rid)))
+    def create_role(self, name, codes):
+        from alhisabat.security import roles
+        return roles.create_role(self.s.conn, self.s.user_id, self.s.company_id, name, codes)
+    def update_role(self, rid, name, codes):
+        from alhisabat.security import roles
+        return roles.update_role(self.s.conn, self.s.user_id, self.s.company_id, int(rid), name, codes)
+    def delete_role(self, rid):
+        from alhisabat.security import roles
+        return roles.delete_role(self.s.conn, self.s.user_id, self.s.company_id, int(rid))
+    def user_role_ids(self, uid):
+        self.s.require('user.manage')
+        from alhisabat.security import roles
+        return roles.user_role_ids(self.s.conn, self.s.company_id, int(uid))
+    def set_user_roles(self, uid, role_ids):
+        from alhisabat.security import roles
+        return roles.set_user_roles(self.s.conn, self.s.user_id, self.s.company_id, int(uid), role_ids)
+    def assign_role(self, tid, rid): return auth.assign_role(self.s.conn, self.s.user_id, self.s.company_id, int(tid), int(rid))
+    def restrict_to_branch(self, user_id, branch_id):
+        return auth.restrict_to_branch(self.s.conn, self.s.user_id, self.s.company_id, int(user_id), int(branch_id))
+    def restrict_to_warehouse(self, user_id, warehouse_id):
+        from alhisabat.business import inventory
+        return inventory.restrict_to_warehouse(self.s.conn, self.s.user_id, self.s.company_id, int(user_id), int(warehouse_id))
+    def restrict_to_cash_account(self, user_id, cash_id):
+        from alhisabat.business import cash
+        return cash.restrict_to_cash_account(self.s.conn, self.s.user_id, self.s.company_id, int(user_id), int(cash_id))
+    def user_restrictions(self, user_id):
+        from alhisabat.ui.core import readmodel
+        return readmodel.user_restrictions(self.s.conn, int(user_id))
+    def branches(self):
+        from alhisabat.ui.core import readmodel
+        return readmodel.branches_list(self.s.conn, self.s.company_id, self.s.user_id)
+    def branches_admin(self): return self.s.branches_admin()
+    def create_branch(self, v): return self.s.create_branch(v)
+    def edit_branch(self, bid, v): return self.s.edit_branch(bid, v)
+    def set_branch_active(self, bid, active): return self.s.set_branch_active(bid, active)
+    def delete_branch(self, bid): return self.s.delete_branch(bid)
+    def branch_isolation_mode(self): return self.s.branch_isolation_mode()
+    def set_branch_isolation(self, mode): return self.s.set_branch_isolation(mode)
+    # إعدادات
+    def settings(self):
+        self.s.require('settings.manage')
+        from alhisabat.ui.core import readmodel
+        rows=readmodel.settings_rows(self.s.conn, self.s.company_id, _SETTINGS_TABLES)
+        for b in self.branches_admin():
+            rows.append({'group':'الفروع','key':f"{b['code']} — {b['name']}",'value':'نشط' if b['is_active'] else 'معطّل'})
+        return rows
+    def update_settings(self, values):
+        self.s.require('settings.manage')
+        j={k:bool(values.get(k)) for k in ('require_review','require_approval','enforce_separation')}
+        for k in ('allow_manual_party_entries','allow_edit_posted_entries','allow_delete_posted_entries'):
+            if k in values: j[k]=bool(values[k])
+        from alhisabat.accounting import journal_engine as je
+        je.set_settings(self.s.conn, self.s.user_id, self.s.company_id, **j)
+        sp={k:(values[k] if k=='credit_limit_mode' else bool(values[k])) for k in ('credit_limit_mode','allow_edit_posted_invoice','allow_negative_stock') if k in values}
+        if sp:
+            from alhisabat.business import sales as sa
+            sa.set_settings(self.s.conn, self.s.user_id, self.s.company_id, **sp)
+        return self.settings()
+    def audit(self, limit=200, table_name=None):
+        self.s.require('audit.view')
+        tables=[table_name] if table_name else ['journal_entries','accounts','parties','items','sales_invoices','purchase_invoices','cash_vouchers','cash_transfers','payroll_runs','fixed_assets','user_roles','import_batches']
+        rows=[]
+        for t in tables: rows+=audit_query.search(self.s.conn, self.s.user_id, self.s.company_id, table_name=t, limit=limit)
+        rows.sort(key=lambda r: r['id'], reverse=True)
+        return rows[:limit]
+    # تقارير
+    def report_spec(self, kind, d_from, d_to, account_id=None, **kw):
+        from alhisabat.ui.core.reports_service import ReportsService
+        return ReportsService(self.s).report_spec(kind, d_from, d_to, account_id=account_id, **kw)
+    def export_report(self, spec, fmt, path):
+        from alhisabat.ui.core.reports_service import ReportsService
+        return ReportsService(self.s).export_report(spec, fmt, path)
+    # نسخ
+    def backups(self): return backup.list_backups(self.s.conn, self.s.user_id, self.s.company_id)
+    def create_backup(self, path, reason='نسخة من الواجهة'): return backup.create_backup(self.s.conn, self.s.user_id, self.s.company_id, path, reason)
+    def create_zip_backup(self, dest_dir, reason='نسخة يدوية', auto=False, keep=None): return backup.create_zip_backup(self.s.conn, self.s.user_id, self.s.company_id, dest_dir, reason, auto=auto, keep=keep)
+    def folder_backups(self, dest_dir): return backup.list_folder_backups(dest_dir)
+    def verify_backup(self, path): return backup.verify_backup(path)
+    def restore(self, path):
+        self.s.conn.close()
+        result=backup.restore_database(self.s.user_id, self.s.company_id, self.s.db_path, path, safety_dir=str(Path(self.s.db_path).parent / 'restore_safety'))
+        self.s.conn=result['connection']; return result
+    # استيراد
+    @staticmethod
+    def read_csv(path):
+        """يقرأ CSV أو Excel (xlsx) إلى صفوف؛ العناوين العربية (الاسم/الرصيد/النوع/العملة) مقبولة."""
+        if not path: raise AccountingError('اختر ملفًا')
+        return importer.read_import_file(path)
+    def warehouse_choices(self):
+        """المستودعات النشطة (id, name) لاختيار مستودع الرصيد الافتتاحي عند استيراد أصناف بكمياتها."""
+        self.s.require('data.import')
+        return [(r[0], r[1]) for r in self.s.conn.execute("SELECT id,name FROM warehouses WHERE company_id=? AND is_active=1 ORDER BY name", (self.s.company_id,))]
+    def unit_names(self):
+        """أسماء وحدات الشركة النشطة (لاختيار الوحدة الافتراضية عند قراءة أصناف من مستند)."""
+        return importer.import_unit_names(self.s.conn, self.s.user_id, self.s.company_id)
+    def read_document(self, path, kind_label, default_unit=''):
+        """يقرأ PDF/صورة إلى صفوف بنفس مفاتيح CSV. التحقق والمكرر والاعتماد يبقى كله في محرك الاستيراد."""
+        self.s.require('data.import')
+        t = IMPORT_TARGETS[kind_label]
+        if t not in ('customer', 'supplier', 'item'):
+            raise AccountingError('قراءة PDF والصور متاحة للعملاء والموردين والأصناف فقط. استخدم CSV للأرصدة الافتتاحية.')
+        res = doc_reader.read_document(path, t, default_unit)
+        if t == 'item':      # توحيد كتابة الوحدة (قطعه/قطعة) على اسم وحدة الشركة الفعلي؛ ما لا يطابق يبقى كما هو فيُكشف خطأ في المعاينة
+            units = {doc_reader._key(n): n for n in self.unit_names()}
+            for r in res['rows']:
+                r['unit'] = units.get(doc_reader._key(r.get('unit', '')), r.get('unit', ''))
+        return res
+    @staticmethod
+    def is_vcf(path):
+        from alhisabat.business import vcard
+        return vcard.is_vcf_file(path)
+    def read_vcf(self, path):
+        """ملف جهات اتصال (VCF) من نسخ هاتف أندرويد الاحتياطي ← قائمة جهات {name, phones, ...}."""
+        self.s.require('data.import')
+        from alhisabat.business import vcard
+        try:
+            return vcard.read_vcf_file(path)
+        except ValueError as e:
+            raise AccountingError(str(e)) from e
+    def import_currencies(self):
+        """العملات المفعّلة للشركة (لاختيار عملة الأرصدة الافتتاحية المستوردة)."""
+        from alhisabat.ui.core import readmodel
+        return [c for c in readmodel.currencies_list(self.s.conn, self.s.company_id) if c['is_enabled']]
+    def import_preview(self, rows, kind_label, auto_create_units=False, auto_create_parties=False, currency=None, rate=None, force_currency=False, fiscal_year_id=None, vcf_opts=None):
+        t=IMPORT_TARGETS[kind_label]
+        if t in ('customer_vcf', 'supplier_vcf'):
+            o = vcf_opts or {}
+            return importer.preview_party_phones_import(self.s.conn, self.s.user_id, self.s.company_id, t.split('_')[0], rows,
+                                                         default_cc=o.get('default_cc') or '+967', normalize_existing=o.get('normalize_existing', True),
+                                                         create_new=o.get('create_new', False), branch_id=o.get('preview_branch_id'),
+                                                         exclude_party_ids=o.get('exclude_party_ids') or (), exclude_new_names=o.get('exclude_new_names') or ())
+        if t in ('customer_opening', 'supplier_opening'):
+            k = 'customer' if t == 'customer_opening' else 'supplier'
+            return importer.preview_party_opening_import(self.s.conn, self.s.user_id, self.s.company_id, k, rows, auto_create=auto_create_parties,
+                                                          currency=currency, rate=rate, force_currency=force_currency,
+                                                          fiscal_year_id=int(fiscal_year_id) if fiscal_year_id else None)
+        return importer.preview_items_import(self.s.conn, self.s.user_id, self.s.company_id, rows, auto_create_units) if t=='item' else importer.preview_parties_import(self.s.conn, self.s.user_id, self.s.company_id, t, rows)
+    def import_commit(self, rows, kind_label, fiscal_year_id=None, auto_create_units=False, opening_stock=None, branch_id=None, auto_create_parties=False,
+                      currency=None, rate=None, force_currency=False, vcf_opts=None):
+        """branch_id: الفرع الذي تُسجَّل عليه السجلات المستوردة (None = الافتراضي حسب وضع الفروع)."""
+        t=IMPORT_TARGETS[kind_label]
+        bid = int(branch_id) if branch_id else None
+        if t in ('customer_vcf', 'supplier_vcf'):
+            o = vcf_opts or {}
+            return importer.commit_party_phones_import(self.s.conn, self.s.user_id, self.s.company_id, t.split('_')[0], rows,
+                                                        default_cc=o.get('default_cc') or '+967', normalize_existing=o.get('normalize_existing', True),
+                                                        create_new=o.get('create_new', False), branch_id=bid or self.s._master_branch(),
+                                                        exclude_party_ids=o.get('exclude_party_ids') or (), exclude_new_names=o.get('exclude_new_names') or (), preview_branch_id=o.get('preview_branch_id'))
+        if t in ('customer_opening', 'supplier_opening'):
+            k = 'customer' if t == 'customer_opening' else 'supplier'
+            if not fiscal_year_id:
+                from alhisabat.ui.core import readmodel
+                fys = readmodel.fiscal_years_list(self.s.conn, self.s.company_id)
+                fiscal_year_id = fys[0]['id'] if fys else 1
+            return importer.commit_party_opening_import(self.s.conn, self.s.user_id, self.s.company_id, k, rows, int(fiscal_year_id), branch_id=bid, auto_create=auto_create_parties,
+                                                         currency=currency, rate=rate, force_currency=force_currency)
+        bid = bid or self.s._master_branch()
+        return importer.commit_items_import(self.s.conn, self.s.user_id, self.s.company_id, rows, auto_create_units, opening_stock, branch_id=bid) if t=='item' else importer.commit_parties_import(self.s.conn, self.s.user_id, self.s.company_id, t, rows, branch_id=bid)

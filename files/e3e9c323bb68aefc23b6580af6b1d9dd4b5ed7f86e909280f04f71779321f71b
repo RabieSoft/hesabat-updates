@@ -1,0 +1,12 @@
+-- 0052: التحقق من ربط صنف قائم بأم ولون (UPDATE) بنفس قواعد الإدراج في 0051.
+CREATE TRIGGER items_variant_rules_upd BEFORE UPDATE OF parent_item_id,color_id ON items
+WHEN (NEW.parent_item_id IS NOT OLD.parent_item_id OR NEW.color_id IS NOT OLD.color_id)
+ AND (NEW.parent_item_id IS NOT NULL OR NEW.color_id IS NOT NULL) BEGIN
+  SELECT RAISE(ABORT,'اللون يحتاج أمًّا، والمتغيّر يحتاج لونًا') WHERE (NEW.parent_item_id IS NULL) <> (NEW.color_id IS NULL);
+  SELECT RAISE(ABORT,'الصنف المجمِّع لا يكون متغيّرًا') WHERE NEW.has_variants=1;
+  SELECT RAISE(ABORT,'الأم غير صالحة (يجب أن تكون صنفًا مخزنيًا مفعَّلًا بالألوان من نفس الشركة)')
+   WHERE NEW.parent_item_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM items p WHERE p.id=NEW.parent_item_id AND p.company_id=NEW.company_id
+         AND p.has_variants=1 AND p.item_type='stock' AND p.parent_item_id IS NULL AND p.id<>NEW.id);
+  SELECT RAISE(ABORT,'اللون من شركة أخرى') WHERE NEW.color_id IS NOT NULL
+   AND NOT EXISTS(SELECT 1 FROM colors c WHERE c.id=NEW.color_id AND c.company_id=NEW.company_id);
+END;

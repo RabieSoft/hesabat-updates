@@ -1,0 +1,165 @@
+"""الشريط العلوي الثابت: الشعار + أزرار الوحدات (لكل زر قائمة منسدلة بصفحاته) + بحث + إشعارات + قائمة المستخدم.
+
+يحل محل الشريط الجانبي وشريط القوائم التقليدي. التعريف من `navigation.TOP_MENUS`، فيحترم الصلاحيات والإفصاح التدريجي
+نفسهما. لا منطق محاسبي هنا. يتطلب PySide6.
+"""
+from PySide6.QtCore import QSize, Qt, QTimer
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QMenu, QToolButton
+
+from alhisabat.ui.components.brand_widgets import icon_pixmap
+from alhisabat.ui.core import strings_ar as S
+from alhisabat.ui.design import icons, tokens as T
+from alhisabat.ui.pages import registry
+
+from . import navigation as N
+
+ICON = 18
+
+
+class TopNavBar(QFrame):
+    def __init__(self, window, user_menu, parent=None):
+        super().__init__(parent)
+        self._w = window
+        self._btns = []                                   # [(زر القائمة، مجموعة مفاتيح صفحاتها)]
+        self._active = None
+        self.setObjectName('topNav')
+        self.setFixedHeight(T.TOPBAR_HEIGHT)
+        self.setLayoutDirection(Qt.RightToLeft)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(12, 0, 12, 0)
+        lay.setSpacing(4)
+
+        badge = QFrame()                                  # شعار + اسم التطبيق (يمين الشريط)
+        badge.setObjectName('navLogoBadge')
+        badge.setFixedSize(36, 36)
+        bl = QHBoxLayout(badge)
+        bl.setContentsMargins(3, 3, 3, 3)
+        mark = QLabel()
+        mark.setAlignment(Qt.AlignCenter)
+        pm = icon_pixmap(28)
+        if pm is not None:
+            mark.setPixmap(pm)
+        bl.addWidget(mark)
+        brand = QLabel(S.APP_NAME)
+        brand.setObjectName('topBrand')
+        lay.addWidget(badge)
+        lay.addWidget(brand)
+        lay.addSpacing(16)
+
+        self._menus = QHBoxLayout()
+        self._menus.setSpacing(2)
+        lay.addLayout(self._menus)
+        lay.addStretch(1)
+
+        self.search_btn = QToolButton()                   # بحث شامل (لوحة الأوامر)
+        self.search_btn.setObjectName('topNavSearch')
+        self.search_btn.setText('التشغيل السريع   Ctrl+K')
+        self.search_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.search_btn.setCursor(Qt.PointingHandCursor)
+        self.search_btn.clicked.connect(window.palette_popup)
+        lay.addWidget(self.search_btn)
+
+        self.notif_menu = QMenu(self)                     # الإشعارات (كانت في شريط الحالة)
+        self.notif_menu.setLayoutDirection(Qt.RightToLeft)
+        self.notif_btn = self._plain_button('🔔')
+        self.notif_btn.setToolTip('الإشعارات')
+        self.notif_btn.setPopupMode(QToolButton.InstantPopup)
+        self.notif_btn.setMenu(self.notif_menu)
+        lay.addWidget(self.notif_btn)
+
+        user = (window.state.get('user') or {}).get('name') or 'المستخدم'
+        self.user_btn = self._plain_button(user)
+        self.user_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.user_btn.setPopupMode(QToolButton.InstantPopup)
+        user_menu.setLayoutDirection(Qt.RightToLeft)
+        self.user_btn.setMenu(user_menu)
+        lay.addWidget(self.user_btn)
+        self.rebuild()
+
+    @staticmethod
+    def _plain_button(text):
+        b = QToolButton()
+        b.setObjectName('topNavBtn')
+        b.setText(text)
+        b.setCursor(Qt.PointingHandCursor)
+        return b
+
+    # ------------------------------------------------------------------ البناء
+    def _clear(self):
+        while self._menus.count():
+            it = self._menus.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+        self._btns = []
+
+    def rebuild(self):
+        """يعيد بناء القوائم (عند تغيّر السمة أو «الخيارات المتقدمة» أو الصلاحيات)."""
+        w = self._w
+        pal = T.palette(w.state.get('mode'))
+        self._clear()
+        for menu, rows in N.top_menus(w.access, w.features(), w.prefs.get('show_advanced')):
+            keys = {r.key for r in rows if r}
+            if menu.direct:
+                b = self._plain_button(menu.title)
+                b.clicked.connect(lambda _c=False, k=rows[0].key: w.open_page(k))
+            else:
+                b = self._plain_button(f'{menu.title}  ▾')
+                b.setPopupMode(QToolButton.InstantPopup)
+                b.setMenu(self._make_menu(b, rows, pal, menu.title))
+            self._menus.addWidget(b)
+            self._btns.append((b, keys))
+        self.search_btn.setIcon(icons.qicon('search', pal['nav_text'], ICON))
+        self.search_btn.setIconSize(QSize(ICON, ICON))
+        self.user_btn.setIcon(icons.qicon('user', pal['nav_text'], ICON))
+        self.user_btn.setIconSize(QSize(ICON, ICON))
+        self._paint_active()
+
+    def _make_menu(self, owner, rows, pal, title=''):
+        m = QMenu(owner)
+        m.setLayoutDirection(Qt.RightToLeft)
+        for spec in rows:
+            if spec is None:
+                m.addSeparator()
+                continue
+            a = m.addAction(icons.qicon(spec.icon, pal['text'], ICON), spec.title)
+            tip = spec.description or ''
+            if spec.phase > 2 and spec.key not in registry.registered():
+                tip = f'قيد البناء — المرحلة {spec.phase}'
+            if tip:
+                a.setToolTip(tip)
+            a.triggered.connect(lambda _c=False, k=spec.key: self._w.open_page(k))
+            if title == 'المحاسبة' and spec.key == 'journal':
+                self._journal_extras(m, pal)
+        return m
+
+    def _journal_extras(self, m, pal):
+        """تحت «القيود المحاسبية»: قيد سند قبض/صرف + القوالب الجاهزة (كانت داخل نافذة القيد المركب)."""
+        w = self._w
+        if not w.access.has('journal.create'):
+            return
+        def go(preset):
+            QTimer.singleShot(0, lambda: (lambda pg: pg and pg.start_new(preset))(w.open_page('journal')))
+        m.addAction(icons.qicon('journal', pal['text'], ICON), 'قيد سند قبض').triggered.connect(lambda _c=False: go('receipt'))
+        m.addAction(icons.qicon('journal', pal['text'], ICON), 'قيد سند صرف').triggered.connect(lambda _c=False: go('payment'))
+        sub = m.addMenu(icons.qicon('journal', pal['text'], ICON), 'قوالب القيود الجاهزة')
+        sub.setLayoutDirection(Qt.RightToLeft)
+        from alhisabat.ui.core import journal_recipes as JR
+        last = None
+        for r in JR.RECIPES:
+            if r.group != last:                          # عنوان المجموعة (غير قابل للنقر) ثم قوالبها
+                last = r.group
+                if sub.actions():
+                    sub.addSeparator()
+                sub.addAction('▪ ' + r.group).setEnabled(False)
+            sub.addAction(r.title).triggered.connect(lambda _c=False, k=r.key: go('recipe:' + k))
+
+    # ------------------------------------------------------------------ تمييز القائمة النشطة
+    def set_active(self, key):
+        self._active = key
+        self._paint_active()
+
+    def _paint_active(self):
+        for b, keys in self._btns:
+            b.setProperty('active', bool(self._active and self._active in keys))
+            b.style().unpolish(b)
+            b.style().polish(b)

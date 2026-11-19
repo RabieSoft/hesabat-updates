@@ -1,0 +1,12 @@
+INSERT INTO permissions(code,name_ar,is_sensitive) VALUES('fiscalyear.close','إغلاق السنة المالية',1);
+INSERT INTO role_permissions SELECT id,'fiscalyear.close' FROM roles WHERE id IN (1,2);
+DELETE FROM role_permissions WHERE role_id=3 AND permission_code='cash.count';
+
+-- العملة المرتبطة بحساب نقدي لا تتغير بعد تسجيل أي حركة عليه.
+CREATE TRIGGER cash_account_currency_lock BEFORE UPDATE OF currency ON cash_accounts
+WHEN OLD.currency<>NEW.currency AND EXISTS(SELECT 1 FROM journal_lines WHERE account_id=OLD.account_id)
+BEGIN SELECT RAISE(ABORT,'لا يمكن تغيير عملة صندوق/بنك له حركات'); END;
+
+-- المطابقة تُفك عبر bank_recon.unmatch؛ لذلك لا تمنع حذف سجل المطابقة داخلياً.
+DROP TRIGGER IF EXISTS bank_match_no_delete;
+DROP TRIGGER IF EXISTS bank_match_no_update;

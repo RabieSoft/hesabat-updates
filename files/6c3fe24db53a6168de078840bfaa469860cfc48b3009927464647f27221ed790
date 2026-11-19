@@ -1,0 +1,27 @@
+-- قوالب القيود + مرفقات القيود (v1.3.2)
+CREATE TABLE IF NOT EXISTS journal_templates (
+  id INTEGER PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id),
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  valuation_method TEXT NOT NULL DEFAULT 'weighted_avg',
+  lines_json TEXT NOT NULL,
+  created_by INTEGER REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(company_id, name)
+);
+CREATE INDEX IF NOT EXISTS ix_jtpl_company ON journal_templates(company_id);
+
+CREATE TABLE IF NOT EXISTS journal_attachments (
+  id INTEGER PRIMARY KEY,
+  entry_id INTEGER NOT NULL REFERENCES journal_entries(id) ON DELETE CASCADE,
+  company_id INTEGER NOT NULL REFERENCES companies(id),
+  file_name TEXT NOT NULL,
+  stored_name TEXT NOT NULL,
+  mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+  size_bytes INTEGER NOT NULL DEFAULT 0,
+  uploaded_by INTEGER REFERENCES users(id),
+  uploaded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS ix_jatt_entry ON journal_attachments(entry_id);
+CREATE INDEX IF NOT EXISTS ix_jatt_company ON journal_attachments(company_id);

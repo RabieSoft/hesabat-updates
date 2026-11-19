@@ -1,0 +1,143 @@
+"""لوحة الإدخال داخل الصفحة: تعرض نماذج الإدخال الصغيرة (إضافة/تعديل) في شريط أعلى الجدول بدل نافذة عائمة.
+
+التخطيط الناتج: القوائم المنسدلة ← شريط الإجراءات ← لوحة الإدخال (هذه) ← الجدول يملأ باقي الشاشة.
+لا يعيد كتابة النماذج: يستضيف الـQDialog نفسه كعنصر داخل اللوحة ويشغّل حلقة أحداث محلية حتى accept/reject، فيبقى
+كل ما بعد exec() في الصفحات (قراءة القيم، الحفظ، الحماية من فقد البيانات، المسودات) كما هو. النماذج الكبيرة
+(فاتورة، قيد، فيها جداول) أو رسائل التأكيد تبقى نوافذ موحّدة الحجم. يمكن إيقاف الميزة من قائمة المستخدم. يتطلب PySide6.
+"""
+from PySide6.QtCore import QEventLoop, Qt
+from PySide6.QtWidgets import (QComboBox, QDateEdit, QDialog, QDoubleSpinBox, QFrame, QHBoxLayout, QLabel,
+                               QLineEdit, QPlainTextEdit, QScrollArea, QSpinBox, QTableView, QTreeView, QListWidget,
+                               QVBoxLayout, QWidget, QBoxLayout)
+
+from alhisabat.ui.design import metrics as M
+
+_INPUTS = (QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QDateEdit, QPlainTextEdit)
+_VIEWS = (QTableView, QTreeView, QListWidget)
+_INNER_OWNERS = (QComboBox, QSpinBox, QDoubleSpinBox, QDateEdit)   # حقول داخلية تُنشئها هذه الأدوات نفسها
+
+
+class _Fallback(Exception):
+    """تعذّر العرض داخل الصفحة: تُعرض النافذة المنبثقة الموحّدة."""
+
+
+class EntryDock(QFrame):
+    def __init__(self, page):
+        super().__init__()
+        self.page = page
+        self._busy = False
+        self.setObjectName('entryDock')
+        self.setLayoutDirection(Qt.RightToLeft)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(10, 6, 10, 8)
+        v.setSpacing(4)
+        self.title = QLabel('')
+        self.title.setObjectName('entryDockTitle')
+        v.addWidget(self.title)
+        self.scroll = QScrollArea()
+        self.scroll.setObjectName('entryDockScroll')
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.setMaximumHeight(M.DOCK_MAX_H)
+        v.addWidget(self.scroll)
+        self.setVisible(False)
+
+    @property
+    def busy(self):
+        return self._busy
+
+    # ------------------------------------------------------------------ الأهلية
+    def eligible(self, dlg):
+        if self._busy or not isinstance(dlg, QDialog) or getattr(dlg, 'no_inline', False):
+            return False
+        prefs = getattr(self.page.window_, 'prefs', None)
+        try:
+            if prefs is not None and not prefs.get('inline_forms'):
+                return False
+        except Exception:  # noqa: BLE001
+            pass
+        hint = dlg.sizeHint()
+        inputs = sum(1 for w in dlg.findChildren(QWidget)
+                     if isinstance(w, _INPUTS) and not isinstance(w.parent(), _INNER_OWNERS))
+        has_views = any(dlg.findChildren(v) for v in _VIEWS)
+        return M.inline_eligible(hint.width(), hint.height(), inputs, has_views, type(dlg).__name__)
+
+    # ------------------------------------------------------------------ التشغيل
+    def run(self, dlg):
+        """يعرض dlg داخل اللوحة حتى يُغلق، ويُرجع نتيجته (Accepted/Rejected) مثل exec()."""
+        hint_w = dlg.sizeHint().width()
+        flags = dlg.windowFlags()
+        parent = dlg.parentWidget()
+        try:
+            dlg.setWindowFlags(Qt.Widget)                     # قبل أي عرض: عنصر عادي لا نافذة
+            dlg.setModal(False)
+            dlg.setSizeGripEnabled(False)
+            dlg.setMaximumWidth(max(min(hint_w + 80, 900), 560))
+            host = QWidget()
+            hl = QHBoxLayout(host)
+            hl.setContentsMargins(0, 0, 0, 0)
+            hl.addWidget(dlg, 0, Qt.AlignTop)
+            hl.addStretch(1)
+            self.scroll.setWidget(host)
+            self.title.setText(dlg.windowTitle())
+        except Exception as exc:  # noqa: BLE001
+            self._restore(dlg, flags, parent)
+            raise _Fallback(str(exc)) from exc
+        self._busy = True
+        self.page._dock_busy = True
+        loop = QEventLoop(self)
+        dlg.finished.connect(loop.quit)
+        dlg.destroyed.connect(loop.quit)
+        self.setVisible(True)
+        try:
+            dlg.show()
+            mb = getattr(dlg, '_min_btn', None)               # زر «–» لا معنى له داخل الصفحة
+            if mb is not None:
+                mb.hide()
+            self._focus_first(dlg)
+            loop.exec()
+        finally:
+            result = dlg.result()
+            self._busy = False
+            self.page._dock_busy = False
+            try:
+                self.setVisible(False)
+                w = self.scroll.takeWidget()
+                self._restore(dlg, flags, parent)
+                if w is not None:
+                    w.deleteLater()
+            except RuntimeError:                              # أُغلقت الصفحة نفسها أثناء الإدخال
+                pass
+        return result
+
+    @staticmethod
+    def _restore(dlg, flags, parent):
+        try:
+            dlg.setMaximumWidth(16777215)
+            dlg.setParent(parent, flags)
+        except Exception:  # noqa: BLE001
+            pass
+
+    @staticmethod
+    def _focus_first(dlg):
+        for w in dlg.findChildren(QWidget):
+            if isinstance(w, (QLineEdit, QComboBox, QPlainTextEdit)) and w.isVisible() and w.isEnabled() \
+                    and not getattr(w, 'isReadOnly', lambda: False)():
+                w.setFocus()
+                return
+
+
+def dock_for(page):
+    """ينشئ لوحة الإدخال كسولًا ويضعها أعلى الصفحة: بعد صف المرشحات (إن وُجد) وقبل الجدول. None إن تعذّر."""
+    dock = getattr(page, '_entry_dock', None)
+    if dock is not None:
+        return dock
+    lay = page.layout()
+    if not isinstance(lay, QBoxLayout):
+        return None
+    dock = EntryDock(page)
+    idx = 1 if lay.count() >= 2 and lay.itemAt(0).layout() is not None else 0
+    lay.insertWidget(idx, dock)
+    page._entry_dock = dock
+    return dock

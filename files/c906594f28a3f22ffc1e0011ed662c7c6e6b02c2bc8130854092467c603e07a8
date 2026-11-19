@@ -1,0 +1,55 @@
+"""قراءات قائمة القيود (SELECT فقط): مصدر القيد، عمودا مدين/دائن، و«إلى: الحساب الدائن» للقيد البسيط.
+مفصولة عن readmodel.py لإبقائه ≤ 500 سطر؛ يُعاد تصديرها من readmodel (readmodel.entry_source / journal_sides).
+"""
+
+
+def entry_source(conn, entry_id):
+    """مصدر القيد لفتح المستند الأصلي (SELECT فقط): {source_type, source_id, entry_type, label_no} أو None."""
+    r = conn.execute("SELECT source_type, source_id, entry_type, COALESCE(posted_no, entry_no) AS label_no "
+                     "FROM journal_entries WHERE id=?", (int(entry_id),)).fetchone()
+    return dict(r) if r else None
+
+
+def journal_sides(conn, rows, limit=3):
+    """عمودا «مدين» و«دائن» في قائمة القيود (SELECT فقط): {entry_id: («من: أ، ب»، «إلى: ج»)} بأسماء الحسابات.
+
+    أكثر من `limit` حسابات في جانب واحد ← تُختصر بـ «…». الجانب الفارغ نص فارغ.
+    """
+    ids = [r['id'] for r in rows]
+    names = {i: ([], []) for i in ids}
+    for k in range(0, len(ids), 500):
+        part = ids[k:k + 500]
+        for l in conn.execute(f"SELECT l.entry_id e, l.debit_base d, l.credit_base c, a.name n FROM journal_lines l "
+                              f"JOIN accounts a ON a.id=l.account_id WHERE l.entry_id IN ({','.join('?' for _ in part)}) "
+                              f"ORDER BY l.entry_id, l.line_no", part):
+            dr, cr = names[l['e']]
+            if (l['d'] or 0) > 0:
+                dr.append(l['n'])
+            if (l['c'] or 0) > 0:
+                cr.append(l['n'])
+
+    def label(prefix, ns):
+        ns = list(dict.fromkeys(ns))
+        if not ns:
+            return ''
+        return prefix + '، '.join(ns[:limit]) + (' …' if len(ns) > limit else '')
+
+    return {i: (label('من: ', dr), label('إلى: ', cr)) for i, (dr, cr) in names.items()}
+
+
+def simple_entry_counters(conn, rows):
+    """القيد اليدوي البسيط (سطران: مدين ودائن، بلا مصدر ولا عكس) ← «إلى: اسم الحساب المقابل (الدائن)» (SELECT فقط)."""
+    ids = [r['id'] for r in rows if not r.get('source_type') and r.get('entry_type') != 'reversal' and not r.get('reverses_entry_id')]
+    out = {}
+    for i in range(0, len(ids), 500):
+        part = ids[i:i + 500]
+        lines = {}
+        for l in conn.execute(f"SELECT l.entry_id e, l.debit_base d, l.credit_base c, a.name n FROM journal_lines l "
+                              f"JOIN accounts a ON a.id=l.account_id WHERE l.entry_id IN ({','.join('?' for _ in part)})", part):
+            lines.setdefault(l['e'], []).append((l['d'] or 0, l['c'] or 0, l['n']))
+        for eid, ls in lines.items():
+            dr = [x for x in ls if x[0] > 0 and x[1] == 0]
+            cr = [x for x in ls if x[1] > 0 and x[0] == 0]
+            if len(ls) == 2 and len(dr) == 1 and len(cr) == 1:
+                out[eid] = 'إلى: ' + cr[0][2]
+    return out

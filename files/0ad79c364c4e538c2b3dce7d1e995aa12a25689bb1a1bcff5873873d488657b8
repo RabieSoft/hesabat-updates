@@ -1,0 +1,310 @@
+"""نوافذ دليل التصنيفات والوحدات والفروع. لا SQL هنا: كل شيء عبر خدمات الصفحة (page.svc)."""
+from decimal import Decimal
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout
+)
+
+
+def _buttons(dlg, form_or_layout, ok_text='حفظ'):
+    bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+    bb.button(QDialogButtonBox.Ok).setText(ok_text)
+    bb.button(QDialogButtonBox.Cancel).setText('إلغاء')
+    bb.accepted.connect(dlg._accept)
+    bb.rejected.connect(dlg.reject)
+    if isinstance(form_or_layout, QFormLayout):
+        form_or_layout.addRow(bb)
+    else:
+        form_or_layout.addWidget(bb)
+
+
+class CategoryDialog(QDialog):
+    """إضافة/تعديل تصنيف. parent_path نص للعرض فقط (التصنيف الأب)."""
+
+    def __init__(self, page, existing=None, parent_id=None, parent_path=''):
+        super().__init__(page)
+        self.parent_id = parent_id
+        self.setWindowTitle('تعديل تصنيف' if existing else ('تصنيف فرعي جديد' if parent_id else 'تصنيف رئيسي جديد'))
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.setMinimumWidth(400)
+        form = QFormLayout(self)
+        if parent_path:
+            form.addRow('التصنيف الأب', QLabel(parent_path))
+        self.name = QLineEdit(existing.get('name', '') if existing else '')
+        self.code = QLineEdit(existing.get('code', '') if existing else '')
+        self.code.setPlaceholderText('فارغ = تلقائي')
+        self.notes = QLineEdit(existing.get('notes', '') if existing else '')
+        form.addRow('اسم التصنيف *', self.name)
+        form.addRow('الكود', self.code)
+        form.addRow('ملاحظات', self.notes)
+        from alhisabat.ui.core import strings_ar as S
+        self.method = QComboBox()
+        self.method.addItem('موروثة من التصنيف الأب (الافتراضي: المتوسط المرجّح)', '')
+        for k, lab in S.COST_METHOD_LABELS.items():
+            self.method.addItem(lab, k)
+        i = self.method.findData((existing or {}).get('cost_method') or '')
+        self.method.setCurrentIndex(max(i, 0))
+        form.addRow('طريقة تقييم المخزون', self.method)
+        note = QLabel(S.COST_METHOD_NOTE); note.setWordWrap(True); note.setObjectName('ctxKey')
+        form.addRow(note)
+        _buttons(self, form)
+
+    def _accept(self):
+        if not self.name.text().strip():
+            return QMessageBox.warning(self, 'تنبيه', 'اسم التصنيف مطلوب')
+        self.accept()
+
+    def values(self):
+        return {'name': self.name.text().strip(), 'code': self.code.text().strip(), 'notes': self.notes.text().strip(),
+                'parent_id': self.parent_id, 'cost_method': self.method.currentData() or ''}
+
+
+class CategoryPickDialog(QDialog):
+    """اختيار تصنيف من الشجرة (مسارات كاملة). allow_none يضيف «بدون تصنيف/جذر»."""
+
+    def __init__(self, page, title, categories, exclude_ids=(), allow_none=False, none_text='بدون تصنيف'):
+        super().__init__(page)
+        self.setWindowTitle(title)
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.setMinimumWidth(420)
+        form = QFormLayout(self)
+        self.combo = QComboBox()
+        if allow_none:
+            self.combo.addItem(none_text, None)
+        for c in categories:
+            if c['id'] in exclude_ids or not c.get('is_active', 1):
+                continue
+            self.combo.addItem(('    ' * c['depth']) + c['name'] + f"   [{c['path']}]" if c['depth'] else c['name'], c['id'])
+        form.addRow('التصنيف', self.combo)
+        _buttons(self, form, 'موافق')
+
+    def _accept(self):
+        self.accept()
+
+    def value(self):
+        return self.combo.currentData()
+
+
+class ItemsPickDialog(QDialog):
+    """اختيار أصناف متعددة بعلامات (مع بحث) لربطها بتصنيف."""
+
+    def __init__(self, page, title, items):
+        super().__init__(page)
+        self.setWindowTitle(title)
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.resize(480, 520)
+        lay = QVBoxLayout(self)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText('بحث بالاسم أو الكود…')
+        self.search.textChanged.connect(self._filter)
+        lay.addWidget(self.search)
+        self.lst = QListWidget()
+        for it in items:
+            li = QListWidgetItem(f"{it.get('code', '')} — {it.get('name', '')}   [{it.get('category') or 'بدون تصنيف'}]")
+            li.setData(Qt.UserRole, it['id'])
+            li.setFlags(li.flags() | Qt.ItemIsUserCheckable)
+            li.setCheckState(Qt.Unchecked)
+            self.lst.addItem(li)
+        lay.addWidget(self.lst, 1)
+        _buttons(self, lay, 'ربط المحدد')
+
+    def _filter(self, text):
+        t = (text or '').strip()
+        for i in range(self.lst.count()):
+            self.lst.item(i).setHidden(bool(t) and t not in self.lst.item(i).text())
+
+    def _accept(self):
+        if not self.ids():
+            return QMessageBox.information(self, 'تنبيه', 'ضع علامة على صنف واحد على الأقل')
+        self.accept()
+
+    def ids(self):
+        return [self.lst.item(i).data(Qt.UserRole) for i in range(self.lst.count())
+                if self.lst.item(i).checkState() == Qt.Checked]
+
+
+class UnitDialog(QDialog):
+    """إضافة/تعديل وحدة في دليل الوحدات."""
+
+    def __init__(self, page, existing=None):
+        super().__init__(page)
+        self.setWindowTitle('تعديل وحدة' if existing else 'وحدة جديدة')
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.setMinimumWidth(380)
+        form = QFormLayout(self)
+        self.name = QLineEdit(existing.get('name', '') if existing else '')
+        self.code = QLineEdit(existing.get('code', '') if existing else '')
+        self.code.setPlaceholderText('فارغ = تلقائي')
+        self.notes = QLineEdit(existing.get('notes', '') if existing else '')
+        self.notes.setPlaceholderText('مثال: الكرتون = 12 حبة')
+        form.addRow('اسم الوحدة *', self.name)
+        form.addRow('الكود', self.code)
+        form.addRow('ملاحظات', self.notes)
+        _buttons(self, form)
+
+    def _accept(self):
+        if not self.name.text().strip():
+            return QMessageBox.warning(self, 'تنبيه', 'اسم الوحدة مطلوب')
+        self.accept()
+
+    def values(self):
+        return {'name': self.name.text().strip(), 'code': self.code.text().strip(), 'notes': self.notes.text().strip()}
+
+
+class ItemUnitsDialog(QDialog):
+    """وحدات التحويل لصنف: عرض/إضافة/تعديل المعامل/إزالة. الوحدة الأساسية ثابتة (معاملها 1)."""
+
+    def __init__(self, page, item):
+        super().__init__(page)
+        self.page, self.item = page, item
+        self.setWindowTitle(f"وحدات الصنف — {item.get('name')}")
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.resize(520, 380)
+        lay = QVBoxLayout(self)
+        self.tbl = QTableWidget(0, 3)
+        self.tbl.setHorizontalHeaderLabels(['الوحدة', 'المعامل (× الوحدة الأساسية)', 'النوع'])
+        self.tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tbl.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.tbl.horizontalHeader().setStretchLastSection(True)
+        self.tbl.setColumnWidth(0, 170)
+        self.tbl.setColumnWidth(1, 200)
+        lay.addWidget(self.tbl, 1)
+        row = QHBoxLayout()
+        for text, fn in (('+ وحدة تحويل', self._add), ('تعديل المعامل', self._edit), ('إزالة', self._remove)):
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        row.addStretch(1)
+        close = QPushButton('إغلاق')
+        close.clicked.connect(self.accept)
+        row.addWidget(close)
+        lay.addLayout(row)
+        self._units = []
+        self._load()
+
+    def _load(self):
+        self.tbl.setRowCount(0)
+        try:
+            self._units = self.page.svc.item_units(self.item['id'])
+        except Exception as exc:  # noqa: BLE001
+            self.page.show_error(exc)
+            self._units = []
+        for u in self._units:
+            r = self.tbl.rowCount()
+            self.tbl.insertRow(r)
+            f = Decimal(u.get('factor_milli') or 0) / Decimal(1000)
+            self.tbl.setItem(r, 0, QTableWidgetItem(u['name']))
+            self.tbl.setItem(r, 1, QTableWidgetItem(f"{f:g}"))
+            self.tbl.setItem(r, 2, QTableWidgetItem('أساسية' if u.get('is_base') else 'تحويل'))
+
+    def _current(self):
+        r = self.tbl.currentRow()
+        return self._units[r] if 0 <= r < len(self._units) else None
+
+    def _ask_factor(self, title, unit_label, default='1'):
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.setLayoutDirection(Qt.RightToLeft)
+        form = QFormLayout(dlg)
+        factor = QLineEdit(default)
+        form.addRow(f"كم من «{self.item.get('unit')}» في {unit_label}؟", factor)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        form.addRow(bb)
+        if dlg.exec() != QDialog.Accepted:
+            return None
+        return factor.text().strip().replace(',', '') or '1'
+
+    def _add(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle('وحدة تحويل جديدة')
+        dlg.setLayoutDirection(Qt.RightToLeft)
+        form = QFormLayout(dlg)
+        cb = QComboBox()
+        have = {u['id'] for u in self._units}
+        try:
+            for u in self.page.svc.units():
+                if u['id'] not in have:
+                    cb.addItem(u['name'], u['id'])
+        except Exception as exc:  # noqa: BLE001
+            self.page.show_error(exc)
+        if cb.count() == 0:
+            return QMessageBox.information(self, 'تنبيه', 'لا توجد وحدات أخرى في دليل الوحدات؛ أضِف وحدة من «دليل الوحدات» أولًا.')
+        factor = QLineEdit('1')
+        form.addRow('الوحدة', cb)
+        form.addRow(f"المعامل (كم × {self.item.get('unit')})", factor)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        form.addRow(bb)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        ok, _ = self.page.guarded(self.page.svc.add_item_unit, self.item['id'], cb.currentData(),
+                                  factor.text().strip().replace(',', '') or '1', reload=False)
+        if ok:
+            self._load()
+
+    def _edit(self):
+        u = self._current()
+        if not u:
+            return QMessageBox.information(self, 'تنبيه', 'حدد وحدة أولًا')
+        if u.get('is_base'):
+            return QMessageBox.information(self, 'تنبيه', 'معامل الوحدة الأساسية ثابت (1)')
+        cur = Decimal(u.get('factor_milli') or 0) / Decimal(1000)
+        f = self._ask_factor('تعديل المعامل', f"«{u['name']}»", f"{cur:g}")
+        if f is None:
+            return
+        ok, _ = self.page.guarded(self.page.svc.update_item_unit, self.item['id'], u['id'], f, reload=False)
+        if ok:
+            self._load()
+
+    def _remove(self):
+        u = self._current()
+        if not u:
+            return QMessageBox.information(self, 'تنبيه', 'حدد وحدة أولًا')
+        if u.get('is_base'):
+            return QMessageBox.information(self, 'تنبيه', 'لا يمكن إزالة الوحدة الأساسية')
+        if QMessageBox.question(self, 'تأكيد', f"إزالة الوحدة «{u['name']}» من هذا الصنف؟",
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        ok, _ = self.page.guarded(self.page.svc.remove_item_unit, self.item['id'], u['id'], reload=False)
+        if ok:
+            self._load()
+
+
+class BranchDialog(QDialog):
+    """إضافة/تعديل فرع."""
+
+    def __init__(self, page, existing=None):
+        super().__init__(page)
+        self.setWindowTitle('تعديل فرع' if existing else 'فرع جديد')
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.setMinimumWidth(420)
+        form = QFormLayout(self)
+        e = existing or {}
+        self.name = QLineEdit(e.get('name', ''))
+        self.code = QLineEdit(e.get('code', ''))
+        self.code.setPlaceholderText('فارغ = تلقائي')
+        self.address = QLineEdit(e.get('address', ''))
+        self.phone = QLineEdit(e.get('phone', ''))
+        self.notes = QPlainTextEdit(e.get('notes', ''))
+        self.notes.setFixedHeight(64)
+        form.addRow('اسم الفرع *', self.name)
+        form.addRow('الكود', self.code)
+        form.addRow('العنوان', self.address)
+        form.addRow('الهاتف', self.phone)
+        form.addRow('ملاحظات', self.notes)
+        _buttons(self, form)
+
+    def _accept(self):
+        if not self.name.text().strip():
+            return QMessageBox.warning(self, 'تنبيه', 'اسم الفرع مطلوب')
+        self.accept()
+
+    def values(self):
+        return {'name': self.name.text().strip(), 'code': self.code.text().strip(), 'address': self.address.text().strip(),
+                'phone': self.phone.text().strip(), 'notes': self.notes.toPlainText().strip()}

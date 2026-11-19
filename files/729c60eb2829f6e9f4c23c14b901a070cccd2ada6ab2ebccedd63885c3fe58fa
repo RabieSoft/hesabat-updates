@@ -1,0 +1,146 @@
+"""تنظيف الأصناف: كشف الأصناف المكررة وحذف ما لا حركة له.
+
+- «لا حركة له» = لا يظهر الصنف في أي جدول فيه عمود item_id (حركات مخزنية بما فيها الرصيد الافتتاحي، فواتير بيع وشراء،
+  جرد، أرصدة، دفعات صلاحية). الاكتشاف ديناميكي من بنية القاعدة، فأي جدول يُضاف مستقبلًا يُحتسب تلقائيًا.
+  جدول item_units (وحدات تحويل الصنف نفسه) لا يُعدّ استخدامًا ويُحذف مع الصنف.
+- التكرار = تطابق اسم الصنف بعد التطبيع (الهمزات، التاء المربوطة/الهاء، الألف المقصورة/الياء، التشكيل والتطويل،
+  الأرقام العربية، تعدد المسافات). الفهرس الفريد في القاعدة لا يمنع هذه الفروق، وهذا سبب تكرارها عند الاستيراد.
+- الحذف نهائي ويُسجَّل في التدقيق، ولا يطال إلا ما تحقق من خلوّه من أي استخدام لحظة التنفيذ.
+- العرض بصلاحية inventory.view، والحذف بصلاحية inventory.manage. بلا PySide6.
+"""
+import re
+
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.audit import audit
+from alhisabat.business import branch_scope
+from alhisabat.database.tx import transaction
+from alhisabat.security import permissions
+
+_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
+_BIDI = dict.fromkeys(list(range(0x200E, 0x2010)) + list(range(0x202A, 0x202F)) + list(range(0x2066, 0x206A)))
+_TASHKEEL = re.compile("[\u064B-\u0652\u0670\u0640]")
+_SKIP_TABLES = {"item_units"}            # إعداد للصنف نفسه لا استخدام له
+_LABELS = {
+    "stock_movements": "حركات مخزنية (تشمل الرصيد الافتتاحي)",
+    "stock_count_lines": "جرد",
+    "sales_invoice_lines": "فواتير مبيعات",
+    "purchase_invoice_lines": "فواتير مشتريات",
+    "stock_balances": "أرصدة مخزنية",
+    "stock_lots": "دفعات صلاحية",
+}
+
+
+def _req(conn, actor_id, company_id, code):
+    permissions.require(conn, actor_id, company_id, code, check_branch=False)
+
+
+def name_key(name):
+    """مفتاح مقارنة الاسم للكشف عن التكرار (نفس قواعد البحث العربي في الواجهة + توحيد المسافات)."""
+    t = str(name or "").translate(_DIGITS).translate(_BIDI).lower()
+    t = _TASHKEEL.sub("", t)
+    for a in "أإآٱ":
+        t = t.replace(a, "ا")
+    t = t.replace("ى", "ي").replace("ة", "ه").replace("ؤ", "و").replace("ئ", "ي")
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def usage_map(conn):
+    """{item_id: [تسمية الاستخدام…]} لكل صنف مستخدم في أي جدول فيه item_id."""
+    used = {}
+    for (t,) in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchall():
+        if t in _SKIP_TABLES:
+            continue
+        if "item_id" not in [r[1] for r in conn.execute(f"PRAGMA table_info({t})")]:
+            continue
+        for (iid,) in conn.execute(f"SELECT DISTINCT item_id FROM {t} WHERE item_id IS NOT NULL").fetchall():
+            used.setdefault(iid, []).append(_LABELS.get(t, t))
+    return used
+
+
+def _rows(conn, company_id, branch_id):
+    f, fa = branch_scope.master_clause(conn, company_id, branch_id, col="i.branch_id")
+    return [dict(r) for r in conn.execute(
+        "SELECT i.id,i.code,i.name,i.barcode,i.category,u.name unit,i.item_type kind,i.is_active,i.created_at "
+        "FROM items i JOIN units u ON u.id=i.base_unit_id WHERE i.company_id=?" + f + " ORDER BY i.id", (company_id, *fa))]
+
+
+def _public(r, usage):
+    return {"id": r["id"], "code": r["code"], "name": r["name"], "category": r["category"], "unit": r["unit"],
+            "kind": r["kind"], "is_active": r["is_active"], "used": bool(usage), "usage": usage}
+
+
+def list_unused_items(conn, user_id, company_id, branch_id=None):
+    """الأصناف التي لا حركة لها ولا مستند ولا رصيد (الظاهرة للفرع الحالي)."""
+    _req(conn, user_id, company_id, "inventory.view")
+    used = usage_map(conn)
+    return [_public(r, []) for r in _rows(conn, company_id, branch_id) if r["id"] not in used]
+
+
+def find_duplicate_items(conn, user_id, company_id, branch_id=None):
+    """مجموعات الأصناف المتشابهة اسمًا: [{key, name, items:[…]}].
+
+    كل صنف فيه used/usage. suggested = مقترح حذفه: كل صنف بلا حركة مكرَّر مع صنف آخر؛ وإن كانت المجموعة كلها بلا حركات
+    يُبقى الأقدم (أصغر معرّف) ويُقترح حذف البقية. لا يُقترح حذف شيء من مجموعة لا يبقى فيها صنف."""
+    _req(conn, user_id, company_id, "inventory.view")
+    used = usage_map(conn)
+    groups = {}
+    for r in _rows(conn, company_id, branch_id):
+        k = name_key(r["name"])
+        if k:
+            groups.setdefault(k, []).append(r)
+    out = []
+    for k, rows in groups.items():
+        if len(rows) < 2:
+            continue
+        items = [_public(r, used.get(r["id"], [])) for r in rows]
+        free = [it for it in items if not it["used"]]
+        keep = free[0]["id"] if len(free) == len(items) else None        # الكل بلا حركات: يُبقى الأقدم
+        for it in items:
+            it["suggested"] = (not it["used"]) and it["id"] != keep
+        out.append({"key": k, "name": items[0]["name"], "items": items})
+    out.sort(key=lambda g: g["key"])
+    return out
+
+
+def _delete(conn, actor_id, company_id, item_ids, branch_id, action, must_leave_one):
+    _req(conn, actor_id, company_id, "inventory.manage")
+    ids = sorted({int(i) for i in item_ids})
+    if not ids:
+        raise AccountingError("حدد صنفًا واحدًا على الأقل")
+    visible = {r["id"]: r for r in _rows(conn, company_id, branch_id)}
+    unknown = [i for i in ids if i not in visible]
+    if unknown:
+        raise AccountingError("بعض الأصناف المحددة غير موجودة أو خارج نطاق الفرع")
+    with transaction(conn):
+        used = usage_map(conn)                                            # إعادة تحقق لحظة التنفيذ
+        busy = [visible[i]["name"] for i in ids if i in used]
+        if busy:
+            raise AccountingError("لا يمكن حذف أصناف لها حركات أو مستندات: " + "، ".join(busy[:5]) + ("…" if len(busy) > 5 else ""))
+        if must_leave_one:
+            chosen = set(ids)
+            members = {}
+            for r in visible.values():
+                members.setdefault(name_key(r["name"]), []).append(r["id"])
+            for i in ids:
+                grp = members.get(name_key(visible[i]["name"]), [])
+                if len(grp) < 2:
+                    raise AccountingError(f"«{visible[i]['name']}» ليس مكررًا")
+                if all(m in chosen for m in grp):
+                    raise AccountingError(f"لا يمكن حذف كل نسخ «{visible[i]['name']}»؛ أبقِ نسخة واحدة على الأقل")
+        for i in ids:
+            r = visible[i]
+            conn.execute("DELETE FROM item_units WHERE item_id=?", (i,))
+            conn.execute("DELETE FROM items WHERE id=? AND company_id=?", (i, company_id))
+            audit.log(conn, actor_id, action, "items", i,
+                      before={"code": r["code"], "name": r["name"], "barcode": r["barcode"], "category": r["category"]})
+    return {"deleted": len(ids)}
+
+
+def delete_unused_items(conn, actor_id, company_id, item_ids, branch_id=None):
+    """حذف أصناف لا حركة لها (يُرفض كل الطلب إن ظهر فيه صنف مستخدم)."""
+    return _delete(conn, actor_id, company_id, item_ids, branch_id, "delete_unused_item", False)
+
+
+def delete_duplicate_items(conn, actor_id, company_id, item_ids, branch_id=None):
+    """حذف نسخ مكررة بلا حركات، بشرط أن تبقى نسخة واحدة على الأقل من كل اسم."""
+    return _delete(conn, actor_id, company_id, item_ids, branch_id, "delete_duplicate_item", True)

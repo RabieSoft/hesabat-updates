@@ -1,0 +1,247 @@
+"""التشغيل السريع: محرّك الترتيب والتجميع الخالص (بلا PySide6 ولا SQL) خلف نافذة Ctrl+K.
+
+يجمع في قائمة واحدة مرتّبة:
+  • مهام  (task)   : إجراءات تنفَّذ مباشرة (فاتورة بيع جديدة، قيد جديد، عميل جديد، تبديل المظهر…).
+  • شاشات (screen) : كل صفحات النظام المسموحة للمستخدم، مع اسم القائمة العلوية التي تنتمي إليها.
+  • سجلات (record) : بحث عميق في بيانات الشركة: عملاء/موردون (اسم، كود، هاتف، رقم ضريبي)، أصناف (اسم، كود، باركود)،
+                     حسابات، فواتير بيع/شراء (رقم، طرف، ملاحظات، أو المبلغ)، قيود يومية (رقم، بيان، بيان الأسطر)،
+                     مستودعات، صناديق وبنوك، فروع، عملات، مستخدمون.
+
+القواعد: كل مصدر يُفحص بصلاحيته (Access) وبنطاق الفرع الحالي؛ مصدر بلا صلاحية أو فاشل يُتجاوز بصمت ولا يوقف البقية.
+البحث يتجاهل التشكيل والهمزات والأرقام العربية/اللاتينية (logic.normalize_ar).
+"""
+import json
+from dataclasses import dataclass
+from typing import Optional
+
+from alhisabat.ui.core.logic import matches, relevance
+
+from . import navigation as N
+
+MAX_RESULTS = 60
+RECENT_LIMIT = 6
+RECENT_KEY = 'quick_recent'
+KIND_ORDER = {'task': 0, 'screen': 1, 'record': 2}
+
+
+@dataclass(frozen=True)
+class Hit:
+    kind: str                  # task | screen | record
+    title: str                 # عمود «الشاشة»
+    group: str                 # عمود «القائمة»: اسم القائمة العلوية / «مهمة» / نوع السجل
+    detail: str = ''
+    page: str = ''             # مفتاح الصفحة (screen/record)
+    params: object = None      # معاملات الصفحة (record) مثل {'id': 5}
+    task: str = ''             # مفتاح المهمة (task)
+    score: int = 0
+    icon: str = 'list'         # اسم أيقونة من design/icons
+    hint: str = ''             # اختصار لوحة المفاتيح إن وُجد (F5…)
+
+
+@dataclass(frozen=True)
+class TaskSpec:
+    key: str
+    title: str
+    page: str = ''             # الصفحة التي تُفتح ثم تُستدعى طريقتها
+    method: str = ''           # اسم الطريقة في الصفحة (مثل _new)
+    args: tuple = ()
+    window_method: str = ''    # بدلًا من ذلك: طريقة في النافذة الرئيسية (toggle_theme…)
+    keywords: str = ''
+    writes: bool = True        # تعدّل بيانات (تُمنع في وضع القراءة فقط)
+    icon: str = 'new'
+    shortcut: str = ''
+
+
+TASKS = (
+    TaskSpec('new_sale', 'فاتورة بيع جديدة', 'sales', '_new', keywords='بيع مبيعات كاشير عميل إنشاء إضافة', icon='cart'),
+    TaskSpec('new_purchase', 'فاتورة شراء جديدة', 'purchases', '_new', keywords='شراء مشتريات مورد إنشاء إضافة', icon='truck'),
+    TaskSpec('new_journal', 'قيد يومية جديد', 'journal', '_new', keywords='قيد يوميه محاسبي إنشاء إضافة', icon='journal'),
+    TaskSpec('new_voucher', 'سند قبض أو صرف جديد', 'cash', '_new_voucher', keywords='سند قبض صرف دفعة صندوق بنك', icon='cash'),
+    TaskSpec('cash_transfer', 'تحويل بين الصناديق والبنوك', 'cash', '_transfer', keywords='تحويل نقل صندوق بنك مناقلة', icon='bank'),
+    TaskSpec('new_customer', 'إضافة عميل', 'parties', '_add', ('customer',), keywords='عميل زبون جديد طرف', icon='users'),
+    TaskSpec('new_supplier', 'إضافة مورد', 'parties', '_add', ('supplier',), keywords='مورد جديد طرف', icon='users'),
+    TaskSpec('new_item', 'إضافة صنف', 'stock', '_add', keywords='صنف مادة منتج جديد مخزون باركود', icon='box'),
+    TaskSpec('new_account', 'إضافة حساب', 'accounts', '_add', keywords='حساب جديد شجرة دليل', icon='tree'),
+    TaskSpec('new_employee', 'تعيين موظف جديد', 'employees', '_add', keywords='موظف تعيين عامل جديد', icon='user'),
+    TaskSpec('new_count', 'جرد مخزون جديد', 'stock_ops', '_new_count', keywords='جرد مخزون تسوية', icon='check'),
+    TaskSpec('toggle_theme', 'تبديل الوضع الليلي / النهاري', window_method='toggle_theme',
+             keywords='مظهر ثيم داكن ليلي نهاري سمة', writes=False, icon='moon', shortcut='Ctrl+Shift+D'),
+    TaskSpec('refresh_page', 'تحديث الصفحة الحالية', window_method='refresh_current', keywords='تحديث refresh',
+             writes=False, icon='refresh', shortcut='F5'),
+    TaskSpec('check_updates', 'البحث عن تحديثات البرنامج', window_method='check_updates',
+             keywords='تحديث إصدار نسخة جديدة', writes=False, icon='import'),
+    TaskSpec('logout', 'تسجيل الخروج / تبديل المستخدم', window_method='logout',
+             keywords='خروج تسجيل مستخدم قفل تبديل logout', writes=False, icon='logout'),
+)
+_TASK_BY_KEY = {t.key: t for t in TASKS}
+
+
+def task(key) -> Optional[TaskSpec]:
+    return _TASK_BY_KEY.get(key)
+
+
+# ------------------------------------------------------------------ مساعدات
+def _menu_of_pages():
+    out = {}
+    for m in N.TOP_MENUS:
+        for k in m.items:
+            if k:
+                out[k] = m.title
+    return out
+
+
+def _page_icon(key):
+    spec = N.get(key)
+    return spec.icon if spec else 'list'
+
+
+# ------------------------------------------------------------------ الشاشات والمهام
+def screen_hits(query, access, features=None, show_advanced=True):
+    menu = _menu_of_pages()
+    out = []
+    for spec in N.search_pages(query, access, features, show_advanced):
+        out.append(Hit('screen', spec.title, menu.get(spec.key, spec.group), spec.description, page=spec.key,
+                       score=relevance(query, spec.title, spec.keywords, spec.group), icon=spec.icon))
+    return out
+
+
+def task_hits(query, access, features=None):
+    out = []
+    for t in TASKS:
+        if t.page:
+            spec = N.get(t.page)
+            if spec is None or not N.allowed(spec, access):
+                continue
+        if not query or matches(query, t.title, t.keywords):
+            out.append(Hit('task', t.title, 'مهمة', 'تنفيذ مباشر', task=t.key, score=relevance(query, t.title, t.keywords),
+                           icon=t.icon, hint=t.shortcut))
+    return out
+
+
+# ------------------------------------------------------------------ بحث السجلات (القراءة في services/search.py)
+def record_hits(session, query, access):
+    """بحث عميق في السجلات عبر session.search_records (بالصلاحيات ونطاق الفرع)؛ يُحوَّل كل قاموس إلى Hit."""
+    try:
+        rows = session.search_records(query, access)
+    except Exception:  # noqa: BLE001 — فشل البحث العميق لا يُسقط الشاشات والمهام
+        return []
+    return [Hit('record', r['title'], r['group'], r['detail'], r['page'], r['params'], score=r['score'], icon=_page_icon(r['page']))
+            for r in rows]
+
+
+def search(session, access, query, features=None, show_advanced=True):
+    """القائمة النهائية. بلا استعلام: المهام ثم كل الشاشات (كجدول «التشغيل السريع»). باستعلام: الأعلى صلة أولًا،
+    وعند التساوي المهام ثم الشاشات ثم السجلات."""
+    q = (query or '').strip()
+    hits = task_hits(q, access, features) + screen_hits(q, access, features, show_advanced)
+    if q:
+        hits += record_hits(session, q, access)
+        hits.sort(key=lambda h: (-h.score, KIND_ORDER[h.kind]))
+    return hits[:MAX_RESULTS] if q else hits
+
+
+# ------------------------------------------------------------------ الأخيرة (تُحفظ في تفضيلات المستخدم المحلية)
+def hit_key(h):
+    """هوية ثابتة للنتيجة (للحذف من التكرار): نوعها + هدفها + معاملاتها (للسجل: وعنوانه)."""
+    params = json.dumps(h.params, sort_keys=True, ensure_ascii=False, default=str) if h.params else ''
+    return (h.kind, h.task or h.page, params, h.title if h.kind == 'record' else '')
+
+
+def _hit_dict(h):
+    return {'kind': h.kind, 'title': h.title, 'group': h.group, 'detail': h.detail, 'page': h.page,
+            'params': h.params, 'task': h.task, 'icon': h.icon, 'hint': h.hint}
+
+
+def recent_load(raw):
+    """نص JSON ← قائمة Hit؛ أي تلف في المخزن يُتجاهل بصمت (قائمة فارغة)."""
+    try:
+        data = json.loads(raw or '[]')
+    except (TypeError, ValueError):
+        return []
+    out = []
+    for d in data if isinstance(data, list) else []:
+        try:
+            if d['kind'] in KIND_ORDER and isinstance(d['title'], str):
+                out.append(Hit(d['kind'], d['title'], d.get('group', ''), d.get('detail', ''), d.get('page', ''),
+                               d.get('params'), d.get('task', ''), 0, d.get('icon') or 'list', d.get('hint', '')))
+        except (KeyError, TypeError):
+            continue
+    return out
+
+
+def recent_push(raw, hit, limit=RECENT_LIMIT):
+    """يضيف النتيجة المنفَّذة في مقدمة «الأخيرة» (بلا تكرار) ويعيد النص الجديد للحفظ."""
+    cur = [h for h in recent_load(raw) if hit_key(h) != hit_key(hit)]
+    return json.dumps([_hit_dict(h) for h in ([hit] + cur)[:limit]], ensure_ascii=False, default=str)
+
+
+def recent_allowed(raw, access):
+    """الأخيرة الصالحة اليوم فقط: المهمة ما زالت موجودة ومسموحة، والصفحة مسموحة بصلاحية المستخدم الحالي."""
+    out = []
+    for h in recent_load(raw):
+        if h.kind == 'task':
+            t = task(h.task)
+            if t is None:
+                continue
+            if t.page:
+                spec = N.get(t.page)
+                if spec is None or not N.allowed(spec, access):
+                    continue
+            out.append(Hit('task', t.title, 'مهمة', 'تنفيذ مباشر', task=t.key, icon=t.icon, hint=t.shortcut))
+        else:
+            spec = N.get(h.page)
+            if spec is not None and N.allowed(spec, access):
+                out.append(h)
+    return out
+
+
+# ------------------------------------------------------------------ ترتيب العرض (أقسام + مرشّح التصنيف)
+FILTERS = (('all', 'الكل'), ('task', 'مهام'), ('screen', 'شاشات'), ('record', 'سجلات'))
+
+
+def layout_rows(hits, recents=(), query='', kind='all'):
+    """يحوّل النتائج إلى صفوف عرض: ('header', نص) أو ('hit', Hit).
+
+    • باستعلام: قائمة مسطّحة بترتيب الصلة (الأقسام تكسر الترتيب).
+    • بلا استعلام: «الأخيرة» ثم «المهام» ثم الشاشات مجمّعة تحت اسم قائمتها؛ ما ظهر في «الأخيرة» لا يتكرر.
+    • kind: all | task | screen | record يرشّح النتائج (الأخيرة تظهر مع «الكل» فقط).
+    """
+    hits = [h for h in hits if kind in ('all', h.kind)]
+    if (query or '').strip():
+        return [('hit', h) for h in hits]
+    rows, seen = [], set()
+    if kind == 'all':
+        rec = [h for h in recents]
+        if rec:
+            rows.append(('header', 'الأخيرة'))
+            for h in rec:
+                seen.add(hit_key(h))
+                rows.append(('hit', h))
+    tasks = [h for h in hits if h.kind == 'task' and hit_key(h) not in seen]
+    if tasks:
+        rows.append(('header', 'المهام السريعة'))
+        rows += [('hit', h) for h in tasks]
+    last = None
+    for h in hits:
+        if h.kind != 'screen' or hit_key(h) in seen:
+            continue
+        if h.group != last:
+            rows.append(('header', f'الشاشات — {h.group}'))
+            last = h.group
+        rows.append(('hit', h))
+    for h in hits:
+        if h.kind == 'record':
+            rows.append(('hit', h))
+    return rows
+
+
+def step_index(selectable, current, step, wrap=True):
+    """التنقل بالأزرار: selectable قائمة مواضع الصفوف القابلة للتحديد؛ يعيد الموضع الجديد (يتجاوز العناوين)."""
+    if not selectable:
+        return -1
+    if current not in selectable:
+        return selectable[0] if step >= 0 else selectable[-1]
+    i = selectable.index(current) + step
+    if wrap and abs(step) == 1:
+        i %= len(selectable)
+    return selectable[max(0, min(len(selectable) - 1, i))]

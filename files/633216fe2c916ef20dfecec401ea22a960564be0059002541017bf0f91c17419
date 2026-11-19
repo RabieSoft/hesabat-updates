@@ -1,0 +1,298 @@
+"""نموذج إدخال العملاء والموردين المدمج: شريط داخل الصفحة فوق الجدول (لا نافذة منبثقة).
+
+التخطيط: [النوع] [الاسم *] [الهاتف] [المجموعة] [أيام السداد] [الحد الائتماني] ثم «تفاصيل إضافية» مطوية، ثم شريط التنبيه والأزرار.
+الإدخال المتتابع: Enter ينقل للحقل التالي، وعند الاسم وحده أو آخر حقل يحفظ؛ بعد الحفظ يُفرَّغ النموذج ويعود المؤشر للاسم
+ويتحدّث الجدول ويُحدَّد السجل الجديد. Ctrl+Enter يحفظ من أي حقل، Esc يمسح/يلغي التعديل.
+المنطق في core/inline_entry_logic.py، والمحرك هو الحَكَم النهائي (الأخطاء تظهر مترجمة). يتطلب PySide6.
+"""
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtWidgets import (QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSpinBox,
+                               QToolButton, QWidget)
+
+from alhisabat.ui.components.basic import DateField, MoneyEdit, repolish
+from alhisabat.ui.core import inline_entry_logic as L
+
+
+class InlinePartyForm(QFrame):
+    saved = Signal(int)                      # معرّف الطرف بعد حفظ ناجح (إضافة أو تعديل)
+    fullFormRequested = Signal(str)          # فتح النموذج الكامل (هوية/اتفاقية) للنوع المحدد
+
+    def __init__(self, page):
+        super().__init__()
+        self.page = page
+        self.setObjectName('inlineEntry')
+        self.setLayoutDirection(Qt.RightToLeft)
+        self._editing = None                 # صف الطرف الجاري تعديله أو None
+        self._names = []
+        self._busy = False
+        self._state = L.evaluate('customer', L.blank('customer'))
+
+        g = QGridLayout(self)
+        g.setContentsMargins(10, 8, 10, 8)
+        g.setHorizontalSpacing(8)
+        g.setVerticalSpacing(4)
+
+        self.mode = QLabel('إضافة سريعة')
+        self.mode.setObjectName('entryDockTitle')
+        self.kind = QComboBox()
+        self.kind.addItem('عميل', 'customer')
+        self.kind.addItem('مورد', 'supplier')
+        self.name = QLineEdit(); self.name.setPlaceholderText('اسم الطرف (مطلوب)')
+        self.phone = QLineEdit(); self.phone.setPlaceholderText('الهاتف'); self.phone.setLayoutDirection(Qt.LeftToRight)
+        self.group = QComboBox()
+        self.terms = QSpinBox(); self.terms.setRange(0, 3650); self.terms.setSuffix(' يوم'); self.terms.setSpecialValueText('نقدًا')
+        self.terms.setLayoutDirection(Qt.LeftToRight)
+        self.credit = MoneyEdit(); self.credit.setPlaceholderText('الحد الائتماني')
+        self.email = QLineEdit(); self.email.setPlaceholderText('البريد الإلكتروني'); self.email.setLayoutDirection(Qt.LeftToRight)
+        self.addr = QLineEdit(); self.addr.setPlaceholderText('العنوان')
+        self.opening = MoneyEdit(); self.opening.setPlaceholderText('الرصيد الافتتاحي')
+        self.opening_dir = QComboBox()
+        self.opening_date = DateField()
+
+        def lab(text, w):
+            box = QWidget(); v = QGridLayout(box); v.setContentsMargins(0, 0, 0, 0); v.setSpacing(2)
+            v.addWidget(QLabel(text), 0, 0); v.addWidget(w, 1, 0)
+            return box
+        self._cells = {}
+        row1 = [('kind', 'النوع', self.kind, 0, 1), ('name', 'الاسم *', self.name, 1, 4), ('phone', 'الهاتف', self.phone, 2, 2),
+                ('group', 'المجموعة', self.group, 3, 2), ('terms', 'أيام السداد', self.terms, 4, 1), ('credit', 'الحد الائتماني', self.credit, 5, 2)]
+        col = 0
+        for key, text, w, _i, span in row1:
+            cell = lab(text, w); self._cells[key] = cell
+            g.addWidget(cell, 0, col, 1, span); col += span
+        g.addWidget(self.mode, 0, col, 1, 2, Qt.AlignTop)
+        self._extra = QWidget(); eg = QGridLayout(self._extra); eg.setContentsMargins(0, 0, 0, 0); eg.setHorizontalSpacing(8)
+        eg.addWidget(lab('البريد الإلكتروني', self.email), 0, 0, 1, 2)
+        eg.addWidget(lab('العنوان', self.addr), 0, 2, 1, 3)
+        self._open_box = QWidget(); og = QHBoxLayout(self._open_box); og.setContentsMargins(0, 0, 0, 0)
+        og.addWidget(lab('الرصيد الافتتاحي', self.opening)); og.addWidget(lab('نوعه', self.opening_dir)); og.addWidget(lab('بتاريخ', self.opening_date))
+        eg.addWidget(self._open_box, 0, 5, 1, 4)
+        self._extra.setVisible(False)
+        g.addWidget(self._extra, 1, 0, 1, 12)
+
+        bar = QHBoxLayout()
+        self.more = QToolButton(); self.more.setText('▾ تفاصيل إضافية'); self.more.setCheckable(True); self.more.setAutoRaise(True)
+        self.more.toggled.connect(self._toggle_extra)
+        self.msg = QLabel(''); self.msg.setWordWrap(True)
+        self.btn_save = QPushButton('حفظ (Enter)'); self.btn_save.setProperty('primary', True); self.btn_save.setAutoDefault(False)
+        self.btn_clear = QPushButton('جديد (Esc)'); self.btn_clear.setAutoDefault(False)
+        self.btn_full = QPushButton('نموذج كامل…'); self.btn_full.setAutoDefault(False)
+        self.btn_full.setToolTip('الهوية واتفاقية فتح الحساب وبقية الحقول')
+        self.btn_save.clicked.connect(self.save)
+        self.btn_clear.clicked.connect(self.reset)
+        self.btn_full.clicked.connect(lambda: self.fullFormRequested.emit(self.kind.currentData()))
+        bar.addWidget(self.more); bar.addWidget(self.msg, 1)
+        bar.addWidget(self.btn_full); bar.addWidget(self.btn_clear); bar.addWidget(self.btn_save)
+        g.addLayout(bar, 2, 0, 1, 12)
+
+        self._fields = {'name': self.name, 'phone': self.phone, 'terms': self.terms, 'credit': self.credit,
+                        'email': self.email, 'address': self.addr, 'opening_amount': self.opening}
+        for key, w in self._fields.items():
+            if hasattr(w, 'returnPressed'):
+                w.returnPressed.connect(lambda k=key: self._on_enter(k))
+            if hasattr(w, 'textChanged'):
+                w.textChanged.connect(self._revalidate)
+        self.terms.valueChanged.connect(self._revalidate)
+        self.terms.lineEdit().returnPressed.connect(lambda: self._on_enter('terms'))
+        self.kind.currentIndexChanged.connect(self._on_kind)
+        QShortcut(QKeySequence('Ctrl+Return'), self, activated=self.save)
+        QShortcut(QKeySequence('Ctrl+Enter'), self, activated=self.save)
+        QShortcut(QKeySequence('Escape'), self, activated=self.reset)
+        self._fill_opening_dir()
+        self._on_kind()
+
+    # ------------------------------------------------------------------ واجهة الصفحة
+    def start_add(self, kind=None):
+        """بدء إضافة (من زر «+ عميل/مورد»)."""
+        self._editing = None
+        if kind and self.kind.findData(kind) >= 0:
+            self.kind.setCurrentIndex(self.kind.findData(kind))
+        self._clear_fields()
+        self._apply_mode()
+        self.focus_name()
+
+    def start_edit(self, row):
+        """تحميل سجل في النموذج للتعديل (نقر مزدوج/زر تعديل)."""
+        self._editing = dict(row)
+        k = row.get('kind') or 'customer'
+        self.kind.setCurrentIndex(max(self.kind.findData(k), 0))
+        self._set_fields(L.raw_from_row(row))
+        self._apply_mode()
+        self.focus_name()
+
+    @property
+    def editing(self):
+        return self._editing is not None
+
+    def set_kind(self, kind):
+        """تغيير النوع دون مسح ما كُتب (يتبع تصفية الصفحة)."""
+        i = self.kind.findData(kind)
+        if i >= 0 and i != self.kind.currentIndex():
+            self.kind.setCurrentIndex(i)
+
+    def focus_name(self):
+        self.name.setFocus(); self.name.selectAll()
+
+    def reload_context(self):
+        """بعد تغيّر الفرع/السياق: أسماء المقارنة والمجموعات والعملات."""
+        self._load_names(); self._fill_groups(); self._fill_opening_dir()
+        self._apply_mode()
+
+    # ------------------------------------------------------------------ بناء الحالة
+    @property
+    def kind_value(self):
+        return self.kind.currentData() or 'customer'
+
+    def _raw(self):
+        return {'name': self.name.text(), 'phone': self.phone.text(), 'email': self.email.text(), 'address': self.addr.text(),
+                'credit': self.credit.text(), 'terms': str(self.terms.value()), 'opening_amount': self.opening.text()}
+
+    def _set_fields(self, raw):
+        for w in (self.name, self.phone, self.email, self.addr, self.credit, self.opening):
+            w.blockSignals(True)
+        self.name.setText(raw.get('name', '')); self.phone.setText(raw.get('phone', ''))
+        self.email.setText(raw.get('email', '')); self.addr.setText(raw.get('address', ''))
+        self.credit.setText(raw.get('credit', '')); self.opening.setText(raw.get('opening_amount', ''))
+        self.terms.setValue(int(raw.get('terms') or 0))
+        for w in (self.name, self.phone, self.email, self.addr, self.credit, self.opening):
+            w.blockSignals(False)
+        self._revalidate()
+
+    def _clear_fields(self):
+        self._set_fields(L.blank(self.kind_value))
+
+    def _fill_groups(self):
+        keep = self.group.currentData()
+        self.group.blockSignals(True)
+        self.group.clear(); self.group.addItem('بلا مجموعة', None)
+        try:
+            from alhisabat.ui.core.party_groups_service import PartyGroupsService
+            for gr in PartyGroupsService(self.page.session).list(self.kind_value):
+                if gr.get('is_active'):
+                    self.group.addItem(gr['name'], gr['id'])
+        except Exception:  # noqa: BLE001 — تعذّر التحميل لا يعطّل الإدخال
+            pass
+        i = self.group.findData(keep) if keep else -1
+        if i < 0:
+            pre = getattr(self.page, 'current_group_id', None)
+            i = self.group.findData(pre) if pre else -1
+        self.group.setCurrentIndex(max(i, 0))
+        self.group.blockSignals(False)
+
+    def _fill_opening_dir(self):
+        self.opening_dir.clear()
+        if self.kind_value == 'customer':
+            self.opening_dir.addItem('مدين — علينا له/عليه (المعتاد)', 1)
+            self.opening_dir.addItem('دائن — رصيد له (مقدّم)', -1)
+        else:
+            self.opening_dir.addItem('دائن — مستحق للمورد (المعتاد)', 1)
+            self.opening_dir.addItem('مدين — رصيد لنا عنده', -1)
+
+    def _load_names(self):
+        try:
+            self._names = list(self.page.svc.names(self.kind_value))
+        except Exception:  # noqa: BLE001
+            self._names = []
+
+    def _on_kind(self, _i=None):
+        customer = self.kind_value == 'customer'
+        self._cells['credit'].setVisible(customer)
+        self._fill_groups(); self._fill_opening_dir(); self._load_names()
+        self._revalidate()
+
+    def _toggle_extra(self, on):
+        self._extra.setVisible(on)
+        self.more.setText('▴ إخفاء التفاصيل' if on else '▾ تفاصيل إضافية')
+
+    def _apply_mode(self):
+        edit = self._editing is not None
+        self.mode.setText(f"تعديل: {self._editing.get('name', '')}" if edit else 'إضافة سريعة')
+        self.kind.setEnabled(not edit)
+        self._cells['group'].setVisible(not edit)
+        self._open_box.setVisible(not edit)             # الرصيد الافتتاحي عند الإضافة فقط (التعديل من زر «رصيد افتتاحي»)
+        self.btn_save.setText('حفظ التعديل (Enter)' if edit else 'حفظ (Enter)')
+        self.btn_clear.setText('إلغاء التعديل (Esc)' if edit else 'جديد (Esc)')
+        self._revalidate()
+
+    # ------------------------------------------------------------------ التحقق والتنقل
+    def _permitted(self):
+        perm = 'party.edit' if self._editing is not None else 'party.create'
+        try:
+            st = self.page.access.state(perm)
+            ok = bool(st.enabled)
+            return ok and not getattr(self.page, 'read_only', False), (st.reason if not ok else 'الفترة/السنة للقراءة فقط' if getattr(self.page, 'read_only', False) else '')
+        except Exception:  # noqa: BLE001
+            return True, ''
+
+    def _revalidate(self, *_):
+        edit_name = self._editing.get('name') if self._editing else None
+        self._state = L.evaluate(self.kind_value, self._raw(), self._names, edit_name)
+        bad = {'name': self.name, 'phone': self.phone, 'email': self.email, 'credit': self.credit, 'opening_amount': self.opening}
+        for key, w in bad.items():
+            inv = key in self._state.errors and bool(w.text().strip())
+            w.setProperty('invalid', inv)
+            w.setToolTip(self._state.errors.get(key, '') if inv else '')
+            repolish(w)
+        ok, why = self._permitted()
+        if self._state.shown:
+            text = ' · '.join(self._state.shown)
+        elif self._state.duplicate:
+            text = f'⚠ يوجد طرف بنفس الاسم: «{self._state.duplicate}» — تأكد أنه ليس تكرارًا.'
+        else:
+            text = why
+        self.msg.setText(text)
+        self.btn_save.setEnabled(ok and self._state.can_save and not self._busy)
+        self.btn_save.setToolTip(why)
+
+    def _on_enter(self, key):
+        action = L.enter_action(self.kind_value, key, self._raw(), self._extra.isVisible())
+        if action == 'save':
+            self.save()
+        else:
+            self.focusNextChild()
+
+    # ------------------------------------------------------------------ الحفظ
+    def reset(self):
+        """Esc/«جديد»: يلغي التعديل أو يمسح الحقول ويعيد التركيز للاسم."""
+        self._editing = None
+        self._clear_fields()
+        self.msg.setText('')
+        self._apply_mode()
+        self.focus_name()
+
+    def save(self):
+        if self._busy:
+            return
+        self._revalidate()
+        if not self.btn_save.isEnabled():
+            if self._state.shown:
+                self.msg.setText(' · '.join(self._state.shown))
+            return
+        self._busy = True
+        kind, raw, editing = self.kind_value, self._raw(), self._editing
+        try:
+            if editing is not None:
+                v = L.edit_values(kind, raw)
+                ok, res = self.page.guarded(self.page.svc.edit, editing['id'], v, reload=False)
+                pid = editing['id']
+            else:
+                v = L.create_values(kind, raw, self.group.currentData(), self.opening_dir.currentData(), self.opening_date.iso())
+                ok, res = self.page.guarded(self.page.svc.create, kind, v, reload=False)
+                pid = (res or {}).get('id')
+        finally:
+            self._busy = False
+        if not ok:
+            self._revalidate()
+            return                                                  # الخطأ ظهر مترجمًا؛ النموذج يبقى بقيمه للتصحيح
+        name = v['name']
+        text = L.saved_message(kind, name, res if editing is None else None, editing is not None)
+        if editing is None:
+            self._names.append(name)
+        self._editing = None
+        self._clear_fields()
+        self._apply_mode()
+        self.msg.setText('✔ ' + text)
+        self.page.notify(text)
+        self.saved.emit(int(pid) if pid else 0)
+        self.focus_name()

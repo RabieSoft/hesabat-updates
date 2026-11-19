@@ -1,0 +1,85 @@
+"""خدمات الموارد: موظفون ورواتب وأصول. بلا PySide6، بلا SQL مباشر (القراءة عبر readmodel).
+
+الكتابة عبر business.*. Decimal فقط.
+"""
+from datetime import date
+from decimal import Decimal
+from alhisabat.business import payroll, fixed_assets, cost_centers
+
+class HrService:
+    def __init__(self, session):
+        self.s=session
+    def employees(self):
+        self.s.require('employee.view')
+        from alhisabat.ui.core import readmodel
+        return readmodel.employees(self.s.conn, self.s.company_id)
+    def hire(self, v):
+        self.s.require('employee.manage')
+        return payroll.hire_employee(self.s.conn, self.s.user_id, self.s.company_id, v['name'], v.get('date') or str(date.today()), Decimal(str(v.get('salary') or 0)), job_title=v.get('job',''), phone=v.get('phone',''))
+    def edit(self, eid, v): return payroll.edit_employee(self.s.conn, self.s.user_id, int(eid), name=v.get('name'), job_title=v.get('job'), phone=v.get('phone'), hire_date=v.get('date'), base_salary=Decimal(str(v['salary'])) if str(v.get('salary') or '').strip()!='' else None)
+    def terminate(self, eid, reason=''): return payroll.terminate_employee(self.s.conn, self.s.user_id, int(eid), reason)
+    def reactivate(self, eid, reason=''): return payroll.reactivate_employee(self.s.conn, self.s.user_id, int(eid), reason)
+    def delete_employee(self, eid):
+        self.s.require('employee.manage')
+        return payroll.delete_employee(self.s.conn, self.s.user_id, int(eid))
+    def statement_spec(self, eid, date_from, date_to):
+        """مواصفة كشف حساب الموظف للمعاينة والطباعة (نفس محرك كشف العميل/المورد)."""
+        self.s.require('employee.view')
+        from alhisabat.reporting import printing
+        return printing.party_statement_print(self.s.conn, self.s.user_id, self.s.company_id, int(eid), date_from, date_to)
+    def cost_centers(self):
+        self.s.require('costcenter.view')
+        return cost_centers.list_flat(self.s.conn, self.s.user_id, self.s.company_id)
+    def create_cc(self, v):
+        self.s.require('costcenter.manage')
+        return cost_centers.create(self.s.conn, self.s.user_id, self.s.company_id, v['name'], code=v.get('code') or None)
+    def edit_cc(self, cc_id, v): return cost_centers.edit(self.s.conn, self.s.user_id, int(cc_id), name=v.get('name'))
+    def set_cc_active(self, cc_id, active): return cost_centers.set_active(self.s.conn, self.s.user_id, int(cc_id), bool(active))
+    def delete_cc(self, cc_id): return cost_centers.delete(self.s.conn, self.s.user_id, int(cc_id))
+    def payroll_runs(self):
+        self.s.require('payroll.run')
+        from alhisabat.ui.core import readmodel
+        return readmodel.payroll_runs(self.s.conn, self.s.company_id)
+    def create_payroll(self, v):
+        from alhisabat.ui.core import readmodel
+        emps=readmodel.payroll_active_employees(self.s.conn, self.s.company_id)
+        lines=[{'employee_id':r['party_id'],'basic':Decimal(r['base_salary_minor'])/Decimal(100)} for r in emps]
+        return payroll.create_run(self.s.conn, self.s.user_id, self.s.company_id, v['period'], v['date'], lines)
+    def post_payroll(self, run_id): return payroll.post_run(self.s.conn, self.s.user_id, int(run_id))
+    def delete_run_draft(self, run_id):
+        self.s.require('payroll.run')
+        return payroll.delete_run_draft(self.s.conn, self.s.user_id, int(run_id))
+    def cancel_run(self, run_id, cancel_date, reason):
+        self.s.require('payroll.run')
+        self.s.require('journal.reverse')
+        return payroll.cancel_run(self.s.conn, self.s.user_id, int(run_id), cancel_date, reason)
+    def pay_employee(self, cash_id, employee_id, amount, pay_date, description=''):
+        self.s.require('payroll.pay')
+        self.s.require('cash.voucher')
+        return payroll.pay_employee(self.s.conn, self.s.user_id, self.s.company_id, int(cash_id), int(employee_id), Decimal(str(amount)), pay_date, description=description)
+
+    def assets(self):
+        self.s.require('asset.view')
+        return fixed_assets.list_assets(self.s.conn, self.s.user_id, self.s.company_id)
+    def create_asset(self, v):
+        self.s.require('asset.manage')
+        return fixed_assets.register_asset(self.s.conn, self.s.user_id, self.s.company_id, v['name'], int(v['account_id']), v['date'], Decimal(str(v['cost'])), int(v['life']))
+    def acquisition(self, asset_id, counter_account_id, description=''):
+        self.s.require('asset.manage')
+        return fixed_assets.record_acquisition(self.s.conn, self.s.user_id, int(asset_id), int(counter_account_id), description)
+    def dispose_asset(self, asset_id, disposal_date, proceeds, counter_account_id, reason=''):
+        self.s.require('asset.manage')
+        return fixed_assets.dispose_asset(self.s.conn, self.s.user_id, int(asset_id), disposal_date, Decimal(str(proceeds)), int(counter_account_id), reason=reason)
+    def dep_preview(self, d): return fixed_assets.depreciation_preview(self.s.conn, self.s.user_id, self.s.company_id, d)
+    def run_dep(self, d, post=False): return fixed_assets.run_depreciation(self.s.conn, self.s.user_id, self.s.company_id, d, post=post)
+    def depreciation_runs(self, limit=200):
+        self.s.require('asset.view')
+        from alhisabat.ui.core import readmodel
+        return readmodel.depreciation_runs(self.s.conn, self.s.company_id, limit=limit)
+    def post_depreciation_run(self, run_id):
+        self.s.require('asset.depreciate')
+        return fixed_assets.post_depreciation_run(self.s.conn, self.s.user_id, int(run_id))
+    def cancel_depreciation_run(self, run_id, cancel_date, reason):
+        self.s.require('asset.depreciate')
+        self.s.require('journal.reverse')
+        return fixed_assets.cancel_depreciation_run(self.s.conn, self.s.user_id, int(run_id), cancel_date, reason)

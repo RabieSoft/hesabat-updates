@@ -1,0 +1,52 @@
+"""خدمات الواجهة: طبقة عرض رفيعة فوق المحركات الخلفية، مقسّمة حسب المجال.
+
+المرحلة 3: تم تقسيم AppSession حسب المجال (accounting, sales, parties, inventory, cash, hr, system, reports)
+مع الحفاظ على AppSession كواجهة موحدة لجميع الصفحات.
+المبالغ المخزنة بالوحدة الصغرى (1/100) تُعاد كما هي بأسماء تنتهي بـ _minor أو تُحوَّل إلى Decimal عند الحاجة.
+"""
+from .accounting import AccountingMixin
+from .base import IMPORT_TARGETS, REPORTS, SessionBase, _SETTINGS_TABLES
+from .cash import CashMixin
+from .hr import HrMixin
+from .inventory import InventoryMixin
+from .notebook import NotebookMixin
+from .parties import PartiesMixin
+from .reports import ReportsMixin
+from .search import SearchMixin
+from .sales import SalesMixin
+from .system import SystemMixin
+
+
+class AppSession(
+    SessionBase,
+    AccountingMixin,
+    SalesMixin,
+    PartiesMixin,
+    InventoryMixin,
+    CashMixin,
+    HrMixin,
+    SystemMixin,
+    ReportsMixin,
+    SearchMixin,
+    NotebookMixin,
+):
+    """جلسة التطبيق الموحّدة للواجهة: تجميع من الوحدات المقسّمة حسب المجال."""
+    pass
+
+
+__all__ = [
+    'AppSession',
+    'IMPORT_TARGETS',
+    'REPORTS',
+    '_SETTINGS_TABLES',
+    'SessionBase',
+    'AccountingMixin',
+    'SalesMixin',
+    'PartiesMixin',
+    'InventoryMixin',
+    'CashMixin',
+    'HrMixin',
+    'SystemMixin',
+    'ReportsMixin',
+    'NotebookMixin',
+]

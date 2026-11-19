@@ -1,0 +1,111 @@
+"""أيقونات SVG داخلية أحادية اللون (خطية، 24×24). بلا مكتبات خارجية. `svg()` خالصة؛ `qicon()` تحتاج PySide6 وتُستورد كسولًا.
+
+كل أيقونة = محتوى داخل <svg> بخط `currentColor` فيُلوَّن عند الرسم.
+"""
+_P = {
+    # إجراءات
+    'new': '<path d="M12 5v14M5 12h14"/>',
+    'edit': '<path d="M4 20l4-1 10-10-3-3L5 16z"/><path d="M14 6l3 3"/>',
+    'delete': '<path d="M5 7h14M9 7V5h6v2M7 7l1 12h8l1-12"/><path d="M10 11v5M14 11v5"/>',
+    'save': '<path d="M5 4h11l3 3v13H5z"/><path d="M8 4v5h7V4M8 20v-6h8v6"/>',
+    'post': '<path d="M5 12l5 5L19 7"/>',
+    'reverse': '<path d="M9 7L4 12l5 5"/><path d="M4 12h10a5 5 0 010 10h-2"/>',
+    'review': '<circle cx="11" cy="11" r="6"/><path d="M16 16l4 4"/>',
+    'approve': '<path d="M12 3l7 3v6c0 4-3 7-7 9-4-2-7-5-7-9V6z"/><path d="M9 12l2 2 4-4"/>',
+    'return': '<path d="M9 7L4 12l5 5"/><path d="M4 12h12a4 4 0 014 4v2"/>',
+    'print': '<path d="M7 9V4h10v5M7 17H5v-7h14v7h-2"/><path d="M7 14h10v6H7z"/>',
+    'export': '<path d="M12 4v11M8 8l4-4 4 4"/><path d="M5 15v5h14v-5"/>',
+    'import': '<path d="M12 15V4M8 11l4 4 4-4"/><path d="M5 15v5h14v-5"/>',
+    'refresh': '<path d="M19 8a7 7 0 00-12-2M5 4v4h4"/><path d="M5 16a7 7 0 0012 2M19 20v-4h-4"/>',
+    'search': '<circle cx="11" cy="11" r="6"/><path d="M16 16l4 4"/>',
+    'filter': '<path d="M4 5h16l-6 8v6l-4-2v-4z"/>',
+    'copy': '<path d="M8 8h11v12H8z"/><path d="M5 16V4h11"/>',
+    'attach': '<path d="M8 12l6-6a3 3 0 014 4l-8 8a5 5 0 01-7-7l7-7"/>',
+    'close': '<path d="M6 6l12 12M18 6L6 18"/>',
+    'check': '<path d="M5 12l5 5L19 7"/>',
+    'plus': '<path d="M12 5v14M5 12h14"/>',
+    'minus': '<path d="M5 12h14"/>',
+    'back': '<path d="M9 6l6 6-6 6"/>',
+    'next': '<path d="M15 6l-6 6 6 6"/>',
+    'up': '<path d="M6 15l6-6 6 6"/>',
+    'down': '<path d="M6 9l6 6 6-6"/>',
+    # حالات
+    'info': '<circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.5"/>',
+    'warning': '<path d="M12 4l9 16H3z"/><path d="M12 10v4M12 17v.5"/>',
+    'error': '<circle cx="12" cy="12" r="9"/><path d="M9 9l6 6M15 9l-6 6"/>',
+    'lock': '<rect x="6" y="11" width="12" height="9"/><path d="M8 11V8a4 4 0 018 0v3"/>',
+    'eye': '<path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+    'eye_off': '<path d="M3 3l18 18"/><path d="M10.6 6.1A9.8 9.8 0 0112 5c6 0 10 7 10 7a17 17 0 01-3.2 3.9M6.6 7.6A17 17 0 002 12s4 7 10 7a9.7 9.7 0 004-.9"/><path d="M9.9 9.9a3 3 0 004.2 4.2"/>',
+    'unlock': '<rect x="6" y="11" width="12" height="9"/><path d="M8 11V8a4 4 0 017-2"/>',
+    'bell': '<path d="M6 17V11a6 6 0 0112 0v6l2 2H4z"/><path d="M10 21h4"/>',
+    # وحدات
+    'home': '<path d="M4 11l8-7 8 7v9h-5v-6H9v6H4z"/>',
+    'chart': '<path d="M4 20V4M4 20h16"/><path d="M8 16v-4M12 16V8M16 16v-6"/>',
+    'notes': '<path d="M6 3h9l4 4v14H6z"/><path d="M14 3v5h5"/><path d="M9 12h7M9 16h7"/>',
+    'book': '<path d="M5 4h10a3 3 0 013 3v13H8a3 3 0 01-3-3z"/><path d="M5 17a3 3 0 013-3h10"/>',
+    'journal': '<path d="M6 3h12v18H6z"/><path d="M9 8h6M9 12h6M9 16h4"/>',
+    'cash': '<rect x="3" y="7" width="18" height="11"/><circle cx="12" cy="12.5" r="2.5"/>',
+    'bank': '<path d="M3 9l9-5 9 5zM5 9v8M9 9v8M15 9v8M19 9v8M3 19h18"/>',
+    'box': '<path d="M4 8l8-4 8 4v9l-8 4-8-4z"/><path d="M4 8l8 4 8-4M12 12v9"/>',
+    'cart': '<path d="M3 5h3l2 11h10l2-8H7"/><circle cx="10" cy="20" r="1"/><circle cx="17" cy="20" r="1"/>',
+    'truck': '<path d="M3 6h11v10H3zM14 9h4l3 3v4h-7"/><circle cx="7" cy="18" r="1.5"/><circle cx="17" cy="18" r="1.5"/>',
+    'users': '<circle cx="9" cy="8" r="3"/><path d="M3 20v-2a5 5 0 0110 0v2"/><path d="M16 5a3 3 0 010 6M18 20v-2a5 5 0 00-3-4.5"/>',
+    'user': '<circle cx="12" cy="8" r="4"/><path d="M5 20v-1a7 7 0 0114 0v1"/>',
+    'building': '<path d="M5 20V4h10v16M15 9h4v11M3 20h18"/><path d="M8 8h4M8 12h4M8 16h4"/>',
+    'branch': '<circle cx="6" cy="6" r="2"/><circle cx="6" cy="18" r="2"/><circle cx="18" cy="9" r="2"/><path d="M6 8v8M6 12c6 0 12 0 12-1"/>',
+    'calendar': '<rect x="4" y="6" width="16" height="14"/><path d="M4 11h16M9 4v4M15 4v4"/>',
+    'settings': '<circle cx="12" cy="12" r="3"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/>',
+    'shield': '<path d="M12 3l7 3v6c0 4-3 7-7 9-4-2-7-5-7-9V6z"/>',
+    'backup': '<path d="M5 18a4 4 0 010-8 6 6 0 0111-2 4.5 4.5 0 011 10z"/><path d="M12 11v6M9 14l3 3 3-3"/>',
+    'percent': '<path d="M19 5L5 19"/><circle cx="7" cy="7" r="2"/><circle cx="17" cy="17" r="2"/>',
+    'coins': '<ellipse cx="9" cy="7" rx="5" ry="3"/><path d="M4 7v5c0 1.7 2.2 3 5 3M14 12c0 1.7-2.2 3-5 3"/><ellipse cx="15" cy="15" rx="5" ry="3"/><path d="M10 15v3c0 1.7 2.2 3 5 3s5-1.3 5-3v-3"/>',
+    'tree': '<rect x="4" y="4" width="6" height="4"/><rect x="14" y="10" width="6" height="4"/><rect x="14" y="16" width="6" height="4"/><path d="M7 8v10h7M7 12h7"/>',
+    'sun': '<circle cx="12" cy="12" r="4"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6L7 7M17 17l1.4 1.4M18.4 5.6L17 7M7 17l-1.4 1.4"/>',
+    'moon': '<path d="M20 14A8 8 0 0110 4a8 8 0 1010 10z"/>',
+    'logout': '<path d="M10 4H5v16h5M14 8l4 4-4 4M18 12H9"/>',
+    'help': '<circle cx="12" cy="12" r="9"/><path d="M9.5 9.5a2.5 2.5 0 015 0c0 1.5-2.5 2-2.5 4M12 17v.5"/>',
+    'table': '<rect x="4" y="5" width="16" height="14"/><path d="M4 10h16M4 15h16M10 5v14"/>',
+    'stamp': '<path d="M9 14h6l1 4H8zM6 18h12v2H6z"/><path d="M12 14V9a3 3 0 10-3-3"/>',
+    'link': '<path d="M10 14a4 4 0 005.7 0l3-3A4 4 0 0013 5l-1 1"/><path d="M14 10a4 4 0 00-5.7 0l-3 3A4 4 0 0011 19l1-1"/>',
+    'mail': '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 7l9 6 9-6"/>',
+    'history': '<path d="M4 12a8 8 0 108-8 8 8 0 00-6 3M4 4v4h4"/><path d="M12 8v4l3 2"/>',
+    'palette': '<path d="M12 3a9 9 0 100 18c1.4 0 2-1 1.5-2.2-.5-1.2.3-2.3 1.6-2.3H17a4 4 0 004-4c0-5-4-9.5-9-9.5z"/><path d="M7.5 11h.5M10 7.5h.5M14 7.5h.5"/>',
+    'list': '<path d="M8 6h12M8 12h12M8 18h12M4 6h.5M4 12h.5M4 18h.5"/>',
+}
+
+NAMES = tuple(sorted(_P))
+
+
+def svg(name, color='#000000', size=24, stroke=1.8):
+    """نص SVG كامل للأيقونة بلون محدد (لا اعتماد على Qt)."""
+    body = _P.get(name, _P['info'])
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 24 24" '
+            f'fill="none" stroke="{color}" stroke-width="{stroke}" stroke-linecap="round" stroke-linejoin="round">{body}</svg>')
+
+
+_CACHE = {}
+
+
+def qicon(name, color='#000000', size=20):
+    """QIcon من SVG (يحتاج PySide6.QtSvg). يعود QIcon فارغًا إن تعذّر، فلا تنهار الواجهة."""
+    key = (name, color, size)
+    if key in _CACHE:
+        return _CACHE[key]
+    from PySide6.QtCore import QByteArray, Qt
+    from PySide6.QtGui import QIcon, QPainter, QPixmap
+    try:
+        from PySide6.QtSvg import QSvgRenderer
+    except Exception:  # noqa: BLE001
+        _CACHE[key] = QIcon()
+        return _CACHE[key]
+    ratio = 2  # شاشات عالية الكثافة
+    r = QSvgRenderer(QByteArray(svg(name, color, size * ratio).encode('utf-8')))
+    pm = QPixmap(size * ratio, size * ratio)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    r.render(p)
+    p.end()
+    pm.setDevicePixelRatio(ratio)
+    ic = QIcon(pm)
+    _CACHE[key] = ic
+    return ic

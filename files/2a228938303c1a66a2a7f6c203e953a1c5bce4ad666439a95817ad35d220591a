@@ -1,0 +1,2 @@
+INSERT INTO permissions(code,name_ar,is_sensitive) VALUES('fiscalyear.reopen','إعادة فتح السنة المالية',1);
+INSERT INTO role_permissions SELECT id,'fiscalyear.reopen' FROM roles WHERE id IN (1,2);

@@ -1,0 +1,217 @@
+"""قارئ vCard (.vcf) للنسخ الاحتياطي لجهات اتصال هاتف أندرويد، وتنظيف الأرقام ومطابقة الأسماء.
+
+خالص بلا Qt ولا قاعدة بيانات. يدعم: vCard 2.1/3.0/4.0، الترميز QUOTED-PRINTABLE (الشائع في تصدير أندرويد القديم)،
+الأسطر المطوية، مجموعات الخصائص (item1.TEL)، عدة بطاقات في ملف واحد، وترميز الملف UTF-8/UTF-16/Windows-1256.
+"""
+import quopri
+import re
+from typing import Dict, List, Optional, Tuple
+
+from alhisabat.messaging.phone import clean_digits, normalize_phone
+
+
+# ---------------------------------------------------------------- قراءة الملف
+def decode_bytes(data: bytes) -> str:
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return data.decode("utf-16")
+    if data[:3] == b"\xef\xbb\xbf":
+        return data[3:].decode("utf-8", errors="replace")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            return data.decode("cp1256")
+        except UnicodeDecodeError:
+            return data.decode("latin-1")
+
+
+def _unfold(text: str) -> List[str]:
+    raw = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    out: List[str] = []
+    i = 0
+    while i < len(raw):
+        line = raw[i]
+        i += 1
+        # QUOTED-PRINTABLE: السطر الذي ينتهي بـ "=" يكمل في السطر التالي
+        if re.search(r"ENCODING=QUOTED-PRINTABLE|;QUOTED-PRINTABLE", line, re.IGNORECASE):
+            while line.endswith("=") and i < len(raw):
+                line = line[:-1] + raw[i]
+                i += 1
+        # طيّ عادي: السطر التالي يبدأ بمسافة/Tab
+        while i < len(raw) and raw[i][:1] in (" ", "\t"):
+            line += raw[i][1:]
+            i += 1
+        if line.strip():
+            out.append(line)
+    return out
+
+
+def _split_unescaped(value: str, sep: str) -> List[str]:
+    parts, cur, esc = [], [], False
+    for ch in value:
+        if esc:
+            cur.append(ch)
+            esc = False
+        elif ch == "\\":
+            esc = True
+            cur.append(ch)
+        elif ch == sep:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    parts.append("".join(cur))
+    return parts
+
+
+def _unescape(v: str) -> str:
+    return re.sub(r"\\([,;\\nN])", lambda m: "\n" if m.group(1) in "nN" else m.group(1), v)
+
+
+def _decode_value(value: str, params: Dict[str, List[str]]) -> str:
+    enc = " ".join(params.get("ENCODING", [])).upper()
+    if "QUOTED-PRINTABLE" in enc or "QUOTED-PRINTABLE" in params:
+        charset = (params.get("CHARSET") or ["UTF-8"])[0]
+        raw = quopri.decodestring(value.encode("latin-1", errors="ignore"))
+        for cs in (charset, "utf-8", "cp1256"):
+            try:
+                return raw.decode(cs)
+            except (UnicodeDecodeError, LookupError):
+                continue
+        return raw.decode("latin-1")
+    return value
+
+
+def _parse_line(line: str) -> Optional[Tuple[str, Dict[str, List[str]], str]]:
+    if ":" not in line:
+        return None
+    head, value = line.split(":", 1)
+    bits = head.split(";")
+    name = bits[0].split(".")[-1].upper()          # item1.TEL → TEL
+    params: Dict[str, List[str]] = {}
+    for b in bits[1:]:
+        if "=" in b:
+            k, v = b.split("=", 1)
+            params.setdefault(k.upper(), []).extend(x.strip('"').upper() if k.upper() == "TYPE" else x.strip('"') for x in v.split(","))
+        elif b:
+            params.setdefault("TYPE", []).append(b.upper())     # vCard 2.1: TEL;CELL;PREF
+            if b.upper() == "QUOTED-PRINTABLE":
+                params["QUOTED-PRINTABLE"] = ["1"]
+    return name, params, value
+
+
+def parse_vcf(text: str) -> List[Dict]:
+    """يعيد قائمة جهات: {name, phones:[{raw, types}], emails:[...], org}. تُهمل البطاقات الخالية من الاسم والهاتف."""
+    contacts: List[Dict] = []
+    cur: Optional[Dict] = None
+    for line in _unfold(text.lstrip("\ufeff")):
+        up = line.strip().upper()
+        if up == "BEGIN:VCARD":
+            cur = {"fn": "", "n": "", "phones": [], "emails": [], "org": ""}
+            continue
+        if up == "END:VCARD":
+            if cur is not None:
+                name = (cur["fn"] or cur["n"] or cur["org"]).strip()
+                if name or cur["phones"]:
+                    contacts.append({"name": " ".join(name.split()), "phones": cur["phones"], "emails": cur["emails"], "org": cur["org"]})
+            cur = None
+            continue
+        if cur is None:
+            continue
+        parsed = _parse_line(line)
+        if not parsed:
+            continue
+        prop, params, value = parsed
+        val = _decode_value(value, params)
+        if prop == "FN":
+            cur["fn"] = _unescape(val)
+        elif prop == "N":
+            f = [_unescape(x) for x in _split_unescaped(val, ";")] + [""] * 5
+            cur["n"] = " ".join(x for x in (f[3], f[1], f[2], f[0], f[4]) if x.strip())
+        elif prop == "ORG":
+            cur["org"] = _unescape(_split_unescaped(val, ";")[0])
+        elif prop == "TEL":
+            v = _unescape(val).strip()
+            if v.lower().startswith("tel:"):
+                v = v[4:]
+            if v:
+                cur["phones"].append({"raw": v, "types": params.get("TYPE", [])})
+        elif prop == "EMAIL":
+            if val.strip():
+                cur["emails"].append(val.strip())
+    return contacts
+
+
+def is_vcf_file(path: str) -> bool:
+    """ملف جهات اتصال؟ بالامتداد (.vcf/.vcard) أو بمحتواه (BEGIN:VCARD) إن كان الاسم بلا امتداد معتاد (ملفات مؤقتة من تطبيقات الهاتف)."""
+    import os
+    p = str(path or "").strip().strip('"').rstrip("\u200e\u200f ")
+    if p.lower().endswith((".vcf", ".vcard")):
+        return True
+    try:
+        if os.path.isfile(p):
+            with open(p, "rb") as f:
+                head = decode_bytes(f.read(4096)).lstrip("\ufeff \r\n\t")
+            return head.upper().startswith("BEGIN:VCARD")
+    except OSError:
+        pass
+    return False
+
+
+def read_vcf_file(path: str) -> List[Dict]:
+    with open(str(path).strip().strip('"').rstrip("\u200e\u200f "), "rb") as f:
+        data = f.read()
+    contacts = parse_vcf(decode_bytes(data))
+    if not contacts:
+        raise ValueError("لم يُعثر على جهات اتصال في الملف (تأكد أنه ملف vCard .vcf)")
+    return contacts
+
+
+# ---------------------------------------------------------------- تنظيف الأرقام
+def clean_phone(raw: str, default_cc: str = "+967") -> Tuple[Optional[str], str]:
+    """(الرقم بصيغة E.164 أو None، سبب الرفض). يزيل المسافات والشرطات والأقواس والامتدادات ويقبل الأرقام العربية."""
+    txt = re.split(r"(?i)\b(?:ext|x)\b\.?|[,;]", str(raw or ""))[0]      # حذف الامتداد/الأرقام الفرعية
+    if not clean_digits(txt):
+        return None, "لا يحتوي أرقامًا"
+    try:
+        e164 = normalize_phone(txt, default_cc)
+    except ValueError:
+        return None, "رقم غير صالح"
+    digits = e164.lstrip("+")
+    if digits.startswith("967"):                    # أرقام اليمن: الجوال 9 أرقام يبدأ بـ 7
+        nat = digits[3:]
+        if len(nat) < 6 or (nat.startswith("7") and len(nat) != 9):
+            return None, "رقم يمني ناقص أو زائد"
+    return e164, ""
+
+
+def clean_contact_phones(contact: Dict, default_cc: str = "+967") -> List[Tuple[str, List[str]]]:
+    """أرقام الجهة الصالحة بلا تكرار: [(E164, types)] مرتبة: الجوال أولًا."""
+    seen, out = set(), []
+    for p in contact.get("phones", []):
+        e, _why = clean_phone(p["raw"], default_cc)
+        if e and e not in seen:
+            seen.add(e)
+            out.append((e, list(p.get("types") or [])))
+    out.sort(key=lambda t: 0 if "CELL" in t[1] or "MOBILE" in t[1] else 1)
+    return out
+
+
+# ---------------------------------------------------------------- مطابقة الأسماء
+_TASHKEEL = re.compile(r"[\u064B-\u065F\u0670\u06D6-\u06ED\u0640]")
+
+
+def norm_name(s: str) -> str:
+    s = _TASHKEEL.sub("", str(s or "")).lower()
+    s = s.translate(str.maketrans("أإآٱىةؤئ", "اااايهوي"))      # أإآٱ→ا، ى→ي، ة→ه، ؤ→و، ئ→ي
+    s = re.sub(r"[^\w\s]|_", " ", s)
+    return " ".join(s.split())
+
+
+def name_tokens_key(s: str) -> str:
+    return " ".join(sorted(norm_name(s).split()))
+
+
+def core_name(s: str) -> str:
+    """الاسم بعد حذف ما بين الأقواس ككلمات وصفية مثل «(عميل)» أو «[مورد]»."""
+    return norm_name(re.sub(r"[\(\[\{][^\)\]\}]*[\)\]\}]", " ", str(s or "")))

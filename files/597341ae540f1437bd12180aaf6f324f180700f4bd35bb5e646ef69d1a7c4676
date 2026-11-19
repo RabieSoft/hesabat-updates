@@ -1,0 +1,245 @@
+"""DocumentSheet: الورقة الواقعية للمستند (فاتورة/قيد/سند/كشف) على مساحة عمل رمادية، بنفس قالب الطباعة (WYSIWYG).
+
+صفحات حقيقية بحجم الورق (A4/A5/إيصال 80مم) بظل خفيف، تكبير/تصغير، وإخراج PDF وطباعة وحفظ HTML. الورقة بيضاء دائمًا
+حتى في السمة الداكنة. وضع العرض مكتمل؛ وضع التحرير داخل الورقة يُربط بالفواتير والقيود في المرحلة 3. يتطلب PySide6.
+"""
+from PySide6.QtCore import QRectF, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QPainter
+from PySide6.QtWidgets import (
+    QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QMessageBox, QPushButton, QScrollArea, QVBoxLayout, QWidget
+)
+
+from alhisabat.ui.core import strings_ar as S
+from alhisabat.ui.design import tokens as T
+
+from . import print_service as PS
+from .document_html import paper_px
+from .document_model import PAPER_LABELS, PAPERS
+
+SHADOW = 6
+GAP = 18
+PAD = 24
+
+
+class PaperCanvas(QWidget):
+    """يرسم صفحات QTextDocument مرصوصة رأسيًا كأوراق بيضاء. الرسم والطباعة من المستند نفسه."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._spec, self._paper, self._zoom, self._doc, self._mode = None, 'A4', 1.0, None, 'light'
+        self.setAttribute(Qt.WA_OpaquePaintEvent, False)
+
+    def set_mode(self, mode):
+        self._mode = mode
+        self.update()
+
+    def set_content(self, spec, paper):
+        self._spec, self._paper = spec, paper
+        self._doc = PS.build_qdocument(spec, paper) if spec else None
+        self._resize()
+        self.update()
+
+    def set_zoom(self, z):
+        self._zoom = max(0.4, min(z, 3.0))
+        self._resize()
+        self.update()
+
+    def zoom(self):
+        return self._zoom
+
+    def page_count(self):
+        return self._doc.pageCount() if self._doc else 0
+
+    def _geom(self):
+        w, h, m = paper_px(self._paper, PS.DPI)
+        if h is None and self._doc:
+            h = int(self._doc.size().height()) + 2 * m
+        return w, (h or 400), m
+
+    def _resize(self):
+        if not self._doc:
+            self.setMinimumSize(QSize(100, 100))
+            return
+        w, h, _m = self._geom()
+        n = self._doc.pageCount()
+        z = self._zoom
+        self.setMinimumSize(int(w * z) + 2 * PAD, int((h * n + GAP * (n - 1)) * z) + 2 * PAD)
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setRenderHint(QPainter.TextAntialiasing, True)
+        pal = T.palette(self._mode)
+        p.fillRect(self.rect(), QColor(pal['workspace']))
+        if not self._doc:
+            p.setPen(QColor(pal['muted']))
+            p.drawText(self.rect(), Qt.AlignCenter, S.GENERIC['empty'])
+            return
+        w, h, m = self._geom()
+        z = self._zoom
+        x0 = max(PAD, (self.width() - int(w * z)) // 2)
+        for i in range(self._doc.pageCount()):
+            y0 = PAD + int(i * (h + GAP) * z)
+            page = QRectF(x0, y0, w * z, h * z)
+            p.fillRect(page.translated(SHADOW, SHADOW), QColor(pal['paper_shadow']))
+            p.fillRect(page, QColor(pal['paper']))
+            p.save()
+            p.translate(x0 + m * z, y0 + m * z)
+            p.scale(z, z)
+            ph = self._doc.pageSize().height()
+            p.setClipRect(QRectF(0, 0, self._doc.pageSize().width(), ph))
+            p.translate(0, -i * ph)
+            self._doc.drawContents(p, QRectF(0, i * ph, self._doc.pageSize().width(), ph))
+            p.restore()
+        p.end()
+
+
+class DocumentSheet(QWidget):
+    paperChanged = Signal(str)
+
+    def __init__(self, paper='A4', parent=None):
+        super().__init__(parent)
+        self.setLayoutDirection(Qt.RightToLeft)
+        self._spec = None
+        self._paper = paper
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        bar = QFrame()
+        bar.setObjectName('paperToolbar')
+        bl = QHBoxLayout(bar)
+        bl.setContentsMargins(8, 4, 8, 4)
+        bl.addWidget(QLabel('الورق:'))
+        self.paper_cb = QComboBox()
+        for k in PAPERS:
+            self.paper_cb.addItem(PAPER_LABELS[k], k)
+        self.paper_cb.setMinimumWidth(120)
+        self.paper_cb.setCurrentIndex(list(PAPERS).index(paper))
+        self.paper_cb.currentIndexChanged.connect(self._on_paper)
+        bl.addWidget(self.paper_cb)
+        self.zoom_out = QPushButton('−')
+        self.zoom_in = QPushButton('+')
+        self.zoom_fit = QPushButton('ملاءمة العرض')
+        self.zoom_lbl = QLabel('100%')
+        for b in (self.zoom_out, self.zoom_in):
+            b.setProperty('compact', True)                  # بلا حشوة أفقية كبيرة وإلا اختفى الرمز («−»/«+»)
+            b.setMinimumWidth(34)
+        self.zoom_out.clicked.connect(lambda: self._zoom(-0.1))
+        self.zoom_in.clicked.connect(lambda: self._zoom(+0.1))
+        self.zoom_fit.clicked.connect(self.fit_width)
+        for w in (self.zoom_out, self.zoom_lbl, self.zoom_in, self.zoom_fit):
+            bl.addWidget(w)
+        bl.addStretch(1)
+        self.pages_lbl = QLabel('')
+        self.pages_lbl.setObjectName('ctxKey')
+        bl.addWidget(self.pages_lbl)
+        self.btn_print = QPushButton('طباعة')
+        self.btn_pdf = QPushButton('حفظ PDF')
+        self.btn_html = QPushButton('حفظ HTML')
+        self.btn_print.setProperty('primary', True)
+        self.btn_print.clicked.connect(self.print_)
+        self.btn_pdf.clicked.connect(self.save_pdf)
+        self.btn_html.clicked.connect(self.save_html)
+        for b in (self.btn_print, self.btn_pdf, self.btn_html):
+            bl.addWidget(b)
+        lay.addWidget(bar)
+
+        self.canvas = PaperCanvas()
+        self.canvas.setObjectName('paperHost')
+        area = QScrollArea()
+        area.setObjectName('paperArea')
+        area.setWidgetResizable(True)
+        area.setWidget(self.canvas)
+        self.area = area
+        lay.addWidget(area, 1)
+
+    # ---------------------------------------------------------------- واجهة عامة
+    def set_document(self, spec):
+        self._spec = spec
+        self._render()
+        if getattr(self, '_auto_fit', False):
+            self.fit_width(0.7)
+
+    def set_compact(self, on=True):
+        """وضع المعاينة الجانبية: شريط أدوات مختصر، وتُلائَم الورقة تلقائيًا لعرض اللوحة (ويُعاد عند تغيّر العرض)."""
+        self._auto_fit = bool(on)
+        self.paper_cb.setMinimumWidth(80 if on else 120)
+        self.zoom_fit.setText('ملاءمة' if on else 'ملاءمة العرض')
+        self.btn_print.setText('طباعة')
+        self.btn_pdf.setText('PDF')
+        self.btn_html.setVisible(not on)
+        self.pages_lbl.setVisible(not on)
+        self.zoom_lbl.setVisible(not on)
+        if on:
+            self.fit_width(0.7)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if getattr(self, '_auto_fit', False) and self._spec:
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(0, lambda: self.fit_width(0.7))
+
+    def set_mode(self, mode):
+        self.canvas.set_mode(mode)
+
+    def paper(self):
+        return self._paper
+
+    def set_paper(self, paper):
+        i = self.paper_cb.findData(paper)
+        if i >= 0:
+            self.paper_cb.setCurrentIndex(i)
+
+    def fit_width(self, min_zoom=0.0):
+        if not self._spec:
+            return
+        w, _h, _m = paper_px(self._paper, PS.DPI)
+        avail = self.area.viewport().width() - 2 * PAD - SHADOW
+        if avail < 120:
+            return
+        self.canvas.set_zoom(max(avail / w, min_zoom))      # حد أدنى للمعاينة الجانبية كي يبقى الخط مقروءًا (مع تمرير أفقي)
+        self._sync_zoom()
+
+    # ---------------------------------------------------------------- داخلي
+    def _render(self):
+        self.canvas.set_content(self._spec, self._paper)
+        self.pages_lbl.setText(f'{self.canvas.page_count()} صفحة' if self._spec else '')
+        self._sync_zoom()
+
+    def _on_paper(self, _i):
+        self._paper = self.paper_cb.currentData()
+        if self._spec:
+            self._render()
+        self.paperChanged.emit(self._paper)
+
+    def _zoom(self, delta):
+        self.canvas.set_zoom(self.canvas.zoom() + delta)
+        self._sync_zoom()
+
+    def _sync_zoom(self):
+        self.zoom_lbl.setText(f'{int(round(self.canvas.zoom() * 100))}%')
+
+    def _need_doc(self):
+        if not self._spec:
+            QMessageBox.information(self, S.APP_NAME, S.GENERIC['empty'])
+            return False
+        return True
+
+    def print_(self):
+        if self._need_doc():
+            PS.print_dialog(self, self._spec, self._paper)
+
+    def save_pdf(self):
+        """يفتح نافذة معاينة PDF (تنقل بين الصفحات + حفظ + طباعة) بدل الحفظ المباشر."""
+        if not self._need_doc():
+            return
+        from .pdf_preview import show_pdf_preview
+        show_pdf_preview(self, self._spec, self._paper)
+
+    def save_html(self):
+        if not self._need_doc():
+            return
+        path, _ = QFileDialog.getSaveFileName(self, 'حفظ HTML', f'{self._spec.title}.html', 'HTML (*.html)')
+        if path:
+            PS.export_html(self._spec, self._paper, path)

@@ -1,0 +1,140 @@
+"""تشغيل خدمة المزامنة من داخل برنامج المكتبي (خيط خلفي) بلا كونسول، واكتشاف عنوان Tailscale.
+
+لا يعتمد على Qt. fastapi وuvicorn يُستوردان عند التشغيل فقط، فيبقى المكتبي يعمل بدونهما.
+"""
+import ipaddress
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+_CGNAT = ipaddress.ip_network("100.64.0.0/10")      # نطاق عناوين Tailscale
+_runners = {}
+
+
+def _v4(text):
+    try:
+        a = ipaddress.ip_address(str(text).strip())
+    except ValueError:
+        return None
+    return a if a.version == 4 else None
+
+
+def local_ips():
+    """عناوين IPv4 لهذا الحاسوب (بلا 127.x)."""
+    found = []
+    try:
+        found += [i[4][0] for i in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)]
+    except OSError:
+        pass
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("10.255.255.255", 1))               # لا يُرسل شيئًا؛ فقط يحدد الواجهة الأساسية
+            found.append(s.getsockname()[0])
+        finally:
+            s.close()
+    except OSError:
+        pass
+    out = []
+    for ip in found:
+        if ip not in out and not ip.startswith("127."):
+            out.append(ip)
+    return out
+
+
+def tailscale_ip():
+    """عنوان Tailscale لهذا الحاسوب أو None (يجرب أمر tailscale ثم يفحص واجهات الشبكة)."""
+    try:
+        r = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=3,
+                           creationflags=(0x08000000 if sys.platform == "win32" else 0))   # بلا نافذة سوداء
+        for tok in r.stdout.split():
+            a = _v4(tok)
+            if a is not None and a in _CGNAT:
+                return str(a)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    for ip in local_ips():
+        a = _v4(ip)
+        if a is not None and a in _CGNAT:
+            return ip
+    return None
+
+
+def candidate_addresses():
+    """[(ip, وصف)] لعنوان الاستماع: Tailscale أولًا (الموصى به)، ثم الشبكة المحلية، ثم كل الشبكات."""
+    ts = tailscale_ip()
+    out = [(ts, "Tailscale (موصى به)")] if ts else []
+    out += [(ip, "شبكة المحل المحلية") for ip in local_ips() if ip != ts]
+    out.append(("0.0.0.0", "كل الشبكات (غير موصى به)"))
+    return out
+
+
+def display_host(host):
+    """العنوان الذي يُكتب في رابط الهاتف: إن كان الاستماع على 0.0.0.0 نستعمل أفضل عنوان فعلي."""
+    if host != "0.0.0.0":
+        return host
+    return tailscale_ip() or (local_ips() or ["127.0.0.1"])[0]
+
+
+class ServerRunner:
+    def __init__(self, db_path):
+        self.db_path = str(db_path)
+        self.host = None
+        self.port = None
+        self._server = None
+        self._thread = None
+
+    @property
+    def running(self):
+        return bool(self._thread and self._thread.is_alive() and self._server and self._server.started)
+
+    @property
+    def url(self):
+        return f"http://{display_host(self.host)}:{self.port}" if self.host else ""
+
+    def start(self, host, port):
+        if self.running:
+            return
+        try:
+            import uvicorn
+            from .app import create_app
+            import fastapi  # noqa: F401
+        except ImportError as e:
+            raise RuntimeError("مكتبات الخدمة غير مثبّتة. نفّذ مرة واحدة: pip install fastapi uvicorn") from e
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.bind((host, int(port)))
+        except OSError as e:
+            raise RuntimeError(f"تعذر استخدام {host}:{port} ({e.strerror or e}). المنفذ مشغول أو العنوان غير موجود على هذا الحاسوب.") from e
+        finally:
+            probe.close()
+        # log_config=None: لا إعداد تسجيل (نسخة exe بلا كونسول لا تملك stdout فينهار uvicorn)
+        cfg = uvicorn.Config(create_app(self.db_path), host=host, port=int(port), log_config=None)
+        server = uvicorn.Server(cfg)
+        thread = threading.Thread(target=server.run, name="alhisabat-sync", daemon=True)
+        thread.start()
+        for _ in range(80):
+            if server.started or not thread.is_alive():
+                break
+            time.sleep(0.1)
+        if not server.started:
+            server.should_exit = True
+            raise RuntimeError("تعذر تشغيل الخدمة. تأكد أن المنفذ غير مستخدم وأن جدار الحماية يسمح للبرنامج.")
+        self._server, self._thread, self.host, self.port = server, thread, host, int(port)
+
+    def stop(self):
+        if self._server is not None:
+            self._server.should_exit = True
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        self._server = self._thread = None
+
+
+def get_runner(db_path):
+    """مشغّل واحد لكل قاعدة بيانات، يبقى حيًّا طوال عمر البرنامج (حتى لو أُغلقت صفحة ربط الهاتف)."""
+    key = str(db_path)
+    if key not in _runners:
+        _runners[key] = ServerRunner(key)
+    return _runners[key]

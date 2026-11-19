@@ -1,0 +1,4 @@
+-- العملة الافتراضية للإدخال (غير العملة الأساسية): تُحدَّد مسبقًا في الفواتير والقيود والصناديق والأرصدة الافتتاحية الجديدة.
+-- العملة الأساسية (للتقارير والمعادل) تبقى كما هي؛ هذه فقط ما يظهر مختارًا عند إنشاء مستند جديد.
+ALTER TABLE companies ADD COLUMN default_currency TEXT REFERENCES currencies(code);
+UPDATE companies SET default_currency=(SELECT code FROM currencies WHERE code='YER' AND is_active=1) WHERE default_currency IS NULL;

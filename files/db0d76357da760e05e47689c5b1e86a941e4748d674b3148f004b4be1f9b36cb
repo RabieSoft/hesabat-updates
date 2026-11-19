@@ -1,0 +1,634 @@
+"""نافذة تحرير/إنشاء القيد (مسودة) بتبويبين: «قيد بسيط» (من حساب ← إلى حساب بمبلغ واحد) و«قيد مركب» (محرر بنود بلوحة المفاتيح،
+توازن لحظي، قوالب، استيراد CSV). المرفقات المعلّقة مشتركة بين التبويبين.
+
+لا تحفظ بنفسها: تجمع القيم (`values()`) وتتركها للصفحة التي تستدعي JournalService (والمحرك هو الحَكَم). يتطلب PySide6.
+"""
+from decimal import Decimal
+
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtWidgets import (
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMessageBox,
+    QPushButton, QTabWidget, QVBoxLayout, QWidget
+)
+
+from alhisabat.accounting.errors import AccountingError
+from PySide6.QtGui import QKeySequence, QShortcut
+
+from alhisabat.ui.components.basic import DateField, DialogGuardMixin, MoneyEdit, ask_reason, repolish
+from alhisabat.ui.components.lines_editor import ColSpec, LinesEditor
+from alhisabat.ui.components.pickers import SearchPicker
+from alhisabat.ui.components.recipe_favorites import FavoritesPanel
+from alhisabat.ui.components.simple_entry_card import build_simple_card, make_save_button
+from alhisabat.ui.components.totals_strip import HeroTotal, TotalsStrip
+from alhisabat.ui.core.journal_favorites import FavoriteStore
+from alhisabat.ui.components import balance_note as BN
+from alhisabat.ui.app_dialogs.journal_recipes import RecipeDialog
+from alhisabat.ui.core import journal_recipes as JR
+from alhisabat.ui.core import entry_logic as EL, format as FMT, journal_service as JS, state as ST, strings_ar as S, errors
+
+
+class JournalEditor(DialogGuardMixin, QDialog):
+    guard_save_stay = False             # الحفظ يتم في الصفحة بعد القبول
+    center_on_show = True               # تنبثق في وسط الشاشة تلقائيًا
+    nonmodal_exec = True                # تصغير «–» والعمل في شاشات أخرى
+    draft_clear_on_page_save = True
+    draft_page = 'journal'
+    draft_title = 'قيد يومي جديد'
+
+    def __init__(self, page, entry=None, preset=None, tab=None):
+        super().__init__(page)
+        self.used_recipe = None         # آخر قالب جاهز/مفضل أُدرج في هذا القيد (يعيد «حفظ وقيد جديد» فتحه)
+        self.page, self.svc, self.entry = page, page.svc, entry
+        self.preset = preset            # 'receipt' | 'payment' | 'recipe:<key>' | None
+        self.draft_key = None if (entry or preset) else 'journal_new'      # مسودة للقيد الجديد فقط (تعديل المسودة المحفوظة موجود أصلًا في القاعدة)
+        s = page.session
+        self.setWindowTitle(f"تعديل القيد رقم {entry.get('entry_no')}" if entry else {'receipt': 'قيد سند قبض', 'payment': 'قيد سند صرف'}.get(preset, 'قيد جديد'))
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.resize(1060, 620)
+        self._pending = []
+        self._tab = 0
+        self._issues = []
+        self.add_another = False
+        self.save_stay_cb = None         # تضعه الصفحة: يحفظ القيد دون إغلاق النافذة (إدخال طويل)
+        self._saving = False
+        lay = QVBoxLayout(self)
+
+        top = QHBoxLayout()
+        yr = page.state.get('year') or {}
+        top.addWidget(QLabel('التاريخ:'))
+        self.date = DateField(yr.get('start'), yr.get('end'), closed_reason_fn=self._closed_reason)
+        top.addWidget(self.date)
+        top.addWidget(QLabel('البيان:'))
+        self.desc = QLineEdit()
+        self.desc.setPlaceholderText('وصف القيد')
+        top.addWidget(self.desc, 1)
+        self.btn_att = QPushButton('+ مرفق')
+        self.btn_att.clicked.connect(self._add_attachment)
+        self._top = top
+        self.cur_lbl_top = QLabel('العملة:')           # تظهر في الشريط العلوي لتبويب «قيد مركب» فقط؛ في «قيد بسيط» تنتقل العملة بجانب المبلغ
+        top.addWidget(self.cur_lbl_top)
+        self.cur = QComboBox()
+        self.cur.setMinimumWidth(130)
+        self.cur.setToolTip('عملة مبالغ القيد كله. يُحوَّل للعملة الأساسية بسعر الصرف المسجّل بتاريخ القيد.')
+        self._base_cur = ''
+        try:
+            self._base_cur = self.svc.base_currency()
+            for code, label, _b in self.svc.currency_options():
+                self.cur.addItem(label, code)
+        except Exception:  # noqa: BLE001
+            self.cur.addItem(self._base_cur or '—', self._base_cur or None)
+        if entry is None:                                          # القيد الجديد يبدأ بعملة الإدخال الافتراضية للشركة (اليمني مثلًا)
+            try:
+                dflt = self.svc.default_currency()
+            except Exception:  # noqa: BLE001
+                dflt = ''
+            if dflt and self.cur.findData(dflt) >= 0:
+                self.cur.setCurrentIndex(self.cur.findData(dflt))
+        self.rate_lbl = QLabel('')
+        self.rate_lbl.setObjectName('ctxKey')
+        self.cur.currentIndexChanged.connect(lambda _i: self._on_currency())
+        if hasattr(self.date, 'dateChanged'):
+            self.date.dateChanged.connect(lambda *_a: self._on_currency())
+        self._cur_top_index = top.count()
+        top.addWidget(self.cur)
+        top.addWidget(self.rate_lbl)
+        top.addWidget(self.btn_att)
+        self.chk_adj = QCheckBox('قيد تسوية')
+        self.chk_adj.setToolTip('يسمح بحسابات المخزون (لتصحيح/إعادة قيد معكوس). يتطلب بيانًا يوضح السبب.')
+        self.chk_adj.setVisible(entry is None)
+        top.addWidget(self.chk_adj)
+        lay.addLayout(top)
+
+        self.tabs = QTabWidget()
+        self.tabs.setLayoutDirection(Qt.RightToLeft)
+        self.tabs.addTab(self._build_simple(s), 'قيد بسيط')
+        self.tabs.addTab(self._build_compound(s), 'قيد مركب')
+        self.tabs.currentChanged.connect(self._on_tab)
+        self.tabs.tabBar().currentChanged.connect(lambda _i: self._place_cur())     # يعمل حتى لو حُجبت إشارات QTabWidget أثناء التبديل البرمجي
+        self._place_cur()
+        self.fav = FavoriteStore(lambda: self._qs().value('favorite_recipes', ''), lambda v: self._qs().setValue('favorite_recipes', v), [r.key for r in JR.RECIPES])
+        self.fav_panel = FavoritesPanel(self.fav)                  # يسار النافذة (المساحة الفارغة) في الاتجاه العربي
+        self.fav_panel.chosen.connect(lambda k: self._open_recipes(k, switch=True))
+        self.fav_panel.browse.connect(lambda: self._open_recipes(None, switch=True))
+        body = QHBoxLayout()
+        body.addWidget(self.tabs, 1)
+        body.addWidget(self.fav_panel)
+        lay.addLayout(body, 1)
+        self.att_lbl = QLabel('')
+        self.att_lbl.setObjectName('ctxKey')
+        lay.addWidget(self.att_lbl)
+
+        self.toast = QLabel('')                          # إشعار أخضر سفلي بعد «حفظ» (النافذة تبقى مفتوحة)
+        self.toast.setAlignment(Qt.AlignCenter)
+        self.toast.setStyleSheet('background: #1b8a4a; color: white; font-weight: bold; border-radius: 6px; padding: 6px 14px;')
+        self.toast.setVisible(False)
+        self._toast_timer = QTimer(self)
+        self._toast_timer.setSingleShot(True)
+        self._toast_timer.timeout.connect(lambda: self.toast.setVisible(False))
+        lay.addWidget(self.toast)
+        bb = QDialogButtonBox()
+        self.ok = bb.addButton('حفظ كمسودة', QDialogButtonBox.AcceptRole)
+        self.ok.setProperty('primary', True)
+        self.ok.setAutoDefault(False)                  # Enter ينقل بين الخلايا ولا يحفظ القيد قبل اكتماله
+        if not entry:
+            more = bb.addButton('حفظ وقيد جديد', QDialogButtonBox.ActionRole)
+            more.setAutoDefault(False)
+            more.clicked.connect(self._save_and_new)
+        cancel = bb.addButton(S.ACTION['cancel'], QDialogButtonBox.RejectRole)
+        cancel.setAutoDefault(False)
+        bb.accepted.connect(self._accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+        QShortcut(QKeySequence('Ctrl+S'), self, activated=lambda: self._save_stay() if self.save_stay_cb else self._accept())
+        QShortcut(QKeySequence('Insert'), self, activated=lambda: self.tabs.currentIndex() == 1 and self.lines.add_row(focus=True))
+
+        self.btn_att.setEnabled(not entry)         # القيد الموجود: المرفقات من نافذة «المرفقات» في الصفحة
+        self._reload_templates()
+        if entry:
+            self.date.set_iso(entry['entry_date'])
+            self.desc.setText(entry.get('description') or '')
+            curs = {ln.get('currency') or self._base_cur for ln in entry['lines']}
+            ecur = next(iter(curs)) if len(curs) == 1 else self._base_cur
+            if self.cur.findData(ecur) >= 0:
+                self.cur.setCurrentIndex(self.cur.findData(ecur))
+            use_orig = ecur != self._base_cur
+            rows = [{'account_id': ln['account_id'],
+                     'debit': (ln.get('debit_orig') if use_orig else ln['debit']) or None,
+                     'credit': (ln.get('credit_orig') if use_orig else ln['credit']) or None,
+                     'memo': ln.get('memo') or ''} for ln in entry['lines']]
+            simple = JS.lines_to_simple(rows)
+            if simple:                                  # سطران بمبلغ واحد → يُفتح كقيد بسيط
+                self._fill_simple(simple)
+            else:                                       # غير ذلك → مركب
+                self.lines.set_rows(rows)
+                self._tab = 1
+                self.tabs.blockSignals(True)
+                self.tabs.setCurrentIndex(1)
+                self.tabs.blockSignals(False)
+        self._totals(self.lines.rows())
+        self._simple_preview()
+        self._on_currency()
+        if preset and not entry:
+            self._apply_preset(preset)
+        elif tab is not None and not entry:                  # «حفظ وقيد جديد»: العودة لآخر واجهة كنت فيها
+            self.tabs.setCurrentIndex(int(tab))
+
+    def _apply_preset(self, preset):
+        if preset in ('receipt', 'payment'):
+            receipt = preset == 'receipt'
+            try:
+                ids = {r[0] for r in self.page.session.conn.execute(
+                    'SELECT account_id FROM cash_accounts WHERE company_id=? AND is_active=1', (self.page.session.company_id,))}
+            except Exception:  # noqa: BLE001
+                ids = set()
+            if ids:                                     # الصندوق/البنك: حسابات النقدية فقط
+                loader = lambda: [r for r in self.page.session.lookup_accounts() if r[0] in ids]  # noqa: E731
+                (self.s_from if receipt else self.s_to)._loader = loader
+                (self.s_from if receipt else self.s_to).reload()
+            lab_from, lab_to = (('الصندوق / البنك (مدين) *', 'الحساب المقابل (دائن) *') if receipt
+                                else ('الحساب المقابل (مدين) *', 'الصندوق / البنك (دائن) *'))
+            self.lbl_from.setText(lab_from)
+            self.lbl_to.setText(lab_to)
+            if not self.desc.text().strip():
+                self.desc.setText('سند قبض' if receipt else 'سند صرف')
+            self.btn_swap.setVisible(False)
+            self.s_preview.set_dir('in' if receipt else 'out')        # سند قبض: أخضر، سند صرف: أحمر
+        elif isinstance(preset, str) and preset.startswith('recipe:'):
+            self.tabs.setCurrentIndex(1)
+            QTimer.singleShot(0, lambda k=preset.split(':', 1)[1]: self._open_recipes(k))
+
+    # ---------------------------------------------------------------- مسودة الاستئناف
+    @staticmethod
+    def _dec_or_none(v):
+        return Decimal(str(v)) if v not in (None, '') else None
+
+    def draft_state(self):
+        rows = [{k: (str(v) if isinstance(v, Decimal) else v) for k, v in r.items()} for r in self.lines.rows()]
+        amt = self.s_amount.value()
+        return {'date': self.date.iso(), 'desc': self.desc.text(), 'tab': self.tabs.currentIndex(),
+                'from': self.s_from.current_id(), 'to': self.s_to.current_id(), 'amount': None if amt is None else str(amt),
+                'memo': self.s_memo.text(), 'rows': rows, 'currency': self._cur_code()}
+
+    def restore_state(self, st):
+        if st.get('date'):
+            self.date.set_iso(st['date'])
+        self.desc.setText(st.get('desc', ''))
+        if st.get('currency') and self.cur.findData(st['currency']) >= 0:
+            self.cur.setCurrentIndex(self.cur.findData(st['currency']))
+        self.s_from.set_id(st.get('from'))
+        self.s_to.set_id(st.get('to'))
+        self.s_amount.set_value(self._dec_or_none(st.get('amount')))
+        self.s_memo.setText(st.get('memo', ''))
+        rows = [dict(r, debit=self._dec_or_none(r.get('debit')), credit=self._dec_or_none(r.get('credit'))) for r in st.get('rows', [])]
+        if any(r.get('account_id') or r.get('debit') or r.get('credit') or r.get('memo') for r in rows):
+            self.lines.set_rows(rows)
+        if st.get('tab') == 1:
+            self._tab = 1
+            self.tabs.blockSignals(True)
+            self.tabs.setCurrentIndex(1)
+            self.tabs.blockSignals(False)
+        self._totals(self.lines.rows())
+        self._simple_preview()
+
+    # ---------------------------------------------------------------- بناء التبويبين
+    def _build_simple(self, s):
+        w = QWidget()
+        outer = QVBoxLayout(w)
+        hint = QLabel('استعمله لقيد من حساب واحد إلى حساب واحد بمبلغ واحد. للقيود ذات الأطراف المتعددة استعمل تبويب «قيد مركب».')
+        hint.setWordWrap(True)
+        hint.setObjectName('ctxKey')
+        outer.addWidget(hint)
+        card = build_simple_card(self, s)              # مدين | دائن جنبًا إلى جنب، ثم المبلغ، ثم بيان السطرين
+        self.s_amount.returnPressed.connect(self._enter_in_amount)   # Enter في المبلغ = حفظ سريع (Tab للانتقال إلى البيان)
+        self.s_memo.returnPressed.connect(self._enter_in_memo)
+        outer.addWidget(card, 0, Qt.AlignHCenter)
+        self.s_preview = HeroTotal('مبلغ القيد')        # الإجمالي الرئيسي: خانة كبرى ملوّنة (تتلوّن أخضر/أحمر في سند القبض/الصرف)
+        outer.addWidget(self.s_preview, 0, Qt.AlignHCenter)
+        self.s_words = QLabel('')                       # المبلغ كتابةً
+        self.s_words.setObjectName('totWords'); self.s_words.setWordWrap(True); self.s_words.setAlignment(Qt.AlignCenter)
+        self.s_words.setVisible(False)
+        outer.addWidget(self.s_words)
+        self.s_note = QLabel('')                        # ملاحظة: أرصدة (مدين/دائن) الحسابين المختارين
+        self.s_note.setObjectName('ctxKey'); self.s_note.setWordWrap(True); self.s_note.setAlignment(Qt.AlignCenter)
+        outer.addWidget(self.s_note)
+        outer.addStretch(1)
+        self.s_from.selected.connect(lambda _i: self._simple_preview())
+        self.s_to.selected.connect(lambda _i: self._simple_preview())
+        self.s_amount.valueChanged.connect(lambda _v: self._simple_preview())
+        return w
+
+    def _build_compound(self, s):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        tpl = QHBoxLayout()
+        tpl.addWidget(QLabel('قالب:'))
+        self.tpl = QComboBox()
+        self.tpl.setMinimumWidth(200)
+        self.btn_load_tpl, self.btn_save_tpl, self.btn_del_tpl = QPushButton('تطبيق'), QPushButton('حفظ كقالب'), QPushButton('حذف القالب')
+        self.btn_csv = QPushButton('استيراد CSV')
+        self.btn_load_tpl.clicked.connect(self._apply_template)
+        self.btn_save_tpl.clicked.connect(self._save_template)
+        self.btn_del_tpl.clicked.connect(self._delete_template)
+        self.btn_csv.clicked.connect(self._import_csv)
+        for x in (self.tpl, self.btn_load_tpl, self.btn_save_tpl, self.btn_del_tpl):
+            tpl.addWidget(x)
+        tpl.addStretch(1)
+        tpl.addWidget(self.btn_csv)
+        lay.addLayout(tpl)
+        self.lines = LinesEditor([
+            ColSpec('account_id', 'الحساب', 'picker', loader=lambda: s.lookup_accounts(), width=300, required=True),
+            ColSpec('debit', 'مدين', 'money', width=140), ColSpec('credit', 'دائن', 'money', width=140), ColSpec('memo', 'بيان السطر')],
+            totals_fn=self._totals, min_rows=2, new_row_fn=self._seed_row)
+        self.lines.linesChanged.connect(self._on_lines_changed)
+        lay.addWidget(self.lines, 1)
+        self.totals_strip = TotalsStrip()               # مدين (أزرق) | دائن (برتقالي) | الفرق (أخضر/أحمر) + شارة التوازن
+        self.balance = self.totals_strip.status         # شارة الحالة (✔ متوازن / ⚠ غير متوازن)
+        brow = QHBoxLayout()                            # التوازن وإلى جانبه «حفظ» (نفس مكان الزر في القيد البسيط: بجوار الأرقام)
+        brow.addWidget(self.totals_strip, 1)
+        self.btn_stay_c = make_save_button(self)
+        brow.addWidget(self.btn_stay_c)
+        lay.addLayout(brow)
+        self.c_words = QLabel('')                       # إجمالي المدين كتابةً
+        self.c_words.setObjectName('totWords'); self.c_words.setWordWrap(True); self.c_words.setVisible(False)
+        lay.addWidget(self.c_words)
+        self.c_note = QLabel('')                        # ملاحظة: أرصدة (مدين/دائن) الحسابات المستخدمة في السطور
+        self.c_note.setObjectName('ctxKey'); self.c_note.setWordWrap(True)
+        lay.addWidget(self.c_note)
+        return w
+
+    # ---------------------------------------------------------------- القيد البسيط
+    @staticmethod
+    def _qs():
+        from PySide6.QtCore import QSettings
+        return QSettings('AlhisabatPro', 'journalEditor')
+
+    def _cur_code(self):
+        return self.cur.currentData() or self._base_cur
+
+    def _on_currency(self):
+        code = self._cur_code()
+        if not code or code == self._base_cur:
+            self.rate_lbl.setText('')
+        else:
+            rate = self.svc.rate_for(code, self.date.iso())
+            self.rate_lbl.setText(f'السعر: {rate.normalize():f}' if rate else '⚠ لا يوجد سعر صرف لهذا التاريخ (أضفه من العملات)')
+        self._simple_preview()
+        if getattr(self, 'lines', None) is not None:
+            self._totals(self.lines.rows())             # يحدّث تفقيط المركب عند تغيير العملة
+
+    def _open_recipes(self, key=None, switch=False):
+        if switch:
+            self.tabs.setCurrentIndex(1)
+        d = RecipeDialog(self, self.svc, key, favorites=self.fav)
+        ok = d.exec()
+        self.fav_panel.reload()                        # قد تتغير المفضلة من قائمة القوالب بزر الفأرة الأيمن
+        if not ok or not d.result_rows:
+            return
+        if self.lines.non_empty_rows() and QMessageBox.question(self, 'قالب جاهز', 'سيستبدل القالب السطور الحالية. متابعة؟') != QMessageBox.Yes:
+            return
+        self.lines.set_rows(d.result_rows)
+        self.used_recipe = d.result_key
+        if not self.desc.text().strip():
+            self.desc.setText(d.result_desc)
+        self._totals(self.lines.rows())
+
+    def _fill_simple(self, d):
+        self.s_from.set_id(d['from_account_id'])
+        self.s_to.set_id(d['to_account_id'])
+        self.s_amount.set_value(d['amount'])
+        self.s_memo.setText(d.get('memo') or '')
+
+    def _simple_values(self):
+        return JS.simple_to_lines(self.s_from.current_id(), self.s_to.current_id(), self.s_amount.value(), self.s_memo.text())
+
+    def _simple_preview(self):
+        a, b, amt = self.s_from.current_id(), self.s_to.current_id(), self.s_amount.value()
+        self.s_preview.set_amount(f'{amt:,.2f} {self._cur_code()}'.strip() if amt and amt > 0 else '0.00')
+        if a and b and amt and amt > 0:
+            self.s_preview.setText(f'مدين {self.s_from.currentText()}  ←  دائن {self.s_to.currentText()}')
+        else:
+            self.s_preview.setText('')
+        self.desc.setPlaceholderText(self._auto_desc() or 'وصف القيد')
+        if getattr(self, 's_words', None) is not None:
+            w = self._words(amt)
+            self.s_words.setText(w); self.s_words.setVisible(bool(w))
+        if getattr(self, 's_cur_lbl', None) is not None:
+            self.s_cur_lbl.setText(self._cur_code() or '')
+        self._refresh_notes()
+
+    def _words(self, amt):
+        """المبلغ كتابةً بعملة القيد ('' إن لم يُدخل مبلغ موجب)."""
+        try:
+            return FMT.amount_in_words(amt, self._cur_code()) if amt and amt > 0 else ''
+        except Exception:  # noqa: BLE001 — التفقيط للعرض فقط
+            return ''
+
+    def _auto_desc(self):
+        """البيان التلقائي للقيد البسيط (أسماء الحسابين) أو '' إن لم يُختر الحسابان."""
+        if self.s_from.current_id() and self.s_to.current_id():
+            return JS.simple_auto_description(self.s_from.currentText(), self.s_to.currentText())
+        return ''
+
+    def _refresh_notes(self):
+        sess, iso, cur = self.page.session, self.date.iso(), self._cur_code()
+        if getattr(self, 's_note', None) is not None:
+            self.s_note.setText(BN.balances_text(sess, [(self.s_from.current_id(), self.s_from.currentText()),
+                                                        (self.s_to.current_id(), self.s_to.currentText())], iso, cur))
+        if getattr(self, 'c_note', None) is not None:
+            try:
+                accs = [(r.get('account_id'), self.lines.cell_text(i, 'account_id')) for i, r in enumerate(self.lines.rows())]
+            except Exception:  # noqa: BLE001
+                accs = []
+            self.c_note.setText(BN.balances_text(sess, accs, iso, cur))
+
+    def _simple_is_empty(self):
+        return not (self.s_from.current_id() or self.s_to.current_id() or self.s_amount.value() or self.s_memo.text().strip())
+
+    def _place_cur(self):
+        """صندوق العملة واحد ينتقل بحسب التبويب: في «قيد بسيط» بجانب المبلغ (يمينه) لتسهيل الإدخال، وفي «قيد مركب» في الشريط العلوي."""
+        row = getattr(self, '_simple_amount_row', None)
+        if row is None:
+            return
+        simple = self.tabs.currentIndex() == 0
+        row.removeWidget(self.cur)
+        self._top.removeWidget(self.cur)
+        if simple:
+            row.insertWidget(0, self.cur)                       # أول عنصر = أقصى اليمين في الاتجاه العربي
+            self.cur_lbl_top.setVisible(False)
+        else:
+            self._top.insertWidget(self._cur_top_index, self.cur)
+            self.cur_lbl_top.setVisible(True)
+        self.cur.setVisible(True)
+
+    def _on_tab(self, idx):
+        prev, self._tab = self._tab, idx
+        if prev == idx:
+            return
+        if idx == 1:                                   # بسيط ← مركب: ننقل ما أُدخل
+            self.desc.setPlaceholderText('وصف القيد')   # البيان التلقائي خاص بالقيد البسيط
+            if not self._simple_is_empty() and not self.lines.non_empty_rows():
+                try:
+                    self.lines.set_rows(self._simple_values())
+                except AccountingError:                # ناقص: ننقل ما أمكن دون تحقق
+                    self.lines.set_rows([{'account_id': self.s_from.current_id(), 'debit': self.s_amount.value(), 'credit': None, 'memo': self.s_memo.text()},
+                                         {'account_id': self.s_to.current_id(), 'debit': None, 'credit': self.s_amount.value(), 'memo': self.s_memo.text()}])
+            return
+        rows = self.lines.non_empty_rows()             # مركب ← بسيط
+        if not rows:
+            return
+        d = JS.lines_to_simple(rows)
+        if d is None:
+            QMessageBox.information(self, 'قيد مركب', 'هذا القيد له أكثر من طرفين أو مبالغ غير متطابقة، ولا يمكن عرضه كقيد بسيط. أكمله من تبويب «قيد مركب».')
+            self._tab = 1
+            self.tabs.blockSignals(True)
+            self.tabs.setCurrentIndex(1)
+            self.tabs.blockSignals(False)
+            return
+        self._fill_simple(d)
+        self._simple_preview()
+
+    # ---------------------------------------------------------------- مساعدات
+    def _closed_reason(self, iso):
+        return ST.period_reason(self.page.session.period_info(iso))
+
+    def _totals(self, rows):
+        d, c, _diff = JS.balance_of(rows)
+        text, tone = EL.journal_status_text(d, c)
+        self.totals_strip.update_totals(d, c, text.rsplit('   ', 1)[-1].strip(), tone)   # الأرقام في الخانات الملوّنة والحالة في الشارة
+        if getattr(self, 'c_words', None) is not None:
+            w = self._words(d)
+            self.c_words.setText(w); self.c_words.setVisible(bool(w))
+        return {}                                      # النص كله في شريط التوازن؛ لا نكرره في شريط المحرر
+
+    def _seed_row(self, rows):
+        """السطر الجديد (Enter في آخر خلية) يأتي بمبلغ الموازنة في الجهة المقابلة: يوفّر كتابة آخر سطر في كل قيد."""
+        side, amt = EL.balancing_suggestion(rows)
+        return {side: amt} if side else None
+
+    def _on_lines_changed(self):
+        self._issues = EL.journal_row_issues(self.lines.rows())
+        self.lines.set_issues(self._issues)
+        self._refresh_notes()
+
+    def _swap_simple(self):
+        a, b = self.s_from.current_id(), self.s_to.current_id()
+        if a is not None:
+            self.s_to.set_id(a)
+        if b is not None:
+            self.s_from.set_id(b)
+        self._simple_preview()
+
+    def _reload_templates(self):
+        self.tpl.clear()
+        try:
+            rows = self.svc.templates()
+        except Exception:  # noqa: BLE001
+            rows = []
+        self.tpl.addItem('— بلا —', None)
+        for t in rows:
+            self.tpl.addItem(t['name'], t['id'])
+        for b in (self.btn_load_tpl, self.btn_del_tpl):
+            b.setEnabled(bool(rows))
+
+    def _apply_template(self):
+        tid = self.tpl.currentData()
+        if tid is None:
+            return
+        try:
+            t = self.svc.template(tid)
+        except Exception as exc:  # noqa: BLE001
+            return self.page.show_error(exc)
+        if t.get('description') and not self.desc.text().strip():
+            self.desc.setText(t['description'])
+        self.lines.set_rows([{'account_id': x['account_id'], 'debit': x['debit'] or None, 'credit': x['credit'] or None, 'memo': x.get('memo', '')}
+                             for x in t['lines']])
+
+    def _save_template(self):
+        rows = self.lines.non_empty_rows()
+        if not rows:
+            return QMessageBox.information(self, 'حفظ كقالب', 'أدخل سطرًا واحدًا على الأقل قبل حفظ القالب.')
+        name, ok = QInputDialog.getText(self, 'حفظ كقالب', 'اسم القالب:')
+        if not ok or not name.strip():
+            return
+        try:
+            self.svc.save_template(name, self.desc.text(), rows)
+        except Exception as exc:  # noqa: BLE001
+            return self.page.show_error(exc)
+        self._reload_templates()
+
+    def _delete_template(self):
+        tid = self.tpl.currentData()
+        if tid is None:
+            return
+        if ask_reason(self, 'حذف القالب', [f'حذف القالب «{self.tpl.currentText()}» نهائيًا.'], need_reason=False, confirm_text='حذف') is None:
+            return
+        try:
+            self.svc.delete_template(tid)
+        except Exception as exc:  # noqa: BLE001
+            return self.page.show_error(exc)
+        self._reload_templates()
+
+    def _import_csv(self):
+        path, _ = QFileDialog.getOpenFileName(self, 'استيراد سطور من CSV', '', 'CSV (*.csv *.txt)')
+        if not path:
+            return
+        try:
+            lines, errs = self.svc.parse_csv(path)
+        except Exception as exc:  # noqa: BLE001
+            return self.page.show_error(exc)
+        if errs:
+            QMessageBox.warning(self, 'استيراد CSV', f'استُورد {len(lines)} سطرًا، وتعذّر {len(errs)}:\n' + '\n'.join(errs[:15]))
+        if lines:
+            self.lines.set_rows([{'account_id': x['account_id'], 'debit': x['debit'] or None, 'credit': x['credit'] or None, 'memo': x['memo']} for x in lines])
+
+    def _add_attachment(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, 'إضافة مرفق', '')
+        self._pending += [{'path': p, 'name': None} for p in paths]
+        self.att_lbl.setText(f'مرفقات ستُحفظ مع القيد: {len(self._pending)}' if self._pending else '')
+
+    def _save_and_new(self):
+        self.add_another = True
+        self._accept()
+
+    def _check(self):
+        """تحقق الواجهة قبل الحفظ (يعرض الرسالة ويُرجع False عند النقص)."""
+        if self.tabs.currentIndex() == 0:
+            try:
+                self._simple_values()
+            except AccountingError as exc:
+                QMessageBox.warning(self, 'بيانات ناقصة', str(exc))
+                return False
+            return True
+        errs = self.lines.validate()
+        if errs:
+            QMessageBox.warning(self, 'بيانات ناقصة', '\n'.join(m for _i, m in errs[:10]))
+            return False
+        issues = EL.journal_row_issues(self.lines.rows())
+        if issues:
+            QMessageBox.warning(self, 'سطور تحتاج تصحيحًا', '\n'.join(sorted({m for _n, _k, m in issues}))[:600])
+            return False
+        if len(self.lines.non_empty_rows()) < 2:
+            QMessageBox.warning(self, 'بيانات ناقصة', 'أدخل سطرين على الأقل.')
+            return False
+        return True
+
+    def _accept(self):
+        self.add_another, want_more = False, self.add_another
+        if not self._check():
+            return
+        self.add_another = want_more
+        self.accept()
+
+    # ---------------------------------------------------------------- «حفظ» دون إغلاق
+    def enable_stay_save(self, cb):
+        """cb(dialog) ← True عند نجاح الحفظ. يُظهر زر «حفظ» الذي يبقي النافذة مفتوحة."""
+        self.save_stay_cb = cb
+        self.btn_stay.setVisible(True)
+        self.btn_stay_c.setVisible(True)
+
+    def _enter_in_amount(self):
+        if self.save_stay_cb is not None and self.s_amount.value():
+            self._save_stay()
+        else:
+            self.s_memo.setFocus()
+
+    def _enter_in_memo(self):
+        if self.save_stay_cb is not None:
+            self._save_stay()
+        else:
+            self._accept()
+
+    def show_toast(self, text='تم الحفظ'):
+        self.toast.setText('✓ ' + text)
+        self.toast.setVisible(True)
+        self._toast_timer.start(2500)
+
+    def _save_stay(self):
+        if self._saving or self.save_stay_cb is None or not self._check():
+            return
+        self._saving = True
+        try:
+            ok = bool(self.save_stay_cb(self))
+        finally:
+            self._saving = False
+        if not ok:
+            return
+        self.show_toast('تم الحفظ')
+        if self.entry is None:
+            self._reset_for_next()
+        self._restored = False
+        self._baseline = self._widget_snapshot()      # بعد الحفظ لا يُعدّ شيء «غير محفوظ»
+
+    @staticmethod
+    def _clear_picker(p):
+        p.setCurrentIndex(-1)
+        p.setEditText('')
+
+    def _reset_for_next(self):
+        """بعد حفظ قيد جديد: نموذج فارغ لقيد تالٍ (يبقى التاريخ والعملة والتبويب الحالي)."""
+        self.desc.clear()
+        self._pending = []
+        self.att_lbl.setText('')
+        self.used_recipe = None
+        self.chk_adj.setChecked(False)
+        self._clear_picker(self.s_from)
+        self._clear_picker(self.s_to)
+        self.s_amount.set_value(None)
+        self.s_memo.clear()
+        self.lines.set_rows([])
+        self._totals(self.lines.rows())
+        self._simple_preview()
+        (self.s_from if self.tabs.currentIndex() == 0 else self.desc).setFocus()   # القيد البسيط: يبدأ التالي من الحساب المدين مباشرة
+
+    def values(self):
+        lines = self._simple_values() if self.tabs.currentIndex() == 0 else self.lines.non_empty_rows()
+        code = self._cur_code()
+        if code and code != self._base_cur:
+            lines = [dict(x, currency=code) for x in lines]
+        self._qs().setValue('last_currency', code or '')
+        desc = self.desc.text().strip()
+        if not desc and self.tabs.currentIndex() == 0:
+            desc = self._auto_desc()                   # بيان فارغ في القيد البسيط ← «قيد بسيط ــ من حساب … الى حساب …»
+        return {'date': self.date.iso(), 'description': desc, 'lines': lines,
+                'pending_attachments': list(self._pending),
+                'entry_type': 'adjustment' if self.chk_adj.isChecked() else 'general'}

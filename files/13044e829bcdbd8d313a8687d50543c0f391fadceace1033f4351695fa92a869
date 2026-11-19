@@ -1,0 +1,74 @@
+"""DashCard: بطاقة مؤشر للوحة التحكم (أيقونة دائرية + عنوان + قيمة + نسبة تغيّر ونص مقارنة). ألوانها من QSS/Tokens. يتطلب PySide6."""
+from decimal import Decimal
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout
+
+from alhisabat.ui.components.basic import repolish
+from alhisabat.ui.design import tokens as T
+from alhisabat.ui.design.icons import qicon
+
+
+class DashCard(QFrame):
+    """بطاقة مؤشر: أيقونة دائرية + عنوان + قيمة كبيرة + (نسبة تغيّر + نص مقارنة) أو نص ثانوي."""
+
+    def __init__(self, title, icon, parent=None):
+        super().__init__(parent)
+        self.setObjectName('dashCard')
+        self._icon = icon
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 12, 16, 12)
+        lay.setSpacing(8)
+        top = QHBoxLayout()
+        self.ico = QFrame()
+        self.ico.setObjectName('dashIcon')
+        self.ico.setFixedSize(38, 38)
+        il = QVBoxLayout(self.ico)
+        il.setContentsMargins(0, 0, 0, 0)
+        self.ico_lbl = QLabel()
+        self.ico_lbl.setAlignment(Qt.AlignCenter)
+        il.addWidget(self.ico_lbl)
+        top.addWidget(self.ico)
+        t = QLabel(title)
+        t.setObjectName('dashCardTitle')
+        top.addWidget(t)
+        top.addStretch(1)
+        lay.addLayout(top)
+        self.value = QLabel('—')
+        self.value.setObjectName('dashCardValue')
+        self.value.setAlignment(Qt.AlignCenter)
+        lay.addWidget(self.value)
+        foot = QHBoxLayout()
+        self.cmp = QLabel('')
+        self.cmp.setObjectName('dashCardSub')
+        self.delta = QLabel('')
+        self.delta.setObjectName('dashDelta')
+        foot.addWidget(self.cmp)
+        foot.addStretch(1)
+        foot.addWidget(self.delta)
+        lay.addLayout(foot)
+        self.set_mode(None)
+
+    def set_mode(self, mode):
+        pal = T.palette(mode or 'light')
+        self.ico_lbl.setPixmap(qicon(self._icon, pal['accent'], 20).pixmap(20, 20))
+
+    def set_value(self, text):
+        self.value.setText(text)
+
+    def set_delta(self, cur, prev, up_is_good, cmp_text):
+        """نسبة التغيّر بين cur وprev (وحدات صغرى). prev صفر/None ← بلا نسبة."""
+        self.cmp.setText(cmp_text)
+        if cur is None or not prev:
+            self.delta.setText('')
+            return
+        pct = (Decimal(cur) - Decimal(prev)) / abs(Decimal(prev)) * 100
+        up = pct >= 0
+        good = up == up_is_good
+        self.delta.setText(f"{'↑' if up else '↓'} {'+' if up else '-'}{abs(pct):.0f}%")
+        self.delta.setProperty('tone', 'good' if good else 'bad')
+        repolish(self.delta)
+
+    def set_note(self, text):
+        self.cmp.setText(text)
+        self.delta.setText('')

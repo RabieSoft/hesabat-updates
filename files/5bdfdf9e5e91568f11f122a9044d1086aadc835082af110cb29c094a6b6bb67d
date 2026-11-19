@@ -1,0 +1,261 @@
+"""منطق الجدول الخالص (فرز/تصفية/تجميع/إجماليات/تصدير) — مفصول عن Qt ليُختبر في أي بيئة. الأرقام Decimal دائمًا."""
+import csv
+import io
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+
+from alhisabat.ui.core import format as fmt
+from alhisabat.ui.design import tokens as T
+from alhisabat.ui.core.logic import matches
+
+NUMERIC = ('money', 'qty', 'int')
+
+
+@dataclass
+class Column:
+    key: str
+    label: str
+    kind: str = 'text'            # text | money | qty | int | date | status | bool
+    width: int = 0                # 0 = تلقائي
+    total: bool = False           # يدخل في صف الإجماليات
+    hidden: bool = False
+    minor: bool = False           # القيمة بالوحدة الصغرى (÷100)
+    milli: bool = False           # الكمية بوحدات ×1000 (qty_milli) → تُقسم على 1000
+    places: int = 2
+    link: bool = False            # عمود رابط (رقم قيد/مستند): نقرة واحدة ← DataGrid.linkClicked
+
+    @property
+    def numeric(self):
+        return self.kind in NUMERIC
+
+
+def to_number(v, col=None):
+    """قيمة خلية ← Decimal أو None (بلا float)."""
+    if v is None or v == '':
+        return None
+    if isinstance(v, bool):
+        return Decimal(int(v))
+    if isinstance(v, Decimal):
+        d = v
+    elif isinstance(v, int):
+        d = Decimal(v)
+    elif isinstance(v, float):
+        d = Decimal(str(v))
+    else:
+        try:
+            d = Decimal(str(v).replace(',', ''))
+        except InvalidOperation:
+            return None
+    if col is not None and col.minor:
+        d = d / 100
+    if col is not None and col.milli:
+        d = d / 1000
+    return d
+
+
+# قيم خام من قاعدة البيانات تُعرض بالعربية في أعمدة نصية معروفة المفاتيح (الفرز والتصفية تبقى على القيمة الأصلية)
+_AR_KEYS = {'currency', 'kind', 'type', 'doc_type', 'source_type', 'ref_type', 'error_code', 'event', 'entry_type',
+            'voucher_type', 'direction', 'nature', 'account_type', 'status', 'state'}
+_AR_VALUES = {
+    # العملات
+    'YER': 'ريال يمني', 'SAR': 'ريال سعودي', 'USD': 'دولار', 'AED': 'درهم إماراتي', 'EUR': 'يورو',
+    'GBP': 'جنيه إسترليني', 'QAR': 'ريال قطري', 'OMR': 'ريال عماني', 'KWD': 'دينار كويتي',
+    'EGP': 'جنيه مصري', 'JOD': 'دينار أردني', 'BHD': 'دينار بحريني', 'IQD': 'دينار عراقي',
+    # أنواع المستندات والأطراف والصناديق
+    'invoice': 'فاتورة', 'return': 'مرتجع', 'sales_invoice': 'فاتورة مبيعات', 'purchase_invoice': 'فاتورة مشتريات',
+    'customer': 'عميل', 'supplier': 'مورد', 'employee': 'موظف', 'cashbox': 'صندوق', 'bank': 'بنك',
+    'receipt': 'سند قبض', 'payment': 'سند صرف', 'sales': 'مبيعات', 'purchases': 'مشتريات',
+    'item': 'صنف', 'service': 'خدمة', 'combo': 'مجموعة', 'goods': 'بضاعة',
+    'input': 'مدخلات', 'output': 'مخرجات', 'text': 'نص', 'document': 'مستند',
+    'in': 'وارد', 'out': 'صادر', 'debit': 'مدين', 'credit': 'دائن',
+    'asset': 'أصول', 'liability': 'خصوم', 'equity': 'حقوق ملكية', 'revenue': 'إيرادات', 'expense': 'مصروفات',
+    # قيود اليومية ومصادرها
+    'general': 'عام', 'opening': 'افتتاحي', 'closing': 'إقفال', 'adjustment': 'تسوية', 'reversal': 'عكس', 'auto': 'تلقائي',
+    'cash_voucher': 'سند نقدية', 'cash_transfer': 'تحويل نقدي', 'cash_count': 'جرد نقدية',
+    'bank_statement': 'كشف بنكي', 'asset_depreciation': 'إهلاك أصل', 'fixed_asset': 'أصل ثابت',
+    'fixed_asset_disposal': 'استبعاد أصل', 'party_opening': 'رصيد افتتاحي لطرف', 'party_reconcile': 'مطابقة', 'payroll_run': 'مسيّر رواتب',
+    'revaluation': 'إعادة تقييم', 'stock_adjustment': 'تسوية مخزون', 'stock_count': 'جرد مخزون',
+    'stock_opening': 'مخزون افتتاحي', 'movement': 'حركة', 'manual': 'يدوي',
+    # أسباب أخطاء الرسائل
+    'not_on_whatsapp': 'الرقم غير مسجل في واتساب', 'selector_failure': 'تعذر الوصول لصندوق الإرسال',
+    'account_blocked': 'تنبيه حظر', 'execution_error': 'خطأ تنفيذ', 'send_unconfirmed': 'لم يتأكد الإرسال',
+    'attach_failure': 'فشل المرفق', 'interrupted': 'انقطع الإرسال', 'opted_out': 'ألغى الاشتراك',
+    'deeplink_failed': 'تعذر فتح الرابط', 'timeout': 'انتهت المهلة',
+    # أحداث سجل الرسائل
+    'enqueued': 'أُدرجت في الطابور', 'retry': 'إعادة محاولة', 'cancelled': 'ملغاة',
+}
+
+
+def _ar(v, col):
+    if col.key in _AR_KEYS and isinstance(v, str):
+        return _AR_VALUES.get(v, _AR_VALUES.get(v.lower(), v))
+    return v
+
+
+def display(v, col):
+    """نص الخلية للعرض (السالب بأقواس لا باللون وحده)."""
+    if v is None or v == '':
+        return ''
+    k = col.kind
+    if k == 'money':
+        return fmt.fmt_money(to_number(v, col), col.places)
+    if k == 'qty':
+        n = to_number(v, col)
+        return '' if n is None else (fmt.fmt_money(n, 3).rstrip('0').rstrip('.') or '0')
+    if k == 'int':
+        n = to_number(v, col)
+        return '' if n is None else str(int(n))
+    if k == 'date':
+        return fmt.fmt_date(v)
+    if k == 'status':
+        return T.status_label(v)
+    if k == 'bool':
+        return 'نعم' if v else 'لا'
+    return str(_ar(v, col))
+
+
+def tone_of(v, col):
+    return T.status_tone(v) if col.kind == 'status' else None
+
+
+def sort_key(v, col):
+    """مفتاح فرز: الأرقام عددية، النصوص بلا تشكيل/همزات، الفارغ آخرًا."""
+    if v is None or v == '':
+        return (1, 0, '')
+    if col.numeric:
+        n = to_number(v, col)
+        return (0, n if n is not None else Decimal(0), '')
+    from alhisabat.ui.core.logic import normalize_ar
+    return (0, 0, normalize_ar(str(v)))
+
+
+def row_matches(row, columns, quick='', col_filters=None):
+    """تصفية: بحث سريع في كل الأعمدة الظاهرة + مرشحات لكل عمود (كلها يجب أن تتحقق)."""
+    cols = {c.key: c for c in columns}
+    for key, text in (col_filters or {}).items():
+        c = cols.get(key)
+        if c and text and not matches(text, display(row.get(key), c)):
+            return False
+    if quick:
+        texts = [display(row.get(c.key), c) for c in columns if not c.hidden]
+        if not matches(quick, *texts):
+            return False
+    return True
+
+
+def apply(rows, columns, quick='', col_filters=None, sort_key_name=None, descending=False):
+    """يُرجع قائمة فهارس الصفوف الظاهرة بعد التصفية والفرز (المصدر لا يُعدَّل)."""
+    idx = [i for i, r in enumerate(rows) if row_matches(r, columns, quick, col_filters)]
+    if sort_key_name:
+        col = next((c for c in columns if c.key == sort_key_name), None)
+        if col:
+            idx.sort(key=lambda i: sort_key(rows[i].get(col.key), col), reverse=descending)
+            if descending:                       # الفارغ يبقى آخرًا حتى عند التنازلي
+                empt = [i for i in idx if rows[i].get(col.key) in (None, '')]
+                idx = [i for i in idx if i not in set(empt)] + empt
+    return idx
+
+
+def totals(rows, columns, indexes=None):
+    """مجاميع الأعمدة المعلَّمة total (على الفهارس المعطاة أو كل الصفوف). Decimal."""
+    pick = rows if indexes is None else [rows[i] for i in indexes]
+    out = {}
+    for c in columns:
+        if c.total and c.numeric:
+            s = Decimal(0)
+            for r in pick:
+                n = to_number(r.get(c.key), c)
+                if n is not None:
+                    s += n
+            out[c.key] = s
+    return out
+
+
+def group(rows, indexes, group_key, columns):
+    """يُرجع [(قيمة_المجموعة، [فهارس])] بترتيب أول ظهور."""
+    col = next((c for c in columns if c.key == group_key), None)
+    order, bucket = [], {}
+    for i in indexes:
+        v = display(rows[i].get(group_key), col) if col else str(rows[i].get(group_key))
+        if v not in bucket:
+            bucket[v] = []
+            order.append(v)
+        bucket[v].append(i)
+    return [(v, bucket[v]) for v in order]
+
+
+def to_csv(rows, columns, indexes=None):
+    """CSV للبيانات المعروضة (UTF-8 مع BOM ليفتح في إكسل بالعربية). المبالغ أرقام خام لا نصوصًا منسّقة."""
+    cols = [c for c in columns if not c.hidden]
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow([c.label for c in cols])
+    for i in (range(len(rows)) if indexes is None else indexes):
+        r = rows[i]
+        line = []
+        for c in cols:
+            v = r.get(c.key)
+            if c.numeric and v not in (None, ''):
+                n = to_number(v, c)
+                line.append(str(n) if n is not None else '')
+            else:
+                line.append(display(v, c))
+        w.writerow(line)
+    return buf.getvalue().encode('utf-8-sig')
+
+
+# ------------------------------------------------------------------ طباعة المحدد (منطق خالص)
+def build_print_spec(columns, rows, keys, cell_keys=None, base=None, title=None, with_totals=False, note=''):
+    """مواصفة طباعة (printing spec) من أعمدة وصفوف مختارة من الجدول.
+
+    columns: أعمدة الجدول (Column)، rows: صفوف dict بترتيب العرض، keys: مفاتيح الأعمدة المطلوبة بالترتيب.
+    cell_keys: None = كل خلايا الصفوف تُطبع؛ أو قائمة بطول rows لمجموعة مفاتيح الخلايا المحدّدة في كل صف
+    (الخلايا غير المحددة تُترك فارغة). base: مواصفة التقرير الأصلية لنسخ الترويسة منها (شركة/فرع/عملة/فترة/معلومات)
+    دون الرصيد الافتتاحي ولا إجماليات الكشف التي تخص الكشف الكامل. الأرقام Decimal دائمًا.
+    """
+    by = {c.key: c for c in columns}
+    cols = [by[k] for k in keys if k in by]
+    if not cols:
+        raise ValueError('اختر عمودًا واحدًا على الأقل للطباعة')
+    if not rows:
+        raise ValueError('لا توجد صفوف للطباعة')
+    out_cols = [{'key': c.key, 'label': c.label, 'numeric': c.numeric} for c in cols]
+    sums = {c.key: Decimal(0) for c in cols if c.numeric}
+    out_rows = []
+    for i, r in enumerate(rows):
+        line = {}
+        for c in cols:
+            if cell_keys is not None and c.key not in cell_keys[i]:
+                line[c.key] = None
+                continue
+            v = r.get(c.key)
+            if c.numeric:
+                n = to_number(v, c)
+                line[c.key] = n
+                if n is not None:
+                    sums[c.key] += n
+            elif c.kind == 'date':
+                line[c.key] = v if v not in (None, '') else ''      # يُمرَّر الخام ليُنسّقه قالب الطباعة
+            else:
+                line[c.key] = display(v, c)
+        out_rows.append(line)
+    base = base or {}
+    extra = [e for e in (base.get('extra') or [])]
+    extra.append(('ملاحظة', note or f'طباعة محدد: {len(out_rows)} صف × {len(cols)} عمود'))
+    totals = []
+    if with_totals:
+        label_of = {c.key: c.label for c in cols}
+        totals = [{'label': f'إجمالي {label_of[k]}', 'value': v} for k, v in sums.items()]
+    return {'title': title or base.get('title') or 'جدول', 'company': base.get('company'), 'branch': base.get('branch'),
+            'currency': base.get('currency'), 'period': base.get('period'), 'printed_at': base.get('printed_at', ''),
+            'extra': extra, 'columns': out_cols, 'rows': out_rows, 'totals': totals}
+
+
+def pick_print_keys(visible_keys, used_keys, saved_keys, is_cell_mode):
+    """الأعمدة المعلَّمة افتراضيًا في نافذة الطباعة: أعمدة التحديد إن كان جزئيًا، وإلا المحفوظة، وإلا الظاهرة."""
+    vis = list(visible_keys)
+    used = [k for k in vis if k in used_keys]
+    if is_cell_mode and used and len(used) < len(vis):
+        return used
+    saved = [k for k in (saved_keys or []) if k in vis or k in used_keys]
+    return saved or vis

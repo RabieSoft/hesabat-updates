@@ -1,0 +1,155 @@
+"""تقارير إضافية: دفتر اليومية (قائمة القيود بسطورها) وأرباح المبيعات حسب الصنف.
+
+كلاهما يُنتج مواصفة طباعة موحّدة (printing._spec) فيعمل معهما كل ما يعمل مع بقية التقارير:
+المعاينة، الطباعة، تصدير HTML/XLSX/CSV، والمبلغ كتابةً. الصلاحيات تُفرض هنا بنفس صلاحيات القراءة في المحرك.
+"""
+from decimal import Decimal
+
+from alhisabat.business import branch_scope, sales as sal
+from alhisabat.reporting import printing as pr
+from alhisabat.security import permissions
+
+JOURNAL_BOOK_MAX_LINES = 5000
+
+
+def journal_book_print(conn, user_id, company_id, date_from, date_to, *, branch_id=None):
+    """دفتر اليومية: كل سطور القيود المرحّلة (والمعكوسة) في الفترة مرتّبة بالتاريخ ثم رقم القيد، بالعملة الأساسية.
+    المسودات لا تظهر (ليست في الدفاتر). الحد الأقصى JOURNAL_BOOK_MAX_LINES سطر مع تنبيه عند القطع."""
+    permissions.require(conn, user_id, company_id, "journal.view", check_branch=False)
+    permissions.require(conn, user_id, company_id, "report.view", check_branch=False)
+    q = ("SELECT e.id eid, e.entry_date, e.posted_no, e.entry_no, e.description edesc, e.status, l.line_no, l.memo, "
+         "l.debit_base, l.credit_base, a.code acode, a.name aname "
+         "FROM journal_entries e JOIN journal_lines l ON l.entry_id=e.id JOIN accounts a ON a.id=l.account_id "
+         "WHERE e.company_id=? AND e.status IN ('posted','reversed') AND e.entry_date BETWEEN ? AND ?")
+    args = [company_id, date_from, date_to]
+    restricted = conn.execute("SELECT branch_id FROM user_branch_access WHERE user_id=?", (user_id,)).fetchall()
+    if restricted:
+        q += " AND e.branch_id IN (%s)" % ",".join("?" * len(restricted)); args += [r[0] for r in restricted]
+    f, fa = branch_scope.txn_clause(conn, company_id, branch_id, col="e.branch_id")
+    q += f; args += fa
+    q += " ORDER BY e.entry_date, COALESCE(e.posted_no, e.entry_no), e.id, l.line_no LIMIT ?"
+    raw = conn.execute(q, (*args, JOURNAL_BOOK_MAX_LINES + 1)).fetchall()
+    truncated = len(raw) > JOURNAL_BOOK_MAX_LINES
+    raw = raw[:JOURNAL_BOOK_MAX_LINES]
+    cols = [{"key": "entry_date", "label": "التاريخ"}, {"key": "no", "label": "رقم القيد"},
+            {"key": "account", "label": "الحساب"}, {"key": "desc", "label": "البيان"},
+            {"key": "debit", "label": "مدين", "numeric": True}, {"key": "credit", "label": "دائن", "numeric": True}]
+    rows, td, tc, entries, last = [], Decimal(0), Decimal(0), set(), None
+    for r in raw:
+        d, c = pr._u(r["debit_base"]) or Decimal(0), pr._u(r["credit_base"]) or Decimal(0)
+        td += d; tc += c; entries.add(r["eid"])
+        first = r["eid"] != last                       # البيان العام للقيد يظهر مرة واحدة في أول سطوره
+        last = r["eid"]
+        desc = r["memo"] or (r["edesc"] if first else "")
+        if first and r["memo"] and r["edesc"]:
+            desc = f"{r['edesc']} — {r['memo']}"
+        rows.append({"entry_id": r["eid"], "entry_date": r["entry_date"] if first else "",
+                     "no": (r["posted_no"] or r["entry_no"]) if first else "",
+                     "account": f"{r['acode']} {r['aname']}", "desc": desc, "debit": d, "credit": c})
+    company, branch = pr._company_header(conn, company_id, branch_id)
+    base = pr._base_cur(conn, company_id)
+    extra = [("عدد القيود", str(len(entries))), ("عدد السطور", str(len(rows)))]
+    if truncated:
+        extra.append(("تنبيه", f"الدفتر يتجاوز {JOURNAL_BOOK_MAX_LINES} سطر؛ ضيّق الفترة لعرضه كاملًا."))
+    totals = [{"label": "إجمالي المدين", "value": td, "words_label": "إجمالي المدين"},
+              {"label": "إجمالي الدائن", "value": tc, "words_label": "إجمالي الدائن"}]
+    if td == tc:
+        totals[0]["words_label"], totals[1]["no_words"] = "إجمالي المدين والدائن", True
+    return pr._with_words(conn, company_id, pr._spec(
+        "دفتر اليومية", company=company, branch=branch, currency=base, period=f"{date_from} — {date_to}",
+        extra=extra, columns=cols, rows=rows, totals=totals))
+
+
+def sales_profit_by_item_print(conn, user_id, company_id, date_from, date_to):
+    """أرباح المبيعات حسب الصنف: المبيعات الصافية (فواتير − مرتجعات مرحّلة) والتكلفة والربح وهامشه، لكل صنف وعملة.
+    التكلفة والربح بالعملة الأساسية فيُحسبان لصفوفها فقط (لا يُخلط يمني بسعودي)؛ صفوف العملات الأجنبية بمبيعاتها فقط."""
+    data = sal.sales_summary(conn, user_id, company_id, date_from, date_to, "item")
+    names = {r["id"]: f"{r['code']} {r['name']}".strip()
+             for r in conn.execute("SELECT id,code,name FROM items WHERE company_id=?", (company_id,))}
+    base = pr._base_cur(conn, company_id)
+    cols = [{"key": "item", "label": "الصنف"}, {"key": "currency", "label": "العملة"},
+            {"key": "sales", "label": "المبيعات (بدون ضريبة)", "numeric": True},
+            {"key": "cost", "label": "التكلفة", "numeric": True}, {"key": "profit", "label": "الربح", "numeric": True},
+            {"key": "margin", "label": "هامش الربح %", "numeric": True}]
+    rows, sales_by_cur, tot_cost, tot_profit = [], {}, Decimal(0), Decimal(0)
+    for r in sorted(data, key=lambda x: (x["cur"], -(x["profit"] or 0), x["k"] or 0)):
+        net = pr._u(r["net_ex"]) or Decimal(0)
+        is_base = r["cur"] == base
+        cost = pr._u(r["cost"]) if is_base else None
+        profit = pr._u(r["profit"]) if is_base else None
+        margin = (profit / net * 100).quantize(Decimal("0.01")) if (profit is not None and net) else None
+        sales_by_cur[r["cur"]] = sales_by_cur.get(r["cur"], Decimal(0)) + net
+        if is_base:
+            tot_cost += cost; tot_profit += profit
+        rows.append({"item": names.get(r["k"], "— بلا صنف —" if not r["k"] else f"#{r['k']}"), "currency": r["cur"],
+                     "sales": net, "cost": cost, "profit": profit, "margin": margin})
+    totals = [{"label": f"إجمالي المبيعات ({c})", "value": v, "currency": c} for c, v in sorted(sales_by_cur.items())]
+    if base in sales_by_cur:
+        totals += [{"label": f"إجمالي التكلفة ({base})", "value": tot_cost, "currency": base, "no_words": True},
+                   {"label": f"إجمالي الربح ({base})", "value": tot_profit, "currency": base}]
+    company, _b = pr._company_header(conn, company_id)
+    return pr._with_words(conn, company_id, pr._spec(
+        "أرباح المبيعات حسب الصنف", company=company, currency=None, period=f"{date_from} — {date_to}",
+        extra=[("ملاحظة", "تقرير تشغيلي؛ الربح = المبيعات الصافية − تكلفة الأصناف المخزنية بالعملة الأساسية. كل عملة في صفوف منفصلة.")],
+        columns=cols, rows=rows, totals=totals))
+
+
+_TYPE_AR = [("asset", "الأصول"), ("liability", "الخصوم"), ("equity", "رأس المال وحقوق الملكية"),
+            ("revenue", "الإيرادات"), ("cogs", "تكلفة المبيعات"), ("expense", "المصروفات")]
+
+
+def currency_summary_print(conn, user_id, company_id, date_to, *, currency=None, branch_id=None):
+    """ملخص الأرصدة ورأس المال حسب العملة: مدين/دائن/صافي لكل نوع حساب، بمبالغ كل عملة الأصلية (لا جمع بين العملات).
+    تراكمي حتى date_to على القيود المرحّلة؛ currency=None ← كل العملات."""
+    permissions.require(conn, user_id, company_id, "report.view", check_branch=False)
+    q = ("SELECT l.currency cur, a.account_type t, SUM(l.debit_orig) d, SUM(l.credit_orig) c "
+         "FROM journal_lines l JOIN journal_entries e ON e.id=l.entry_id JOIN accounts a ON a.id=l.account_id "
+         "WHERE e.company_id=? AND e.status IN ('posted','reversed') AND e.entry_date<=?")
+    args = [company_id, date_to]
+    if currency:
+        q += " AND l.currency=?"; args.append(currency)
+    restricted = conn.execute("SELECT branch_id FROM user_branch_access WHERE user_id=?", (user_id,)).fetchall()
+    if restricted:
+        q += " AND e.branch_id IN (%s)" % ",".join("?" * len(restricted)); args += [r[0] for r in restricted]
+    f, fa = branch_scope.txn_clause(conn, company_id, branch_id, col="e.branch_id")
+    q += f; args += fa
+    q += " GROUP BY l.currency, a.account_type ORDER BY l.currency"
+    data = {}
+    for r in conn.execute(q, args).fetchall():
+        data.setdefault(r[0], {})[r[1]] = (int(r[2] or 0), int(r[3] or 0))
+
+    names = {r[0]: r[1] for r in conn.execute("SELECT code, name_ar FROM currencies")} if _has_name_ar(conn) else {}
+    cols = [{"key": "cur", "label": "العملة"}, {"key": "item", "label": "البند"},
+            {"key": "debit", "label": "مدين", "numeric": True}, {"key": "credit", "label": "دائن", "numeric": True},
+            {"key": "net", "label": "الصافي", "numeric": True}, {"key": "side", "label": "طبيعة الصافي"}]
+
+    def side(n):
+        return "مدين" if n > 0 else ("دائن" if n < 0 else "—")
+
+    rows, totals = [], []
+    for cur in sorted(data):
+        label = names.get(cur) or cur
+        td = tc = 0
+        for code, ar in _TYPE_AR:
+            d, c = data[cur].get(code, (0, 0))
+            td += d; tc += c
+            if d == 0 and c == 0:
+                continue
+            rows.append({"cur": label, "item": ar, "debit": Decimal(d) / 100, "credit": Decimal(c) / 100,
+                         "net": Decimal(abs(d - c)) / 100, "side": side(d - c)})
+        rows.append({"cur": label, "item": "الإجمالي", "debit": Decimal(td) / 100, "credit": Decimal(tc) / 100,
+                     "net": Decimal(abs(td - tc)) / 100, "side": side(td - tc)})
+        ed, ec = data[cur].get("equity", (0, 0))
+        totals.append({"label": f"رأس المال وحقوق الملكية ({label})", "value": Decimal(ec - ed) / 100, "currency": cur})
+        totals.append({"label": f"إجمالي المدين ({label})", "value": Decimal(td) / 100, "currency": cur})
+        totals.append({"label": f"إجمالي الدائن ({label})", "value": Decimal(tc) / 100, "currency": cur})
+        totals.append({"label": f"الصافي ({label}) — {side(td - tc)}", "value": Decimal(abs(td - tc)) / 100, "currency": cur})
+    company, branch = pr._company_header(conn, company_id, branch_id)
+    return pr._with_words(conn, company_id, pr._spec(
+        "ملخص الأرصدة ورأس المال حسب العملة", company=company, branch=branch,
+        currency=currency, period=f"حتى {date_to}", columns=cols, rows=rows, totals=totals,
+        extra=[("ملاحظة", "كل عملة بمبالغها الأصلية على حدة ولا يُجمع بين العملات. رأس المال = دائن − مدين لحسابات حقوق الملكية.")]))
+
+
+def _has_name_ar(conn):
+    return any(r[1] == "name_ar" for r in conn.execute("PRAGMA table_info(currencies)"))

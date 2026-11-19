@@ -1,0 +1,241 @@
+"""خدمة إدارة رسائل واتساب (MessagingService).
+
+طبقة أعمال تفصل الواجهة الرسومية عن قاعدة البيانات وخيوط المعالجة.
+"""
+from typing import Any, Dict, List, Optional, Tuple
+
+from alhisabat.audit import audit
+from alhisabat.database.connection import connect
+from alhisabat.messaging import movements, queue
+from alhisabat.messaging.transports.base import ConnectionStatus
+from alhisabat.messaging.worker import get_worker
+
+
+class MessagingService:
+    def __init__(self, db_path: str, branch_id: Optional[int] = None, user_id: Optional[int] = None):
+        self.db_path = str(db_path)
+        self.branch_id = branch_id
+        self.user_id = user_id
+
+    def _conn(self):
+        return connect(self.db_path)
+
+    # ------------------------------------------------------------- الطابور
+    def list_queue(self, status: Optional[str] = None, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
+        with self._conn() as conn:
+            return queue.list_outbox_messages(conn, self.branch_id, status=status, limit=limit, offset=offset)
+
+    def cancel_message(self, outbox_id: int) -> None:
+        with self._conn() as conn:
+            conn.execute("UPDATE wa_outbox SET status='cancelled' WHERE id=?", (outbox_id,))
+            conn.execute(
+                "INSERT INTO wa_log(outbox_id, event, detail, at) VALUES (?, 'cancelled', 'ألغيت بواسطة المستخدم', CURRENT_TIMESTAMP)",
+                (outbox_id,),
+            )
+            if self.user_id:
+                audit.log(conn, self.user_id, "wa_message_cancel", "wa_outbox", outbox_id)
+            conn.commit()
+
+    def retry_message(self, outbox_id: int) -> None:
+        with self._conn() as conn:
+            conn.execute("UPDATE wa_outbox SET status='queued', error_code='' WHERE id=?", (outbox_id,))
+            conn.execute(
+                "INSERT INTO wa_log(outbox_id, event, detail, at) VALUES (?, 'retry', 'أعيدت للطابور بواسطة المستخدم', CURRENT_TIMESTAMP)",
+                (outbox_id,),
+            )
+            if self.user_id:
+                audit.log(conn, self.user_id, "wa_message_retry", "wa_outbox", outbox_id)
+            conn.commit()
+
+    # ------------------------------------------------------------- الإرسال
+    def enqueue(
+        self,
+        phone: str,
+        body: str,
+        party_id: Optional[int] = None,
+        kind: str = "text",
+        ref_type: str = "",
+        ref_id: Optional[int] = None,
+        attachment_path: str = "",
+        bypass_idempotency: bool = False,
+    ) -> int:
+        with self._conn() as conn:
+            cfg = queue.get_settings(conn, self.branch_id)
+            outbox_id = queue.enqueue_message(
+                conn,
+                branch_id=self.branch_id,
+                phone=phone,
+                body=body,
+                party_id=party_id,
+                kind=kind,
+                ref_type=ref_type,
+                ref_id=ref_id,
+                attachment_path=attachment_path,
+                created_by=self.user_id,
+                bypass_idempotency=bypass_idempotency,
+                default_country_code=cfg.get("country_code", "+967"),
+            )
+            if self.user_id:
+                audit.log(conn, self.user_id, "wa_message_enqueue", "wa_outbox", outbox_id, after={"phone": phone, "ref_type": ref_type, "ref_id": ref_id})
+            conn.commit()
+            return outbox_id
+
+    # ------------------------------------------------------------- القوالب
+    def list_templates(self) -> List[Dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT id, code, title, body, is_active FROM wa_templates "
+                "WHERE (branch_id IS ? OR branch_id IS NULL) ORDER BY id ASC",
+                (self.branch_id,),
+            ).fetchall()
+            return [{"id": r[0], "code": r[1], "title": r[2], "body": r[3], "is_active": bool(r[4])} for r in rows]
+
+    def get_template(self, code: str) -> Optional[Dict[str, Any]]:
+        with self._conn() as conn:
+            r = conn.execute(
+                "SELECT id, code, title, body, is_active FROM wa_templates "
+                "WHERE code=? AND (branch_id IS ? OR branch_id IS NULL) ORDER BY branch_id DESC LIMIT 1",
+                (code, self.branch_id),
+            ).fetchone()
+            if not r:
+                return None
+            return {"id": r[0], "code": r[1], "title": r[2], "body": r[3], "is_active": bool(r[4])}
+
+    def save_template(self, code: str, title: str, body: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO wa_templates(branch_id, code, title, body, is_active) "
+                "VALUES (?, ?, ?, ?, 1) "
+                "ON CONFLICT(branch_id, code) DO UPDATE SET title=excluded.title, body=excluded.body",
+                (self.branch_id, code, title, body),
+            )
+            if self.user_id:
+                audit.log(conn, self.user_id, "wa_template_save", "wa_templates", None, after={"code": code, "title": title})
+            conn.commit()
+
+
+    # ------------------------------------------------------------- الحركات الجديدة
+    def scan_movements(self, since_date: str, limit: int = 500) -> List[Dict[str, Any]]:
+        tpls = {t["code"]: t["body"] for t in self.list_templates() if t["is_active"]}
+        with self._conn() as conn:
+            conn.row_factory = __import__("sqlite3").Row
+            return movements.scan_new_movements(conn, self.branch_id, since_date, tpls, limit)
+
+    def enqueue_movements(self, items: List[Dict[str, Any]]) -> Tuple[int, List[str]]:
+        """يدرج كل حركة محددة في الطابور (ref_type='movement'). يعيد (عدد الناجح، رسائل الأخطاء)."""
+        ok, errors = 0, []
+        for it in items:
+            try:
+                self.enqueue(phone=it["phone"], body=it["body"], party_id=it["party_id"],
+                             kind="text", ref_type="movement", ref_id=it["entry_id"])
+                ok += 1
+            except Exception as e:  # رقم غير صالح / opt-out / بلا موافقة / مكرر
+                errors.append(f"{it['party_name']} ({it['doc_label']} {it['doc_no']}): {e}")
+        return ok, errors
+
+    def ignore_movements(self, items: List[Dict[str, Any]]) -> int:
+        with self._conn() as conn:
+            n = movements.ignore_movements(conn, items, self.user_id)
+            conn.commit()
+            return n
+
+    # ------------------------------------------------------------- الأطراف
+    def list_parties_with_phones(self, search: str = "") -> List[Dict[str, Any]]:
+        with self._conn() as conn:
+            query = (
+                "SELECT p.id, p.code, p.name, p.phone, p.wa_consent, p.kind "
+                "FROM parties p "
+                "WHERE p.is_active=1 AND (p.branch_id IS ? OR p.branch_id IS NULL) AND p.phone <> '' "
+            )
+            params = [self.branch_id]
+            if search:
+                query += "AND (p.name LIKE ? OR p.phone LIKE ? OR p.code LIKE ?) "
+                s_param = f"%{search}%"
+                params.extend([s_param, s_param, s_param])
+            query += "ORDER BY p.name ASC LIMIT 150"
+            rows = conn.execute(query, params).fetchall()
+            return [
+                {
+                    "id": r[0],
+                    "code": r[1],
+                    "name": r[2],
+                    "phone": r[3],
+                    "wa_consent": bool(r[4]),
+                    "kind": "عميل" if r[5] == "customer" else "مورد",
+                }
+                for r in rows
+            ]
+
+    # ------------------------------------------------------------- الإعدادات
+    def get_settings(self) -> Dict[str, Any]:
+        with self._conn() as conn:
+            return queue.get_settings(conn, self.branch_id)
+
+    def save_settings(self, settings_dict: Dict[str, Any]) -> None:
+        with self._conn() as conn:
+            queue.save_settings(conn, self.branch_id, settings_dict)
+            if self.user_id:
+                audit.log(conn, self.user_id, "wa_settings_save", "wa_settings", self.branch_id, after=settings_dict)
+            conn.commit()
+
+    # ------------------------------------------------------------- السجل
+    def list_logs(self, limit: int = 100) -> List[Dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT l.id, l.outbox_id, o.phone, l.event, l.detail, l.at "
+                "FROM wa_log l LEFT JOIN wa_outbox o ON o.id = l.outbox_id "
+                "WHERE (o.branch_id IS ? OR o.branch_id IS NULL) ORDER BY l.id DESC LIMIT ?",
+                (self.branch_id, limit),
+            ).fetchall()
+            return [
+                {
+                    "id": r[0],
+                    "outbox_id": r[1] or "—",
+                    "phone": r[2] or "—",
+                    "event": r[3],
+                    "detail": r[4],
+                    "at": r[5],
+                }
+                for r in rows
+            ]
+
+    # ------------------------------------------------------------- العامل
+    def get_worker_instance(self):
+        return get_worker(self.db_path, self.branch_id)
+
+    def is_worker_running(self) -> bool:
+        return self.get_worker_instance().is_running
+
+    def start_worker(self) -> None:
+        self.get_worker_instance().start()
+
+    def stop_worker(self) -> None:
+        w = self.get_worker_instance()
+        w.manually_stopped = True      # إيقاف مقصود: لا إعادة تشغيل تلقائي
+        w.stop()
+        w.manually_stopped = True
+
+    def worker_status_text(self) -> str:
+        return self.get_worker_instance().status_text
+
+    def is_worker_paused(self) -> bool:
+        return self.get_worker_instance().is_paused
+
+    def resume_worker(self) -> None:
+        self.get_worker_instance().resume()
+
+    def ensure_worker(self) -> bool:
+        """يشغّل خدمة الطابور تلقائيًا إن وُجدت رسائل بانتظار الإرسال ولم يوقفها المستخدم عمدًا.
+        (كانت الرسائل تبقى «في الانتظار» للأبد لأن الخدمة لا تعمل إلا بزر يدوي.)"""
+        w = self.get_worker_instance()
+        if w.is_running or w.manually_stopped:
+            return w.is_running
+        with self._conn() as conn:
+            n = conn.execute("SELECT COUNT(*) FROM wa_outbox WHERE status='queued' AND (branch_id IS ? OR branch_id IS NULL)",
+                             (self.branch_id,)).fetchone()[0]
+        if n:
+            w.start()
+        return w.is_running
+
+    def check_connection(self) -> ConnectionStatus:
+        return self.get_worker_instance().check_connection()

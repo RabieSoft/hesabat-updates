@@ -1,0 +1,128 @@
+"""قالب سند القبض / سند الصرف (A4/A5): عنوان كبير، «استلمنا من / صرفنا إلى»، المبلغ في خانة بارزة وكتابةً، البيان،
+بيانات الصندوق/البنك والحساب المقابل والقيد، الفواتير المسددة، ثم خانات توقيع عريضة. HTML مما يدعمه محرك النص الغني في Qt.
+بلا PySide6. الأرقام كلها من المواصفة (printing._voucher_details)؛ هنا عرض فقط."""
+from decimal import Decimal
+
+from alhisabat.ui.core import format as fmt
+
+from . import document_classic as C
+from .document_classic import BLUE, FRAME, LINE, RED, FONT, _e, _ltr, _tr, dmy, money, currency_label
+
+_KIND_AR = {'cashbox': 'صندوق', 'bank': 'بنك'}
+_STATUS_AR = {'draft': 'مسودة', 'posted': 'مرحّل', 'cancelled': 'ملغى'}
+_BAND = '#f3f6fa'
+
+
+def _cell(content, w=None, align='right', size=11, bold=True, bg=None, color='', extra='', height=None):
+    st = f'border: 1px solid {LINE}; padding:6px 8px; font-size:{size}pt;' + (f' color:{color};' if color else '') + (f' background-color:{bg};' if bg else '')
+    attrs = (f' width="{w}%"' if w else '') + (f' bgcolor="{bg}"' if bg else '') + (f' height="{height}"' if height else '') + (f' {extra}' if extra else '')
+    inner = f'<b>{content}</b>' if bold else content
+    return f'<td{attrs} align="{align}" valign="middle" style="{st}">{inner}</td>'
+
+
+def _label(text, w=None, size=10):
+    return _cell(_e(text), w, 'right', size, True, BLUE)
+
+
+def _row(cells):
+    return _tr(cells)
+
+
+def _tbl(rows):
+    return f'<table width="100%" border="1" cellspacing="0" cellpadding="0" style="border: 1px solid {LINE}; border-collapse: collapse;">{"".join(rows)}</table>'
+
+
+def _counter_text(v):
+    return v.get('party_name') or '، '.join(dict.fromkeys(v.get('counter_accounts') or [])) or ''
+
+
+def body(doc, opts):
+    v = doc.voucher
+    receipt = v['kind'] == 'receipt'
+    sym, cname = currency_label(v['currency'] or doc.currency)
+    amount = v['amount'] if isinstance(v['amount'], Decimal) else Decimal(str(v['amount'] or 0))
+    rows = []
+    # 1) شريط البيانات الأساسية: رقم السند | التاريخ | العملة | الحالة
+    st = _STATUS_AR.get(v.get('status'), '')
+    rows.append(_row([_label('رقم السند', 10), _cell(_ltr(doc.number or '(مسودة)'), 22, 'center', 12, True, None, RED),
+                      _label('التاريخ', 9), _cell(_ltr(dmy(doc.date)), 16, 'center', 12),
+                      _label('العملة', 9), _cell(_e(cname), 34, 'center', 11)]))
+    out = _tbl(rows)
+    # 2) «استلمنا من السيد/ة» / «صرفنا إلى السيد/ة»
+    who = _counter_text(v)
+    lab = 'استلمنا من السيد/ة :' if receipt else 'صرفنا إلى السيد/ة :'
+    kind_tag = {'customer': 'عميل', 'supplier': 'مورد', 'employee': 'موظف'}.get(v.get('party_kind') or '', '')
+    who_html = _e(who) + (f' <span style="font-size:9pt;">({kind_tag})</span>' if (who and kind_tag) else '')
+    out += _tbl([_row([_label(lab, 22, 11), _cell(who_html or '&nbsp;', 78, 'right', 15, True, None, '', '', 34)])])
+    # 3) المبلغ رقمًا وكتابةً
+    amt_txt = f'{_e(fmt.fmt_money(amount))} {_ltr(sym) if sym else ""}'
+    out += _tbl([_row([_label('مبلغ وقدره :', 22, 11),
+                       _cell(amt_txt, 30, 'center', 18, True, '#fff8e5', RED, '', 38),
+                       _cell(_e(doc.amount_words or ''), 48, 'right', 10.5, True, None, '', '', 38)])])
+    # 4) البيان
+    desc = v.get('description') or ''
+    out += _tbl([_row([_label('وذلك عن :' if receipt else 'وذلك مقابل :', 22, 11),
+                       _cell(_e(desc) or '&nbsp;', 78, 'right', 12, False, None, '', '', 60)])])
+    # 5) الصندوق/البنك + الحساب المقابل + القيد
+    kind_ar = _KIND_AR.get(v.get('cash_kind') or '', '')
+    pay_lab = ('استلم في ' if receipt else 'صُرف من ') + (kind_ar or 'الصندوق/البنك')
+    cells = [_label(pay_lab, 16, 10), _cell(_e(v.get('cash_name')), 34, 'right', 11)]
+    if v.get('journal_no') is not None:
+        cells += [_label('رقم القيد المحاسبي', 18, 10), _cell(_ltr(v['journal_no']), 32, 'center', 11)]
+    else:
+        cells += [_label('القيد المحاسبي', 18, 10), _cell('لم يُرحَّل بعد', 32, 'center', 10)]
+    out += _tbl([_row(cells)])
+    extra = []
+    if v.get('exchange_rate') and str(v['exchange_rate']) not in ('1', '1.0', '1.00'):
+        extra += [_label('سعر الصرف', 16, 10), _cell(_ltr(v['exchange_rate']), 34, 'center', 11)]
+    if v.get('party_name') and v.get('counter_accounts'):
+        extra += [_label('الحساب المقابل', 16, 10), _cell(_e('، '.join(dict.fromkeys(v['counter_accounts']))), 34, 'right', 11)]
+    if extra:
+        while len(extra) < 4:
+            extra += ['<td></td>']
+        out += _tbl([_row(extra)])
+    # 6) الفواتير المسددة
+    allocs = v.get('allocations') or []
+    if allocs:
+        hd = _row([_label('نوع المستند', 30, 10), _label('رقم الفاتورة', 25, 10), _label('تاريخها', 20, 10), _label('المبلغ المسدد', 25, 10)])
+        trs = ''.join(_row([_cell(_e(a['type']), None, 'right', 10, False), _cell(_ltr(a['no']), None, 'center', 10, False),
+                            _cell(_ltr(dmy(a['date'])), None, 'center', 10, False), _cell(money(a['amount']), None, 'right', 10, False)]) for a in allocs)
+        out += (f'<table width="100%" border="0" cellspacing="0" cellpadding="3"><tr><td><b style="font-size:10pt;">الفواتير المسددة بهذا السند</b></td></tr></table>'
+                + _tbl([hd, trs]))
+    # 7) توزيع المبلغ على الحسابات (سند بحسابات مقابلة)
+    if len(doc.rows) > 1 and not v.get('party_name'):
+        hd = _row([_label('الحساب', 40, 10), _label('المبلغ', 20, 10), _label('بيان', 40, 10)])
+        trs = ''.join(_row([_cell(_e(r.get('account')), None, 'right', 10, False), _cell(money(r.get('amount')), None, 'right', 10),
+                            _cell(_e(r.get('note')), None, 'right', 10, False)]) for r in doc.rows)
+        out += (f'<table width="100%" border="0" cellspacing="0" cellpadding="3"><tr><td><b style="font-size:10pt;">توزيع المبلغ على الحسابات</b></td></tr></table>'
+                + _tbl([hd, trs]))
+    return out
+
+
+def signatures(doc, opts, v):
+    """خانات توقيع عريضة (ارتفاع واضح للتوقيع/الختم) مع اسم المُعِدّ والمُرحِّل تحت الخانة المناسبة."""
+    if not opts.show_signatures:
+        return ''
+    receipt = v['kind'] == 'receipt'
+    labels = ['أمين الصندوق', 'المحاسب', 'المدير المالي', 'المُسلِّم (الدافع)'] if receipt else ['المُعِدّ', 'المحاسب', 'المدير المالي', 'المستلم']
+    names = {0: v.get('created_by') or '', 1: v.get('posted_by') or ''}
+    w = int(100 / len(labels))
+    cells = [f'<td width="{w}%" align="center" valign="top" height="95" style="border: 1px solid {LINE}; padding:4px;">'
+             f'<b style="font-size:10pt;">{_e(lab)}</b><br><span style="font-size:8pt; color:#555;">{_e(names.get(i, ""))}</span></td>'
+             for i, lab in enumerate(labels)]
+    return _tbl([_tr(cells)])
+
+
+def render_voucher(doc, paper, opts, header_image_html='', fill_px=0, pages=None):
+    size = opts.font_pt or (10 if paper == 'A4' else 9)
+    v = doc.voucher
+    inner = body(doc, opts) + signatures(doc, opts, v) + C.filler(fill_px)
+    note = doc.footer_note or opts.footer_note
+    if note:
+        inner += f'<p align="right" style="margin:6px 4px 0 4px; font-size:8pt;">{_e(note)}</p>'
+    frame = (f'<table width="100%" border="0" cellspacing="0" cellpadding="0"><tr><td style="border: 1px solid {FRAME};">'
+             f'{inner}</td></tr></table>')
+    gap = '<p style="margin:0; font-size:4pt;">&nbsp;</p>'
+    return (f'<html dir="rtl"><head><meta charset="utf-8"></head>'
+            f'<body dir="rtl" style="font-family:{FONT}; font-size:{size}pt; color:{FRAME}; background-color:#ffffff;">'
+            f'{C.header(doc, opts, header_image_html)}{gap}{frame}{gap}{C.footer(doc, pages, pages, opts)}</body></html>')

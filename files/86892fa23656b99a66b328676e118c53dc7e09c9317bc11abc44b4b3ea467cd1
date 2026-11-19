@@ -1,0 +1,22 @@
+from alhisabat.database.tx import transaction
+from alhisabat.security import permissions
+from alhisabat.audit import audit
+
+NATURE = {"asset": "debit", "cogs": "debit", "expense": "debit",
+          "liability": "credit", "equity": "credit", "revenue": "credit"}
+
+
+def create_account(conn, company_id, code, name, account_type, parent_id=None,
+                   is_group=False, is_control=False, is_system=False, *, created_by):
+    permissions.require(conn, created_by, company_id, "account.system_edit" if is_system else "account.create")
+    level = 1
+    if parent_id is not None:
+        level = conn.execute("SELECT level FROM accounts WHERE id=?", (parent_id,)).fetchone()[0] + 1
+    with transaction(conn):
+        cur = conn.execute(
+            "INSERT INTO accounts(company_id,code,name,parent_id,level,account_type,nature,is_group,is_control,is_system,created_by)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (company_id, code, name, parent_id, level, account_type, NATURE[account_type],
+             int(is_group), int(is_control), int(is_system), created_by))
+        audit.log(conn, created_by, "create_account", "accounts", cur.lastrowid, after={"code": code, "name": name})
+    return cur.lastrowid

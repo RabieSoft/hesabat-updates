@@ -1,0 +1,94 @@
+"""مراكز التكلفة: شجرة هرمية (مثل الحسابات) تُعلَّق على سطر القيد. يمكن ربط مركز افتراضي بفرع لتوزيع تلقائي من المستندات
+(سطور الإيراد/المصروف فقط؛ لا تُعلَّق على سطور الرقابة كالعميل/المورد/المخزون/الضريبة/النقدية)."""
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.audit import audit
+from alhisabat.database.tx import transaction
+from alhisabat.security import permissions
+
+
+def _cc(conn, cc_id, company_id=None):
+    r = conn.execute("SELECT * FROM cost_centers WHERE id=?", (cc_id,)).fetchone()
+    if not r or (company_id is not None and r["company_id"] != company_id):
+        raise AccountingError("مركز التكلفة غير موجود في هذه الشركة")
+    return r
+
+
+def _has_movements(conn, cc_id):
+    return conn.execute("SELECT 1 FROM journal_lines WHERE cost_center_id=? LIMIT 1", (cc_id,)).fetchone() is not None
+
+
+def create(conn, actor_id, company_id, name, *, parent_id=None, code=None, is_group=False, branch_id=None):
+    permissions.require(conn, actor_id, company_id, "costcenter.manage", check_branch=False)
+    if not name or not name.strip():
+        raise AccountingError("اسم مركز التكلفة مطلوب")
+    level = 1
+    if parent_id is not None:
+        p = _cc(conn, parent_id, company_id)
+        level = p["level"] + 1
+    if branch_id is not None and is_group:
+        raise AccountingError("المركز الافتراضي للفرع يجب أن يكون مركز حركة وليس تجميعيا")
+    with transaction(conn):
+        if not code:
+            code = "CC%03d" % (conn.execute("SELECT COUNT(*)+1 FROM cost_centers WHERE company_id=?", (company_id,)).fetchone()[0])
+        cid = conn.execute("INSERT INTO cost_centers(company_id,code,name,parent_id,level,is_group,branch_id,created_by) VALUES(?,?,?,?,?,?,?,?)",
+                           (company_id, code, name.strip(), parent_id, level, int(is_group), branch_id, actor_id)).lastrowid
+        audit.log(conn, actor_id, "create_cost_center", "cost_centers", cid, after={"code": code, "name": name})
+    return cid
+
+
+def edit(conn, actor_id, cc_id, *, name=None, branch_id=None):
+    cc = _cc(conn, cc_id)
+    permissions.require(conn, actor_id, cc["company_id"], "costcenter.manage", check_branch=False)
+    new_name = (name if name is not None else cc["name"]).strip()
+    if not new_name:
+        raise AccountingError("اسم مركز التكلفة مطلوب")
+    new_branch = cc["branch_id"] if branch_id is None else branch_id
+    if new_branch is not None and cc["is_group"]:
+        raise AccountingError("مركز تجميعي لا يصلح افتراضيا لفرع")
+    with transaction(conn):
+        conn.execute("UPDATE cost_centers SET name=?,branch_id=? WHERE id=?", (new_name, new_branch, cc_id))
+        audit.log(conn, actor_id, "edit_cost_center", "cost_centers", cc_id, {"name": cc["name"]}, {"name": new_name})
+
+
+def set_active(conn, actor_id, cc_id, active: bool):
+    cc = _cc(conn, cc_id)
+    permissions.require(conn, actor_id, cc["company_id"], "costcenter.manage", check_branch=False)
+    if not active and conn.execute("SELECT 1 FROM cost_centers WHERE parent_id=? AND is_active=1", (cc_id,)).fetchone():
+        raise AccountingError("لا يمكن تعطيل مركز تجميعي وتحته مراكز نشطة")
+    with transaction(conn):
+        conn.execute("UPDATE cost_centers SET is_active=? WHERE id=?", (int(active), cc_id))
+        audit.log(conn, actor_id, "cost_center_active", "cost_centers", cc_id, after={"active": active})
+
+
+def delete(conn, actor_id, cc_id):
+    cc = _cc(conn, cc_id)
+    permissions.require(conn, actor_id, cc["company_id"], "costcenter.manage", check_branch=False)
+    with transaction(conn):
+        conn.execute("DELETE FROM cost_centers WHERE id=?", (cc_id,))
+        audit.log(conn, actor_id, "delete_cost_center", "cost_centers", cc_id, {"code": cc["code"]})
+
+
+def for_branch(conn, company_id, branch_id):
+    """المركز الافتراضي لفرع، إن وُجد وكان نشطا. يُستخدم لتوزيع تلقائي من المستندات."""
+    if branch_id is None:
+        return None
+    r = conn.execute("SELECT id FROM cost_centers WHERE company_id=? AND branch_id=? AND is_active=1", (company_id, branch_id)).fetchone()
+    return r[0] if r else None
+
+
+def get_tree(conn, user_id, company_id, include_inactive=True):
+    permissions.require(conn, user_id, company_id, "costcenter.view", check_branch=False)
+    rows = conn.execute("SELECT * FROM cost_centers WHERE company_id=? ORDER BY code", (company_id,)).fetchall()
+    nodes = {r["id"]: {**dict(r), "children": []} for r in rows if include_inactive or r["is_active"]}
+    roots = []
+    for n in nodes.values():
+        (nodes[n["parent_id"]]["children"] if n["parent_id"] in nodes else roots).append(n)
+    return roots
+
+
+def list_flat(conn, user_id, company_id, active_only=False):
+    permissions.require(conn, user_id, company_id, "costcenter.view", check_branch=False)
+    q = "SELECT * FROM cost_centers WHERE company_id=?"
+    if active_only:
+        q += " AND is_active=1"
+    return [dict(r) for r in conn.execute(q + " ORDER BY code", (company_id,))]

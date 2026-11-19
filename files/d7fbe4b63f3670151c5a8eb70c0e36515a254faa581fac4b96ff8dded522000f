@@ -1,0 +1,190 @@
+"""حوارات نهاية الفترة والسنة: الأرصدة الافتتاحية اليدوية، إنشاء سنة، وإقفال الفترة."""
+from decimal import Decimal
+# pyrefly: ignore [missing-import]
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
+    QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton,
+    QTableWidget, QTableWidgetItem, QVBoxLayout,
+)
+
+
+class ManualOpeningDialog(QDialog):
+    """نافذة إدخال الأرصدة الافتتاحية اليدوية (للسنة الأولى) مع تحقق لحظي من التوازن."""
+
+    def __init__(self, parent, session, year_name):
+        super().__init__(parent)
+        self.session = session
+        self.year_name = year_name
+        self.lines = []
+        self.setWindowTitle(f"قيد افتتاح يدوي — سنة {year_name}")
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.resize(720, 520)
+        self._build_ui()
+
+    def _build_ui(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(8)
+
+        form = QFormLayout()
+        self.e_memo = QLineEdit("الأرصدة الافتتاحية الأولية")
+        form.addRow("البيان العام للقيد:", self.e_memo)
+        lay.addLayout(form)
+
+        box_add = QHBoxLayout()
+        self.cb_account = QComboBox()
+        self.cb_account.setMinimumWidth(220)
+        try:
+            for aid, label in self.session.lookup_accounts(groups=False):
+                self.cb_account.addItem(label, aid)
+        except Exception:
+            pass
+        self.e_debit = QLineEdit()
+        self.e_debit.setPlaceholderText("مدين 0.00")
+        self.e_credit = QLineEdit()
+        self.e_credit.setPlaceholderText("دائن 0.00")
+        self.e_line_memo = QLineEdit()
+        self.e_line_memo.setPlaceholderText("ملاحظة السطر...")
+        btn_add = QPushButton("إضافة سطر")
+        btn_add.clicked.connect(self._add_line)
+
+        box_add.addWidget(QLabel("الحساب:"))
+        box_add.addWidget(self.cb_account, 2)
+        box_add.addWidget(QLabel("مدين:"))
+        box_add.addWidget(self.e_debit, 1)
+        box_add.addWidget(QLabel("دائن:"))
+        box_add.addWidget(self.e_credit, 1)
+        box_add.addWidget(self.e_line_memo, 1)
+        box_add.addWidget(btn_add)
+        lay.addLayout(box_add)
+
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["الحساب", "مدين", "دائن", "البيان", "إجراء"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        lay.addWidget(self.table, 1)
+
+        self.bar_balance = QHBoxLayout()
+        self.lbl_tot_debit = QLabel("إجمالي المدين: 0.00")
+        self.lbl_tot_credit = QLabel("إجمالي الدائن: 0.00")
+        self.lbl_diff = QLabel("الفرق: 0.00")
+        self.lbl_status = QLabel("أدخل بنود القيد الافتتاحي.")
+        self.lbl_status.setStyleSheet("font-weight: bold;")
+        for w in (self.lbl_tot_debit, self.lbl_tot_credit, self.lbl_diff, self.lbl_status):
+            self.bar_balance.addWidget(w)
+        self.bar_balance.addStretch(1)
+        lay.addLayout(self.bar_balance)
+
+        self.bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.btn_save = self.bb.button(QDialogButtonBox.Ok)
+        self.btn_save.setText("حفظ القيد الافتتاحي")
+        self.btn_save.setEnabled(False)
+        self.bb.accepted.connect(self.accept)
+        self.bb.rejected.connect(self.reject)
+        lay.addWidget(self.bb)
+
+    def _add_line(self):
+        aid = self.cb_account.currentData()
+        if aid is None:
+            return QMessageBox.warning(self, "تنبيه", "اختر حسابًا صالحًا.")
+        acc_text = self.cb_account.currentText()
+        d_str = self.e_debit.text().strip() or "0"
+        c_str = self.e_credit.text().strip() or "0"
+        try:
+            d, c = Decimal(d_str), Decimal(c_str)
+        except Exception:
+            return QMessageBox.warning(self, "خطأ", "المبالغ يجب أن تكون أرقامًا عشرية صحيحة.")
+        if d < 0 or c < 0:
+            return QMessageBox.warning(self, "خطأ", "المبالغ لا يمكن أن تكون سالبة.")
+        if d == 0 and c == 0:
+            return QMessageBox.warning(self, "خطأ", "يجب إدخال مبلغ مدين أو دائن أكبر من صفر.")
+        if d > 0 and c > 0:
+            return QMessageBox.warning(self, "خطأ", "السطر الواحد إما مدين أو دائن وليس كلاهما.")
+
+        self.lines.append({
+            "account_id": int(aid), "account_label": acc_text,
+            "debit": d, "credit": c, "memo": self.e_line_memo.text().strip(),
+        })
+        self.e_debit.clear()
+        self.e_credit.clear()
+        self.e_line_memo.clear()
+        self._refresh_table()
+
+    def _remove_line(self, idx):
+        if 0 <= idx < len(self.lines):
+            self.lines.pop(idx)
+            self._refresh_table()
+
+    def _refresh_table(self):
+        self.table.setRowCount(len(self.lines))
+        tot_d = tot_c = Decimal("0")
+        for i, l in enumerate(self.lines):
+            self.table.setItem(i, 0, QTableWidgetItem(l["account_label"]))
+            self.table.setItem(i, 1, QTableWidgetItem(str(l["debit"])))
+            self.table.setItem(i, 2, QTableWidgetItem(str(l["credit"])))
+            self.table.setItem(i, 3, QTableWidgetItem(l["memo"]))
+            btn_del = QPushButton("حذف")
+            btn_del.clicked.connect(lambda _, row=i: self._remove_line(row))
+            self.table.setCellWidget(i, 4, btn_del)
+            tot_d += l["debit"]
+            tot_c += l["credit"]
+
+        diff = tot_d - tot_c
+        self.lbl_tot_debit.setText(f"إجمالي المدين: {tot_d}")
+        self.lbl_tot_credit.setText(f"إجمالي الدائن: {tot_c}")
+        self.lbl_diff.setText(f"الفرق: {diff}")
+
+        is_balanced = (tot_d == tot_c and tot_d > 0 and len(self.lines) >= 2)
+        if is_balanced:
+            self.lbl_status.setText("✔ القيد متوازن ومستعد للحفظ.")
+            self.lbl_status.setStyleSheet("color: green; font-weight: bold;")
+            self.btn_save.setEnabled(True)
+        else:
+            self.lbl_status.setText("يجب إضافة سطرين على الأقل (مدين ودائن)." if len(self.lines) < 2 else f"✖ غير متوازن: فارق {diff}")
+            self.lbl_status.setStyleSheet("color: red; font-weight: bold;")
+            self.btn_save.setEnabled(False)
+
+    def get_result(self):
+        result_lines = [{"account_id": l["account_id"], "debit": str(l["debit"]), "credit": str(l["credit"]), "memo": l["memo"]} for l in self.lines]
+        return result_lines, self.e_memo.text().strip() or "الأرصدة الافتتاحية الأولية"
+
+
+def prompt_new_year_dialog(parent):
+    """نافذة إنشاء سنة مالية جديدة."""
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("سنة مالية جديدة")
+    dlg.setLayoutDirection(Qt.RightToLeft)
+    form = QFormLayout(dlg)
+    e_name = QLineEdit(); e_name.setPlaceholderText("مثال: 2026")
+    e_start = QLineEdit(); e_start.setPlaceholderText("YYYY-MM-DD")
+    e_end = QLineEdit(); e_end.setPlaceholderText("YYYY-MM-DD")
+    form.addRow("اسم السنة:", e_name)
+    form.addRow("تاريخ البداية:", e_start)
+    form.addRow("تاريخ النهاية:", e_end)
+    bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+    bb.accepted.connect(dlg.accept)
+    bb.rejected.connect(dlg.reject)
+    form.addRow(bb)
+    if dlg.exec() != QDialog.Accepted:
+        return None
+    name, s, e = e_name.text().strip(), e_start.text().strip(), e_end.text().strip()
+    return (name, s, e) if (name and s and e) else None
+
+
+def prompt_close_period_dialog(parent):
+    """تأكيد إقفال الفترة مع خيار السماح بالمسودات."""
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("تأكيد إقفال الفترة")
+    dlg.setLayoutDirection(Qt.RightToLeft)
+    lay = QVBoxLayout(dlg)
+    lay.addWidget(QLabel("سيتم إقفال الفترة ومنع الترحيل فيها مستقبلاً."))
+    cb = QCheckBox("السماح بالإقفال في حال وجود قيود مسودة")
+    lay.addWidget(cb)
+    bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+    bb.accepted.connect(dlg.accept)
+    bb.rejected.connect(dlg.reject)
+    lay.addWidget(bb)
+    if dlg.exec() != QDialog.Accepted:
+        return None
+    return cb.isChecked()

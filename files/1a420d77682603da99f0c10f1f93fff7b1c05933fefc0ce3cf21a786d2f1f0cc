@@ -1,0 +1,76 @@
+"""المبلغ كتابةً (تفقيط) لكل التقارير — نقطة واحدة تشتق نص التفقيط من إجماليات المواصفة الموحّدة.
+
+القاعدة: كل إجمالي في `spec["totals"]` غير الصفري يُكتب بالحروف بعملته، سطرًا لكل إجمالي (مفصولة بـ «\\n»):
+  «إجمالي المدين: فقط ألف ريال لا غير».
+- العملة: `t["currency"]` إن وُجدت (أعمار الديون/الملخصات متعددة العملات)، وإلا عملة المواصفة، وإلا `fallback`
+  (العملة الأساسية للشركة). بلا عملة معروفة لا يُكتب شيء (لا نخمّن).
+- مفاتيح اختيارية على كل بند إجمالي: `words_label` (عنوان السطر بدل `label`)، `no_words=True` (لا يُكتب).
+- المستند الذي يحمل `amount_words` جاهزًا (فاتورة/سند/قيد/مخزون) لا يُمَس.
+- الإجمالي السالب يُكتب بقيمته المطلقة مع «(سالب)» في عنوانه، والصفري يُتجاوز.
+الدوال نقية (لا تعدّل المواصفة) عدا `attach_words` التي تضع النتيجة في `amount_words` إن كان فارغًا.
+"""
+from decimal import Decimal
+
+
+def _amount_in_words(amount, currency):
+    try:                                    # استيراد متأخر: تجنّب ربط طبقة التقارير بالواجهة عند تحميل الوحدة
+        from alhisabat.ui.core import format as _fmt
+        return _fmt.amount_in_words(amount, currency)
+    except Exception:  # noqa: BLE001 — التفقيط للعرض فقط؛ لا يُفشل تقريرًا
+        return ""
+
+
+def _words_lines(spec, fallback=None):
+    """قائمة أسطر التفقيط لإجماليات المواصفة (فارغة إن لا شيء يُكتب)."""
+    cur0 = str(spec.get("currency") or fallback or "").strip().upper()
+    lines = []
+    for t in spec.get("totals") or []:
+        v = t.get("value")
+        if t.get("no_words") or isinstance(v, bool) or not isinstance(v, (Decimal, int)) or v == 0:
+            continue
+        cur = str(t.get("currency") or cur0).strip().upper()
+        if not cur:
+            continue
+        txt = _amount_in_words(abs(Decimal(v)), cur)
+        if not txt:
+            continue
+        label = str(t.get("words_label") or t.get("label") or "").strip()
+        if v < 0:
+            label = (label + " (سالب)").strip()
+        lines.append(f"{label}: {txt}" if label else txt)
+    return lines
+
+
+def total_tips(spec, fallback=None):
+    """تفقيط كل إجمالي على حدة بنفس ترتيب `spec["totals"]` (نص فارغ حيث لا يُكتب: صفر/بلا عملة/no_words) — لتلميح الماوس."""
+    cur0 = str(spec.get("currency") or fallback or "").strip().upper()
+    tips = []
+    for t in spec.get("totals") or []:
+        v = t.get("value")
+        cur = str(t.get("currency") or cur0).strip().upper()
+        if t.get("no_words") or isinstance(v, bool) or not isinstance(v, (Decimal, int)) or v == 0 or not cur:
+            tips.append(""); continue
+        txt = _amount_in_words(abs(Decimal(v)), cur)
+        tips.append((txt + (" (سالب)" if v < 0 else "")) if txt else "")
+    return tips
+
+
+def words_for_spec(spec, fallback=None):
+    """نص التفقيط الجاهز للعرض: المُجهَّز في المواصفة إن وُجد، وإلا المشتق من الإجماليات (أسطر مفصولة بـ «\\n»)."""
+    if spec.get("amount_words"):
+        return spec["amount_words"]
+    return "\n".join(_words_lines(spec, fallback))
+
+
+def attach_words(spec, fallback=None):
+    """يضع `amount_words` في المواصفة إن كان فارغًا ويعيدها (للاستعمال في آخر كل باني تقرير)."""
+    if not spec.get("amount_words"):
+        w = words_for_spec(spec, fallback)
+        if w:
+            spec["amount_words"] = w
+    return spec
+
+
+def split_lines(text):
+    """أسطر التفقيط غير الفارغة من نص `amount_words` (للعرض سطرًا سطرًا في HTML/XLSX)."""
+    return [p.strip() for p in str(text or "").split("\n") if p.strip()]

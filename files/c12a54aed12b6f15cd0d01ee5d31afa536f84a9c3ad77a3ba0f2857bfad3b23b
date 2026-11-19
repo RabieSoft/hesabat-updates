@@ -1,0 +1,189 @@
+"""الإقفال الشهري (نطاق تواريخ حر) فوق محرك الفترات الحالي دون استبداله.
+
+- الإقفال الشهري يقفل الفترة فقط (يمنع الترحيل/التعديل العادي فيها): لا يصفّر الإيرادات والمصروفات ولا ينشئ أي قيد.
+- قبل الإقفال: فحص شامل (مسودات، مستندات معلقة، توازن القيود والميزان، مطابقة الأطراف والصناديق والمخزون عبر التشخيص).
+  أي خطأ مؤكد يمنع الإقفال؛ والملاحظات القابلة للمراجعة تظهر كتحذيرات.
+- حرية النطاق: إن لم يطابق تاريخا البداية/النهاية حدود الفترات فتُقسَّم الفترة الحدّية (لا تُقسَّم إن كان على جانبيها قيود
+  لأن القيود المرحّلة لا يُنقل ارتباطها بفترتها).
+- إعادة الفتح تتطلب صلاحية period.reopen وسببًا، وتُسجَّل (المستخدم + التاريخ + السبب + النطاق) في period_close_log وسجل التدقيق.
+"""
+from datetime import date, timedelta
+
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.accounting import balance_engine as be, diagnostics, fx_engine, period_engine as pe
+from alhisabat.audit import audit
+from alhisabat.database.tx import transaction
+from alhisabat.security import permissions
+
+# ملاحظات تُعرض كتحذير لا كمانع في الإقفال الشهري (تخص السنة/الإقفال السنوي أو تقييم العملات الاختياري شهريًا)
+WARN_ONLY = {"fx_unrealized", "account_nature", "inactive_with_movement", "bank_unmatched", "mapping_missing", "unposted_drafts"}
+
+
+def _iso(v):
+    return v.isoformat() if isinstance(v, date) else str(v)[:10]
+
+
+def _company_year(conn, company_id, start, end):
+    if start > end:
+        raise AccountingError("تاريخ بداية الفترة بعد تاريخ نهايتها")
+    ys = be.same_year(conn, company_id, start, end)           # يرمي إن خرج النطاق عن سنة واحدة
+    y = conn.execute("SELECT * FROM fiscal_years WHERE company_id=? AND start_date=?", (company_id, ys)).fetchone()
+    return y
+
+
+def periods_in_range(conn, company_id, start, end):
+    return conn.execute(
+        "SELECT p.* FROM fiscal_periods p JOIN fiscal_years y ON y.id=p.fiscal_year_id WHERE y.company_id=? "
+        "AND p.end_date>=? AND p.start_date<=? ORDER BY p.start_date", (company_id, start, end)).fetchall()
+
+
+def _entries_count(conn, period_id, d_from=None, d_to=None):
+    q, a = "SELECT COUNT(*) FROM journal_entries WHERE period_id=?", [period_id]
+    if d_from:
+        q += " AND entry_date>=?"; a.append(d_from)
+    if d_to:
+        q += " AND entry_date<=?"; a.append(d_to)
+    return conn.execute(q, a).fetchone()[0]
+
+
+def _split(conn, user_id, company_id, p, first_day_of_right):
+    """يقسم فترة مفتوحة إلى [بداية..اليوم السابق] و[first_day_of_right..نهاية]. يحافظ على ارتباط القيود بفترتها."""
+    if p["status"] != "open":
+        raise AccountingError(f"الفترة «{p['name']}» مقفلة: أعد فتحها أولًا لتعديل حدودها")
+    left_n = _entries_count(conn, p["id"], None, (date.fromisoformat(first_day_of_right) - timedelta(days=1)).isoformat())
+    right_n = _entries_count(conn, p["id"], first_day_of_right, None)
+    if left_n and right_n:
+        raise AccountingError(f"لا يمكن تقسيم الفترة «{p['name']}» عند {first_day_of_right}: توجد قيود على جانبيها. "
+                              "اختر تاريخًا يطابق حدود الفترة أو يقع قبل أول قيد/بعد آخر قيد فيها")
+    left_end = (date.fromisoformat(first_day_of_right) - timedelta(days=1)).isoformat()
+    no = p["period_no"]
+    with transaction(conn):
+        # إزاحة أرقام الفترات اللاحقة (قيد التفرد UNIQUE(year,no)) عبر قيم سالبة مؤقتة
+        conn.execute("UPDATE fiscal_periods SET period_no=-(period_no+1) WHERE fiscal_year_id=? AND period_no>?", (p["fiscal_year_id"], no))
+        conn.execute("UPDATE fiscal_periods SET period_no=-period_no WHERE fiscal_year_id=? AND period_no<0", (p["fiscal_year_id"],))
+        left_name, right_name = p["name"], f"{p['name']} (تابع)"
+        if right_n:       # الفترة الأصلية (بقيودها) تبقى اليمنى؛ اليسرى جديدة وفارغة
+            conn.execute("UPDATE fiscal_periods SET period_no=?, start_date=? WHERE id=?", (no + 1, first_day_of_right, p["id"]))
+            conn.execute("INSERT INTO fiscal_periods(fiscal_year_id,period_no,name,start_date,end_date) VALUES(?,?,?,?,?)",
+                         (p["fiscal_year_id"], no, left_name, p["start_date"], left_end))
+        else:             # الأصلية تبقى اليسرى؛ اليمنى جديدة وفارغة
+            conn.execute("UPDATE fiscal_periods SET end_date=? WHERE id=?", (left_end, p["id"]))
+            conn.execute("INSERT INTO fiscal_periods(fiscal_year_id,period_no,name,start_date,end_date) VALUES(?,?,?,?,?)",
+                         (p["fiscal_year_id"], no + 1, right_name, first_day_of_right, p["end_date"]))
+        audit.log(conn, user_id, "split_period", "fiscal_periods", p["id"], {"start": p["start_date"], "end": p["end_date"]},
+                  {"split_at": first_day_of_right}, "ضبط حدود فترة لإقفال نطاق حر")
+        conn.execute("INSERT INTO period_close_log(company_id,action,range_start,range_end,periods_count,reason,performed_by) VALUES(?,?,?,?,?,?,?)",
+                     (company_id, "split", p["start_date"], p["end_date"], 2, f"تقسيم عند {first_day_of_right}", user_id))
+
+
+def align_range(conn, user_id, company_id, start, end):
+    """يجعل حدود الفترات تطابق [start,end] تمامًا بتقسيم الفترتين الحدّيتين عند الحاجة. يرمي إن تعذّر بأمان."""
+    start, end = _iso(start), _iso(end)
+    permissions.require(conn, user_id, company_id, "period.close", check_branch=False)
+    _company_year(conn, company_id, start, end)
+    with transaction(conn):
+        first = next((p for p in periods_in_range(conn, company_id, start, end) if p["start_date"] <= start <= p["end_date"]), None)
+        if first and first["start_date"] < start:
+            _split(conn, user_id, company_id, first, start)
+        last = next((p for p in periods_in_range(conn, company_id, start, end) if p["start_date"] <= end <= p["end_date"]), None)
+        if last and last["end_date"] > end:
+            _split(conn, user_id, company_id, last, (date.fromisoformat(end) + timedelta(days=1)).isoformat())
+    return periods_in_range(conn, company_id, start, end)
+
+
+def precheck_range(conn, user_id, company_id, start, end):
+    """فحص ما قبل الإقفال الشهري. يعيد {ok, periods, checks[{name,status(pass/warn/fail),detail,finding?}]}."""
+    start, end = _iso(start), _iso(end)
+    permissions.require(conn, user_id, company_id, "report.view", check_branch=False)
+    y = _company_year(conn, company_id, start, end)
+    ck = []
+
+    def add(name, status, detail="", finding=None):
+        ck.append({"name": name, "status": status, "detail": detail, "finding": finding})
+    pers = periods_in_range(conn, company_id, start, end)
+    aligned = bool(pers) and pers[0]["start_date"] == start and pers[-1]["end_date"] == end
+    add("النطاق يطابق حدود الفترات المالية", "pass" if aligned else "fail",
+        "" if aligned else "حدود النطاق تقع داخل فترة: استعمل «ضبط حدود النطاق» ليقسّم الفترة الحدّية بأمان")
+    add("السنة المالية مفتوحة", "pass" if y["status"] == "open" else "fail", "" if y["status"] == "open" else "السنة مقفلة: أعد فتح السنة أولًا")
+    already = [p["name"] for p in pers if p["status"] == "closed"]
+    add("الفترات غير مقفلة مسبقًا", "pass" if not already else "warn", "،".join(already))
+    older = conn.execute("SELECT name FROM fiscal_periods WHERE fiscal_year_id=? AND status='open' AND end_date<?", (y["id"], start)).fetchall()
+    add("الفترات الأقدم مقفلة (يُنصح بالإقفال بالتسلسل)", "pass" if not older else "warn", "،".join(r[0] for r in older))
+    drafts = conn.execute("SELECT COUNT(*) FROM journal_entries WHERE company_id=? AND status='draft' AND entry_date BETWEEN ? AND ?",
+                          (company_id, start, end)).fetchone()[0]
+    add("لا قيود مسودة ضمن النطاق", "pass" if not drafts else "fail", f"{drafts} مسودة" if drafts else "")
+    docs = 0
+    for tbl, col in (("sales_invoices", "invoice_date"), ("purchase_invoices", "invoice_date"), ("cash_vouchers", "voucher_date"),
+                     ("stock_counts", "count_date"), ("payroll_runs", "pay_date"), ("asset_depreciation_runs", "run_date")):
+        docs += conn.execute(f"SELECT COUNT(*) FROM {tbl} WHERE company_id=? AND status='draft' AND {col} BETWEEN ? AND ?", (company_id, start, end)).fetchone()[0]
+    add("لا مستندات مسودة (فواتير/سندات/جرد/رواتب) ضمن النطاق", "pass" if not docs else "fail", f"{docs} مستند" if docs else "")
+    bad = conn.execute(
+        f"SELECT COUNT(*) FROM journal_entries e WHERE e.company_id=? AND e.status IN {be.POSTED} AND e.entry_date BETWEEN ? AND ? AND ("
+        "(SELECT COALESCE(SUM(debit_base),0) FROM journal_lines WHERE entry_id=e.id)<>(SELECT COALESCE(SUM(credit_base),0) FROM journal_lines WHERE entry_id=e.id))",
+        (company_id, start, end)).fetchone()[0]
+    add("قيود النطاق متوازنة", "pass" if not bad else "fail", f"{bad} قيد غير متوازن" if bad else "")
+    diag = diagnostics.run_diagnostics(conn, user_id, company_id, as_of=end)
+    seen = set()
+    for f in diag["findings"]:
+        if f["code"] in ("unposted_drafts",):          # مغطّاة أعلاه بنطاق التاريخ
+            continue
+        st = "fail" if (f["severity"] == diagnostics.CONFIRMED and f["code"] not in WARN_ONLY) else "warn"
+        key = (f["code"], f["subject"])
+        if key in seen:
+            continue
+        seen.add(key)
+        add(f["title"], st, f"{f['subject']} — {f['cause']}", f)
+    if not any(c["finding"] for c in ck):
+        add("مطابقة الأرصدة (دفتر الأستاذ، الميزان، الأطراف، الصناديق، المخزون، العملات)", "pass")
+    return {"ok": all(c["status"] != "fail" for c in ck), "periods": [dict(p) for p in pers], "checks": ck, "range": [start, end],
+            "note": "الإقفال الشهري لا يصفّر الإيرادات والمصروفات ولا ينشئ قيد إقفال سنوي"}
+
+
+def close_range(conn, user_id, company_id, start, end, *, align=False):
+    """يقفل كل الفترات ضمن النطاق في معاملة واحدة بعد اجتياز الفحص. لا ينشئ قيودًا."""
+    start, end = _iso(start), _iso(end)
+    permissions.require(conn, user_id, company_id, "period.close", check_branch=False)
+    with transaction(conn):
+        if align:
+            align_range(conn, user_id, company_id, start, end)
+        chk = precheck_range(conn, user_id, company_id, start, end)
+        fails = [c for c in chk["checks"] if c["status"] == "fail"]
+        if fails:
+            raise AccountingError("تعذر الإقفال الشهري: " + "؛ ".join(f"{c['name']} ({c['detail']})" if c["detail"] else c["name"] for c in fails))
+        todo = [p for p in chk["periods"] if p["status"] == "open"]
+        if not todo:
+            raise AccountingError("كل الفترات في النطاق مقفلة بالفعل")
+        for p in todo:
+            pe.close_period(conn, p["id"], user_id)
+        warns = [c["name"] for c in chk["checks"] if c["status"] == "warn"]
+        conn.execute("INSERT INTO period_close_log(company_id,action,range_start,range_end,periods_count,checks_summary,performed_by) VALUES(?,?,?,?,?,?,?)",
+                     (company_id, "close", start, end, len(todo), "تحذيرات: " + "،".join(warns) if warns else "بلا تحذيرات", user_id))
+        audit.log(conn, user_id, "close_range", "fiscal_periods", todo[0]["id"], {"status": "open"},
+                  {"status": "closed", "range": [start, end], "periods": len(todo), "warnings": warns})
+    return {"closed": len(todo), "warnings": warns, "range": [start, end]}
+
+
+def reopen_range(conn, user_id, company_id, start, end, reason):
+    """إعادة فتح الفترات المقفلة ضمن النطاق بصلاحية period.reopen وبسبب إلزامي (يُسجَّل السبب والمستخدم والتاريخ)."""
+    start, end = _iso(start), _iso(end)
+    if not reason or not reason.strip():
+        raise AccountingError("إعادة فتح الفترة تتطلب ذكر السبب")
+    permissions.require(conn, user_id, company_id, "period.reopen", check_branch=False)
+    y = _company_year(conn, company_id, start, end)
+    if y["status"] != "open":
+        raise AccountingError("السنة المالية مقفلة: أعد فتح السنة (بصلاحيتها وسببها) قبل إعادة فتح فترة منها")
+    todo = [p for p in periods_in_range(conn, company_id, start, end) if p["status"] == "closed"]
+    if not todo:
+        raise AccountingError("لا توجد فترات مقفلة في النطاق")
+    with transaction(conn):
+        for p in todo:
+            pe.reopen_period(conn, p["id"], user_id, reason)
+        conn.execute("INSERT INTO period_close_log(company_id,action,range_start,range_end,periods_count,reason,performed_by) VALUES(?,?,?,?,?,?,?)",
+                     (company_id, "reopen", start, end, len(todo), reason, user_id))
+    return {"reopened": len(todo), "range": [start, end]}
+
+
+def log(conn, user_id, company_id, limit=100):
+    permissions.require(conn, user_id, company_id, "report.view", check_branch=False)
+    return conn.execute("SELECT l.*, u.full_name FROM period_close_log l LEFT JOIN users u ON u.id=l.performed_by WHERE l.company_id=? "
+                        "ORDER BY l.id DESC LIMIT ?", (company_id, limit)).fetchall()

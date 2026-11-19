@@ -1,0 +1,76 @@
+"""واجهة استعلام موحّدة لسجل التدقيق (audit_log) بدل الاستعلام المباشر المبعثر في كل وحدة. audit_log جدول واحد
+عبر كل الشركات (بلا عمود company_id، لأن كثيرا من أحداثه — مثل رفض صلاحية أو نسخة احتياطية — لا يخص شركة واحدة
+أصلا)، فتصفيته حسب الشركة تتطلب معرفة الجدول (table_name) للربط بعمود company_id الخاص به؛ لذلك تصفية بشركة
+بلا تحديد نوع الجدول مرفوضة صراحة بدل نتيجة مضلِّلة."""
+import csv
+import io
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.security import permissions
+
+# الجداول الرئيسية التي يُسجَّل عليها تدقيق ولها عمود شركة مباشر يمكن الربط به
+COMPANY_SCOPED_TABLES = {
+    "companies": None, "journal_entries": "company_id", "fiscal_years": "company_id", "fiscal_periods": None,
+    "accounts": "company_id", "parties": "company_id", "items": "company_id", "warehouses": "company_id",
+    "units": "company_id", "cost_centers": "company_id", "cash_accounts": "company_id", "tax_rates": "company_id",
+    "exchange_rates": "company_id", "sales_invoices": "company_id", "purchase_invoices": "company_id",
+    "cash_vouchers": "company_id", "cash_transfers": "company_id", "cash_counts": "company_id",
+    "stock_counts": "company_id", "stock_movements": "company_id", "payroll_runs": "company_id",
+    "fixed_assets": "company_id", "asset_depreciation_runs": "company_id", "import_batches": "company_id",
+    "account_mappings": "company_id", "user_roles": "company_id", "user_branch_access": None,
+    "closing_settings": "company_id", "journal_settings": "company_id", "sales_settings": "company_id",
+    "numbering_settings": "company_id", "branches": "company_id", "year_closings": "company_id",
+}
+
+
+def _has_audit_view_anywhere(conn, user_id):
+    return conn.execute("SELECT 1 FROM user_roles ur JOIN role_permissions rp ON rp.role_id=ur.role_id "
+                        "WHERE ur.user_id=? AND rp.permission_code='audit.view' LIMIT 1", (user_id,)).fetchone() is not None
+
+
+def search(conn, user_id, company_id=None, *, table_name=None, action=None, record_id=None, user_filter=None,
+          date_from=None, date_to=None, limit=50, offset=0):
+    """يعيد صفوف audit_log، الأحدث أولا. تصفية بشركة تتطلب table_name من COMPANY_SCOPED_TABLES."""
+    if company_id is not None:
+        permissions.require(conn, user_id, company_id, "audit.view", check_branch=False)
+    elif not _has_audit_view_anywhere(conn, user_id):
+        raise permissions.PermissionDenied("ليس لديك صلاحية عرض سجل التدقيق")
+    q, args = "SELECT * FROM audit_log WHERE 1=1", []
+    if company_id is not None:
+        if not table_name:
+            raise AccountingError("تصفية سجل التدقيق حسب الشركة تتطلب تحديد نوع الجدول (table_name)")
+        if table_name not in COMPANY_SCOPED_TABLES:
+            raise AccountingError(f"الجدول «{table_name}» غير معروف لتصفية التدقيق")
+        col = COMPANY_SCOPED_TABLES[table_name]
+        if col is None:
+            if table_name == "companies":
+                q += " AND table_name=? AND record_id=?"; args += [table_name, company_id]
+            else:
+                raise AccountingError(f"لا يمكن تصفية الجدول «{table_name}» حسب الشركة (لا يحمل عمود شركة مباشرا)")
+        else:
+            q += f" AND table_name=? AND record_id IN (SELECT id FROM {table_name} WHERE {col}=?)"
+            args += [table_name, company_id]
+    elif table_name:
+        q += " AND table_name=?"; args.append(table_name)
+    if action is not None:
+        q += " AND action=?"; args.append(action)
+    if record_id is not None:
+        q += " AND record_id=?"; args.append(record_id)
+    if user_filter is not None:
+        q += " AND user_id=?"; args.append(user_filter)
+    if date_from is not None:
+        q += " AND at>=?"; args.append(date_from)
+    if date_to is not None:
+        q += " AND at<=?"; args.append(date_to)
+    q += " ORDER BY id DESC LIMIT ? OFFSET ?"
+    args += [min(int(limit), 500), int(offset)]
+    return [dict(r) for r in conn.execute(q, args)]
+
+
+def export_csv(rows):
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    cols = ["id", "at", "user_id", "action", "table_name", "record_id", "reason", "before_json", "after_json"]
+    w.writerow(cols)
+    for r in rows:
+        w.writerow([r.get(c, "") for c in cols])
+    return buf.getvalue().encode("utf-8-sig")

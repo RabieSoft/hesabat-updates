@@ -1,0 +1,142 @@
+"""تقارير المكتبي للهاتف (GET /v1/reports/{code}) بالشكل العام: title/summary/columns/rows/totals (docs/SYNC_API_V2.md في مشروع الأندرويد).
+
+- ميزان المراجعة، قائمة الدخل، المركز المالي، دليل الحسابات: من دوال «مواصفات الطباعة» نفسها التي تعتمدها الواجهة المكتبية.
+- حركة الصنف تفصيلي (item_movement): تجميع بنود الفواتير المرحّلة لكل صنف مع تصفية: فترة، مخزن، نوع الفاتورة، حساب، صنف.
+  المبالغ دائمًا بالعملة الأساسية (المعادل بسعر كل فاتورة).
+المبالغ تُرسل كأعداد صحيحة بالوحدة الصغرى (÷100) لتطابق type=money في التطبيق، والكميات بالألف (type=qty).
+"""
+from datetime import date
+from decimal import Decimal, ROUND_HALF_UP
+
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.reporting import printing
+
+KINDS = {"sales": ("sales_invoices", "sales_invoice_lines", "customer_id", "invoice", 1, "مبيعات"),
+         "sales_return": ("sales_invoices", "sales_invoice_lines", "customer_id", "return", -1, "مرتجع مبيعات"),
+         "purchases": ("purchase_invoices", "purchase_invoice_lines", "supplier_id", "invoice", 1, "مشتريات"),
+         "purchases_return": ("purchase_invoices", "purchase_invoice_lines", "supplier_id", "return", -1, "مرتجع مشتريات")}
+
+DEFS = (
+    {"code": "item_movement", "title": "حركة الصنف تفصيلي", "subtitle": "مبيعات ومشتريات كل صنف بتصفية متقدمة", "ranged": True, "currency": False},
+    {"code": "trial_balance", "title": "ميزان المراجعة", "subtitle": "أرصدة الحسابات ومجاميع الحركة", "ranged": True, "currency": False},
+    {"code": "income_statement", "title": "قائمة الدخل", "subtitle": "الإيرادات والتكلفة والمصروفات وصافي النتيجة", "ranged": True, "currency": False},
+    {"code": "balance_sheet", "title": "المركز المالي (رأس المال)", "subtitle": "الأصول والخصوم وحقوق الملكية حتى تاريخ", "ranged": True, "currency": False},
+    {"code": "accounts_chart", "title": "دليل الحسابات", "subtitle": "شجرة الحسابات وأنواعها", "ranged": False, "currency": False},
+)
+
+
+def definitions(can):
+    return [dict(d) for d in DEFS] if can("report.view") else []
+
+
+def _iso(v, name):
+    try:
+        return date.fromisoformat(str(v)).isoformat()
+    except (TypeError, ValueError):
+        raise AccountingError(f"{name}: صيغة التاريخ يجب أن تكون YYYY-MM-DD")
+
+
+def _minor(v):
+    return None if v is None else int((Decimal(v) * 100).quantize(Decimal(1), ROUND_HALF_UP))
+
+
+def _from_spec(spec):
+    """مواصفة الطباعة ← شكل الهاتف العام. الأعمدة الرقمية money، وإجماليات التقرير في summary."""
+    cols = [{"key": c["key"], "label": c["label"], **({"type": "money"} if c.get("numeric") else {})} for c in spec["columns"]]
+    money = {c["key"] for c in cols if c.get("type") == "money"}
+    rows = [{k: (_minor(v) if k in money and v is not None else (v if v is None or isinstance(v, (int, str)) else str(v)))
+             for k, v in r.items() if k in {c["key"] for c in cols}} for r in spec["rows"]]
+    summary = [{"label": t["label"], "value": _minor(t["value"]), "type": "money"} for t in spec.get("totals", []) if t.get("value") is not None]
+    return {"title": spec["title"], "period": spec.get("period"), "summary": summary, "columns": cols, "rows": rows}
+
+
+def _accounts_chart(s):
+    s.require("account.view")
+    rows = [{"code": r["code"], "name": r["name"], "type": r["account_type"], "kind": "مجموعة" if r["is_group"] else "حساب"}
+            for r in s.conn.execute("SELECT code,name,account_type,is_group FROM accounts WHERE company_id=? AND is_active=1 ORDER BY code", (s.company_id,))]
+    return {"title": "دليل الحسابات", "summary": [{"label": "عدد الحسابات", "value": len(rows)}],
+            "columns": [{"key": "code", "label": "الرقم"}, {"key": "name", "label": "الحساب"}, {"key": "type", "label": "النوع"}, {"key": "kind", "label": "التصنيف"}],
+            "rows": rows}
+
+
+def _item_movement(s, d):
+    s.require("report.view")
+    kind = str(d.get("kind") or "all")
+    if kind != "all" and kind not in KINDS:
+        raise AccountingError("نوع الفواتير غير معروف")
+    wh = int(d["warehouse_id"]) if d.get("warehouse_id") else None
+    party = int(d["party_id"]) if d.get("party_id") else None
+    item = int(d["item_id"]) if d.get("item_id") else None
+    kinds = [kind] if kind != "all" else list(KINDS)
+    agg = {}                              # (item_id, kind) → [qty_milli, total, cost, lines]
+    for k in kinds:
+        inv, lines, pcol, doc_type, sign, _label = KINDS[k]
+        q = (f"SELECT l.item_id, l.qty_milli, l.net_ex, l.cost_base_minor, i.exchange_rate FROM {lines} l JOIN {inv} i ON i.id=l.invoice_id "
+             f"WHERE i.company_id=? AND i.status='posted' AND i.doc_type=? AND i.invoice_date BETWEEN ? AND ? AND l.item_id IS NOT NULL")
+        args = [s.company_id, doc_type, d["date_from"], d["date_to"]]
+        if s.branch_id is not None:
+            q += " AND (i.branch_id IS NULL OR i.branch_id=?)"
+            args.append(s.branch_id)
+        if wh:
+            q += " AND i.warehouse_id=?"
+            args.append(wh)
+        if party:
+            q += f" AND i.{pcol}=?"
+            args.append(party)
+        if item:
+            q += " AND l.item_id=?"
+            args.append(item)
+        for r in s.conn.execute(q, args):
+            total = int((Decimal(r["net_ex"]) * Decimal(r["exchange_rate"] or 1)).quantize(Decimal(1), ROUND_HALF_UP))
+            a = agg.setdefault((r["item_id"], k), [0, 0, 0, 0])
+            a[0] += sign * r["qty_milli"]
+            a[1] += sign * total
+            a[2] += sign * (r["cost_base_minor"] or 0)
+            a[3] += 1
+    names = {r["id"]: (r["code"], r["name"]) for r in s.conn.execute("SELECT id,code,name FROM items WHERE company_id=?", (s.company_id,))}
+    rows, tot_qty, tot_amt, tot_cost, tot_profit, n_lines = [], 0, 0, 0, 0, 0
+    for (iid, k), (qty, total, cost, n) in sorted(agg.items(), key=lambda x: (names.get(x[0][0], ("", ""))[1], x[0][1])):
+        sales_side = k.startswith("sales")
+        profit = (total - cost) if sales_side else 0
+        price = int((Decimal(total) / Decimal(qty) * 1000).quantize(Decimal(1), ROUND_HALF_UP)) if qty else 0
+        rows.append({"no": names.get(iid, ("", ""))[0], "name": names.get(iid, ("", "؟"))[1], "kind": KINDS[k][5],
+                     "qty": qty, "price": price, "cost": cost, "total": total, "profit": profit})
+        tot_qty += qty
+        tot_amt += total if sales_side else 0
+        tot_cost += cost if sales_side else 0
+        tot_profit += profit
+        n_lines += n
+    return {"title": "حركة الصنف تفصيلي",
+            "summary": [{"label": "عدد البنود", "value": n_lines}, {"label": "الكمية", "value": tot_qty, "type": "qty"},
+                        {"label": "إجمالي المبيعات", "value": tot_amt, "type": "money"}, {"label": "تكلفة المبيعات", "value": tot_cost, "type": "money"},
+                        {"label": "صافي الأرباح", "value": tot_profit, "type": "money"}],
+            "columns": [{"key": "no", "label": "الرقم"}, {"key": "name", "label": "الصنف"}, {"key": "kind", "label": "النوع"},
+                        {"key": "qty", "label": "العدد", "type": "qty"}, {"key": "price", "label": "متوسط السعر", "type": "money"},
+                        {"key": "cost", "label": "التكلفة", "type": "money"}, {"key": "total", "label": "الإجمالي", "type": "money"},
+                        {"key": "profit", "label": "الربح", "type": "money"}],
+            "rows": rows,
+            "totals": {"qty": tot_qty, "cost": tot_cost, "total": sum(r["total"] for r in rows), "profit": tot_profit}}
+
+
+def run(s, code, params):
+    """ينفّذ التقرير [code] بمعاملات الاستعلام [params] (dict نصوص) داخل جلسة المستخدم [s]."""
+    if code not in {d["code"] for d in DEFS}:
+        raise AccountingError("تقرير غير معروف")
+    today = date.today()
+    d = dict(params)
+    d["date_from"] = _iso(d.get("date_from") or f"{today.year}-01-01", "date_from")
+    d["date_to"] = _iso(d.get("date_to") or today.isoformat(), "date_to")
+    if d["date_from"] > d["date_to"]:
+        raise AccountingError("تاريخ البداية بعد تاريخ النهاية")
+    uid, cid = s.user_id, s.company_id
+    if code == "item_movement":
+        return _item_movement(s, d)
+    if code == "accounts_chart":
+        return _accounts_chart(s)
+    if code == "trial_balance":
+        spec = printing.trial_balance_print(s.conn, uid, cid, d["date_from"], d["date_to"], branch_id=s.branch_id)
+    elif code == "income_statement":
+        spec = printing.income_statement_print(s.conn, uid, cid, d["date_from"], d["date_to"], branch_id=s.branch_id)
+    else:
+        spec = printing.balance_sheet_print(s.conn, uid, cid, d["date_to"], branch_id=s.branch_id)
+    return _from_spec(spec)

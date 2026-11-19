@@ -1,0 +1,3 @@
+CREATE TRIGGER fiscal_year_closed_no_update BEFORE UPDATE ON fiscal_years
+WHEN OLD.status='closed' AND (NEW.name<>OLD.name OR NEW.start_date<>OLD.start_date OR NEW.end_date<>OLD.end_date OR NEW.company_id<>OLD.company_id OR NEW.status<>OLD.status)
+BEGIN SELECT RAISE(ABORT,'السنة المالية المقفلة غير قابلة للتعديل'); END;

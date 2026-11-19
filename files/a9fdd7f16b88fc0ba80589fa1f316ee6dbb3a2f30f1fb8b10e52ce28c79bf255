@@ -1,0 +1,79 @@
+"""الانتقال من رقم القيد (في كشف حساب أو أي تقرير أو جدول) إلى شاشة المستند الأصلي. خالص بلا PySide6.
+
+كل قيد إما مولَّد من مستند (فاتورة/سند/تحويل/مسير…) ← `source_type`+`source_id`، أو قيد يدوي ← شاشة القيود نفسها.
+القيد العكسي يُفتح في شاشة القيود (هو قيد قائم بذاته وليس المستند الأصلي).
+"""
+from dataclasses import dataclass
+from typing import Optional
+
+# source_type ← (مفتاح الصفحة، الاسم العربي)
+SOURCES = {
+    'sales_invoice': ('sales', 'فاتورة مبيعات'),
+    'sales_return': ('sales', 'مرتجع مبيعات'),
+    'purchase_invoice': ('purchases', 'فاتورة مشتريات'),
+    'purchase_return': ('purchases', 'مرتجع مشتريات'),
+    'cash_voucher': ('cash', 'سند نقدي'),
+    'cash_transfer': ('cash', 'تحويل نقدي'),
+    'cash_count': ('cash', 'جرد صندوق'),
+    'bank_statement': ('bank_recon', 'كشف بنكي'),
+    'payroll_run': ('payroll', 'مسير رواتب'),
+    'fixed_asset': ('assets', 'أصل ثابت'),
+    'fixed_asset_disposal': ('assets', 'استبعاد أصل'),
+    'asset_depreciation': ('assets', 'إهلاك أصول'),
+    'depreciation_run': ('assets', 'إهلاك أصول'),
+    'stock_count': ('stock_ops', 'جرد مخزون'),
+    'stock_adjustment': ('stock_ops', 'تسوية مخزون'),
+    'stock_opening': ('stock_ops', 'رصيد افتتاحي للمخزون'),
+    'revaluation': ('period_end', 'إعادة تقييم'),
+    'year_closing': ('period_end', 'إقفال السنة'),
+    'party_opening': ('parties', 'رصيد افتتاحي لطرف'),
+}
+SOURCE_PAGES = {k: v[0] for k, v in SOURCES.items()}      # للتوافق مع drilldown.SOURCE_PAGES
+
+
+@dataclass(frozen=True)
+class Target:
+    page: str                       # مفتاح الصفحة المراد فتحها
+    source_type: Optional[str]      # None ← القيد نفسه في شاشة القيود
+    source_id: Optional[int]
+    entry_id: Optional[int]
+    label: str                      # «فاتورة مبيعات» / «قيد محاسبي»
+
+    @property
+    def is_journal(self):
+        return self.page == 'journal'
+
+
+def journal_target(entry_id):
+    return Target('journal', None, None, int(entry_id) if entry_id else None, 'قيد محاسبي')
+
+
+def resolve(source_type=None, source_id=None, entry_id=None, entry_type=None):
+    """الهدف المناسب أو None إن لم يتوفر شيء يُفتح (لا قيد ولا مستند)."""
+    eid = int(entry_id) if entry_id else None
+    if entry_type == 'reversal' and eid:
+        return journal_target(eid)
+    if source_type in SOURCES and source_id:
+        page, label = SOURCES[source_type]
+        return Target(page, source_type, int(source_id), eid, label)
+    return journal_target(eid) if eid else None
+
+
+def request_open(widget, info):
+    """يطلب فتح المستند الأصلي من أقرب أب (صفحة) يملك الإشارة open_entry_requested. يُرجع True إن وُجد."""
+    w = widget
+    while w is not None:
+        sig = getattr(w, 'open_entry_requested', None)
+        if sig is not None:
+            sig.emit(info)
+            return True
+        parent = getattr(w, 'parent', None)
+        w = parent() if callable(parent) else None
+    return False
+
+
+def info_from_row(row, entry_key='entry_id'):
+    """معلومات الفتح من صف جدول/تقرير: entry_id أو المفتاح المعطى، وإن وُجد مصدره."""
+    row = row or {}
+    return {'entry_id': row.get(entry_key) or row.get('entry_id'),
+            'source_type': row.get('source_type'), 'source_id': row.get('source_id')}

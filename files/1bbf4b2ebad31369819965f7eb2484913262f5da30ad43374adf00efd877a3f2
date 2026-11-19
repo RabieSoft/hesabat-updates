@@ -1,0 +1,228 @@
+"""محرك الأرصدة المركزي: كل رصيد في النظام يُحسب من هنا فقط (من القيود المرحّلة/المعكوسة).
+
+قواعد:
+- المسودات لا تدخل الأرصدة.
+- الحسابات الدائمة (أصول/خصوم/حقوق) رصيدها تراكمي عبر السنوات.
+- الحسابات المؤقتة (إيرادات/تكلفة/مصروفات) رصيدها الافتتاحي يبدأ من أول السنة المالية؛ ما قبلها هو "نتيجة سنوات سابقة"
+  تنتقل بقيد الإقفال (Gate 06) وليس بالجمع.
+- الحساب التجميعي = مجموع أبنائه؛ الحسابات المدموجة تُطوى في هدف الدمج (fold_merged) حسب الافتراض.
+"""
+from collections import defaultdict
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.security import permissions
+from alhisabat.business.branch_scope import main_branch_id
+
+PERMANENT = ("asset", "liability", "equity")
+POSTED = "('posted','reversed')"
+PERM_SQL = "('asset','liability','equity')"
+
+
+def perm_floor(conn, company_id, ystart):
+    """أول يوم تُحتسب منه أرصدة الحسابات الدائمة: بداية أحدث سنة (≤ السنة المطلوبة) لها قيد افتتاح مرحّل، وإلا من البداية."""
+    r = conn.execute(
+        "SELECT MAX(y.start_date) FROM fiscal_years y WHERE y.company_id=? AND y.start_date<=? AND EXISTS("
+        "SELECT 1 FROM journal_entries e WHERE e.fiscal_year_id=y.id AND e.entry_type='opening' AND e.status='posted')",
+        (company_id, ystart)).fetchone()
+    return r[0] or "0000-01-01"
+
+
+def frag(alias="a", include_closing=True):
+    """مقاطع SQL موحّدة: eff = تاريخ التصنيف (قيد الافتتاح يُعامَل كرصيد قبل بداية السنة)،
+    counted = أي القيود تدخل في رصيد الحساب (دائم: من أرضية الافتتاح؛ مؤقت: من أول السنة)."""
+    eff = ("(CASE WHEN e.entry_type='opening' OR (e.entry_type='reversal' AND EXISTS(SELECT 1 FROM journal_entries o "
+           "WHERE o.id=e.reverses_entry_id AND o.entry_type='opening')) THEN date(:ys,'-1 day') ELSE e.entry_date END)")
+    # قيد افتتاح لا يقع عند الأرضية (وعكسه) يُستبعد: هو مجرد تكرار لأرصدة محسوبة من التاريخ، وعكسه يحيّده
+    counted = (f"(({alias}.account_type IN {PERM_SQL} AND e.entry_date>=:fl AND (e.entry_type<>'opening' OR e.entry_date=:fl)"
+               f" AND NOT (e.entry_type='reversal' AND EXISTS(SELECT 1 FROM journal_entries o WHERE o.id=e.reverses_entry_id"
+               f" AND o.entry_type='opening' AND o.entry_date<>:fl)))"
+               f" OR ({alias}.account_type NOT IN {PERM_SQL} AND e.entry_date>=:ys))")
+    return eff, counted, ("" if include_closing else " AND e.entry_type<>'closing'")
+
+
+def year_start(conn, company_id, d):
+    r = conn.execute("SELECT start_date FROM fiscal_years WHERE company_id=? AND ? BETWEEN start_date AND end_date",
+                     (company_id, d)).fetchone()
+    if not r:
+        raise AccountingError("التاريخ خارج السنوات المالية المعرّفة")
+    return r[0]
+
+
+def same_year(conn, company_id, d_from, d_to):
+    if d_from > d_to:
+        raise AccountingError("تاريخ البداية بعد تاريخ النهاية")
+    ys = year_start(conn, company_id, d_from)
+    if year_start(conn, company_id, d_to) != ys:
+        raise AccountingError("الفترة يجب أن تقع داخل سنة مالية واحدة")
+    return ys
+
+
+def branch_scope(conn, user_id, branch_id):
+    restricted = [r[0] for r in conn.execute("SELECT branch_id FROM user_branch_access WHERE user_id=?", (user_id,))]
+    if branch_id is not None:
+        if restricted and branch_id not in restricted:
+            raise permissions.PermissionDenied("ليس لديك صلاحية العمل على هذا الفرع")
+        return [branch_id]
+    return restricted or None
+
+
+def load_accounts(conn, company_id):
+    return {r["id"]: r for r in conn.execute("SELECT * FROM accounts WHERE company_id=?", (company_id,))}
+
+
+def final_target(accs, aid):
+    seen = set()
+    while accs[aid]["merged_into_id"] and aid not in seen:
+        seen.add(aid); aid = accs[aid]["merged_into_id"]
+    return aid
+
+
+def movements(conn, company_id, d_from, d_to, ystart, branches=None, cost_center_id=None, account_ids=None,
+              include_closing=True):
+    """{account_id: [open_net, period_debit, period_credit]} بالعملة الأساسية."""
+    eff, counted, extra = frag("a", include_closing)
+    where, args = extra, {"c": company_id, "f": d_from, "t": d_to, "ys": ystart, "fl": perm_floor(conn, company_id, ystart)}
+    if branches is not None:
+        keys = []
+        for i, b in enumerate(branches):
+            args[f"b{i}"] = b; keys.append(f":b{i}")
+        args["mb"] = main_branch_id(conn, company_id)
+        where += f" AND COALESCE(e.branch_id,:mb) IN ({','.join(keys)})"
+    if cost_center_id is not None:
+        where += " AND l.cost_center_id=:cc"; args["cc"] = cost_center_id
+    if account_ids is not None:
+        keys = []
+        for i, a in enumerate(account_ids):
+            args[f"a{i}"] = a; keys.append(f":a{i}")
+        where += f" AND l.account_id IN ({','.join(keys) or 'NULL'})"
+    rows = conn.execute(
+        f"""SELECT l.account_id,
+              COALESCE(SUM(CASE WHEN {eff} < :f THEN l.debit_base - l.credit_base ELSE 0 END),0) open_net,
+              COALESCE(SUM(CASE WHEN {eff} BETWEEN :f AND :t THEN l.debit_base ELSE 0 END),0) pd,
+              COALESCE(SUM(CASE WHEN {eff} BETWEEN :f AND :t THEN l.credit_base ELSE 0 END),0) pc
+            FROM journal_lines l JOIN journal_entries e ON e.id=l.entry_id JOIN accounts a ON a.id=l.account_id
+            WHERE e.company_id=:c AND e.status IN {POSTED} AND e.entry_date <= :t AND {counted} {where}
+            GROUP BY l.account_id""", args).fetchall()
+    return {r["account_id"]: [r["open_net"], r["pd"], r["pc"]] for r in rows}
+
+
+def aggregate(accs, mov, fold_merged=True):
+    """يطوي المدموج ثم يجمع الأبناء في الآباء. يرجع {account_id: [open_net, pd, pc]} لكل الحسابات."""
+    tot = {aid: [0, 0, 0] for aid in accs}
+    for aid, v in mov.items():
+        t = final_target(accs, aid) if fold_merged else aid
+        for i in range(3):
+            tot[t][i] += v[i]
+    for a in sorted(accs.values(), key=lambda x: -x["level"]):
+        if a["parent_id"] is not None:
+            p = tot[a["parent_id"]]
+            for i in range(3):
+                p[i] += tot[a["id"]][i]
+    return tot
+
+
+def _split(net):
+    return (net, 0) if net >= 0 else (0, -net)
+
+
+def prior_unclosed_result(conn, company_id, as_of):
+    """صافي (مدين - دائن) للحسابات المؤقتة بين أرضية الافتتاح وبداية سنة as_of ولم يُقفل بعد (بعد الإقفال = 0)."""
+    ys = year_start(conn, company_id, as_of)
+    fl = perm_floor(conn, company_id, ys)
+    r = conn.execute(
+        f"SELECT COALESCE(SUM(l.debit_base-l.credit_base),0) FROM journal_lines l JOIN journal_entries e ON e.id=l.entry_id "
+        f"JOIN accounts a ON a.id=l.account_id WHERE e.company_id=? AND e.status IN {POSTED} AND e.entry_date>=? AND e.entry_date<? "
+        f"AND a.account_type NOT IN {PERM_SQL}", (company_id, fl, ys)).fetchone()
+    return r[0]
+
+
+def trial_balance(conn, user_id, company_id, date_from, date_to, *, branch_id=None, cost_center_id=None,
+                  max_level=None, hide_zero=False, fold_merged=True, include_closing=True):
+    permissions.require(conn, user_id, company_id, "report.view", check_branch=False)
+    ys = same_year(conn, company_id, date_from, date_to)
+    branches = branch_scope(conn, user_id, branch_id)
+    accs = load_accounts(conn, company_id)
+    tot = aggregate(accs, movements(conn, company_id, date_from, date_to, ys, branches, cost_center_id,
+                                    include_closing=include_closing), fold_merged)
+    rows, T = [], defaultdict(int)
+    for a in sorted(accs.values(), key=lambda x: x["code"]):
+        o, pd, pc = tot[a["id"]]
+        close = o + pd - pc
+        if hide_zero and o == pd == pc == 0 and close == 0:
+            continue
+        if max_level is not None and a["level"] > max_level:
+            continue
+        od, oc = _split(o); cd, cc = _split(close)
+        rows.append({"account_id": a["id"], "code": a["code"], "name": a["name"], "level": a["level"],
+                     "account_type": a["account_type"], "is_group": bool(a["is_group"]), "is_active": bool(a["is_active"]),
+                     "opening_debit": od, "opening_credit": oc, "period_debit": pd, "period_credit": pc,
+                     "closing_debit": cd, "closing_credit": cc})
+        if not a["is_group"]:      # الإجماليات من حسابات الحركة فقط حتى لا يتكرر الجمع
+            T["opening_net"] += o; T["period_debit"] += pd; T["period_credit"] += pc; T["closing_net"] += close
+            T["opening_debit"] += od; T["opening_credit"] += oc; T["closing_debit"] += cd; T["closing_credit"] += cc
+    prior = prior_unclosed_result(conn, company_id, date_from)
+    totals = {k: T[k] for k in ("opening_debit", "opening_credit", "period_debit", "period_credit",
+                                "closing_debit", "closing_credit")}
+    return {"rows": rows, "totals": totals,
+            "period_balanced": totals["period_debit"] == totals["period_credit"],
+            "opening_difference": T["opening_net"], "closing_difference": T["closing_net"],
+            # الفرق غير الصفري طبيعي فقط إذا كانت نتيجة سنوات سابقة لم تُقفل بعد (قبل Gate 06)
+            "unclosed_prior_result": prior,
+            "differences_explained_by_unclosed_prior_result":
+                (T["opening_net"] == -prior and T["closing_net"] == -prior) if branches is None else None}
+
+
+def subtree_ids(conn, account_id, include_merged=True):
+    cond = "a.parent_id=t.id OR a.merged_into_id=t.id" if include_merged else "a.parent_id=t.id"
+    q = f"WITH RECURSIVE t(id) AS (SELECT ? UNION SELECT a.id FROM accounts a JOIN t ON {cond}) SELECT id FROM t"
+    return [r[0] for r in conn.execute(q, (account_id,))]
+
+
+def account_summary(conn, user_id, company_id, account_id, date_from, date_to, *, branch_id=None, cost_center_id=None,
+                    include_closing=True):
+    """ملخص الحساب (المواصفات §27): رصيد بداية السنة، مدين/دائن الفترة، الرصيد النهائي، وحسب العملة الأصلية."""
+    permissions.require(conn, user_id, company_id, "account.view", check_branch=False)
+    permissions.require(conn, user_id, company_id, "report.view", check_branch=False)
+    accs = load_accounts(conn, company_id)
+    a = accs.get(account_id)
+    if not a:
+        raise AccountingError("الحساب غير موجود في هذه الشركة")
+    ys = same_year(conn, company_id, date_from, date_to)
+    branches = branch_scope(conn, user_id, branch_id)
+    ids = subtree_ids(conn, account_id)
+    ids = [i for i in ids if i in accs]
+    mov = movements(conn, company_id, date_from, date_to, ys, branches, cost_center_id, ids, include_closing)
+    o = pd = pc = 0
+    for i in ids:
+        v = mov.get(i)
+        if v:
+            o += v[0]; pd += v[1]; pc += v[2]
+    year_open = movements(conn, company_id, ys, ys, ys, branches, cost_center_id, ids, include_closing)   # الرصيد قبل أول يوم في السنة
+    y_open = sum(v[0] for v in year_open.values())
+    close = o + pd - pc
+    sign = 1 if a["nature"] == "debit" else -1
+    eff, counted, extra = frag("x", include_closing)
+    args = {"c": company_id, "t": date_to, "ys": ys, "fl": perm_floor(conn, company_id, ys)}
+    where = extra
+    if branches is not None:
+        where += " AND e.branch_id IN (%s)" % ",".join(f":b{i}" for i in range(len(branches)))
+        args.update({f"b{i}": b for i, b in enumerate(branches)})
+    keys = ",".join(f":a{i}" for i in range(len(ids)))
+    args.update({f"a{i}": x for i, x in enumerate(ids)})
+    cur = conn.execute(
+        f"""SELECT l.currency, SUM(l.debit_orig) d, SUM(l.credit_orig) c, SUM(l.debit_base) bd, SUM(l.credit_base) bc
+            FROM journal_lines l JOIN journal_entries e ON e.id=l.entry_id JOIN accounts x ON x.id=l.account_id
+            WHERE e.company_id=:c AND e.status IN {POSTED} AND e.entry_date<=:t AND l.account_id IN ({keys}) {where}
+              AND {counted}
+            GROUP BY l.currency ORDER BY l.currency""", args).fetchall()
+    return {"account_id": account_id, "code": a["code"], "name": a["name"], "nature": a["nature"],
+            "opening_net": o, "year_opening_net": y_open, "period_debit": pd, "period_credit": pc, "closing_net": close,
+            "opening_balance": sign * o, "year_opening_balance": sign * y_open, "closing_balance": sign * close,
+            "by_currency": [{"currency": r["currency"], "debit_orig": r["d"], "credit_orig": r["c"],
+                             "net_orig": sign * (r["d"] - r["c"]), "net_base": sign * (r["bd"] - r["bc"])} for r in cur]}
+
+
+def account_balance(conn, user_id, company_id, account_id, as_of, *, branch_id=None):
+    """الرصيد الرسمي للحساب (مع أبنائه والمدموج فيه) حتى تاريخ معيّن، بطبيعة الحساب."""
+    ys = year_start(conn, company_id, as_of)
+    s = account_summary(conn, user_id, company_id, account_id, ys, as_of, branch_id=branch_id)
+    return s["closing_balance"]

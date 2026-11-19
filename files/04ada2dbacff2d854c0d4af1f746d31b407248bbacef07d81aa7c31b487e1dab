@@ -1,0 +1,326 @@
+"""EntryTable: جدول إدخال سريع مرن (لأرصدة أول المدة وأي شاشة بنود).
+
+- أعمدة بأنواع: item/combo (بحث بالكتابة مع اقتراحات) · qty/money (أرقام عربية أو لاتينية) · date (يقبل 05/2027) · text · ro (للقراءة).
+- Enter/Tab ينقل للخلية التالية ويفتح محررها؛ كتابة في آخر سطر تضيف سطرًا جديدًا تلقائيًا؛ Del يحذف السطر.
+- الأعمدة قابلة لتغيير العرض بالسحب والجدول يتمدد مع النافذة. الخلايا الخاطئة تُلوَّن مع تلميح السبب (ألوان من tokens).
+- خفيف للآلاف من الأسطر: خلايا نصية عادية (لا ودجت لكل خلية) والمحررات تُنشأ عند التحرير فقط.
+المنطق الحسابي في core/calc_logic.py (خالص). يتطلب PySide6.
+"""
+from dataclasses import dataclass
+from typing import List, Optional
+
+from PySide6.QtCore import QEvent, QStringListModel, Qt, QTimer, Signal
+from PySide6.QtGui import QBrush, QColor
+from PySide6.QtWidgets import (
+    QAbstractItemDelegate, QAbstractItemView, QCompleter, QHeaderView, QLineEdit, QStyledItemDelegate, QTableWidget, QTableWidgetItem
+)
+
+from alhisabat.ui.core import calc_logic as CL
+from alhisabat.ui.core.logic import normalize_ar
+from alhisabat.ui.design import tokens as T
+
+ID_ROLE = Qt.UserRole            # معرّف الاختيار (صنف/مستودع)
+BAD_ROLE = Qt.UserRole + 1       # رسالة الخطأ إن وُجدت
+
+
+@dataclass
+class Col:
+    key: str
+    label: str
+    kind: str = 'text'           # item | combo | qty | money | date | text | ro
+    width: int = 110
+    stretch: bool = False        # عمود يأخذ المساحة المتبقية (الصنف عادةً)
+
+
+class _BaseDelegate(QStyledItemDelegate):
+    """Enter ينقل للخلية التالية؛ الأسهم ↑↓ تنقل بين الصفوف و←→ بين الأعمدة (←→ داخل النص تتحرك بالمؤشر أولًا
+    ثم تنتقل للخلية المجاورة عند بلوغ طرف النص أو إذا كان النص كله محددًا). الجدول RTL: العمود الأول يمين."""
+
+    def _popup_visible(self, editor):
+        c = getattr(editor, 'completer', lambda: None)()
+        return c is not None and c.popup() is not None and c.popup().isVisible()
+
+    def setEditorData(self, editor, index):
+        super().setEditorData(editor, index)
+        if isinstance(editor, QLineEdit):
+            editor.selectAll()                      # الدخول للخلية يحدد نصها؛ سهم يمين/يسار ينقل للخلية المجاورة
+
+    def _go(self, editor, drow, dcol):
+        self.commitData.emit(editor)
+        self.closeEditor.emit(editor, QAbstractItemDelegate.NoHint)
+        view = self.parent()
+        idx = view.currentIndex()
+        QTimer.singleShot(0, lambda: view.move_from(idx.row(), idx.column(), drow, dcol))
+
+    def eventFilter(self, editor, event):
+        if event.type() == QEvent.KeyPress:
+            k = event.key()
+            if k in (Qt.Key_Return, Qt.Key_Enter):
+                if self._popup_visible(editor):
+                    return False
+                self.commitData.emit(editor)
+                self.closeEditor.emit(editor, QAbstractItemDelegate.EditNextItem)
+                return True
+            if not event.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.ShiftModifier) and isinstance(editor, QLineEdit):
+                if k in (Qt.Key_Up, Qt.Key_Down) and not self._popup_visible(editor):
+                    self._go(editor, -1 if k == Qt.Key_Up else 1, 0)
+                    return True
+                if k in (Qt.Key_Left, Qt.Key_Right):
+                    txt = editor.text()
+                    rtl = editor.layoutDirection() == Qt.RightToLeft
+                    forward = (k == Qt.Key_Left) == rtl          # الاتجاه المنطقي للمؤشر داخل النص
+                    pos = editor.cursorPosition()
+                    all_sel = bool(txt) and editor.selectedText() == txt
+                    at_edge = not editor.hasSelectedText() and (pos >= len(txt) if forward else pos <= 0)
+                    if not txt or all_sel or at_edge:
+                        # ← بصريًا = عمود أعلى رقمًا في جدول RTL، و→ = عمود أقل
+                        self._go(editor, 0, 1 if k == Qt.Key_Left else -1)
+                        return True
+        return super().eventFilter(editor, event)
+
+
+class _TextDelegate(_BaseDelegate):
+    def __init__(self, parent=None, align_center=False, placeholder=''):
+        super().__init__(parent)
+        self.center, self.placeholder = align_center, placeholder
+
+    def createEditor(self, parent, option, index):
+        e = QLineEdit(parent)
+        e.setPlaceholderText(self.placeholder)
+        if self.center:
+            e.setAlignment(Qt.AlignCenter)
+            e.setLayoutDirection(Qt.LeftToRight)
+        return e
+
+
+class _ChoiceDelegate(_BaseDelegate):
+    """بحث بالكتابة في قائمة (id، نص). يحفظ النص المعروض والمعرّف؛ نص لا يطابق أي خيار يُترك بلا معرّف (خطأ ظاهر)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.set_choices([])
+
+    def set_choices(self, choices):
+        self.choices = list(choices)
+        self.by_text = {t: i for i, t in self.choices}
+        self.norm = [(normalize_ar(t), i, t) for i, t in self.choices]
+        self.model = QStringListModel([t for _i, t in self.choices])
+
+    def resolve(self, text):
+        """(id، النص الكامل) من نص مكتوب: تطابق تام ثم تطابق جزئي وحيد؛ وإلا (None، النص)."""
+        t = (text or '').strip()
+        if t in self.by_text:
+            return self.by_text[t], t
+        q = normalize_ar(t)
+        if not q:
+            return None, t
+        hits = [(i, full) for n, i, full in self.norm if q in n]
+        return (hits[0] if len(hits) == 1 else (None, t))
+
+    def createEditor(self, parent, option, index):
+        e = QLineEdit(parent)
+        c = QCompleter(self.model, e)
+        c.setCaseSensitivity(Qt.CaseInsensitive)
+        c.setFilterMode(Qt.MatchContains)
+        c.setMaxVisibleItems(12)
+        e.setCompleter(c)
+        c.activated.connect(lambda _t, ed=e: (self.commitData.emit(ed), self.closeEditor.emit(ed, QAbstractItemDelegate.EditNextItem)))
+        return e
+
+    def setEditorData(self, editor, index):
+        editor.setText(index.data(Qt.DisplayRole) or '')
+        editor.selectAll()
+
+    def setModelData(self, editor, model, index):
+        rid, full = self.resolve(editor.text())
+        model.blockSignals(True)                    # إشارة تغيير واحدة بعد ضبط النص والمعرّف معًا (لا حالة وسيطة بلا معرّف)
+        try:
+            model.setData(index, full, Qt.DisplayRole)
+            model.setData(index, rid, ID_ROLE)
+        finally:
+            model.blockSignals(False)
+        model.dataChanged.emit(index, index)
+
+
+class EntryTable(QTableWidget):
+    cellEdited = Signal(int, str)        # (رقم السطر من 0، مفتاح العمود) بعد أي تعديل من المستخدم
+    rowsChanged = Signal()
+
+    def __init__(self, columns: List[Col], parent=None):
+        super().__init__(0, len(columns), parent)
+        self.cols = columns
+        self._keys = {c.key: i for i, c in enumerate(columns)}
+        self._silent = 0
+        self._deleg = {}
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.setHorizontalHeaderLabels([c.label for c in columns])
+        self.verticalHeader().setDefaultSectionSize(30)
+        self.setAlternatingRowColors(True)
+        self.setSelectionBehavior(QAbstractItemView.SelectItems)
+        self.setEditTriggers(QAbstractItemView.AllEditTriggers)
+        h = self.horizontalHeader()
+        h.setSectionResizeMode(QHeaderView.Interactive)           # كل الأعمدة قابلة للسحب
+        h.setMinimumSectionSize(60)
+        h.setStretchLastSection(False)
+        for i, c in enumerate(columns):
+            self.setColumnWidth(i, c.width)
+            if c.stretch:
+                h.setSectionResizeMode(i, QHeaderView.Stretch)    # الصنف يتمدد مع النافذة ويمكن تثبيته بالسحب
+            d = {'item': _ChoiceDelegate, 'combo': _ChoiceDelegate}.get(c.kind)
+            if d:
+                dd = d(self)
+            elif c.kind in ('qty', 'money'):
+                dd = _TextDelegate(self, align_center=True)
+            elif c.kind == 'date':
+                dd = _TextDelegate(self, align_center=True, placeholder='اكتب بأي ترتيب: 31/05/2027 أو 05/2027')
+            else:
+                dd = _TextDelegate(self)
+            self._deleg[c.key] = dd
+            self.setItemDelegateForColumn(i, dd)
+        self.itemChanged.connect(self._on_item_changed)
+
+    # ---------------------------------------------------------------- بيانات
+    def set_choices(self, key, choices):
+        self._deleg[key].set_choices(choices)
+
+    def col(self, key):
+        return self._keys[key]
+
+    def add_row(self, values=None):
+        values = values or {}
+        self._silent += 1
+        try:
+            r = self.rowCount()
+            self.insertRow(r)
+            for i, c in enumerate(self.cols):
+                it = QTableWidgetItem('')
+                it.setTextAlignment(Qt.AlignCenter if c.kind in ('qty', 'money', 'date', 'ro') else Qt.AlignVCenter | Qt.AlignRight)
+                if c.kind == 'ro':
+                    it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                self.setItem(r, i, it)
+            for k, v in values.items():
+                self.set_value(r, k, v, silent=True)
+        finally:
+            self._silent -= 1
+        self.rowsChanged.emit()
+        return r
+
+    def set_value(self, row, key, text, rid=None, silent=True):
+        it = self.item(row, self.col(key))
+        if it is None:
+            return
+        if silent:
+            self._silent += 1
+        try:
+            it.setText('' if text is None else str(text))
+            if rid is not None or self.cols[self.col(key)].kind in ('item', 'combo'):
+                it.setData(ID_ROLE, rid)
+        finally:
+            if silent:
+                self._silent -= 1
+
+    def text(self, row, key):
+        it = self.item(row, self.col(key))
+        return (it.text() if it else '').strip()
+
+    def rid(self, row, key):
+        it = self.item(row, self.col(key))
+        return it.data(ID_ROLE) if it else None
+
+    def is_blank(self, row):
+        return not any(self.text(row, c.key) for c in self.cols if c.kind != 'ro') and self.rid(row, self.cols[0].key) is None
+
+    def remove_current(self):
+        r = self.currentRow()
+        if r >= 0:
+            self.removeRow(r)
+            if self.rowCount() == 0:
+                self.add_row()
+            self.rowsChanged.emit()
+
+    def clear_rows(self):
+        self.setRowCount(0)
+
+    def mark(self, row, key, message=''):
+        """يلوّن الخلية بخطأ (message غير فارغة) أو يمسح التلوين."""
+        it = self.item(row, self.col(key))
+        if it is None:
+            return
+        it.setData(BAD_ROLE, message or None)
+        it.setToolTip(message or '')
+        it.setBackground(QBrush(QColor(self._pal()['danger_soft'])) if message else QBrush())
+
+    def tone(self, row, key, tone=''):
+        """تلوين معلوماتي (warning/danger) بلا اعتباره خطأ حفظ."""
+        it = self.item(row, self.col(key))
+        if it is not None and not it.data(BAD_ROLE):
+            it.setBackground(QBrush(QColor(self._pal()[f'{tone}_soft'])) if tone else QBrush())
+
+    def _pal(self):
+        return T.active_palette()
+
+    # ---------------------------------------------------------------- أحداث
+    def _on_item_changed(self, it):
+        if self._silent:
+            return
+        key = self.cols[it.column()].key
+        r = it.row()
+        kind = self.cols[it.column()].kind
+        self._silent += 1
+        try:
+            if kind == 'date':
+                try:
+                    norm = CL.parse_expiry_input(it.text())
+                    it.setText(norm)
+                    self.mark(r, key, '')
+                except ValueError as exc:
+                    self.mark(r, key, str(exc))
+            elif kind in ('qty', 'money'):
+                try:
+                    v = CL.to_dec(it.text())
+                    if v is not None and v < 0:
+                        raise ValueError('لا تقبل قيمة سالبة')
+                    it.setText(CL.fmt_num(v, 4) if v is not None else '')
+                    self.mark(r, key, '')
+                except ValueError:
+                    self.mark(r, key, 'قيمة غير صالحة: اكتب رقمًا فقط')
+            elif kind in ('item', 'combo'):
+                self.mark(r, key, '' if it.data(ID_ROLE) is not None or not it.text().strip() else 'اختر من القائمة: لا يوجد تطابق')
+        finally:
+            self._silent -= 1
+        self.cellEdited.emit(r, key)
+        if r == self.rowCount() - 1 and not self.is_blank(r):
+            QTimer.singleShot(0, self.add_row)                    # سطر جديد تلقائيًا عند الكتابة في الأخير
+
+    def move_from(self, row, col, drow, dcol):
+        """ينقل التركيز من (row, col) خطوة واحدة ويفتح محرر الخلية الهدف؛ يتخطى الأعمدة للقراءة فقط؛ لا يخرج عن الجدول."""
+        if row < 0 or col < 0:
+            return
+        r, c = row + drow, col + dcol
+        while 0 <= c < self.columnCount() and dcol and not (self.item(r, c) and self.item(r, c).flags() & Qt.ItemIsEditable):
+            c += dcol
+        if not (0 <= r < self.rowCount() and 0 <= c < self.columnCount()):
+            r, c = row, col                                   # على الحافة: ابقَ في الخلية الحالية (مع إعادة فتح محررها)
+        self.setCurrentCell(r, c)
+        it = self.item(r, c)
+        if it is not None and it.flags() & Qt.ItemIsEditable:
+            self.editItem(it)
+
+    def keyPressEvent(self, ev):
+        k = ev.key()
+        if not ev.modifiers() and k in (Qt.Key_Up, Qt.Key_Down, Qt.Key_Left, Qt.Key_Right) and self.currentRow() >= 0:
+            # خارج التحرير (الخلية محددة فقط): نفس منطق الأسهم، في جدول RTL ← = العمود التالي
+            d = {Qt.Key_Up: (-1, 0), Qt.Key_Down: (1, 0), Qt.Key_Left: (0, 1), Qt.Key_Right: (0, -1)}[k]
+            self.move_from(self.currentRow(), self.currentColumn(), *d)
+            return
+        if ev.key() == Qt.Key_Delete and ev.modifiers() & Qt.ControlModifier:
+            self.remove_current()
+            return
+        if ev.key() in (Qt.Key_Delete, Qt.Key_Backspace) and not ev.modifiers():
+            it = self.currentItem()
+            if it is not None and it.flags() & Qt.ItemIsEditable:
+                it.setText('')
+                if self.cols[it.column()].kind in ('item', 'combo'):
+                    it.setData(ID_ROLE, None)
+                return
+        super().keyPressEvent(ev)

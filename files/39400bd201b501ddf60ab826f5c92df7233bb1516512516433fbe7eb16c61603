@@ -1,0 +1,168 @@
+"""خدمات نهاية الفترة والسنة: واجهة رفيعة فوق محركات المحاسبة (لا SQL، Decimal حيث يلزم).
+
+القراءة الخفيفة عبر readmodel؛ الكتابة عبر closing_engine/period_engine/opening_engine/fx_engine/integrity/inventory_recon.
+الصفحة تستدعي هذه الخدمة فقط. بلا PySide6، بلا float.
+"""
+from datetime import date
+from decimal import Decimal
+
+from alhisabat.accounting import (closing_engine as CE, diagnostics as DG, fx_engine as FX, integrity as INT, inventory_recon as IR, opening_engine as OE,
+                                  period_close as PC, period_engine as PE, template_audit as TA)
+from alhisabat.accounting.errors import AccountingError
+
+
+class PeriodEndService:
+    def __init__(self, session):
+        self.s = session
+
+    # ── سنوات وفترات ─────────────────────────────────
+    def overview(self):
+        from alhisabat.ui.core import readmodel
+        return readmodel.fiscal_overview(self.s.conn, self.s.company_id)
+
+    def create_year(self, name, start, end):
+        # start/end كـ ISO أو date
+        return PE.create_fiscal_year(self.s.conn, self.s.company_id, name,
+                                     _d(start), _d(end), user_id=self.s.user_id)
+
+    def close_period(self, period_id, allow_drafts=False):
+        return PE.close_period(self.s.conn, int(period_id), self.s.user_id, allow_drafts=bool(allow_drafts))
+
+    def reopen_period(self, period_id, reason):
+        return PE.reopen_period(self.s.conn, int(period_id), self.s.user_id, reason)
+
+    # ── فحوصات الإقفال ونتيجة السنة ────────────────
+    def pre_close(self, year_id):
+        return CE.pre_close_checks(self.s.conn, self.s.user_id, self.s.company_id, int(year_id))
+
+    def year_result(self, year_id, include_closing=False):
+        return CE.year_result(self.s.conn, self.s.user_id, self.s.company_id, int(year_id), include_closing=bool(include_closing))
+
+    def closing_settings(self):
+        return CE.get_settings(self.s.conn, self.s.company_id)
+
+    def set_closing_settings(self, transfer_to_retained):
+        return CE.set_settings(self.s.conn, self.s.user_id, self.s.company_id, transfer_to_retained=bool(transfer_to_retained))
+
+    # ── إقفال/إعادة فتح السنة ───────────────────────
+    def close_year(self, year_id):
+        return CE.close_fiscal_year(self.s.conn, self.s.user_id, self.s.company_id, int(year_id))
+
+    def close_year_simple(self, year_id):
+        """إقفال بخطوة واحدة: فترات + تقييم + قيود الإقفال + السنة التالية + الافتتاح (معاملة واحدة)."""
+        r = CE.close_year_simple(self.s.conn, self.s.user_id, self.s.company_id, int(year_id))
+        try:                                         # بعد نجاح الإقفال: أرشيف السنة + اختصار سطح مكتب باسم النظام وسنة الإقفال
+            from alhisabat.system import year_archive
+            from alhisabat.ui.shell.main_window import APP_DIR
+            y = next((x for x in self.overview() if x['id'] == int(year_id)), None)
+            a = year_archive.archive_after_close(self.s.db_path, y['name'] if y else year_id, APP_DIR)
+            r['archive'] = a
+            r['notes'] = list(r.get('notes') or []) + a['notes']
+        except Exception as ex:  # noqa: BLE001 — الإقفال تمّ؛ فشل الأرشفة لا يتراجع عنه
+            r['notes'] = list(r.get('notes') or []) + [f'لم تُحفظ نسخة الأرشيف: {ex}']
+        return r
+
+    def reopen_year(self, year_id, reason):
+        return CE.reopen_fiscal_year(self.s.conn, self.s.user_id, self.s.company_id, int(year_id), reason)
+
+    # ── أرصدة افتتاحية ───────────────────────────────
+    def opening_preview(self, from_year_id, to_year_id):
+        return OE.opening_preview(self.s.conn, self.s.user_id, self.s.company_id, int(from_year_id), int(to_year_id))
+
+    def opening_compare(self, from_year_id, opening_entry_id):
+        from alhisabat.ui.core import readmodel
+        fy = readmodel.fiscal_year(self.s.conn, self.s.company_id, int(from_year_id))
+        rows = OE.compare(self.s.conn, self.s.company_id, fy, int(opening_entry_id))
+        accs = dict(self.s.lookup_accounts(groups=None)) if hasattr(self.s, 'lookup_accounts') else {}
+        for r in rows:
+            if 'code' not in r and r.get('account_id') in accs:
+                parts = accs[r['account_id']].split(' — ', 1)
+                r['code'] = parts[0]
+                r['name'] = parts[1] if len(parts) > 1 else parts[0]
+        return rows
+
+    def generate_opening(self, from_year_id, to_year_id):
+        return OE.generate_opening_entry(self.s.conn, self.s.user_id, self.s.company_id, int(from_year_id), int(to_year_id))
+
+    def manual_opening(self, year_id, lines, description="الأرصدة الافتتاحية الأولية"):
+        """lines بصيغة المحرك: [{account_id, debit, credit, ...}]."""
+        return OE.create_manual_opening(self.s.conn, self.s.user_id, self.s.company_id, int(year_id), lines, description)
+
+    # ── سلامة ومطابقة وتقييم ───────────────────────
+    def integrity(self, as_of=None):
+        return INT.financial_integrity_check(self.s.conn, self.s.user_id, self.s.company_id, as_of=as_of)
+
+    def revaluation_preview(self, as_of):
+        return FX.revaluation_preview(self.s.conn, self.s.user_id, self.s.company_id, as_of)
+
+    def revalue(self, as_of, post=False):
+        return FX.revalue(self.s.conn, self.s.user_id, self.s.company_id, as_of, post=bool(post))
+
+    def inventory_recon(self, as_of):
+        return IR.reconcile(self.s.conn, self.s.company_id, as_of)
+
+    def inventory_verify(self):
+        return IR.verify_cache(self.s.conn, self.s.company_id)
+
+
+    # ── الإقفال الشهري بنطاق حر (V2.0.9) ────────────────
+    def range_precheck(self, start, end):
+        return PC.precheck_range(self.s.conn, self.s.user_id, self.s.company_id, _d(start), _d(end))
+
+    def range_close(self, start, end, align=False):
+        return PC.close_range(self.s.conn, self.s.user_id, self.s.company_id, _d(start), _d(end), align=bool(align))
+
+    def range_reopen(self, start, end, reason):
+        return PC.reopen_range(self.s.conn, self.s.user_id, self.s.company_id, _d(start), _d(end), reason)
+
+    def range_align(self, start, end):
+        """ضبط حدود الفترات على نطاق حر (تقسيم الفترة الحدّية بأمان) قبل الإقفال."""
+        return PC.align_range(self.s.conn, self.s.user_id, self.s.company_id, _d(start), _d(end))
+
+    def range_periods(self, start, end):
+        return PC.periods_in_range(self.s.conn, self.s.company_id, _d(start).isoformat(), _d(end).isoformat())
+
+    def range_log(self):
+        return PC.log(self.s.conn, self.s.user_id, self.s.company_id)
+
+    # ── التشخيص والمطابقة (V2.0.9) ──────────────────────
+    def diagnostics(self, as_of=None):
+        return DG.run_diagnostics(self.s.conn, self.s.user_id, self.s.company_id, as_of=_d(as_of).isoformat() if as_of else None)
+
+    def fix_preview(self, fix, params):
+        return DG.preview_fix(self.s.conn, self.s.user_id, self.s.company_id, fix, params)
+
+    def fix_apply(self, fix, params, reason, approved=False):
+        return DG.apply_fix(self.s.conn, self.s.user_id, self.s.company_id, fix, params, reason=reason, approved=bool(approved))
+
+    def fix_history(self):
+        return DG.history(self.s.conn, self.s.user_id, self.s.company_id)
+
+    # ── تقرير مطابقة الافتتاح وإعادة التوليد (V2.0.9) ────
+    def opening_report(self, from_year_id, to_year_id):
+        return OE.opening_report(self.s.conn, self.s.user_id, self.s.company_id, int(from_year_id), int(to_year_id))
+
+    def opening_post_checked(self, from_year_id, to_year_id, entry_id):
+        """اعتماد قيد الافتتاح فقط إن طابق أرصدة الختام (لا فروقات غير مبررة)."""
+        return OE.post_opening_checked(self.s.conn, self.s.user_id, self.s.company_id, int(from_year_id), int(to_year_id), int(entry_id))
+
+    def opening_inventory(self, year_id):
+        from alhisabat.ui.core import readmodel
+        return OE.inventory_opening_snapshot(self.s.conn, self.s.company_id, readmodel.fiscal_year(self.s.conn, self.s.company_id, int(year_id)))
+
+    def fx_summary(self, as_of):
+        """فروقات العملة المحققة وغير المحققة حتى التاريخ."""
+        return DG.fx_summary(self.s.conn, self.s.company_id, _d(as_of).isoformat())
+
+    def regenerate_opening(self, from_year_id, to_year_id, reason):
+        return OE.regenerate_opening_entry(self.s.conn, self.s.user_id, self.s.company_id, int(from_year_id), int(to_year_id), reason)
+
+    # ── مراجعة القوالب (V2.0.9) ─────────────────────────
+    def templates_audit(self):
+        return {"builtin": TA.audit_builtin(), "user": TA.audit_user_templates(self.s.conn, self.s.user_id, self.s.company_id)}
+
+
+def _d(v):
+    if isinstance(v, date):
+        return v
+    return date.fromisoformat(str(v)[:10])

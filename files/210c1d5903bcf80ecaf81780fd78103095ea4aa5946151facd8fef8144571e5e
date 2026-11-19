@@ -1,0 +1,68 @@
+"""ناقل الرابط المباشر (DeepLinkTransport) — وضع «يدوي مساعد» بصفر مخاطر حظر.
+
+يفتح المحادثة في تطبيق واتساب الرسمي المثبت على الجهاز أو المتصفح،
+ويُعلّم الرسالة بأنها «مُسلَّمة للمستخدم» (handed) ليضغط المستخدم زر الإرسال بنفسه.
+"""
+import os
+import sys
+import urllib.parse
+import webbrowser
+from typing import Optional
+
+from alhisabat.messaging.phone import to_wa_number
+from alhisabat.messaging.transports.base import ConnectionStatus, MessageTransport, SendResult
+
+
+class DeepLinkTransport(MessageTransport):
+    def is_available(self) -> bool:
+        return True
+
+    def check_connection(self) -> ConnectionStatus:
+        return ConnectionStatus(
+            state="connected",
+            message="الوضع اليدوي المساعد جاهز دائمًا (يفتح في تطبيق واتساب)",
+        )
+
+    def send_message(
+        self,
+        phone: str,
+        text: str,
+        attachment_path: Optional[str] = None,
+    ) -> SendResult:
+        wa_num = to_wa_number(phone)
+        encoded_text = urllib.parse.quote(text or "")
+
+        # الرابط المباشر لتطبيق واتساب، واحتياطيًا رابط wa.me
+        desktop_uri = f"whatsapp://send?phone={wa_num}&text={encoded_text}"
+        web_uri = f"https://wa.me/{wa_num}?text={encoded_text}"
+
+        opened = False
+        if sys.platform == "win32":
+            try:
+                os.startfile(desktop_uri)
+                opened = True
+            except OSError:
+                pass
+
+        if not opened:
+            try:
+                webbrowser.open(web_uri)
+                opened = True
+            except Exception as e:
+                return SendResult(
+                    success=False,
+                    status="failed",
+                    error_code="deeplink_failed",
+                    detail=f"تعذر فتح رابط واتساب: {e}",
+                )
+
+        detail_msg = "تم فتح المحادثة في تطبيق واتساب للمستخدم"
+        if attachment_path:
+            detail_msg += f" (يُرجى إرفاق الملف يدويًا: {attachment_path})"
+
+        return SendResult(
+            success=True,
+            status="handed",
+            error_code="",
+            detail=detail_msg,
+        )

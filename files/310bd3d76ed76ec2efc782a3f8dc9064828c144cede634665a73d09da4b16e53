@@ -1,0 +1,570 @@
+"""خدمات التقارير والقوائم المالية (ReportsService): طبقة الخدمات الموحدة للمركز المالي والتقارير.
+
+تلتزم بقيود المحرك:
+- Decimal فقط للمبالغ ولا float إطلاقًا.
+- استدعاء المحرك المحاسبي مباشرة (balance_engine, financial_statements, cost_center_reports, ledger_engine, aging).
+- توليد مواصفات الطباعة الموحدة لكل تقرير لمعاينتها على DocumentSheet وتصديرها (HTML, XLSX, CSV).
+"""
+from datetime import date
+from decimal import Decimal
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Any
+
+from alhisabat.accounting import balance_engine as be, cost_center_reports as ccr, financial_statements as fs, ledger_engine as le
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.business import aging as ag, inventory as inv
+from alhisabat.reporting import extra_reports, group_reports, party_reports, printing, words as report_words
+from alhisabat.ui.core import readmodel
+from alhisabat.ui.core.format import minor_to_decimal
+
+
+def _d(v) -> Optional[Decimal]:
+    if v is None:
+        return None
+    if isinstance(v, Decimal):
+        return v
+    return Decimal(int(v)) / 100
+
+
+REPORT_CATEGORIES = {
+    'القوائم المالية الرسمية': [
+        'ميزان المراجعة',
+        'ملخص الأرصدة ورأس المال حسب العملة',
+        'قائمة الدخل',
+        'المركز المالي',
+        'التدفقات النقدية',
+    ],
+    'القوائم المقارنة': [
+        'قائمة الدخل المقارنة',
+        'المركز المالي المقارن',
+    ],
+    'تقارير مراكز التكلفة': [
+        'أرباح وخسائر مراكز التكلفة',
+        'دفتر أستاذ مركز التكلفة',
+    ],
+    'كشوف الحسابات والدفاتر': [
+        'دفتر اليومية',
+        'كشف حساب',
+        'كشف حساب مجموعة',
+        'كشف حساب تفصيلي',
+        'ملخص الحساب',
+    ],
+    'مطابقة الأرصدة والمصادقات': [
+        'مطابقة أرصدة العملاء والموردين',
+        'مصادقة كشف حساب',
+    ],
+    'التقارير التشغيلية': [
+        'أعمار ديون العملاء',
+        'أعمار ديون الموردين',
+        'تقرير المخزون',
+        'أرباح المبيعات حسب الصنف',
+        'الإقرار الضريبي',
+        'ملخص المبيعات',
+        'ملخص المشتريات',
+    ],
+}
+
+ALL_REPORTS = [item for sublist in REPORT_CATEGORIES.values() for item in sublist]
+
+
+class ReportsService:
+    def __init__(self, session):
+        self.s = session
+
+    @property
+    def conn(self):
+        return self.s.conn
+
+    @property
+    def user_id(self):
+        return self.s.user_id
+
+    @property
+    def company_id(self):
+        return self.s.company_id
+
+    # ---------------------------------------------------------------- القوائم المالية
+    def trial_balance(self, date_from: str, date_to: str, *, branch_id: Optional[int] = None,
+                      cost_center_id: Optional[int] = None, max_level: Optional[int] = None,
+                      hide_zero: bool = False, fold_merged: bool = True, include_closing: bool = True) -> Dict[str, Any]:
+        return be.trial_balance(self.conn, self.user_id, self.company_id, date_from, date_to,
+                                branch_id=branch_id, cost_center_id=cost_center_id, max_level=max_level,
+                                hide_zero=hide_zero, fold_merged=fold_merged, include_closing=include_closing)
+
+    def income_statement(self, date_from: str, date_to: str, *, branch_id: Optional[int] = None,
+                         max_level: Optional[int] = None) -> Dict[str, Any]:
+        return fs.income_statement(self.conn, self.user_id, self.company_id, date_from, date_to,
+                                  branch_id=branch_id, max_level=max_level)
+
+    def compare_income_statement(self, periods: List[Tuple[str, str, str]], *, branch_id: Optional[int] = None,
+                                 max_level: Optional[int] = None) -> List[Dict[str, Any]]:
+        return fs.compare_income_statement(self.conn, self.user_id, self.company_id, periods,
+                                          branch_id=branch_id, max_level=max_level)
+
+    def balance_sheet(self, as_of: str, *, branch_id: Optional[int] = None,
+                      max_level: Optional[int] = None) -> Dict[str, Any]:
+        return fs.balance_sheet(self.conn, self.user_id, self.company_id, as_of,
+                               branch_id=branch_id, max_level=max_level)
+
+    def compare_balance_sheet(self, dates: List[Tuple[str, str]], *, branch_id: Optional[int] = None,
+                              max_level: Optional[int] = None) -> List[Dict[str, Any]]:
+        return fs.compare_balance_sheet(self.conn, self.user_id, self.company_id, dates,
+                                       branch_id=branch_id, max_level=max_level)
+
+    def cash_flow_statement(self, date_from: str, date_to: str, *, branch_id: Optional[int] = None) -> Dict[str, Any]:
+        return fs.cash_flow_statement(self.conn, self.user_id, self.company_id, date_from, date_to,
+                                     branch_id=branch_id)
+
+    # ---------------------------------------------------------------- تقارير مراكز التكلفة
+    def cost_center_pl(self, date_from: str, date_to: str, *, include_unassigned: bool = True) -> Dict[Any, Any]:
+        return ccr.cost_center_pl(self.conn, self.user_id, self.company_id, date_from, date_to,
+                                  include_unassigned=include_unassigned)
+
+    def cost_center_ledger(self, cost_center_id: Optional[int], date_from: str, date_to: str, *,
+                           limit: int = 200, offset: int = 0) -> List[Dict[str, Any]]:
+        return ccr.cost_center_ledger(self.conn, self.user_id, self.company_id, cost_center_id, date_from, date_to,
+                                      limit=limit, offset=offset)
+
+    # ---------------------------------------------------------------- دفتر الأستاذ وكشوف الحسابات
+    def ledger(self, account_id: int, date_from: str, date_to: str, *, include_children: bool = True,
+               branch_id: Optional[int] = None, currency: Optional[str] = None,
+               limit: int = 200, offset: int = 0) -> Dict[str, Any]:
+        return le.ledger(self.conn, self.user_id, self.company_id, int(account_id), date_from, date_to,
+                         include_children=include_children, branch_id=branch_id,
+                         currency=currency, limit=limit, offset=offset)
+
+    def account_summary(self, account_id: int, date_from: str, date_to: str, *,
+                        branch_id: Optional[int] = None, cost_center_id: Optional[int] = None,
+                        include_closing: bool = True) -> Dict[str, Any]:
+        return be.account_summary(self.conn, self.user_id, self.company_id, int(account_id), date_from, date_to,
+                                  branch_id=branch_id, cost_center_id=cost_center_id, include_closing=include_closing)
+
+    def account_balance(self, account_id: int, as_of: str, *, branch_id: Optional[int] = None) -> Decimal:
+        val = be.account_balance(self.conn, self.user_id, self.company_id, int(account_id), as_of, branch_id=branch_id)
+        return _d(val) or Decimal(0)
+
+    # ---------------------------------------------------------------- تقارير تشغيلية
+    def aging(self, kind: str, as_of: Optional[str] = None) -> Dict[str, Any]:
+        return ag.aging(self.conn, self.user_id, self.company_id, kind, as_of or str(date.today()), include_zero=False)
+
+    def aging_documents(self, kind: str, as_of: Optional[str] = None) -> Dict[str, Any]:
+        return ag.aging_documents(self.conn, self.user_id, self.company_id, kind, as_of or str(date.today()))
+
+    def stock_report(self) -> List[Dict[str, Any]]:
+        return inv.stock_report(self.conn, self.user_id, self.company_id, branch_id=self.s.branch_id)
+
+    # ---------------------------------------------------------------- بيانات مساعدة / بحث
+    def base_currency(self) -> str:
+        from alhisabat.accounting import rates as fxr
+        return fxr.base_currency(self.conn, self.company_id)
+
+    def default_view_label(self) -> str:
+        from alhisabat.ui.core import readmodel
+        return readmodel.default_view_label(self.conn, self.company_id)
+
+    def lookup_currencies(self) -> List[Tuple[str, str]]:
+        """العملات المفعّلة لترشيح الكشوف: [(code, تسمية)]، والأساسية أولًا (تُعرض وحدها)."""
+        from alhisabat.ui.core import readmodel
+        cs = [c for c in readmodel.currencies_list(self.conn, self.company_id) if c.get('is_enabled') or c.get('is_base')]
+        cs.sort(key=lambda c: 0 if c.get('is_base') else 1)
+        return [(c['code'], f"{c.get('name_ar') or c['code']} ({c['code']})") for c in cs]
+
+    def lookup_report_groups(self, group_kind: str) -> List[Tuple[Optional[int], str]]:
+        """مجموعات كشف الحساب: [(id, تسمية)]. للأطراف أول عنصر «بلا مجموعة» (id=0)، وللأصناف التصنيفات بمسارها."""
+        from alhisabat.business import parties, item_catalog
+        if group_kind == 'item':
+            return [(group_reports.ALL_GROUPS, 'كل التصنيفات')] + [(g['id'], ('— ' * g.get('depth', 0)) + g['name']) for g in
+                    item_catalog.list_categories(self.conn, self.user_id, self.company_id, include_inactive=False, branch_id=self.s.branch_id)]
+        out = [(group_reports.ALL_GROUPS, 'كل المجموعات'), (0, 'بلا مجموعة')]
+        out += [(g['id'], g['name']) for g in parties.list_groups(self.conn, self.user_id, self.company_id, group_kind) if g['is_active']]
+        return out
+
+    def lookup_accounts(self) -> List[Tuple[int, str]]:
+        return self.s.lookup_accounts()
+
+    def lookup_cost_centers(self) -> List[Dict[str, Any]]:
+        return readmodel.cost_centers_list(self.conn, self.company_id)
+
+    def lookup_branches(self) -> List[Dict[str, Any]]:
+        return self.s.branches_for_user(self.user_id, self.company_id)
+
+    def lookup_fiscal_years(self) -> List[Dict[str, Any]]:
+        return readmodel.fiscal_years_list(self.conn, self.company_id)
+
+    # ---------------------------------------------------------------- مواصفات الطباعة والمعاينة
+    def report_spec(self, kind: str, d_from: str, d_to: str, **kw) -> Dict[str, Any]:
+        """مواصفة الطباعة الموحدة لأي تقرير، ومعها «المبلغ كتابةً» لإجمالياته بعملته (الأساسية إن لم تحمل المواصفة عملة)."""
+        spec = self._report_spec(kind, d_from, d_to, **kw)
+        return report_words.attach_words(spec, self.base_currency())
+
+    def _report_spec(self, kind: str, d_from: str, d_to: str, *, account_id: Optional[int] = None,
+                     cost_center_id: Optional[int] = None, branch_id: Optional[int] = None,
+                     max_level: Optional[int] = None, hide_zero: bool = False,
+                     include_closing: bool = True, periods: Optional[List[Tuple[str, str, str]]] = None,
+                     dates: Optional[List[Tuple[str, str]]] = None, currency: Optional[str] = None,
+                     group_kind: Optional[str] = None, group_id: Optional[int] = None,
+                     balance_side: Optional[str] = None) -> Dict[str, Any]:
+        c, u, cid = self.conn, self.user_id, self.company_id
+        kw = {}
+        if branch_id is not None:
+            kw['branch_id'] = branch_id
+        if kind == 'كشف حساب مجموعة':
+            if not group_kind:
+                raise AccountingError('اختر نوع المجموعة (عملاء / موردين / أصناف) ثم المجموعة.')
+            return group_reports.group_report_print(c, u, cid, group_kind, group_id, d_from, d_to, currency=currency, branch_id=branch_id, balance_side=balance_side)
+
+        if kind == 'ميزان المراجعة':
+            return printing.trial_balance_print(c, u, cid, d_from, d_to, cost_center_id=cost_center_id,
+                                                max_level=max_level, hide_zero=hide_zero, include_closing=include_closing, **kw)
+        if kind == 'ملخص الأرصدة ورأس المال حسب العملة':
+            return extra_reports.currency_summary_print(c, u, cid, d_to, currency=currency, **kw)
+        if kind == 'قائمة الدخل':
+            return printing.income_statement_print(c, u, cid, d_from, d_to, max_level=max_level, **kw)
+        if kind == 'المركز المالي':
+            return printing.balance_sheet_print(c, u, cid, d_to, max_level=max_level, **kw)
+        if kind == 'التدفقات النقدية':
+            return printing.cash_flow_print(c, u, cid, d_from, d_to, **kw)
+        if kind == 'كشف حساب':
+            if not account_id:
+                raise AccountingError('اختر الحساب لعرض كشف الحساب.')
+            if currency:
+                kw['currency'] = currency            # كشف بعملة واحدة بمبالغها الأصلية
+            if balance_side:
+                kw['balance_side'] = balance_side
+            return printing.ledger_print(c, u, cid, int(account_id), d_from, d_to, **kw)
+        if kind == 'كشف حساب تفصيلي':
+            if not account_id:
+                raise AccountingError('اختر الحساب لعرض كشف الحساب التفصيلي.')
+            return party_reports.detailed_statement_print(c, u, cid, int(account_id), d_from, d_to, currency=currency or None,
+                                                          branch_id=branch_id)
+        if kind == 'مطابقة أرصدة العملاء والموردين':
+            if group_kind not in (None, 'customer', 'supplier'):
+                raise AccountingError('اختر عملاء أو موردين.')
+            return party_reports.reconciliation_print(c, u, cid, d_to, kind=group_kind, currency=currency or None, branch_id=branch_id)
+        if kind == 'مصادقة كشف حساب':
+            if not account_id:
+                raise AccountingError('اختر حساب العميل أو المورد لإصدار المصادقة.')
+            p = c.execute('SELECT id FROM parties WHERE account_id=? AND company_id=?', (int(account_id), cid)).fetchone()
+            if not p:
+                raise AccountingError('الحساب المختار ليس حساب عميل أو مورد.')
+            return party_reports.confirmation_print(c, u, cid, p['id'], d_from, d_to, currency=currency or None, branch_id=branch_id)
+        if kind == 'أرباح وخسائر مراكز التكلفة':
+            return printing.cost_center_pl_print(c, u, cid, d_from, d_to)
+        if kind == 'أعمار ديون العملاء':
+            return printing.aging_print(c, u, cid, 'customer', d_to, currency=currency, balance_side=balance_side)
+        if kind == 'أعمار ديون الموردين':
+            return printing.aging_print(c, u, cid, 'supplier', d_to, currency=currency, balance_side=balance_side)
+        if kind == 'تقرير المخزون':
+            return printing.stock_report_print(c, u, cid)
+        if kind == 'دفتر اليومية':
+            return extra_reports.journal_book_print(c, u, cid, d_from, d_to, **kw)
+        if kind == 'أرباح المبيعات حسب الصنف':
+            return extra_reports.sales_profit_by_item_print(c, u, cid, d_from, d_to)
+        if kind == 'الإقرار الضريبي':
+            return self._tax_report_spec(d_from, d_to, **kw)
+        if kind in ('ملخص المبيعات', 'ملخص المشتريات'):
+            return self._trade_summary_spec(kind == 'ملخص المبيعات', d_from, d_to, **kw)
+
+        if kind == 'قائمة الدخل المقارنة':
+            return self._compare_income_statement_spec(periods or [(d_from, d_to, f"{d_from} — {d_to}")], **kw)
+        if kind == 'المركز المالي المقارن':
+            return self._compare_balance_sheet_spec(dates or [(d_to, d_to)], **kw)
+        if kind == 'دفتر أستاذ مركز التكلفة':
+            if not cost_center_id:
+                raise AccountingError('اختر مركز التكلفة لعرض دفتر الأستاذ الخاص به.')
+            return self._cost_center_ledger_spec(int(cost_center_id), d_from, d_to)
+        if kind == 'ملخص الحساب':
+            if not account_id:
+                raise AccountingError('اختر الحساب لعرض ملخصه.')
+            return self._account_summary_spec(int(account_id), d_from, d_to, cost_center_id=cost_center_id, **kw)
+
+        raise AccountingError(f'تقرير غير معروف: {kind}')
+
+    def _compare_income_statement_spec(self, periods: List[Tuple[str, str, str]], **kw) -> Dict[str, Any]:
+        results = self.compare_income_statement(periods, **kw)
+        comp_name = results[0].get('company') if results else None
+        cols = [{'key': 'name', 'label': 'البند'}]
+        for i, p in enumerate(periods):
+            cols.append({'key': f'p_{i}', 'label': p[2], 'numeric': True})
+
+        # تجميع البنود عبر الفترات
+        account_map = {}
+        for i, r in enumerate(results):
+            for sec, items in [('revenue', r['revenue']), ('cogs', r['cogs']), ('expenses', r['expenses'])]:
+                for it in items:
+                    if it['is_group']:
+                        continue
+                    key = (sec, it['account_id'], it['code'], it['name'], it['level'])
+                    if key not in account_map:
+                        account_map[key] = [Decimal(0)] * len(periods)
+                    account_map[key][i] = _d(it['amount']) or Decimal(0)
+
+        rows = []
+        for sec_name, sec_key in [('الإيرادات', 'revenue'), ('تكلفة النشاط', 'cogs')]:
+            sec_items = [k for k in account_map if k[0] == sec_key]
+            for k in sec_items:
+                row_data = {'name': ('  ' * (k[4] - 1)) + k[3], 'account_id': k[1], 'code': k[2]}
+                for i in range(len(periods)):
+                    row_data[f'p_{i}'] = account_map[k][i]
+                rows.append(row_data)
+            tot_row = {'name': f'إجمالي {sec_name}'}
+            for i, r in enumerate(results):
+                tot = r['total_revenue'] if sec_key == 'revenue' else r['total_cogs']
+                tot_row[f'p_{i}'] = _d(tot) or Decimal(0)
+            rows.append(tot_row)
+
+        gross_row = {'name': 'مجمل الربح'}
+        for i, r in enumerate(results):
+            gross_row[f'p_{i}'] = _d(r['gross_profit']) or Decimal(0)
+        rows.append(gross_row)
+
+        exp_items = [k for k in account_map if k[0] == 'expenses']
+        for k in exp_items:
+            row_data = {'name': ('  ' * (k[4] - 1)) + k[3], 'account_id': k[1], 'code': k[2]}
+            for i in range(len(periods)):
+                row_data[f'p_{i}'] = account_map[k][i]
+            rows.append(row_data)
+        tot_exp = {'name': 'إجمالي المصروفات'}
+        for i, r in enumerate(results):
+            tot_exp[f'p_{i}'] = _d(r['total_expenses']) or Decimal(0)
+        rows.append(tot_exp)
+
+        totals = []
+        for i, r in enumerate(results):
+            totals.append({'label': f'صافي {periods[i][2]}', 'value': _d(r['net_result']) or Decimal(0)})
+
+        return {
+            'title': 'قائمة الدخل المقارنة',
+            'company': comp_name,
+            'branch': kw.get('branch_id'),
+            'currency': None,
+            'period': ' — '.join(p[2] for p in periods),
+            'printed_at': date.today().isoformat(),
+            'extra': [('الفترات المقارنة', str(len(periods)))],
+            'columns': cols,
+            'rows': rows,
+            'totals': totals,
+        }
+
+    def _compare_balance_sheet_spec(self, dates: List[Tuple[str, str]], **kw) -> Dict[str, Any]:
+        results = self.compare_balance_sheet(dates, **kw)
+        comp_name = results[0].get('company') if results else None
+        cols = [{'key': 'name', 'label': 'البند'}]
+        for i, d in enumerate(dates):
+            cols.append({'key': f'd_{i}', 'label': d[1], 'numeric': True})
+
+        account_map = {}
+        for i, r in enumerate(results):
+            for sec, items in [('assets', r['assets']), ('liabilities', r['liabilities']), ('equity', r['equity'])]:
+                for it in items:
+                    if it['is_group']:
+                        continue
+                    key = (sec, it.get('account_id'), it.get('code'), it['name'], it.get('level', 1))
+                    if key not in account_map:
+                        account_map[key] = [Decimal(0)] * len(dates)
+                    account_map[key][i] = _d(it['amount']) or Decimal(0)
+
+        rows = []
+        for sec_name, sec_key, tot_key in [('الأصول', 'assets', 'total_assets'),
+                                           ('الخصوم', 'liabilities', 'total_liabilities'),
+                                           ('حقوق الملكية', 'equity', 'total_equity')]:
+            sec_items = [k for k in account_map if k[0] == sec_key]
+            for k in sec_items:
+                row_data = {'name': ('  ' * (k[4] - 1)) + k[3], 'account_id': k[1], 'code': k[2]}
+                for i in range(len(dates)):
+                    row_data[f'd_{i}'] = account_map[k][i]
+                rows.append(row_data)
+            tot_row = {'name': f'إجمالي {sec_name}'}
+            for i, r in enumerate(results):
+                tot_row[f'd_{i}'] = _d(r[tot_key]) or Decimal(0)
+            rows.append(tot_row)
+
+        totals = []
+        for i, r in enumerate(results):
+            totals.append({'label': f"متوازنة ({dates[i][1]})" if r['balanced'] else f"غير متوازنة! ({dates[i][1]})",
+                           'value': _d(r['total_assets']) or Decimal(0), 'words_label': f"إجمالي الأصول ({dates[i][1]})"})
+
+        return {
+            'title': 'قائمة المركز المالي المقارن',
+            'company': comp_name,
+            'branch': kw.get('branch_id'),
+            'currency': None,
+            'period': ' — '.join(d[1] for d in dates),
+            'printed_at': date.today().isoformat(),
+            'extra': [('التواريخ المقارنة', str(len(dates)))],
+            'columns': cols,
+            'rows': rows,
+            'totals': totals,
+        }
+
+    def _cost_center_ledger_spec(self, cost_center_id: int, d_from: str, d_to: str) -> Dict[str, Any]:
+        rows_raw = self.cost_center_ledger(cost_center_id, d_from, d_to, limit=1000)
+        c_name_val, c_code = readmodel.cost_center_info(self.conn, cost_center_id)
+        cc_name = f"{c_code or ''} {c_name_val}".strip() if c_name_val else f"مركز #{cost_center_id}"
+
+        cols = [
+            {'key': 'entry_date', 'label': 'التاريخ'},
+            {'key': 'posted_no', 'label': 'رقم القيد'},
+            {'key': 'account', 'label': 'الحساب'},
+            {'key': 'description', 'label': 'البيان'},
+            {'key': 'debit', 'label': 'مدين', 'numeric': True},
+            {'key': 'credit', 'label': 'دائن', 'numeric': True},
+            {'key': 'source', 'label': 'المصدر'},
+        ]
+        rows = []
+        tot_debit = Decimal(0)
+        tot_credit = Decimal(0)
+        for r in rows_raw:
+            d = _d(r['debit_base']) or Decimal(0)
+            c = _d(r['credit_base']) or Decimal(0)
+            tot_debit += d
+            tot_credit += c
+            rows.append({
+                'entry_id': r['entry_id'],
+                'entry_date': r['entry_date'],
+                'posted_no': r['posted_no'],
+                'account': f"{r['account_code']} {r['account_name']}",
+                'description': r['description'],
+                'debit': d,
+                'credit': c,
+                'source': f"{r['source_type']} #{r['source_id']}" if r.get('source_type') else 'يدوي',
+                'source_type': r.get('source_type'),
+                'source_id': r.get('source_id'),
+            })
+
+        company_name_val = readmodel.company_name(self.conn, self.company_id)
+        return {
+            'title': f'دفتر أستاذ مركز التكلفة: {cc_name}',
+            'company': company_name_val,
+            'period': f'{d_from} — {d_to}',
+            'printed_at': date.today().isoformat(),
+            'extra': [('مركز التكلفة', cc_name)],
+            'columns': cols,
+            'rows': rows,
+            'totals': [
+                {'label': 'إجمالي المدين', 'value': tot_debit},
+                {'label': 'إجمالي الدائن', 'value': tot_credit},
+                {'label': 'الصافي', 'value': tot_debit - tot_credit},
+            ],
+        }
+
+    def _account_summary_spec(self, account_id: int, d_from: str, d_to: str, **kw) -> Dict[str, Any]:
+        s = self.account_summary(account_id, d_from, d_to, **kw)
+        cols = [
+            {'key': 'metric', 'label': 'المؤشر'},
+            {'key': 'amount', 'label': 'المبلغ بالعملة الأساسية', 'numeric': True},
+        ]
+        rows = [
+            {'metric': 'رصيد بداية السنة', 'amount': _d(s['year_opening_balance']) or Decimal(0)},
+            {'metric': 'رصيد بداية الفترة', 'amount': _d(s['opening_balance']) or Decimal(0)},
+            {'metric': 'مدين الفترة', 'amount': _d(s['period_debit']) or Decimal(0)},
+            {'metric': 'دائن الفترة', 'amount': _d(s['period_credit']) or Decimal(0)},
+            {'metric': 'صافي حركة الفترة', 'amount': _d(s['closing_net'] - s['opening_net']) or Decimal(0)},
+            {'metric': 'الرصيد الختامي', 'amount': _d(s['closing_balance']) or Decimal(0)},
+        ]
+        # تفصيل العملات
+        if s.get('by_currency'):
+            for c in s['by_currency']:
+                cur = c['currency']
+                rows.append({'metric': f'رصيد عملة ({cur})', 'amount': _d(c['net_base']) or Decimal(0)})
+
+        company_name_val = readmodel.company_name(self.conn, self.company_id)
+        acc_label = f"{s['code']} {s['name']}"
+        return {
+            'title': f'ملخص الحساب: {acc_label}',
+            'company': company_name_val,
+            'period': f'{d_from} — {d_to}',
+            'printed_at': date.today().isoformat(),
+            'extra': [('الحساب', acc_label), ('طبيعة الحساب', 'مدين' if s['nature'] == 'debit' else 'دائن')],
+
+            'columns': cols,
+            'rows': rows,
+            'totals': [{'label': 'الرصيد النهائي', 'value': _d(s['closing_balance']) or Decimal(0)}],
+        }
+
+    def _tax_report_spec(self, d_from: str, d_to: str, **kw) -> Dict[str, Any]:
+        data = readmodel.tax_report_data(self.conn, self.company_id, d_from, d_to, branch_id=kw.get('branch_id'))
+        s_inv = data['sales'].get('invoice', (0, 0))
+        s_ret = data['sales'].get('return', (0, 0))
+        p_inv = data['purchases'].get('invoice', (0, 0))
+        p_ret = data['purchases'].get('return', (0, 0))
+
+        s_net = _d(s_inv[0] - s_ret[0]) or Decimal(0)
+        s_tax = _d(s_inv[1] - s_ret[1]) or Decimal(0)
+        p_net = _d(p_inv[0] - p_ret[0]) or Decimal(0)
+        p_tax = _d(p_inv[1] - p_ret[1]) or Decimal(0)
+        net_tax_due = s_tax - p_tax
+
+        cols = [
+            {'key': 'item', 'label': 'البند'},
+            {'key': 'base_amount', 'label': 'المبلغ الخاضع للضريبة', 'numeric': True},
+            {'key': 'tax_amount', 'label': 'مبلغ الضريبة', 'numeric': True},
+        ]
+        rows = [
+            {'item': '1. المبيعات الخاضعة للضريبة', 'base_amount': _d(s_inv[0]) or Decimal(0), 'tax_amount': _d(s_inv[1]) or Decimal(0)},
+            {'item': '2. مرتجعات المبيعات (-)', 'base_amount': _d(s_ret[0]) or Decimal(0), 'tax_amount': _d(s_ret[1]) or Decimal(0)},
+            {'item': '3. إجمالي المبيعات وضريبة المخرجات', 'base_amount': s_net, 'tax_amount': s_tax},
+            {'item': '4. المشتريات الخاضعة للضريبة', 'base_amount': _d(p_inv[0]) or Decimal(0), 'tax_amount': _d(p_inv[1]) or Decimal(0)},
+            {'item': '5. مرتجعات المشتريات (-)', 'base_amount': _d(p_ret[0]) or Decimal(0), 'tax_amount': _d(p_ret[1]) or Decimal(0)},
+            {'item': '6. إجمالي المشتريات وضريبة المدخلات', 'base_amount': p_net, 'tax_amount': p_tax},
+        ]
+        comp_name = readmodel.company_name(self.conn, self.company_id)
+        tot_lbl = 'صافي الضريبة المستحقة للسداد' if net_tax_due >= 0 else 'صافي الضريبة القابلة للاسترداد'
+        return {
+            'title': 'الإقرار الضريبي (ملخص الضريبة)',
+            'company': comp_name,
+            'branch': kw.get('branch_id'),
+            'currency': None,
+            'period': f"{d_from} — {d_to}",
+            'printed_at': date.today().isoformat(),
+            'extra': [],
+            'columns': cols,
+            'rows': rows,
+            'totals': [{'label': tot_lbl, 'value': abs(net_tax_due)}],
+        }
+
+    def _trade_summary_spec(self, is_sales: bool, d_from: str, d_to: str, **kw) -> Dict[str, Any]:
+        """ملخص المبيعات/المشتريات حسب الطرف، لكل عملة على حدة (لا جمع بين العملات). تقرير تشغيلي."""
+        from alhisabat.business import purchases as pur, sales as sal
+        if is_sales:
+            raw = sal.sales_summary(self.conn, self.user_id, self.company_id, d_from, d_to, 'customer')
+            title, party_lbl = 'ملخص المبيعات حسب العميل', 'العميل'
+        else:
+            raw = pur.purchase_summary(self.conn, self.user_id, self.company_id, d_from, d_to, 'supplier')
+            title, party_lbl = 'ملخص المشتريات حسب المورد', 'المورد'
+        names = readmodel.party_names(self.conn, self.company_id)
+        cols = [{'key': 'party', 'label': party_lbl}, {'key': 'currency', 'label': 'العملة'},
+                {'key': 'net', 'label': 'الصافي بدون ضريبة', 'numeric': True},
+                {'key': 'tax', 'label': 'الضريبة', 'numeric': True}]
+        if is_sales:
+            cols += [{'key': 'profit', 'label': 'الربح', 'numeric': True}]
+        rows = []
+        for r in raw:
+            row = {'party': names.get(r['k'], '— بلا طرف —' if not r['k'] else str(r['k'])), 'currency': r['cur'],
+                   'net': _d(r['net_ex']) or Decimal(0), 'tax': _d(r['tax']) or Decimal(0)}
+            if is_sales:
+                row['profit'] = _d(r['profit'])
+            rows.append(row)
+        by_cur: Dict[str, Decimal] = {}
+        for r in rows:                                     # إجمالي كل عملة (شامل الضريبة) على حدة؛ لا جمع بين العملات
+            by_cur[r['currency']] = by_cur.get(r['currency'], Decimal(0)) + r['net'] + r['tax']
+        totals = [{'label': f'الإجمالي شامل الضريبة ({c_})', 'value': v, 'currency': c_} for c_, v in sorted(by_cur.items())]
+        return {
+            'title': title, 'company': readmodel.company_name(self.conn, self.company_id), 'branch': kw.get('branch_id'),
+            'currency': None, 'period': f"{d_from} — {d_to}", 'printed_at': date.today().isoformat(),
+            'extra': [('ملاحظة', 'تقرير تشغيلي؛ التقرير المحاسبي الرسمي من الأستاذ. كل عملة في صفوف منفصلة.')],
+            'columns': cols, 'rows': rows, 'totals': totals,
+        }
+
+    def export_report(self, spec: Dict[str, Any], fmt: str, path: str) -> str:
+        fmt = fmt.lower()
+        if fmt == 'html':
+            data = printing.render_html(spec).encode('utf-8')
+        elif fmt == 'xlsx':
+            data = printing.render_xlsx(spec)
+        elif fmt == 'csv':
+            data = printing.render_csv(spec)
+        else:
+            raise AccountingError('صيغة التصدير غير مدعومة. المتاح: HTML للطباعة، XLSX، CSV.')
+        Path(path).write_bytes(data)
+        return path

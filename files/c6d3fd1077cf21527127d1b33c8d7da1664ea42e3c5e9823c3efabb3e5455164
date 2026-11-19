@@ -1,0 +1,115 @@
+"""سياسات الأمان ومنع الحظر لرسائل واتساب.
+
+دوال خالصة (Pure Functions) قابلة للاختبار بلا Qt وبلا قاعدة بيانات.
+"""
+from datetime import date, datetime
+from typing import Optional, Tuple
+
+HARD_MAX_DAILY_CAP = 400
+HARD_MAX_HOURLY_CAP = 100
+MIN_SAFE_DELAY = 5
+WARMUP_LADDER = (20, 40, 60, 80, 100, 120, 150)
+
+
+def compute_warmup_cap(
+    warmup_start_date: Optional[str],
+    current_date: Optional[str] = None,
+    configured_daily_cap: int = 150,
+) -> int:
+    """حساب السقف اليومي الفعلي مع مراعاة منحنى التسخين لأول 7 أيام.
+
+    أيام 1-7: 20، 40، 60، 80، 100، 120، 150.
+    بعد اليوم السابع: السقف المحدد في الإعدادات (لا يتجاوز 400 مطلقًا).
+    """
+    safe_cap = min(max(1, int(configured_daily_cap)), HARD_MAX_DAILY_CAP)
+    if not warmup_start_date:
+        return safe_cap
+
+    try:
+        start_d = date.fromisoformat(str(warmup_start_date).strip()[:10])
+        curr_d = (
+            date.fromisoformat(str(current_date).strip()[:10])
+            if current_date
+            else date.today()
+        )
+        delta_days = (curr_d - start_d).days
+        if delta_days < 0:
+            return WARMUP_LADDER[0]
+        if delta_days < len(WARMUP_LADDER):
+            return min(WARMUP_LADDER[delta_days], safe_cap)
+        return safe_cap
+    except (ValueError, TypeError):
+        return safe_cap
+
+
+def is_within_window(
+    current_time_str: str,
+    window_start: str = "08:00",
+    window_end: str = "21:00",
+) -> bool:
+    """فحص ما إذا كان الوقت الحالي ضمن نافذة الإرسال المسموحة (HH:MM)."""
+    try:
+        cur_t = current_time_str.strip()[:5]
+        w_start = window_start.strip()[:5]
+        w_end = window_end.strip()[:5]
+        if w_start <= w_end:
+            return w_start <= cur_t <= w_end
+        # نافذة ليلية عابرة لمنتصف الليل
+        return cur_t >= w_start or cur_t <= w_end
+    except Exception:
+        return True
+
+
+def is_consecutive_failures_tripped(consecutive_failures: int, max_failures: int = 3) -> bool:
+    """إيقاف تلقائي بعد 3 إخفاقات متتالية."""
+    return int(consecutive_failures) >= max_failures
+
+
+def make_idempotency_key(
+    kind: str,
+    ref_type: str,
+    ref_id: any,
+    phone: str,
+    date_bucket: str = "",
+) -> str:
+    """توليد مفتاح عدم التكرار.
+
+    date_bucket (مثلاً تاريخ اليوم YYYY-MM-DD) يمنع تكرار نفس المستند لنفس الرقم خلال 24 ساعة.
+    """
+    parts = [
+        str(kind or "text").strip().lower(),
+        str(ref_type or "").strip().lower(),
+        str(ref_id or "").strip(),
+        str(phone or "").strip(),
+    ]
+    if date_bucket:
+        parts.append(str(date_bucket).strip()[:10])
+    return ":".join(parts)
+
+
+def check_send_policy(
+    daily_sent: int,
+    hourly_sent: int,
+    effective_daily_cap: int,
+    hourly_cap: int,
+    current_time: str,
+    window_start: str = "08:00",
+    window_end: str = "21:00",
+    consecutive_failures: int = 0,
+) -> Tuple[bool, str]:
+    """فحص متكامل لسياسات الأمان قبل إرسال الرسالة التالية."""
+    if is_consecutive_failures_tripped(consecutive_failures, 3):
+        return False, "تم إيقاف الإرسال تلقائيًا بسبب توالي 3 إخفاقات"
+
+    if not is_within_window(current_time, window_start, window_end):
+        return False, f"الوقت الحالي ({current_time[:5]}) خارج نافذة العمل المسموحة ({window_start}-{window_end})"
+
+    clamped_hourly = min(max(1, int(hourly_cap)), HARD_MAX_HOURLY_CAP)
+    if int(hourly_sent) >= clamped_hourly:
+        return False, f"تم بلوغ السقف الساعي للأمان ({clamped_hourly} رسالة/ساعة)"
+
+    clamped_daily = min(max(1, int(effective_daily_cap)), HARD_MAX_DAILY_CAP)
+    if int(daily_sent) >= clamped_daily:
+        return False, f"تم بلوغ السقف اليومي للأمان ({clamped_daily} رسالة/يوم)"
+
+    return True, "جاهز للإرسال"

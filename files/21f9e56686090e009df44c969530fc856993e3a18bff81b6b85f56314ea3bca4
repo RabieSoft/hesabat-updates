@@ -1,0 +1,53 @@
+"""مطابقة المخزون المحاسبي بالتشغيلي وفحص سلامة الأرصدة المخزنة (SQL فقط: تستعملها فحوص السلامة والإقفال)."""
+from alhisabat.accounting import balance_engine as be
+
+
+def applicable(conn, company_id):
+    return conn.execute("SELECT 1 FROM items WHERE company_id=? LIMIT 1", (company_id,)).fetchone() is not None
+
+
+def operational_values(conn, company_id, as_of):
+    """{حساب المخزون: قيمة الحركات حتى as_of}؛ المفتاح None للأصناف التي لا حساب مخزون لها ولا ربط."""
+    rows = conn.execute(
+        "SELECT COALESCE(i.inventory_account_id,(SELECT m.account_id FROM account_mappings m WHERE m.company_id=i.company_id "
+        "AND m.map_key='inventory')) acc, SUM(CASE mv.direction WHEN 'in' THEN mv.value_base ELSE -mv.value_base END) v "
+        "FROM stock_movements mv JOIN items i ON i.id=mv.item_id WHERE mv.company_id=? AND mv.movement_date<=? GROUP BY acc",
+        (company_id, as_of)).fetchall()
+    return {r["acc"]: r["v"] for r in rows}
+
+
+def reconcile(conn, company_id, as_of):
+    if not applicable(conn, company_id):
+        return {"applicable": False, "ok": True, "rows": [], "unlinked_movements": 0}
+    ys = be.year_start(conn, company_id, as_of)
+    accs = be.load_accounts(conn, company_id)
+    tot = be.aggregate(accs, be.movements(conn, company_id, ys, as_of, ys))
+    op = operational_values(conn, company_id, as_of)
+    mapped = conn.execute("SELECT account_id FROM account_mappings WHERE company_id=? AND map_key='inventory'", (company_id,)).fetchone()
+    keys = set(op) | ({mapped[0]} if mapped else set())
+    rows = []
+    for k in sorted(keys, key=lambda x: (x is None, x)):
+        if k is None:
+            rows.append({"account_id": None, "code": "—", "operational": op[None], "accounting": 0, "diff": op[None]})
+            continue
+        acc_val = tot[k][0] + tot[k][1] - tot[k][2]
+        rows.append({"account_id": k, "code": accs[k]["code"], "operational": op.get(k, 0), "accounting": acc_val,
+                     "diff": op.get(k, 0) - acc_val})
+    unlinked = conn.execute("SELECT COUNT(*) FROM stock_movements WHERE company_id=? AND journal_entry_id IS NULL AND value_base>0 "
+                            "AND movement_type NOT IN ('transfer_in','transfer_out') AND movement_date<=?", (company_id, as_of)).fetchone()[0]
+    return {"applicable": True, "ok": all(r["diff"] == 0 for r in rows), "rows": rows, "unlinked_movements": unlinked}
+
+
+def verify_cache(conn, company_id):
+    """الأرصدة المخزنة (stock_balances) = مجموع الحركات لكل (صنف، مستودع). يرجع قائمة الفروقات."""
+    calc = {(r["item_id"], r["warehouse_id"]): (r["q"], r["v"]) for r in conn.execute(
+        "SELECT item_id,warehouse_id,SUM(CASE direction WHEN 'in' THEN qty_milli ELSE -qty_milli END) q,"
+        "SUM(CASE direction WHEN 'in' THEN value_base ELSE -value_base END) v FROM stock_movements WHERE company_id=? "
+        "GROUP BY item_id,warehouse_id", (company_id,))}
+    stored = {(r["item_id"], r["warehouse_id"]): (r["qty_milli"], r["value_base"]) for r in conn.execute(
+        "SELECT b.* FROM stock_balances b JOIN items i ON i.id=b.item_id WHERE i.company_id=?", (company_id,))}
+    bad = []
+    for k in set(calc) | set(stored):
+        if calc.get(k, (0, 0)) != stored.get(k, (0, 0)):
+            bad.append({"item_id": k[0], "warehouse_id": k[1], "calculated": calc.get(k, (0, 0)), "stored": stored.get(k, (0, 0))})
+    return bad

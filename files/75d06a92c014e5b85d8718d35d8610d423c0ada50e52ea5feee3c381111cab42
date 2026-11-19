@@ -1,0 +1,1191 @@
+"""نوافذ الفاتورة: إنشاء/تعديل + مرتجع. بلا منطق محاسبي، بلا float.
+
+v1.6: ملخص حي لإجماليات الفاتورة من المحرك نفسه (preview_totals) بدل الإدخال الأعمى، رصيد الطرف والحد الائتماني أثناء الإدخال،
+«سداد كامل»، تحقق يعطّل الحفظ مع بيان السبب، Ctrl+S وInsert، «حفظ وفاتورة جديدة»، وحفظ الدفعات والتكاليف المباشرة
+ورقم فاتورة المورد عند تعديل المسودة (كانت تضيع بصمت). الطباعة عبر DocumentSheet من printing.invoice_print.
+"""
+from decimal import Decimal
+
+from PySide6.QtCore import QTimer, Qt, Signal
+from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut
+from PySide6.QtWidgets import (
+    QButtonGroup, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMessageBox,
+    QPushButton, QRadioButton, QScrollArea, QVBoxLayout, QWidget
+)
+
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.ui.components import invoice_colors as IC
+from alhisabat.ui.components.basic import AmountInWords, DateField, DialogGuardMixin, MoneyEdit, make_resizable, repolish, ModeRadio
+from alhisabat.ui.components.lines_editor import ColSpec, LinesEditor
+from alhisabat.ui.components.pickers import SearchPicker, cached_loader
+from alhisabat.ui.core import entry_logic as EL, format as fmt, strings_ar as S
+
+
+from alhisabat.ui.core.logic import fmt_qty_milli as EL_fmt_qty
+
+
+def _safe(fn, default):
+    """استدعاء قائمة اختيار: الصلاحية قد تمنعها فتظهر فارغة ولا تنهار النافذة."""
+    try:
+        return fn()
+    except Exception:  # noqa: BLE001
+        return default
+
+
+class InvoiceEditor(DialogGuardMixin, QDialog):
+    guard_save_stay = False
+    nonmodal_exec = True
+    center_on_show = True
+    draft_clear_on_page_save = True
+    submitted = Signal()                 # المضمَّن: طلب الحفظ بعد اجتياز التحقق (بدل accept() الذي يخفي العنصر)
+    clearRequested = Signal()            # المضمَّن: زر «جديدة/مسح» أو «إلغاء التعديل»
+
+    def __init__(self, page, kind, existing=None, defaults=None):
+        super().__init__(page)
+        self.page, self.kind, self.existing = page, kind, existing
+        self._defaults = dict(defaults or {})            # ما يُتذكَّر من الفاتورة السابقة (التاريخ والعملة) للفاتورة الجديدة فقط
+        self.draft_key = None if existing else f'invoice_{kind}_new'     # مسودة للفاتورة الجديدة فقط
+        self.draft_page = 'sales' if kind == 'sales' else 'purchases'
+        self.draft_title = 'فاتورة مبيعات جديدة' if kind == 'sales' else 'فاتورة مشتريات جديدة'
+        self.add_another = False
+        is_sales = kind == 'sales'
+        self._party_kind = 'customer' if is_sales else 'supplier'
+        self._carry_payments, self._carry_costs, self._totals, self._carry_disc_amount = [], [], None, ''
+        self._ctx = None
+        self._last_pick, self._last_price_info = None, None
+        self._unit_names = {}
+        self._units_cache = {}                           # item_id -> {unit_id: factor_milli} لتحويل السعر عند تغيير الوحدة
+        self.setWindowTitle('تعديل فاتورة' if existing else ('فاتورة مبيعات' if is_sales else 'فاتورة مشتريات'))
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.setObjectName('invDialog')
+        if self.embedded:
+            self.setWindowFlags(Qt.Widget)               # قبل أي عرض: عنصر عادي داخل الصفحة لا نافذة
+            self.setSizeGripEnabled(False)
+        else:
+            self._fit_to_screen()
+        s = page.session
+        outer = QVBoxLayout(self)                          # المحتوى داخل منطقة تمرير: على الشاشات الصغيرة لا ينضغط الجدول بل يظهر شريط تمرير
+        outer.setContentsMargins(12, 8, 12, 8)
+        outer.setSpacing(6)
+        if self.embedded:                                  # داخل الصفحة: هوامش دنيا ليظهر قالب الفاتورة كاملًا
+            outer.setContentsMargins(4, 0, 4, 2)
+            outer.setSpacing(3)
+        scroll = QScrollArea(); scroll.setObjectName('invScroll'); scroll.setWidgetResizable(True); scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setLayoutDirection(Qt.RightToLeft)
+        body = QWidget(); body.setObjectName('invBody'); body.setLayoutDirection(Qt.RightToLeft)
+        scroll.setWidget(body)
+        outer.addWidget(scroll, 1)
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(0, 0, 6, 0)
+        lay.setSpacing(4 if self.embedded else 8)
+
+        # ---- شريط العنوان الملوّن: نوع الفاتورة + حالتها + إجمالي حي
+        title = QFrame(); title.setObjectName('invTitleBar'); title.setProperty('kind', kind)
+        tl = QHBoxLayout(title); tl.setContentsMargins(14, 6, 14, 6); tl.setSpacing(12)
+        tcol = QVBoxLayout(); tcol.setSpacing(0)
+        self.title_lbl = QLabel('فاتورة مبيعات' if is_sales else 'فاتورة مشتريات'); self.title_lbl.setObjectName('invTitle')
+        no = (existing or {}).get('invoice_no')
+        sub_txt = (f'تعديل مسودة {no}' if no else 'تعديل مسودة') if existing else 'فاتورة جديدة — تُحفظ كمسودة ثم تُرحَّل'
+        self.title_sub = QLabel(sub_txt); self.title_sub.setObjectName('invTitleSub')
+        tcol.addWidget(self.title_lbl); tcol.addWidget(self.title_sub)
+        tl.addLayout(tcol, 1)
+        chip = QFrame(); chip.setObjectName('invChip')
+        cl = QHBoxLayout(chip); cl.setContentsMargins(12, 3, 12, 3); cl.setSpacing(8)
+        chip_k = QLabel('إجمالي الفاتورة:'); chip_k.setObjectName('invChipKey')
+        self.chip_val = QLabel('—'); self.chip_val.setObjectName('invChipVal'); self.chip_val.setLayoutDirection(Qt.LeftToRight)
+        cl.addWidget(chip_k); cl.addWidget(self.chip_val)
+        tl.addWidget(chip)
+        lay.addWidget(title)
+        title.setVisible(not self.embedded)               # المضمَّن: العنوان في شريط اللوحة، والإجمالي في صندوق الملخص
+
+        # ---- الرأس: بطاقة بصفين واضحين (لكل حقل عنوان فوقه)
+        yr = page.state.get('year') or {}
+        self.mode = ModeRadio([('نقدي', 'cash'), ('آجل', 'credit')])
+        self.mode.setToolTip('نقدي: يُسدَّد كامل المبلغ فورًا في الصندوق/البنك. آجل: يبقى على الطرف (ويمكن دفع جزء الآن).')
+        self.party = SearchPicker(cached_loader(lambda: _safe(lambda: s.lookup_parties(self._party_kind), [])),
+                                  placeholder='— بدون طرف (نقدي) — أو ابحث بالاسم/الكود…')
+        self.btn_lock_party = QPushButton('🔒'); self.btn_lock_party.setCheckable(True); self.btn_lock_party.setProperty('compact', True)
+        self.btn_lock_party.setMaximumWidth(36); self.btn_lock_party.setAutoDefault(False)
+        self.btn_lock_party.setToolTip('تثبيت الطرف: يمنع تغييره بالخطأ أثناء إدخال بنود الفاتورة (يُلغى التثبيت بنفس الزر)')
+        self.btn_lock_party.toggled.connect(lambda ck: self.party.setEnabled(not ck))
+        party_wrap = QWidget(); pw = QHBoxLayout(party_wrap); pw.setContentsMargins(0, 0, 0, 0); pw.setSpacing(4)
+        pw.addWidget(self.party, 1); pw.addWidget(self.btn_lock_party)
+        self._wh_loader = cached_loader(lambda: _safe(s.lookup_warehouses, []))
+        self.wh = SearchPicker(self._wh_loader, placeholder='— بدون مستودع —')
+        self.currency = QComboBox()                      # قائمة العملات المفعّلة؛ الأولى = الأساسية (قيمتها '' فتُرحَّل بسعر 1)
+        self._fill_currencies(s)
+        self.date = DateField(yr.get('start'), yr.get('end'))
+        self.discount = MoneyEdit(); self.discount.setPlaceholderText('0')
+        self.notes = QLineEdit(); self.notes.setPlaceholderText('ملاحظات')
+        self.supplier_ref = QLineEdit()
+        self.user_box = QLineEdit(self._current_user_name()); self.user_box.setReadOnly(True); self.user_box.setFocusPolicy(Qt.NoFocus)
+        self.user_box.setToolTip('المستخدم الذي يُدخل الفاتورة (من جلسة الدخول)')
+        self.user_box.setMinimumWidth(110)
+        self.rate_lbl = QLabel(''); self.rate_lbl.setObjectName('ctxKey')
+        self.btn_rate = QPushButton('تسجيل سعر الصرف…'); self.btn_rate.clicked.connect(self._register_rate); self.btn_rate.setVisible(False)
+        self.currency.currentIndexChanged.connect(self._on_currency)
+        self.date.dateChanged.connect(lambda _d: self._on_currency())
+        hdr = QFrame(); hdr.setObjectName('invCard')
+        hv = QVBoxLayout(hdr); hv.setContentsMargins(10, 4, 10, 4); hv.setSpacing(1)
+        hrow = QHBoxLayout(); hrow.setSpacing(12)
+
+        def field(cap, w, stretch=0):
+            """حقل بعنوان فوقه داخل صف الرأس الواحد؛ يرجع الكتلة ليمكن إخفاؤها كاملة."""
+            blk = QWidget(); bl = QVBoxLayout(blk); bl.setContentsMargins(0, 0, 0, 0); bl.setSpacing(2)
+            lab = QLabel(cap); lab.setObjectName('invFieldLbl')
+            bl.addWidget(lab); bl.addWidget(w)
+            hrow.addWidget(blk, stretch)
+            return blk
+        self.date.setMinimumWidth(128)
+        self.currency.setMinimumWidth(120)
+        field('نوع الفاتورة', self.mode)
+        party_wrap.setMaximumWidth(430)                    # خانة الطرف بحجم معقول لا تمتد على كامل العرض
+        field('العميل' if is_sales else 'المورد', party_wrap, 3)
+        if not is_sales:
+            self.supplier_ref.setPlaceholderText('اختياري — يمنع التكرار')
+            field('رقم فاتورة المورد', self.supplier_ref, 2)
+        self.wh_block = field('المستودع', self.wh, 3)
+        field('التاريخ', self.date)
+        field('العملة', self.currency)
+        field('المستخدم', self.user_box)
+        hrow.addStretch(2)                                 # الفائض يذهب لفراغ جانبي بدل تضخيم الحقول
+        hv.addLayout(hrow)
+        self.sub_wrap = QWidget(); sub = QHBoxLayout(self.sub_wrap); sub.setContentsMargins(0, 0, 0, 0)
+        self.party_info = QLabel(''); self.party_info.setObjectName('invHint')
+        sub.addWidget(self.party_info, 1); sub.addWidget(self.rate_lbl); sub.addWidget(self.btn_rate)
+        hv.addWidget(self.sub_wrap)
+        self.sub_wrap.setVisible(False)                    # يظهر فقط عند وجود رصيد طرف أو عملة أجنبية
+        lay.addWidget(hdr)
+
+        # ---- البنود: الخصم والضريبة على مستوى السطر محذوفان من الإدخال (الخصم العام فقط)؛ يبقيان مخفيين لحمل قيم المسودات القديمة
+        tax_opts = _safe(lambda: s.lookup_tax_rates('output' if is_sales else 'input'), [])
+
+        def make_cols():                                   # نسختان مستقلتان: شريط الإدخال الثابت + قائمة البنود المضافة
+            return [
+                ColSpec('item_id', 'الصنف', 'picker', loader=lambda: _safe(s.lookup_items_for_invoice, []), width=340, required=True, stretch=True),
+                ColSpec('color', 'اللون', 'variant', width=170, hidden=True),          # قائمة معاينة بألوان الصنف المختار؛ مخفي إن لم يكن له ألوان
+                ColSpec('qty', 'الكمية', 'money', width=110, places=3, required=True),
+                ColSpec('unit_id', 'الوحدة', 'unit', width=110),
+                ColSpec('price', 'السعر', 'money', width=130, required=True),
+                ColSpec('amount', 'الإجمالي', 'money', width=140),
+                ColSpec('disc', 'خصم %', 'money', width=0, hidden=True),
+                ColSpec('tax_rate_id', 'الضريبة', 'picker', loader=lambda: tax_opts, width=0, hidden=True),
+            ] + ([] if is_sales else [ColSpec('lot_no', 'رقم الدفعة', width=120), ColSpec('expiry_date', 'تاريخ الانتهاء', 'date', width=130)])
+        calc = ('qty', 'price', 'amount')
+        # القائمة: البنود المضافة فقط (بلا صفوف فارغة)؛ تبقى قابلة للتعديل المباشر في مكانها
+        self.lines = LinesEditor(make_cols(), min_rows=0, calc=calc, row_h=32, object_name='invTable')
+        self.lines.hide_toolbar()
+        self.lines.table.setMinimumHeight(60)
+        self.lines.variant_api = (self.page.svc.variants_of, self.page.svc.parent_of)
+        # شريط الإدخال الثابت: صف واحد، Enter ينتقل للحقل التالي وفي آخر حقل يحفظ البند وينزّله للقائمة
+        self.entry = LinesEditor(make_cols(), min_rows=1, calc=calc, row_h=34, object_name='invTable')
+        self.entry.hide_toolbar()
+        self.entry.variant_api = self.lines.variant_api
+        self.entry.commit_fn = self._commit_entry
+        self.entry.table.setFixedHeight(72)
+        self.entry.table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.entry.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.btn_commit = QPushButton('✔ حفظ'); self.btn_commit.setProperty('primary', True)
+        self.btn_commit.setToolTip('يضيف البند إلى القائمة (Enter في آخر حقل). البنود المضافة تُعدَّل مباشرة في القائمة.')
+        self.btn_rm = QPushButton('🗑 حذف')
+        self.btn_rm.setToolTip('يمسح ما كُتب في شريط الإدخال؛ وإن كان فارغًا يحذف السطر المحدد في القائمة (Ctrl+Delete)')
+        for b_ in (self.btn_commit, self.btn_rm):
+            b_.setAutoDefault(False); b_.setFixedHeight(32); b_.setMinimumWidth(74)
+        self.btn_commit.clicked.connect(lambda: self._commit_entry())
+        self.btn_rm.clicked.connect(self._remove_line)
+        lines_card = QFrame(); lines_card.setObjectName('invCard')
+        lc = QVBoxLayout(lines_card); lc.setContentsMargins(10, 4, 10, 4); lc.setSpacing(3)
+        lines_card.setMinimumHeight(330)                    # حدّ أدنى مضمون للجدول مهما صغرت الشاشة
+        if self.embedded:                                   # داخل الصفحة: الفاتورة كلها أمام المستخدم، فالقائمة تتمدد بما يتبقى
+            lines_card.setMinimumHeight(170)
+        else:
+            self.lines.table.setMinimumHeight(180)
+        lh = QHBoxLayout()
+        ltitle = QLabel('بنود الفاتورة'); ltitle.setObjectName('invSectionTitle')
+        lkeys = QLabel('Enter: الحقل التالي / حفظ البند  ·  Ctrl+Delete: حذف السطر المحدد  ·  Ctrl+S: حفظ الفاتورة')
+        lkeys.setObjectName('invHint')
+        self.items_count = QLabel(''); self.items_count.setObjectName('invSectionTitle')
+        lh.addWidget(ltitle); lh.addWidget(self.items_count); lh.addStretch(1); lh.addWidget(lkeys)
+        lc.addLayout(lh)
+        self.dup_lbl = QLabel(''); self.dup_lbl.setObjectName('invWarn'); self.dup_lbl.setWordWrap(True); self.dup_lbl.setVisible(False)
+        lc.addWidget(self.dup_lbl)
+        self.loss_lbl = QLabel(''); self.loss_lbl.setObjectName('invDanger'); self.loss_lbl.setWordWrap(True); self.loss_lbl.setVisible(False)
+        lc.addWidget(self.loss_lbl)
+        erow = QHBoxLayout(); erow.setSpacing(8)
+        erow.addWidget(self.entry, 1)
+        ebtn = QHBoxLayout(); ebtn.setSpacing(4); ebtn.addWidget(self.btn_commit); ebtn.addWidget(self.btn_rm)
+        ebw = QWidget(); ebw.setLayout(ebtn)
+        erow.addWidget(ebw, 0, Qt.AlignBottom)
+        lc.addLayout(erow)
+        self.entry_msg = QLabel(''); self.entry_msg.setObjectName('invWarn'); self.entry_msg.setVisible(False)
+        lc.addWidget(self.entry_msg)
+        lc.addWidget(self.lines, 1)
+        self.item_info = QLabel('')          # آخر سعر للصنف المختار + رصيده بالمخزون — يظهر عند اختيار صنف في شريط الإدخال
+        self.item_info.setObjectName('invHint')
+        lc.addWidget(self.item_info)
+        IC.attach(self, lc)                  # شريط أرصدة ألوان الأصناف الملوّنة (مخفي لغيرها)
+        lay.addWidget(lines_card, 1)
+
+        # ---- صف واحد: الدفعة + الخصم العام + الملاحظات
+        def cap(t):
+            l_ = QLabel(t); l_.setObjectName('invFieldLbl'); return l_
+        pay_box = QFrame(); pay_box.setObjectName('invCard')
+        pl = QHBoxLayout(pay_box); pl.setContentsMargins(10, 3, 10, 3); pl.setSpacing(8)
+        self.pay_cash = SearchPicker(cached_loader(lambda: _safe(s.lookup_pay_accounts, [])), placeholder='— بدون دفعة الآن —')
+        self.pay_amount = MoneyEdit(); self.pay_amount.setMaximumWidth(130)
+        self.btn_full = QPushButton('سداد كامل')
+        self.btn_full.setAutoDefault(False)
+        self.btn_full.clicked.connect(self._pay_full)
+        self.discount.setMaximumWidth(90)
+        pl.addWidget(cap('الصندوق/البنك')); pl.addWidget(self.pay_cash, 3)
+        pl.addWidget(cap('الدفعة الآن')); pl.addWidget(self.pay_amount, 1); pl.addWidget(self.btn_full)
+        pl.addSpacing(10)
+        pl.addWidget(cap('خصم عام %')); pl.addWidget(self.discount)
+        pl.addSpacing(10)
+        pl.addWidget(cap('ملاحظات')); pl.addWidget(self.notes, 4)
+        lay.addWidget(pay_box)
+
+        # ---- شريط الملخص الحي (أفقي مضغوط)
+        sum_box = QFrame(); sum_box.setObjectName('invCard')
+        sb = QHBoxLayout(sum_box); sb.setContentsMargins(10, 3, 10, 3); sb.setSpacing(14)
+        self._sum, self._sum_keys = {}, {}
+        small = [('gross', 'قبل الخصم'), ('discount', 'الخصم العام'), ('net', 'الصافي'), ('tax', 'الضريبة (مسودة قديمة)'), ('paid', 'المدفوع')]
+        if is_sales:
+            small.append(('profit', 'ربح الفاتورة (تقديري)'))
+        for key, lab in small:
+            k = QLabel(lab); k.setObjectName('invSumKey')
+            v = QLabel('—'); v.setObjectName('invSumVal'); v.setProperty('sk', key)      # لون الخانة بدلالتها (QSS: invSumVal[sk])
+            v.setLayoutDirection(Qt.LeftToRight)
+            v.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            pair = QHBoxLayout(); pair.setSpacing(4); pair.addWidget(k); pair.addWidget(v)
+            sb.addLayout(pair)
+            self._sum[key], self._sum_keys[key] = v, k
+        for w in (self._sum['tax'], self._sum_keys['tax']):
+            w.setVisible(False)                           # تظهر فقط إن حملت مسودة قديمة ضريبة
+        sb.addStretch(1)
+        for key, cap_, name in (('total', 'الإجمالي', 'invTotalBox'), ('due', 'المتبقي', 'invDueBox')):
+            box = QFrame(); box.setObjectName(name)
+            bl = QVBoxLayout(box); bl.setContentsMargins(10, 2, 10, 2); bl.setSpacing(0)
+            box.setFixedHeight(46); box.setMinimumWidth(150)
+            k = QLabel(cap_); k.setObjectName('invBigKey')
+            v = QLabel('—'); v.setObjectName('invBigVal'); v.setLayoutDirection(Qt.LeftToRight); v.setAlignment(Qt.AlignCenter)
+            bl.addWidget(k, 0, Qt.AlignCenter); bl.addWidget(v, 1, Qt.AlignCenter)
+            sb.addWidget(box)
+            self._sum[key] = v
+            if key == 'due':
+                self._due_box = box
+        lay.addWidget(sum_box)
+
+        # ---- أحجام صغيرة معقولة لحقول الرأس والدفعة
+        for w_ in (self.party, self.wh, self.date, self.currency, self.mode, self.pay_cash, self.pay_amount, self.discount, self.notes,
+                   self.supplier_ref, self.btn_full, self.btn_lock_party, self.user_box):
+            w_.setFixedHeight(30)
+
+        self.words = AmountInWords()
+        if not self.embedded:
+            lay.addWidget(self.words)                      # المضمَّن: يوضع في شريط الأزرار السفلي الثابت
+
+        self.msg = QLabel('')
+        self.msg.setObjectName('invWarn')
+        self.msg.setWordWrap(True)
+        self.msg.setVisible(False)
+        lay.addWidget(self.msg)
+
+        bb = QDialogButtonBox()
+        self.ok = bb.addButton('حفظ كمسودة', QDialogButtonBox.AcceptRole)
+        self.ok.setProperty('primary', True)
+        self.ok.setAutoDefault(False)
+        self.btn_more = None
+        if not existing:
+            self.btn_more = bb.addButton('حفظ وفاتورة جديدة', QDialogButtonBox.ActionRole)
+            self.btn_more.setAutoDefault(False)
+            self.btn_more.clicked.connect(self._save_and_new)
+        cancel = bb.addButton(S.ACTION['cancel'], QDialogButtonBox.RejectRole)
+        cancel.setAutoDefault(False)
+        bb.accepted.connect(self._accept)
+        bb.rejected.connect(self.clearRequested.emit if self.embedded else self.reject)
+        if self.embedded:
+            self.ok.setText('حفظ (Ctrl+S)')
+            cancel.setText('إلغاء التعديل' if existing else 'فاتورة جديدة / مسح')
+            if self.btn_more is not None:
+                self.btn_more.setVisible(False)               # بعد كل حفظ تعود اللوحة لفاتورة جديدة تلقائيًا
+        if self.embedded:                                  # صف سفلي ثابت واحد: المبلغ كتابةً + «حُفظ تلقائيًا» + أزرار الحفظ
+            if getattr(self, '_draft_lbl', None) is None:
+                self._draft_lbl = QLabel(''); self._draft_lbl.setObjectName('ctxKey')
+            wrow = QHBoxLayout(); wrow.setContentsMargins(0, 0, 0, 0); wrow.setSpacing(10)
+            wrow.addWidget(self.words, 1); wrow.addWidget(self._draft_lbl); wrow.addWidget(bb)
+            outer.addLayout(wrow)
+        else:
+            outer.addWidget(bb)                            # أزرار الحفظ ثابتة أسفل النافذة خارج التمرير
+
+        sc_save = QShortcut(QKeySequence('Ctrl+S'), self, activated=self._accept)
+        sc_ins = QShortcut(QKeySequence('Insert'), self, activated=self._focus_entry)
+        if self.embedded:                                   # لا يتعارض مع عناصر الصفحة الأخرى: يعمل والتركيز داخل اللوحة فقط
+            sc_save.setContext(Qt.WidgetWithChildrenShortcut)
+            sc_ins.setContext(Qt.WidgetWithChildrenShortcut)
+
+        if existing:
+            self._load_existing(existing, is_sales)
+
+        self.lines.linesChanged.connect(self._refresh)
+        self.lines.cellPicked.connect(self._on_item_picked)
+        self.lines.unitChanged.connect(self._on_unit_changed)
+        self.entry.cellPicked.connect(lambda r, k, i: self._on_item_picked(r, k, i, ed=self.entry))
+        self.entry.unitChanged.connect(lambda r, k, u: self._on_unit_changed(r, k, u, ed=self.entry))
+        self.wh.selected.connect(lambda _i: self._refresh_item_info())
+        self.discount.valueChanged.connect(lambda _v: self._refresh())
+        self.pay_amount.valueChanged.connect(lambda _v: self._refresh())
+        self.pay_cash.selected.connect(lambda _i: self._refresh())
+        if not existing:
+            self._apply_defaults()                         # يتذكر تاريخ وعملة الفاتورة السابقة قبل أن يُعدّ _ready الحسابات
+        self._ready = True
+        IC.wire(self)
+        self._on_currency()
+        self.party.selected.connect(lambda _i: self._on_party())
+        self.mode.currentIndexChanged.connect(lambda _i: self._on_mode())
+        self.mode.activated.connect(lambda _i: setattr(self, '_touched', True))      # اختيار المستخدم الصريح يُحترم
+        self._auto_warehouse()
+        self._on_party()
+        self._refresh()
+
+    def _current_user_name(self):
+        """اسم المستخدم الحالي للعرض فقط (يفشل بصمت إلى نص فارغ)."""
+        try:
+            return str(self.page.session.username() or '')
+        except Exception:  # noqa: BLE001
+            return ''
+
+    def _apply_defaults(self):
+        d = self._defaults
+        if d.get('date'):
+            self.date.set_iso(d['date'])                   # خارج حدود السنة يُقصّ تلقائيًا إلى أقرب حد
+        if 'currency' in d and d['currency'] is not None:
+            self._set_currency(d['currency'])
+
+    def memory(self):
+        """ما يُحمل للفاتورة التالية: التاريخ والعملة (قيمة العملة الأساسية = '')."""
+        return {'date': self.date.iso(), 'currency': self._cur_code()}
+
+    def _focus_entry(self, col=0):
+        QTimer.singleShot(0, lambda: self.entry._focus(0, col))
+
+    def _commit_entry(self):
+        """يضيف بند شريط الإدخال إلى القائمة أسفله ثم يفرّغ الشريط ويعيد التركيز للصنف. True = تمت الإضافة أو لا شيء للإضافة."""
+        rows = self.entry.non_empty_rows()
+        if not rows:
+            return True
+        row = dict(rows[0])
+        miss = [(i, c.label) for i, c in enumerate(self.entry.cols) if c.required and row.get(c.key) in (None, '')]
+        msg, col = '', 0
+        if miss:
+            msg, col = 'أكمل: ' + '، '.join(m for _i, m in miss), miss[0][0]
+        elif row.get('qty') is not None and Decimal(str(row['qty'])) <= 0:
+            msg, col = 'الكمية يجب أن تكون أكبر من صفر', 2
+        else:
+            errs = self.entry.validate()
+            if errs:
+                msg = errs[0][1].split(': ', 1)[-1]
+        if msg:
+            self.entry_msg.setText(msg); self.entry_msg.setVisible(True)
+            self._focus_entry(col)
+            return False
+        n = self.lines.add_row(row)
+        iid = row.get('item_id')
+        if iid:
+            self.lines.set_unit_options(n, 'unit_id', self._unit_opts(iid), select=row.get('unit_id'))
+        self.lines.table.scrollToBottom()
+        self._reset_entry()
+        return True
+
+    def _reset_entry(self):
+        self.entry.set_rows([])
+        self._last_pick, self._last_price_info = None, None
+        self.item_info.setText('')
+        self.entry_msg.setVisible(False)
+        self._focus_entry()
+
+    def _remove_line(self):
+        if self.entry.non_empty_rows():
+            self._reset_entry()
+            return
+        t = self.lines.table
+        if t.rowCount() == 0:
+            return
+        if t.currentRow() < 0:
+            t.setCurrentCell(t.rowCount() - 1, 0)
+        self.lines.remove_current()
+        self._focus_entry()
+
+    def _auto_warehouse(self):
+        """مستودع واحد فقط: يُختار تلقائيًا ويُخفى الحقل لتوفير المساحة؛ عند وجود أكثر من مستودع يظهر كالمعتاد.
+        فاتورة محفوظة بمستودع آخر (مثلًا غير مفعّل) تُبقي الحقل ظاهرًا ولا تُغيَّر قيمتها."""
+        rows = _safe(self._wh_loader, [])
+        wid = (self.existing or {}).get('warehouse_id')
+        auto = len(rows) == 1 and wid in (None, rows[0][0])
+        self.wh_block.setVisible(not auto)
+        if auto and self.wh.current_id() is None:
+            self.wh.set_id(rows[0][0])
+
+    def accept(self):
+        if self.embedded:
+            self.submitted.emit()                            # الصفحة تحفظ؛ العنصر يبقى ظاهرًا حتى ينجح الحفظ
+            return
+        super().accept()
+
+    def keyPressEvent(self, ev):
+        if self.embedded and ev.key() == Qt.Key_Escape:
+            ev.ignore()                                      # Esc داخل الصفحة لا يغلق ولا يمسح فاتورة بالخطأ
+            return
+        super().keyPressEvent(ev)
+
+    def _fit_to_screen(self):
+        """نافذة أكبر من السابق (1400×860 كحد أقصى) لكن لا تتجاوز ~94% من الشاشة المتاحة؛ قابلة للتكبير والسحب."""
+        w, h = 1400, 860
+        scr = QGuiApplication.primaryScreen()
+        if scr is not None:
+            av = scr.availableGeometry()
+            w, h = min(w, int(av.width() * 0.94)), min(h, int(av.height() * 0.94))
+        make_resizable(self, w, h, (min(980, w), min(640, h)))
+
+    # ---------------------------------------------------------------- تحميل مسودة موجودة
+    def _load_existing(self, ex, is_sales):
+        self.date.set_iso(ex.get('invoice_date') or '')
+        self.party.set_id(ex.get('customer_id') if is_sales else ex.get('supplier_id'))
+        self.wh.set_id(ex.get('warehouse_id'))
+        self._set_currency(ex.get('currency') or '')
+        self.notes.setText(ex.get('notes') or '')
+        self.supplier_ref.setText(ex.get('supplier_ref') or '')
+        rows = []
+        for l in ex.get('lines', []):
+            pct = Decimal(l.get('line_discount_value') or 0) / 100 if l.get('line_discount_type') == 'percent' else None
+            rows.append({'item_id': l.get('item_id'), 'qty': Decimal(l.get('qty_milli') or 0) / 1000,
+                         'price': Decimal(l.get('unit_price_minor') or 0) / 100, 'disc': pct, 'tax_rate_id': l.get('tax_rate_id'),
+                         'amount': (Decimal(l['amount_minor']) / 100) if l.get('amount_minor') is not None else (Decimal(l.get('qty_milli') or 0) / 1000) * (Decimal(l.get('unit_price_minor') or 0) / 100),
+                         'unit_id': l.get('unit_id'), 'lot_no': l.get('lot_no') or '', 'expiry_date': l.get('expiry_date') or ''})
+        self.lines.set_rows(rows)
+        self._fill_all_units()
+        if ex.get('discount_type') == 'percent' and ex.get('discount_value'):
+            self.discount.set_value(Decimal(ex['discount_value']) / 100)
+        elif ex.get('discount_type') == 'amount' and ex.get('discount_value'):     # خصم مبلغ ثابت: يُحفظ كما هو ولا يُفرَّغ
+            self._carry_disc_amount = str(Decimal(ex['discount_value']) / 100)
+            self.discount.setEnabled(False)
+            self.discount.setToolTip(f'الخصم العام مبلغ ثابت ({self._carry_disc_amount}) ويُحفظ كما هو.')
+        pays = ex.get('payments') or []
+        if pays:                                        # أول دفعة تظهر في الحقول؛ الباقي يُحمل كما هو كي لا يضيع عند الحفظ
+            self.pay_cash.set_id(pays[0].get('account_id'))
+            self.pay_amount.set_value(Decimal(pays[0].get('amount_minor') or 0) / 100)
+            self._carry_payments = [{'account_id': int(p['account_id']), 'amount': str(Decimal(p.get('amount_minor') or 0) / 100)}
+                                    for p in pays[1:]]
+        self._carry_costs = [{'account_id': c['account_id'], 'amount': Decimal(c.get('amount_minor') or 0) / 100,
+                              'description': c.get('description') or '', 'capitalize': bool(c.get('capitalize', 1))}
+                             for c in ex.get('direct_costs') or []]
+
+    # ---------------------------------------------------------------- مسودة الاستئناف
+    _DEC_KEYS = ('qty', 'price', 'disc', 'amount')
+
+    def draft_state(self):
+        def ser(v):
+            return str(v) if isinstance(v, Decimal) else v
+        rows = [{k: ser(v) for k, v in r.items()} for r in self.lines.non_empty_rows()]
+        pay = self.pay_amount.value()
+        return {'date': self.date.iso(), 'party': self.party.current_id(), 'wh': self.wh.current_id(), 'cur': self._cur_code() or '',
+                'mode': self.mode.currentData(), 'notes': self.notes.text(), 'supplier_ref': self.supplier_ref.text(),
+                'discount': self.discount.text(), 'disc_amount': self._carry_disc_amount, 'rows': rows,
+                'pay_cash': self.pay_cash.current_id(), 'pay_amount': None if pay is None else str(pay),
+                'carry_payments': list(self._carry_payments),
+                'carry_costs': [{k: ser(v) for k, v in c.items()} for c in self._carry_costs]}
+
+    def restore_state(self, st):
+        if st.get('date'):
+            self.date.set_iso(st['date'])
+        self.party.set_id(st.get('party'))
+        self.wh.set_id(st.get('wh'))
+        self._set_currency(st.get('cur') or '')
+        i = self.mode.findData(st.get('mode'))
+        if i >= 0:
+            self.mode.setCurrentIndex(i)
+        self.notes.setText(st.get('notes', ''))
+        self.supplier_ref.setText(st.get('supplier_ref', ''))
+        self.discount.setText(st.get('discount', ''))
+        self._carry_disc_amount = st.get('disc_amount') or ''
+        rows = [{k: (Decimal(str(v)) if k in self._DEC_KEYS and v not in (None, '') else v) for k, v in r.items()}
+                for r in st.get('rows', [])]
+        if rows:
+            self.lines.set_rows(rows)
+            self._fill_all_units()
+        self.pay_cash.set_id(st.get('pay_cash'))
+        self.pay_amount.set_value(Decimal(st['pay_amount']) if st.get('pay_amount') else None)
+        self._carry_payments = list(st.get('carry_payments') or [])
+        self._carry_costs = [dict(c, amount=Decimal(str(c.get('amount') or 0))) for c in st.get('carry_costs') or []]
+        self._touched = True
+        self._refresh()
+
+    # ---------------------------------------------------------------- الحساب الحي
+    def _mode_touched(self):
+        return getattr(self, '_touched', False)
+
+    def _carried_paid_minor(self):
+        return int(sum((Decimal(p['amount']) for p in self._carry_payments), Decimal(0)) * 100)
+
+    def _paid_minor(self):
+        v = self.pay_amount.value()
+        return int((v or Decimal(0)) * 100) + self._carried_paid_minor()
+
+    def _preview_input(self):
+        return {'lines': self.lines.non_empty_rows(), 'discount': self.discount.text().strip().replace(',', ''),
+                'discount_amount': self._carry_disc_amount}
+
+    def _on_mode(self):
+        """نقدي: السداد كاملًا فورًا. آجل: يلزم طرف، والدفعة اختيارية."""
+        if self.mode.currentData() == 'cash' and self.pay_cash.current_id() is None:
+            rows = _safe(lambda: self.page.session.lookup_pay_accounts(), [])
+            if rows:
+                self.pay_cash.set_id(rows[0][0])
+        self._refresh()
+
+    def _on_party(self):
+        pid = self.party.current_id()
+        credit_ix = self.mode.findData('credit')
+        self.mode.setItemEnabled(credit_ix, bool(pid))          # بلا طرف: المبيعات نقدية تلقائيًا
+        if not pid:
+            self.mode.setCurrentIndex(self.mode.findData('cash'))
+        elif self.mode.currentData() == 'cash' and not self._mode_touched():
+            self.mode.setCurrentIndex(credit_ix)                          # اختيار طرف: آجل افتراضيًا (يمكن تحويله لنقدي)
+        ctx = self.page.svc.party_context(self.kind, pid) if pid else None
+        self._ctx = ctx
+        if not ctx:
+            self.party_info.setText('')
+        else:
+            txt = f"رصيد الطرف الحالي: {EL.minor_to_text(ctx['balance'])}"
+            if ctx.get('limit'):
+                txt += f"   |   الحد الائتماني: {EL.minor_to_text(ctx['limit'])}"
+            self.party_info.setText(txt)
+        self._refresh()
+
+    # ---------------------------------------------------------------- معلومات الصنف الحية (آخر سعر + رصيد المخزون)
+    def _item_currency_matches(self, last):
+        want = self._cur_code() or self._base_code
+        have = (last.get('currency') or self._base_code) if last else None
+        return have == want
+
+    def _unit_opts(self, item_id):
+        """[(unit_id، اسم)] لصنف (الأساسية أولًا) مع تخزين المعاملات مؤقتًا."""
+        units = _safe(lambda: self.page.svc.item_units(item_id), []) if item_id else []
+        self._units_cache[item_id] = {u['id']: int(u['factor_milli']) for u in units}
+        self._unit_names.update({u['id']: u['name'] for u in units})
+        return [(u['id'], u['name']) for u in units]
+
+    def _fill_all_units(self):
+        """بعد تحميل مسودة: تعبئة قوائم الوحدات لكل سطر فيه صنف (القيمة المحفوظة تُختار تلقائيًا)."""
+        for n, r in enumerate(self.lines.rows()):
+            if r.get('item_id'):
+                self.lines.set_unit_options(n, 'unit_id', self._unit_opts(r['item_id']))
+
+    @staticmethod
+    def _convert_price(price, from_factor, to_factor):
+        """سعر وحدة → سعر وحدة أخرى لنفس الصنف عبر وحدة الأساس (المعامل = عدد وحدات الأساس ×1000)."""
+        return (Decimal(price) * Decimal(to_factor) / Decimal(from_factor)).quantize(Decimal('0.01'))
+
+    def _on_item_picked(self, row, key, item_id, ed=None):
+        if key != 'item_id':
+            return
+        ed = ed or self.lines                               # المحرر الذي صدرت منه الإشارة: شريط الإدخال أو القائمة
+        self._last_pick = (row, item_id)
+        opts = self._unit_opts(item_id)
+        self._last_price_info = _safe(lambda: self.page.svc.last_price(
+            self.kind, item_id, self.party.current_id(), (self.existing or {}).get('id')), None) if item_id else None
+        info = self._last_price_info
+        factors = self._units_cache.get(item_id, {})
+        want_unit = info.get('unit_id') if info and info.get('unit_id') in factors else None      # نبيع بنفس وحدة آخر مرة
+        if item_id:
+            ed.set_unit_options(row, 'unit_id', opts, select=want_unit)
+        else:
+            ed.set_unit_options(row, 'unit_id', [])
+        pw = ed.cell_widget(row, 'price')
+        if item_id and info and self._item_currency_matches(info) and pw is not None:
+            cur_price, auto = pw.value(), pw.property('auto_val')
+            # نملأ السعر إن كان فارغًا أو كان هو نفسه سعرًا عُبّئ تلقائيًا لصنف سابق في هذا السطر (تغيير الصنف)؛ سعر المستخدم لا يُمَسّ
+            if not cur_price or (auto not in (None, '') and Decimal(str(auto)) == cur_price):
+                unit_now = ed.rows()[row].get('unit_id') if row < len(ed.rows()) else None
+                f_last, f_now = int(info.get('factor_milli') or 1000), int(factors.get(unit_now) or factors.get(want_unit) or 1000)
+                price = self._convert_price(info['price'], f_last, f_now) if f_last != f_now else info['price']
+                ed.set_cell_value(row, 'price', price)
+                pw.setProperty('auto_val', str(price))
+                pw.setProperty('auto_base', str(self._convert_price(info['price'], f_last, 1000)))
+        self._refresh_item_info()
+
+    def _on_unit_changed(self, row, key, unit_id, ed=None):
+        """تغيير وحدة السطر: إن كان السعر معبّأ تلقائيًا من «آخر سعر» نحوّله للوحدة الجديدة؛ سعر المستخدم اليدوي لا يُمَسّ."""
+        ed = ed or self.lines
+        pw = ed.cell_widget(row, 'price')
+        if pw is None or not unit_id:
+            return
+        auto, base = pw.property('auto_val'), pw.property('auto_base')
+        item_id = (ed.rows()[row].get('item_id') if row < len(ed.rows()) else None)
+        f_new = (self._units_cache.get(item_id) or {}).get(unit_id)
+        if auto in (None, '') or base in (None, '') or not f_new or pw.value() != Decimal(str(auto)):
+            return
+        price = self._convert_price(Decimal(str(base)), 1000, f_new)
+        ed.set_cell_value(row, 'price', price)
+        pw.setProperty('auto_val', str(price))
+
+    def _refresh_item_info(self):
+        pick = self._last_pick
+        if not pick or not pick[1]:
+            self.item_info.setText('')
+            return
+        _row, item_id = pick
+        parts = []
+        if self._last_price_info:
+            who = ' لنفس الطرف' if self._last_price_info.get('same_party') else ''
+            cur = self._last_price_info.get('currency') or self._base_code
+            li = self._last_price_info
+            unit = self._unit_names.get(li.get('unit_id'))
+            draft = ' — مسودة' if li.get('status') == 'draft' else ''
+            word = 'آخر سعر بيع' if self.kind == 'sales' else 'آخر سعر شراء'
+            parts.append(f"{word}{who}: {fmt.fmt_money(li['price'], currency=cur)}{' / ' + unit if unit else ''} ({li.get('date', '')}{draft})")
+        else:
+            parts.append('لا توجد مبيعات/مشتريات سابقة لهذا الصنف')
+        milli = _safe(lambda: self.page.svc.stock_on_hand_milli(item_id, self.wh.current_id()), None)
+        if milli is not None:
+            scope = 'بالمستودع المحدد' if self.wh.current_id() else 'في كل المستودعات'
+            parts.append(f"المتاح بالمخزون {scope}: {EL_fmt_qty(milli)}")
+        self.item_info.setText('   •   '.join(parts))
+
+    def _refresh(self):
+        notes = []
+        self._totals = None
+        try:
+            self._totals = self.page.svc.preview(self.kind, self._preview_input())
+        except AccountingError as exc:                   # رسالة المحرك نفسها (مثلاً: حساب الإيراد غير مربوط للصنف)
+            notes.append(str(exc))
+        except Exception as exc:  # noqa: BLE001 — المعاينة مساعدة فقط ولا تعطّل الإدخال
+            notes.append(f'تعذّرت المعاينة: {exc}')
+        st = self._rate_state()
+        if st and st['rate'] is not None and self._totals:
+            eq = Decimal(int(self._totals['total'])) * st['rate'] / 100
+            notes.append(f"المعادل بالعملة الأساسية ≈ {eq:,.2f} {st.get('base_code', '')}")
+        if st is not None and st['rate'] is None:
+            notes.append(f"تنبيه: لن يُرحَّل المستند قبل تسجيل سعر صرف {self._cur_code()} (يمكن حفظه مسودة الآن).")
+        credit = None
+        if self._ctx and self.kind == 'sales':
+            credit = {'limit': self._ctx.get('limit'), 'balance': self._ctx.get('balance')}
+        if self.mode.currentData() == 'cash' and self._totals is not None:    # نقدي: المبلغ = المتبقي دائمًا
+            due = max(int(self._totals['total']) - self._carried_paid_minor(), 0)
+            if int((self.pay_amount.value() or Decimal(0)) * 100) != due:
+                self.pay_amount.blockSignals(True); self.pay_amount.set_value(Decimal(due) / 100); self.pay_amount.blockSignals(False)
+        sm = EL.invoice_summary(self._totals, self._paid_minor(), credit)
+        for k, w in self._sum.items():
+            if k in sm:
+                w.setText(sm[k])
+        notes += sm['warnings']
+        n_items = len(EL.invoice_rows_for_preview(self.lines.non_empty_rows()))
+        self.items_count.setText(f'عدد أصناف الفاتورة: {n_items}' if n_items else '')
+        cur = self._cur_code() or self._base_code
+        self.words.set_amount((Decimal(int(self._totals['total'])) / 100) if self._totals else None, cur)
+        if 'profit' in self._sum:
+            profit = _safe(lambda: self.page.svc.estimate_profit(self.kind, self.lines.non_empty_rows(), self.wh.current_id()), None) \
+                if self._totals else None
+            self._sum['profit'].setText(fmt.fmt_money(profit, currency=cur) if profit is not None else '—')
+        reason = self._block_reason()
+        text = '\n'.join(notes + ([reason] if reason else []))
+        self.msg.setText(text)
+        self.msg.setVisible(bool(text))
+        self.ok.setEnabled(not reason)
+        self.ok.setToolTip(reason)
+        if self.btn_more is not None:
+            self.btn_more.setEnabled(not reason)
+            self.btn_more.setToolTip(reason)
+        self.btn_full.setEnabled(self._totals is not None and self.pay_cash.current_id() is not None)
+        self.chip_val.setText(f"{sm['total']} {cur}" if self._totals else '—')
+        has_tax = bool(self._totals and int(self._totals.get('tax') or 0))   # ضريبة موروثة من مسودة قديمة فقط: لا نخفيها كي لا يُضلَّل المجموع
+        self._sum['tax'].setVisible(has_tax); self._sum_keys['tax'].setVisible(has_tax)
+        if self._totals:
+            self._due_box.setProperty('state', 'zero' if int(self._totals['total']) - self._paid_minor() <= 0 else 'due')
+            repolish(self._due_box)
+        self._sync_sub()
+        self._refresh_duplicates()
+        self._refresh_below_cost(st)
+
+    def _sync_sub(self):
+        self.sub_wrap.setVisible(bool(self.party_info.text() or self.rate_lbl.text() or self.btn_rate.isVisible()))
+
+    # ---------------------------------------------------------------- تنبيه تكرار الصنف
+    def _dup_groups(self):
+        return EL.duplicate_item_groups(self.lines.rows())
+
+    def _dup_text(self, groups):
+        return EL.duplicate_item_text(groups, lambda n: self.lines.cell_text(n - 1, 'item_id'))
+
+    def _refresh_duplicates(self):
+        groups = self._dup_groups()
+        marks = {n: 'هذا الصنف مكرر في أكثر من سطر' for _iid, nums in groups for n in nums}
+        self.lines.mark_cells('item_id', marks)
+        if groups:
+            self.dup_lbl.setText('⚠ تنبيه تكرار: ' + self._dup_text(groups) + ' — راجع الكميات أو ادمجها في سطر واحد.')
+        self.dup_lbl.setVisible(bool(groups))
+
+    # ---------------------------------------------------------------- تنبيه البيع بأقل من التكلفة (مبيعات فقط)
+    def _below_cost(self, st=None):
+        if self.kind != 'sales':
+            return []
+        st = st if st is not None else self._rate_state()
+        if st is not None and st.get('rate') is None:      # عملة أجنبية بلا سعر صرف: لا مقارنة ممكنة
+            return []
+        rate = st['rate'] if st is not None else None
+        return _safe(lambda: self.page.svc.below_cost_rows(
+            self.kind, self.lines.rows(), self.wh.current_id(), rate, self.discount.text().strip().replace(',', '') or None), [])
+
+    def _below_cost_text(self, found, sep='؛ '):
+        cur = self._base_code
+        return sep.join(f"«{self.lines.cell_text(f['row'] - 1, 'item_id')}» سطر {f['row']}: السعر {fmt.fmt_money(f['price'], currency=cur)} "
+                        f"أقل من التكلفة {fmt.fmt_money(f['cost'], currency=cur)}" for f in found)
+
+    def _refresh_below_cost(self, st=None):
+        found = self._below_cost(st)
+        self.lines.mark_cells('price', {f['row']: f"أقل من التكلفة ({fmt.fmt_money(f['cost'], currency=self._base_code)})" for f in found}, prop='loss')
+        if found:
+            self.loss_lbl.setText('⛔ تنبيه: بيع بأقل من التكلفة — ' + self._below_cost_text(found))
+        self.loss_lbl.setVisible(bool(found))
+
+    def _confirm_below_cost(self):
+        """البيع بخسارة قد يكون مقصودًا (تصفية/عرض) فلا نمنعه، لكن نطلب تأكيدًا صريحًا قبل الحفظ. True = تابع الحفظ."""
+        found = self._below_cost()
+        if not found:
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle('تنبيه: بيع بأقل من التكلفة')
+        box.setText('بعض البنود تُباع بأقل من تكلفتها الحالية:\n\n' + self._below_cost_text(found, '\n'))
+        box.setInformativeText('هل تريد حفظ الفاتورة كما هي؟')
+        keep = box.addButton('حفظ رغم الخسارة', QMessageBox.AcceptRole)
+        back = box.addButton('رجوع للتعديل', QMessageBox.RejectRole)
+        box.setDefaultButton(back)
+        box.exec()
+        return box.clickedButton() is keep
+
+    def _confirm_duplicates(self):
+        """قبل الحفظ: التكرار قد يكون مقصودًا (أسعار/دفعات مختلفة) فلا نمنعه، لكن نطلب تأكيدًا صريحًا. True = تابع الحفظ."""
+        groups = self._dup_groups()
+        if not groups:
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle('تنبيه: صنف مكرر')
+        box.setText('يوجد صنف مكرر في بنود الفاتورة:\n\n' + self._dup_text(groups).replace('؛ ', '\n'))
+        box.setInformativeText('هل تريد حفظ الفاتورة كما هي؟')
+        keep = box.addButton('حفظ رغم التكرار', QMessageBox.AcceptRole)
+        back = box.addButton('رجوع للتعديل', QMessageBox.RejectRole)
+        box.setDefaultButton(back)
+        box.exec()
+        return box.clickedButton() is keep
+
+    # ---------------------------------------------------------------- العملة وسعر الصرف
+    def _fill_currencies(self, s):
+        self._base_code = ''
+        opts = _safe(lambda: self.page.svc.currency_options(), [])
+        if not opts:                                       # تعذّرت القراءة: تبقى الأساسية وحدها (قيمة فارغة)
+            self.currency.addItem('العملة الأساسية', '')
+            return
+        dflt = ''
+        for c in opts:
+            if c.get('is_base'):
+                self._base_code = c['code']
+                self.currency.addItem(f"{c.get('name_ar') or c['code']} ({c['code']}) — الأساسية", '')
+            else:
+                self.currency.addItem(f"{c.get('name_ar') or c['code']} ({c['code']})", c['code'])
+            if c.get('is_default'):
+                dflt = '' if c.get('is_base') else c['code']
+        i = self.currency.findData(dflt)                   # عملة الإدخال الافتراضية للشركة (يمني مثلًا) لكل مستند جديد؛
+        if i >= 0:                                         # المسودة المحفوظة تُعيد عملتها عبر _set_currency لاحقًا
+            self.currency.setCurrentIndex(i)
+
+    def _cur_code(self):
+        return (self.currency.currentData() or '').strip().upper()
+
+    def _set_currency(self, code):
+        code = (code or '').strip().upper()
+        if code == self._base_code:
+            code = ''
+        i = self.currency.findData(code)
+        if i < 0 and code:                                 # عملة المسودة لم تعد مفعّلة: تبقى ظاهرة ولا تُفقد
+            self.currency.addItem(f'{code} (غير مفعّلة)', code)
+            i = self.currency.count() - 1
+        self.currency.setCurrentIndex(max(i, 0))
+
+    def _rate_state(self):
+        code = self._cur_code()
+        if not code:
+            return None
+        try:
+            return self.page.svc.rate_info(code, self.date.iso())
+        except Exception:  # noqa: BLE001 — الفحص مساعد؛ المحرك يبقى الحَكَم عند الترحيل
+            return None
+
+    def _on_currency(self, *_a):
+        if not getattr(self, '_ready', False):
+            return
+        code, st = self._cur_code(), self._rate_state()
+        self.btn_rate.setVisible(bool(code))
+        if not code:
+            self.rate_lbl.setText('')
+        elif st and st['rate'] is not None:
+            self.rate_lbl.setText(f"1 {code} = {st['rate']} {st.get('base_code', '')} (سعر {self.date.iso()})")
+        else:
+            self.rate_lbl.setText(f'لا يوجد سعر صرف لـ{code} بهذا التاريخ — سجّله قبل الترحيل.')
+        self._refresh()
+
+    def _register_rate(self):
+        code = self._cur_code()
+        if not code:
+            return
+        text, ok = QInputDialog.getText(self, 'سعر الصرف', f'كم يساوي 1 {code} بالعملة الأساسية ({self._base_code}) بتاريخ {self.date.iso()}؟')
+        if not ok or not text.strip():
+            return
+        try:
+            self.page.svc.set_rate(code, self.date.iso(), text.strip().replace(',', ''))
+        except (AccountingError, PermissionError) as exc:
+            QMessageBox.warning(self, 'سعر الصرف', str(exc))
+            return
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, 'سعر الصرف', f'تعذّر تسجيل السعر: {exc}')
+            return
+        self._on_currency()
+
+    def _block_reason(self):
+        """سبب تعطيل الحفظ (فارغ = مسموح). المحرك يبقى الحَكَم؛ هذه فحوص إدخال بديهية فقط."""
+        if not EL.invoice_rows_for_preview(self.lines.non_empty_rows()):
+            return 'أدخل بندًا واحدًا مكتملًا على الأقل (صنف وكمية).'
+        if self.mode.currentData() == 'credit' and self.party.current_id() is None:
+            return 'البيع/الشراء الآجل يحتاج اختيار الطرف.'
+        if self.mode.currentData() == 'cash' and self.pay_cash.current_id() is None:
+            return 'اختر الصندوق/البنك للسداد النقدي.'
+        if self.pay_amount.text().strip() and self.pay_amount.value() is None:
+            return 'مبلغ الدفعة غير صالح.'
+        if (self.pay_amount.value() or 0) > 0 and self.pay_cash.current_id() is None:
+            return 'اختر الصندوق/البنك للدفعة.'
+        if self._totals and self._paid_minor() > int(self._totals['total']):
+            return 'مجموع الدفعات يتجاوز إجمالي الفاتورة.'
+        return ''
+
+    def _pay_full(self):
+        if self._totals:
+            due = int(self._totals['total']) - self._carried_paid_minor()
+            self.pay_amount.set_value(Decimal(max(due, 0)) / 100)
+
+    # ---------------------------------------------------------------- حفظ
+    def _save_and_new(self):
+        self.add_another = True
+        self._accept()
+
+    def _accept(self):
+        if not self._commit_entry():                         # بند مكتوب في الشريط ولم يُحفظ بعد: يُضاف تلقائيًا قبل حفظ الفاتورة
+            self.add_another = False
+            return
+        errs = self.lines.validate()
+        if errs:
+            self.add_another = False
+            return QMessageBox.warning(self, 'بيانات ناقصة', '\n'.join(m for _i, m in errs[:8]))
+        reason = self._block_reason()
+        if reason:
+            self.add_another = False
+            return QMessageBox.warning(self, 'بيانات ناقصة', reason)
+        if not self._confirm_duplicates() or not self._confirm_below_cost():
+            self.add_another = False
+            return
+        self.accept()
+
+    def values(self):
+        disc = self.discount.text().strip().replace(',', '')
+        pay = self.pay_amount.value()
+        payments = list(self._carry_payments)
+        if pay and pay > 0:
+            payments.insert(0, {'account_id': int(self.pay_cash.current_id()), 'amount': str(pay)})
+        return {'date': self.date.iso(), 'party_id': self.party.current_id(), 'warehouse_id': self.wh.current_id(),
+                'currency': self._cur_code() or None, 'discount': disc or None,
+                'discount_amount': self._carry_disc_amount or None, 'notes': self.notes.text().strip(),
+                'supplier_ref': self.supplier_ref.text().strip(), 'direct_costs': list(self._carry_costs),
+                'lines': [{'item_id': r.get('item_id'), 'qty': r.get('qty'), 'price': r.get('price'), 'disc': r.get('disc'),
+                           'tax_rate_id': r.get('tax_rate_id'), 'unit_id': r.get('unit_id'), 'lot_no': r.get('lot_no'), 'expiry_date': r.get('expiry_date')}
+                          for r in self.lines.non_empty_rows()],
+                'payments': payments}
+
+
+class EmbeddedInvoiceEditor(InvoiceEditor):
+    """محرر الفاتورة مضمَّنًا داخل نافذة الفاتورة المنبثقة للمبيعات/المشتريات (انظر components/invoice_popup.py: نافذة الفاتورة المنبثقة)."""
+    embedded = True
+    center_on_show = False
+
+
+class ReturnEditor(QDialog):
+    """مرتجع فاتورة (مبيعات/مشتريات): ملخص الفاتورة الأصلية، جدول كميات واضح (الأصلية/سبق إرجاعه/المتاح/المرتجع)،
+    إجمالي المرتجع من المحرك نفسه، ثم **الاسترداد**: الصندوق/البنك والمبلغ. الفاتورة بلا طرف تُسترد كاملة وجوبًا.
+    الباقي بعد الاسترداد يُخصم من رصيد الطرف (يبقى ذمة). المحرك هو الحَكَم النهائي عند الحفظ."""
+
+    def __init__(self, page, kind, invoice):
+        super().__init__(page)
+        from PySide6.QtWidgets import QHeaderView, QTableWidget, QTableWidgetItem
+        self.page, self.kind, self.inv = page, kind, invoice
+        self._is_sales = kind == 'sales'
+        self._total_minor = None
+        self._party_id = invoice.get('customer_id') if self._is_sales else invoice.get('supplier_id')
+        word = 'مبيعات' if self._is_sales else 'مشتريات'
+        party_word = 'العميل' if self._is_sales else 'المورد'
+        self.setWindowTitle('مرتجع ' + word)
+        self.setLayoutDirection(Qt.RightToLeft)
+        make_resizable(self, 900, 620, (760, 500))
+        lay = QVBoxLayout(self)
+        lay.setSpacing(8)
+
+        # ---- ملخص الفاتورة الأصلية
+        sel = getattr(page, '_sel', None) or {}
+        party_txt = (f"{party_word}: {sel['party']}" if sel.get('party') else f"بلا {party_word} (فاتورة نقدية)")
+        cur = invoice.get('currency') or ''
+        head = QLabel(f"مرتجع على فاتورة {word} رقم  {invoice.get('invoice_no') or invoice.get('id')}")
+        head.setStyleSheet('font-size: 15px; font-weight: bold;')
+        lay.addWidget(head)
+        info = QLabel(f"التاريخ: {invoice.get('invoice_date', '')}     ·     {party_txt}"
+                      f"     ·     الإجمالي: {fmt.fmt_money(invoice.get('grand_total'), minor=True)} {cur}"
+                      f"     ·     المدفوع: {fmt.fmt_money(invoice.get('paid_total'), minor=True)} {cur}")
+        info.setObjectName('ctxKey')
+        lay.addWidget(info)
+        hint = QLabel('اكتب في عمود «كمية المرتجع» الكمية المراد إرجاعها لكل صنف (لا تتجاوز «المتاح»)، أو اضغط «إرجاع كل المتاح».')
+        hint.setWordWrap(True)
+        hint.setStyleSheet('color: var(--color-text-muted);')
+        lay.addWidget(hint)
+
+        # ---- جدول البنود
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(['الصنف', 'الكمية الأصلية', 'سبق إرجاعه', 'المتاح للإرجاع', 'كمية المرتجع'])
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.Stretch)
+        for c in (1, 2, 3, 4):
+            hh.setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        self.table.setLayoutDirection(Qt.RightToLeft)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setSelectionMode(QTableWidget.NoSelection)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setAlternatingRowColors(True)
+        self.rows = []                                  # (سطر الفاتورة، حقل الكمية، المتاح بالألف)
+        for l in invoice.get('lines', []):
+            r = self.table.rowCount()
+            self.table.insertRow(r)
+            qty = int(l.get('qty_milli') or 0)
+            done = int(l.get('returned_milli') or 0)
+            avail = max(qty - done, 0)
+            name = f"{l.get('item_code') or ''} — {l.get('item_name') or l.get('description') or ''}".strip(' —')
+            for c, txt in ((0, name), (1, EL_fmt_qty(qty)), (2, EL_fmt_qty(done)), (3, EL_fmt_qty(avail))):
+                it = QTableWidgetItem(txt)
+                if c:
+                    it.setTextAlignment(Qt.AlignCenter)
+                self.table.setItem(r, c, it)
+            w = MoneyEdit(places=3)
+            w.setMinimumWidth(120)
+            w.setPlaceholderText('0')
+            if avail <= 0:
+                w.setEnabled(False)
+                w.setPlaceholderText('مُرجَع بالكامل')
+            w.textChanged.connect(self._refresh)
+            w.returnPressed.connect(lambda ix=len(self.rows): self._next_qty(ix))        # Enter: ينتقل لكمية الصنف التالي
+            self.table.setCellWidget(r, 4, w)
+            self.table.setRowHeight(r, 34)
+            self.rows.append((l, w, avail))
+        lay.addWidget(self.table, 1)
+
+        tools = QHBoxLayout()
+        self.btn_all = QPushButton('إرجاع كل المتاح')
+        self.btn_all.setAutoDefault(False)
+        self.btn_all.clicked.connect(self._fill_all)
+        self.btn_clear = QPushButton('مسح الكميات')
+        self.btn_clear.setAutoDefault(False)
+        self.btn_clear.clicked.connect(self._clear)
+        tools.addWidget(self.btn_all)
+        tools.addWidget(self.btn_clear)
+        self.date = DateField()
+        self.notes = QLineEdit()
+        self.notes.setPlaceholderText('سبب المرتجع / ملاحظة (اختياري)')
+        tools.addSpacing(10)
+        tools.addWidget(QLabel('التاريخ:'))
+        tools.addWidget(self.date)
+        tools.addWidget(self.notes, 1)                       # التاريخ والملاحظة في نفس صف الأزرار بدل صفين إضافيين
+        lay.addLayout(tools)
+
+        # ---- الاسترداد + الملخص في صف واحد مضغوط
+        bottom = QHBoxLayout(); bottom.setSpacing(10)
+        pay_box = QFrame()
+        pay_box.setFrameShape(QFrame.StyledPanel)
+        pf = QHBoxLayout(pay_box); pf.setContentsMargins(10, 4, 10, 4); pf.setSpacing(8)
+        ttl = QLabel('استرداد ' + ('للعميل' if self._is_sales else 'من المورد'))
+        ttl.setStyleSheet('font-weight: bold;')
+        s = page.session
+        self.pay_cash = SearchPicker(cached_loader(lambda: _safe(s.lookup_pay_accounts, [])),
+                                     placeholder='— بدون استرداد نقدي (يُخصم من الرصيد) —')
+        self.pay_amount = MoneyEdit(); self.pay_amount.setMaximumWidth(130)
+        self.btn_full = QPushButton('استرداد كامل')
+        self.btn_full.setAutoDefault(False)
+        self.btn_full.clicked.connect(self._refund_full)
+        for w_ in (self.pay_cash, self.pay_amount, self.btn_full):
+            w_.setFixedHeight(30)
+        pf.addWidget(ttl)
+        pf.addWidget(QLabel('الصندوق/البنك')); pf.addWidget(self.pay_cash, 3)
+        pf.addWidget(QLabel('المبلغ')); pf.addWidget(self.pay_amount, 1); pf.addWidget(self.btn_full)
+        self.pay_note = QLabel('')
+        self.pay_note.setWordWrap(True)
+        self.pay_note.setStyleSheet('color: var(--color-text-muted); font-size: 11px;')
+        bottom.addWidget(pay_box, 4)
+
+        sum_box = QFrame(); sum_box.setObjectName('invCard')
+        sum_box.setFrameShape(QFrame.StyledPanel)
+        g = QHBoxLayout(sum_box); g.setContentsMargins(10, 4, 10, 4); g.setSpacing(14)
+        self._sum = {}
+        for k, t in (('total', 'إجمالي المرتجع'), ('refund', 'المسترد الآن'), ('rest', 'يُخصم من رصيد الطرف' if self._party_id else 'المتبقي')):
+            kl = QLabel(t); kl.setObjectName('invSumKey'); g.addWidget(kl)
+            v = QLabel('—')
+            v.setObjectName('invSumVal'); v.setProperty('sk', k)
+            v.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            g.addWidget(v)
+            self._sum[k] = v
+        bottom.addWidget(sum_box, 3)
+        lay.addLayout(bottom)
+        lay.addWidget(self.pay_note)
+
+        self.err = QLabel('')
+        self.err.setWordWrap(True)
+        self.err.setStyleSheet('color: var(--color-danger); font-weight: bold;')
+        self.err.setVisible(False)
+        lay.addWidget(self.err)
+
+        bb = QDialogButtonBox()
+        self.ok = bb.addButton('إنشاء المرتجع', QDialogButtonBox.AcceptRole)
+        self.ok.setProperty('primary', True)
+        self.ok.setAutoDefault(False)
+        c = bb.addButton(S.ACTION['cancel'], QDialogButtonBox.RejectRole)
+        c.setAutoDefault(False)
+        bb.accepted.connect(self._accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+        # الفاتورة بلا طرف (نقدية): الاسترداد كامل وجوبًا → اختر أول صندوق تلقائيًا
+        if self._party_id is None:
+            rows = _safe(lambda: s.lookup_pay_accounts(), [])
+            if rows:
+                self.pay_cash.set_id(rows[0][0])
+            self.pay_note.setText('فاتورة نقدية بلا ' + ('عميل' if self._is_sales else 'مورد') + ': يجب استرداد كامل قيمة المرتجع.')
+        first = next((w for _l, w, avail in self.rows if avail > 0), None)
+        if first is not None:
+            QTimer.singleShot(0, first.setFocus)             # ابدأ الكتابة فورًا في أول صنف قابل للإرجاع
+        self._auto_refund = True                         # يتبع المبلغ المسترد الإجمالي ما لم يعدّله المستخدم
+        self.pay_amount.textEdited.connect(self._manual_refund)
+        self.pay_amount.textChanged.connect(self._refresh)
+        self.pay_cash.selected.connect(lambda _i: self._refresh())
+        self.date.dateIso.connect(lambda _d: self._refresh())
+        self._refresh()
+
+    # ---------------------------------------------------------------- منطق الواجهة
+    def _next_qty(self, i):
+        """Enter في كمية مرتجع: الصنف التالي القابل للإرجاع، وبعد آخر صنف إلى الصندوق/المبلغ المسترد."""
+        for _l, w, avail in self.rows[i + 1:]:
+            if avail > 0:
+                w.setFocus(); w.selectAll(); return
+        (self.pay_amount if self.pay_cash.current_id() else self.pay_cash).setFocus()
+
+    def _manual_refund(self, _t):
+        self._auto_refund = False
+
+    def _fill_all(self):
+        for _l, w, avail in self.rows:
+            if avail > 0:
+                w.set_value(Decimal(avail) / 1000)
+        self._auto_refund = True
+
+    def _clear(self):
+        for _l, w, _a in self.rows:
+            w.setText('')
+        self._auto_refund = True
+
+    def _refund_full(self):
+        if self._total_minor:
+            self._set_refund(self._total_minor)
+            if self.pay_cash.current_id() is None:
+                rows = _safe(lambda: self.page.session.lookup_pay_accounts(), [])
+                if rows:
+                    self.pay_cash.set_id(rows[0][0])
+            self._auto_refund = True
+            self._refresh()
+
+    def _set_refund(self, minor):
+        self.pay_amount.blockSignals(True)
+        self.pay_amount.set_value(Decimal(minor) / 100 if minor else None)
+        self.pay_amount.blockSignals(False)
+
+    def _entered(self):
+        """[(orig_line_id, qty نص)] للأسطر المعبّأة + أخطاء الكميات (نص أول خطأ أو '')."""
+        out, bad = [], ''
+        for l, w, avail in self.rows:
+            txt = w.text().strip().replace(',', '')
+            ok = True
+            if txt:
+                v = w.value()
+                if v is None or v <= 0:
+                    ok = False
+                    bad = bad or 'كمية مرتجع غير صالحة'
+                elif int(v * 1000) > avail:
+                    ok = False
+                    bad = bad or f"كمية المرتجع تتجاوز المتاح للصنف «{l.get('item_name') or ''}»"
+                else:
+                    out.append((int(l['id']), txt))
+            w.setProperty('invalid', not ok)
+            repolish(w)
+        return out, bad
+
+    def _refresh(self, *_):
+        entered, bad = self._entered()
+        msg = bad
+        self._total_minor = None
+        if entered and not bad:
+            try:
+                self._total_minor = int(self.page.svc.return_preview(
+                    self.kind, self.inv['id'], [{'orig_line_id': i, 'qty': q} for i, q in entered], self.date.iso()))
+            except Exception as exc:  # noqa: BLE001 — رسالة المحرك كما هي
+                msg = str(exc)
+        total = self._total_minor
+        # الاسترداد التلقائي: كامل إن لم يكن هناك طرف، أو كانت الفاتورة الأصلية مسدّدة بالكامل
+        if self._auto_refund and total is not None:
+            full_default = self._party_id is None or int(self.inv.get('due_total') or 0) <= 0
+            self._set_refund(total if full_default else 0)
+        refund = int((self.pay_amount.value() or Decimal(0)) * 100)
+        if total is None:
+            for k in self._sum:
+                self._sum[k].setText('—')
+        else:
+            self._sum['total'].setText(fmt.fmt_money(total, minor=True))
+            self._sum['refund'].setText(fmt.fmt_money(refund, minor=True))
+            self._sum['rest'].setText(fmt.fmt_money(total - refund, minor=True))
+            if not msg:
+                if self.pay_amount.text().strip() and self.pay_amount.value() is None:
+                    msg = 'مبلغ الاسترداد غير صالح'
+                elif refund > total:
+                    msg = 'المبلغ المسترد يتجاوز إجمالي المرتجع'
+                elif refund > 0 and self.pay_cash.current_id() is None:
+                    msg = 'اختر الصندوق/البنك الذي يتم الاسترداد عبره'
+                elif self._party_id is None and refund != total:
+                    msg = 'الفاتورة نقدية بلا طرف: يجب استرداد كامل المرتجع (اختر الصندوق/البنك واضغط «استرداد كامل»)'
+        self.btn_full.setEnabled(bool(total))
+        self._err_msg = msg
+        self.err.setText(msg)
+        self.err.setVisible(bool(msg))
+        self.ok.setEnabled(bool(entered) and not msg and total is not None)
+
+    def _accept(self):
+        if not self.ok.isEnabled():
+            return
+        self.accept()
+
+    def values(self):
+        entered, _bad = self._entered()
+        refund = self.pay_amount.value() or Decimal(0)
+        payments = []
+        if refund > 0 and self.pay_cash.current_id() is not None:
+            payments.append({'account_id': int(self.pay_cash.current_id()), 'amount': str(refund)})
+        return {'date': self.date.iso(), 'lines': [{'orig_line_id': i, 'qty': q} for i, q in entered],
+                'payments': payments, 'notes': self.notes.text().strip()}

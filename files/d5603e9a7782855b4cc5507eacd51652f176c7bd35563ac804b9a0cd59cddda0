@@ -1,0 +1,570 @@
+"""محرك القيود: كل قيد في النظام يمر من هنا. التحقق النهائي (توازن، فترة، عدم التعديل) تفرضه قاعدة البيانات أيضا."""
+import json
+from decimal import Decimal, ROUND_HALF_UP
+from alhisabat.database.tx import transaction
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.accounting import balance_engine as be, period_engine, rates as fxr
+from alhisabat.audit import audit
+from alhisabat.business import branch_scope
+from alhisabat.security import permissions
+
+WORKFLOW_EXEMPT_TYPES = ("auto", "reversal", "closing")   # يولّدها النظام وليست مدخلات يدوية
+
+
+def _minor(amount) -> int:
+    return int((Decimal(str(amount)) * 100).quantize(Decimal(1), ROUND_HALF_UP))
+
+
+def _assert_open(per):
+    if per["ps"] != "open" or per["ys"] != "open":
+        raise AccountingError("الفترة أو السنة المالية مغلقة: لا يمكن إدخال أو نقل قيد إلى تاريخ فيها")
+
+
+def _entry(conn, entry_id):
+    e = conn.execute("SELECT * FROM journal_entries WHERE id=?", (entry_id,)).fetchone()
+    if not e:
+        raise AccountingError("القيد غير موجود")
+    return e
+
+
+# ---------------- الإعدادات ----------------
+def get_settings(conn, company_id):
+    r = conn.execute("SELECT * FROM journal_settings WHERE company_id=?", (company_id,)).fetchone()
+    return dict(r) if r else {"company_id": company_id, "require_review": 0, "require_approval": 0, "enforce_separation": 0,
+                              "allow_manual_party_entries": 0, "allow_edit_posted_entries": 0, "allow_delete_posted_entries": 0}
+
+
+def set_settings(conn, actor_id, company_id, *, require_review, require_approval, enforce_separation,
+                 allow_manual_party_entries=None, allow_edit_posted_entries=None, allow_delete_posted_entries=None):
+    """القيم None = بلا تغيير. تغيير «قيد يدوي على الأطراف» يتطلب journal.party_manual، و«تعديل المرحّل» journal.edit_posted،
+    و«حذف المرحّل» journal.delete_posted (كلها لمدير النظام فقط)."""
+    permissions.require(conn, actor_id, company_id, "settings.manage")
+    old = get_settings(conn, company_id)
+    new = {"require_review": int(require_review), "require_approval": int(require_approval), "enforce_separation": int(enforce_separation)}
+    for key, val, perm in (("allow_manual_party_entries", allow_manual_party_entries, "journal.party_manual"),
+                           ("allow_edit_posted_entries", allow_edit_posted_entries, "journal.edit_posted"),
+                           ("allow_delete_posted_entries", allow_delete_posted_entries, "journal.delete_posted")):
+        cur = int(old.get(key, 0))
+        if val is not None and int(bool(val)) != cur:
+            permissions.require(conn, actor_id, company_id, perm, check_branch=False)
+        new[key] = cur if val is None else int(bool(val))
+    cols = list(new)
+    with transaction(conn):
+        conn.execute(f"INSERT INTO journal_settings(company_id,{','.join(cols)}) VALUES(?{',?' * len(cols)}) "
+                     f"ON CONFLICT(company_id) DO UPDATE SET {','.join(f'{c}=excluded.{c}' for c in cols)}",
+                     (company_id, *[new[c] for c in cols]))
+        audit.log(conn, actor_id, "set_journal_settings", "journal_settings", company_id,
+                  {k: old.get(k, 0) for k in new}, new)
+
+
+def _party_override(conn, company_id, user_id, entry_type, lines, description):
+    """يُرجع 1 إذا كان القيد اليدوي العام يمس حساب عميل/مورد تفصيليًا ومسموحًا به (إعداد مفعّل + صلاحية المدير)، وإلا 0
+    (فيرفضه تريجر السطور برسالة واضحة). يشترط بيانًا للقيد لأنه تجاوز لقاعدة الشاشة المناسبة."""
+    if entry_type != "general" or not lines:
+        return 0
+    ids = {int(l["account_id"]) for l in lines if l.get("account_id")}
+    if not ids or not conn.execute(
+            f"SELECT 1 FROM parties WHERE account_id IN ({','.join('?' * len(ids))}) LIMIT 1", list(ids)).fetchone():
+        return 0
+    if not get_settings(conn, company_id).get("allow_manual_party_entries"):
+        return 0
+    permissions.require(conn, user_id, company_id, "journal.party_manual", check_branch=False)
+    if len((description or "").strip()) < 3:
+        raise AccountingError("القيد اليدوي على حسابات العملاء/الموردين يتطلب بيانًا (وصفًا) يوضح سببه")
+    return 1
+
+
+# ---------------- بناء السطور ----------------
+def _check_rate_overrides(conn, company_id, lines, entry_date, user_id):
+    """السعر الصريح على سطر أجنبي مقبول فقط إن طابق سعر الجدول لتاريخ القيد؛ وإلا فهو «تجاوز» يتطلب صلاحية currency.override_rate
+    (تُفحص قبل بدء المعاملة ليبقى تسجيل الرفض في التدقيق) ويُسجَّل في التدقيق عند نجاحه."""
+    base = fxr.base_currency(conn, company_id)
+    out = []
+    for ln in lines:
+        cur = ln.get("currency", base)
+        if cur == base or ln.get("rate") is None:
+            continue
+        r = fxr._dec(ln["rate"])
+        try:
+            t = fxr.get_rate(conn, company_id, cur, entry_date)
+        except AccountingError:
+            t = None
+        if t is None or r != t:
+            permissions.require(conn, user_id, company_id, "currency.override_rate", check_branch=False)
+            out.append({"currency": cur, "rate": str(r), "table_rate": str(t) if t is not None else None})
+    return out
+
+
+def _check_branch_accounts(conn, company_id, branch_id, lines):
+    """قيد فرع لا يُرحَّل على حساب عميل/مورد/صندوق يتبع فرعًا آخر (يحفظ استقلال الفروع)."""
+    if branch_id is None or not lines:
+        return
+    hide = branch_scope.foreign_account_ids(conn, company_id, branch_id)
+    for ln in lines:
+        if ln.get("account_id") in hide:
+            nm = conn.execute("SELECT code,name FROM accounts WHERE id=?", (ln["account_id"],)).fetchone()
+            raise AccountingError(f"الحساب «{nm['code']} — {nm['name']}» يتبع فرعًا آخر ولا يمكن استخدامه في قيد هذا الفرع")
+
+
+def _build_lines(conn, company_id, lines, entry_date, rounding_tolerance=None):
+    """lines: [{account_id, currency, debit, credit, rate, memo}] بالعملة الأصلية → صفوف جاهزة للإدخال.
+    فرق التقريب الناتج عن التحويل بين العملات (ضمن الحد الرياضي الممكن) يُسجَّل في حساب فروقات العملة المربوط."""
+    base = conn.execute("SELECT base_currency FROM companies WHERE id=?", (company_id,)).fetchone()[0]
+    rows, n_foreign = [], 0
+    for ln in lines:
+        cur = ln.get("currency", base)
+        if cur == base:
+            rate = Decimal(1)
+        else:
+            n_foreign += 1
+            if not fxr.currency_enabled(conn, company_id, cur):
+                raise AccountingError(f"العملة {cur} غير مفعّلة لهذه الشركة")
+            # السعر الصريح مسموح (يدوي)؛ وإلا يؤخذ من جدول الأسعار بتاريخ القيد، ولا افتراض للسعر 1 أبدا
+            rate = fxr._dec(ln["rate"]) if ln.get("rate") is not None else fxr.get_rate(conn, company_id, cur, entry_date)
+        if rate <= 0:
+            raise AccountingError("سعر الصرف يجب أن يكون أكبر من صفر")
+        d, c = _minor(ln.get("debit", 0)), _minor(ln.get("credit", 0))
+        if (d > 0) == (c > 0):
+            raise AccountingError("كل سطر يجب أن يكون إما مدينا أو دائنا (وليس الاثنين أو لا شيء)")
+        db = int((Decimal(d) * rate).quantize(Decimal(1), ROUND_HALF_UP))
+        cb = int((Decimal(c) * rate).quantize(Decimal(1), ROUND_HALF_UP))
+        rows.append([ln["account_id"], cur, d, c, str(rate), db, cb, ln.get("memo", ""), ln.get("cost_center_id")])
+    diff = sum(r[5] for r in rows) - sum(r[6] for r in rows)
+    # الحد الافتراضي: أقصى خطأ تقريب ممكن لسطور أجنبية؛ محركات المستندات (قيود بسطور أساسية وأجنبية) قد تمرّر حدا أوسع صراحةً
+    tol = n_foreign // 2 if rounding_tolerance is None else rounding_tolerance
+    if diff != 0 and n_foreign >= (2 if rounding_tolerance is None else 1) and abs(diff) <= tol:
+        m = conn.execute("SELECT account_id FROM account_mappings WHERE company_id=? AND map_key='fx_differences'",
+                         (company_id,)).fetchone()
+        if m:
+            amt = abs(diff)
+            rows.append([m[0], base, 0 if diff > 0 else amt, amt if diff > 0 else 0, "1",
+                         0 if diff > 0 else amt, amt if diff > 0 else 0, "فرق تقريب العملة", None])
+    return rows
+
+
+def _insert_lines(conn, entry_id, rows):
+    for i, r in enumerate(rows, 1):
+        conn.execute("INSERT INTO journal_lines(entry_id,line_no,account_id,currency,debit_orig,credit_orig,exchange_rate,"
+                     "debit_base,credit_base,memo,cost_center_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (entry_id, i, *r))
+
+
+def _lines_json(conn, entry_id):
+    return [dict(r) for r in conn.execute(
+        "SELECT line_no,account_id,currency,debit_orig,credit_orig,exchange_rate,debit_base,credit_base,memo,cost_center_id "
+        "FROM journal_lines WHERE entry_id=? ORDER BY line_no", (entry_id,))]
+
+
+# ---------------- المسودة ----------------
+def create_draft(conn, company_id, user_id, entry_date, lines, description="", branch_id=None,
+                 entry_type="general", source_type=None, source_id=None, trusted_rates=False, rounding_tolerance=None):
+    branch_id = branch_scope.resolve_for_user(conn, company_id, user_id, branch_id)
+    permissions.require(conn, user_id, company_id, "journal.create", branch_id)
+    _check_branch_accounts(conn, company_id, branch_id, lines)
+    per = period_engine.find_period(conn, company_id, entry_date)
+    _assert_open(per)
+    # trusted_rates: محركات المستندات الداخلية فقط (مثل مرتجع بسعر الفاتورة الأصلية) — سعر المستند مسجّل في المستند نفسه
+    overrides = [] if trusted_rates else _check_rate_overrides(conn, company_id, lines, entry_date, user_id)
+    party_ov = _party_override(conn, company_id, user_id, entry_type, lines, description)
+    with transaction(conn):
+        rows = _build_lines(conn, company_id, lines, entry_date, rounding_tolerance)
+        no = conn.execute("SELECT COALESCE(MAX(entry_no),0)+1 FROM journal_entries WHERE company_id=? AND fiscal_year_id=?",
+                          (company_id, per["yid"])).fetchone()[0]
+        eid = conn.execute(
+            "INSERT INTO journal_entries(company_id,branch_id,fiscal_year_id,period_id,entry_no,entry_date,description,"
+            "entry_type,source_type,source_id,created_by,party_override) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (company_id, branch_id, per["yid"], per["pid"], no, entry_date, description, entry_type,
+             source_type, source_id, user_id, party_ov)).lastrowid
+        _insert_lines(conn, eid, rows)
+        audit.log(conn, user_id, "create_draft", "journal_entries", eid, after={"entry_no": no})
+        if party_ov:
+            audit.log(conn, user_id, "manual_party_entry", "journal_entries", eid, after={"entry_no": no},
+                      reason="قيد يدوي على حسابات عملاء/موردين بصلاحية المدير")
+        for o in overrides:
+            audit.log(conn, user_id, "rate_override", "journal_entries", eid, after=o)
+    return eid
+
+
+def create_draft_explicit(conn, company_id, user_id, entry_date, lines, description, entry_type, branch_id=None,
+                          source_type=None, source_id=None):
+    """قيود الإقفال والافتتاح فقط: المبالغ الأساسية تُمرَّر صراحةً (تحافظ على القيم دون إعادة تحويل).
+    lines: [{account_id, currency, side('debit'|'credit'), orig(وحدة صغرى), base(وحدة صغرى)}]"""
+    if entry_type not in ("closing", "opening") and not (entry_type == "adjustment" and source_type == "revaluation") \
+            and not (entry_type == "auto" and source_type in ("cash_voucher", "cash_transfer", "cash_count", "bank_statement")):
+        raise AccountingError("المبالغ الصريحة مسموحة لقيود الإقفال والافتتاح وإعادة التقييم وسندات النقدية فقط")
+    branch_id = branch_scope.resolve_for_user(conn, company_id, user_id, branch_id)
+    permissions.require(conn, user_id, company_id, "journal.create", branch_id)
+    per = period_engine.find_period(conn, company_id, entry_date)
+    _assert_open(per)
+    with transaction(conn):
+        no = conn.execute("SELECT COALESCE(MAX(entry_no),0)+1 FROM journal_entries WHERE company_id=? AND fiscal_year_id=?",
+                          (company_id, per["yid"])).fetchone()[0]
+        eid = conn.execute(
+            "INSERT INTO journal_entries(company_id,branch_id,fiscal_year_id,period_id,entry_no,entry_date,description,"
+            "entry_type,source_type,source_id,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (company_id, branch_id, per["yid"], per["pid"], no, entry_date, description, entry_type, source_type, source_id,
+             user_id)).lastrowid
+        for i, ln in enumerate(lines, 1):
+            orig, base = int(ln["orig"]), int(ln["base"])
+            if base <= 0 or orig < 0 or ln["side"] not in ("debit", "credit"):
+                raise AccountingError("سطر قيد صريح غير صالح")
+            rate = str((Decimal(base) / Decimal(orig)).quantize(Decimal("0.00000001"))) if orig > 0 else "1"
+            d, c = (orig, 0) if ln["side"] == "debit" else (0, orig)
+            db, cb = (base, 0) if ln["side"] == "debit" else (0, base)
+            conn.execute("INSERT INTO journal_lines(entry_id,line_no,account_id,currency,debit_orig,credit_orig,exchange_rate,"
+                         "debit_base,credit_base,memo,cost_center_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                         (eid, i, ln["account_id"], ln["currency"], d, c, rate, db, cb, ln.get("memo", ""), ln.get("cost_center_id")))
+        audit.log(conn, user_id, "create_draft", "journal_entries", eid, after={"entry_no": no, "type": entry_type})
+    return eid
+
+
+def _editable_draft(conn, entry_id, user_id):
+    e = _entry(conn, entry_id)
+    permissions.require(conn, user_id, e["company_id"], "journal.create", e["branch_id"])
+    if e["status"] != "draft":
+        raise AccountingError("القيد المرحّل لا يُعدَّل: التصحيح بالعكس وقيد تصحيح")
+    if e["workflow_state"] != "draft":
+        raise AccountingError("القيد تحت المراجعة أو معتمد: أعده إلى المسودة قبل التعديل")
+    if e["created_by"] != user_id and not permissions.has(conn, user_id, e["company_id"], "journal.approve"):
+        raise permissions.PermissionDenied("لا يمكنك تعديل مسودة أنشأها مستخدم آخر")
+    return e
+
+
+def update_draft(conn, entry_id, user_id, *, lines=None, entry_date=None, description=None):
+    e = _editable_draft(conn, entry_id, user_id)
+    per = None
+    if entry_date is not None and entry_date != e["entry_date"]:
+        per = period_engine.find_period(conn, e["company_id"], entry_date)
+        if per["yid"] != e["fiscal_year_id"]:
+            raise AccountingError("لا يمكن نقل القيد إلى سنة مالية أخرى: أنشئ قيدا جديدا")
+        _assert_open(per)
+    if lines is not None:
+        _check_branch_accounts(conn, e["company_id"], e["branch_id"], lines)
+    before = {"entry_date": e["entry_date"], "description": e["description"], "lines": _lines_json(conn, entry_id)}
+    overrides = _check_rate_overrides(conn, e["company_id"], lines, entry_date or e["entry_date"], user_id) if lines is not None else []
+    new_desc = description if description is not None else e["description"]
+    party_ov = _party_override(conn, e["company_id"], user_id, e["entry_type"], lines, new_desc) if lines is not None else e["party_override"]
+    with transaction(conn):
+        rows = _build_lines(conn, e["company_id"], lines, entry_date or e["entry_date"]) if lines is not None else None
+        conn.execute("UPDATE journal_entries SET entry_date=?,period_id=?,description=?,party_override=? WHERE id=?",
+                     (entry_date or e["entry_date"], per["pid"] if per else e["period_id"], new_desc, party_ov, entry_id))
+        if rows is not None:
+            conn.execute("DELETE FROM journal_lines WHERE entry_id=?", (entry_id,))
+            _insert_lines(conn, entry_id, rows)
+        audit.log(conn, user_id, "update_draft", "journal_entries", entry_id, before,
+                  {"entry_date": entry_date or e["entry_date"], "description": description if description is not None else e["description"],
+                   "lines": _lines_json(conn, entry_id)})
+        for o in overrides:
+            audit.log(conn, user_id, "rate_override", "journal_entries", entry_id, after=o)
+
+
+def delete_draft(conn, entry_id, user_id):
+    e = _editable_draft(conn, entry_id, user_id)
+    snap = {"entry_no": e["entry_no"], "entry_date": e["entry_date"], "description": e["description"],
+            "lines": _lines_json(conn, entry_id)}
+    with transaction(conn):
+        conn.execute("DELETE FROM journal_lines WHERE entry_id=?", (entry_id,))
+        conn.execute("DELETE FROM journal_entries WHERE id=?", (entry_id,))
+        audit.log(conn, user_id, "delete_draft", "journal_entries", entry_id, snap)
+
+
+# ---------------- المراجعة والاعتماد ----------------
+def review(conn, entry_id, user_id):
+    e = _entry(conn, entry_id)
+    permissions.require(conn, user_id, e["company_id"], "journal.review", e["branch_id"])
+    if e["status"] != "draft" or e["workflow_state"] != "draft":
+        raise AccountingError("القيد ليس مسودة بانتظار المراجعة")
+    if get_settings(conn, e["company_id"])["enforce_separation"] and e["created_by"] == user_id:
+        raise AccountingError("فصل المهام: لا يمكنك مراجعة قيد أنشأته أنت")
+    with transaction(conn):
+        conn.execute("UPDATE journal_entries SET workflow_state='reviewed',reviewed_by=?,reviewed_at=CURRENT_TIMESTAMP,"
+                     "return_reason=NULL WHERE id=?", (user_id, entry_id))
+        audit.log(conn, user_id, "review", "journal_entries", entry_id, {"workflow_state": "draft"}, {"workflow_state": "reviewed"})
+
+
+def approve(conn, entry_id, user_id):
+    e = _entry(conn, entry_id)
+    permissions.require(conn, user_id, e["company_id"], "journal.approve", e["branch_id"])
+    st = get_settings(conn, e["company_id"])
+    if e["status"] != "draft" or e["workflow_state"] == "approved":
+        raise AccountingError("القيد ليس بانتظار الاعتماد")
+    if st["require_review"] and e["workflow_state"] != "reviewed":
+        raise AccountingError("القيد لم تتم مراجعته بعد")
+    if st["enforce_separation"] and e["created_by"] == user_id:
+        raise AccountingError("فصل المهام: لا يمكنك اعتماد قيد أنشأته أنت")
+    with transaction(conn):
+        conn.execute("UPDATE journal_entries SET workflow_state='approved',approved_by=?,approved_at=CURRENT_TIMESTAMP,"
+                     "return_reason=NULL WHERE id=?", (user_id, entry_id))
+        audit.log(conn, user_id, "approve", "journal_entries", entry_id, {"workflow_state": e["workflow_state"]}, {"workflow_state": "approved"})
+
+
+def return_to_draft(conn, entry_id, user_id, reason):
+    e = _entry(conn, entry_id)
+    if not permissions.has(conn, user_id, e["company_id"], "journal.approve"):
+        permissions.require(conn, user_id, e["company_id"], "journal.review", e["branch_id"])
+    if not reason or not reason.strip():
+        raise AccountingError("الإعادة إلى المسودة تتطلب ذكر السبب")
+    if e["status"] != "draft" or e["workflow_state"] == "draft":
+        raise AccountingError("القيد ليس تحت المراجعة أو الاعتماد")
+    with transaction(conn):
+        conn.execute("UPDATE journal_entries SET workflow_state='draft',reviewed_by=NULL,reviewed_at=NULL,approved_by=NULL,"
+                     "approved_at=NULL,return_reason=? WHERE id=?", (reason, entry_id))
+        audit.log(conn, user_id, "return_to_draft", "journal_entries", entry_id, {"workflow_state": e["workflow_state"]},
+                  {"workflow_state": "draft"}, reason)
+
+
+# ---------------- الترحيل والعكس ----------------
+def _next_posted_no(conn, company_id, year_id):
+    return conn.execute("SELECT COALESCE(MAX(posted_no),0)+1 FROM journal_entries WHERE company_id=? AND fiscal_year_id=?",
+                        (company_id, year_id)).fetchone()[0]
+
+
+def _check_cash_not_negative(conn, entry_id):
+    """صندوق مسجَّل لا يُسمح له بالرصيد السالب (لكل عملة أصلية) حتى تاريخ القيد؛ يُفحص عند القيد الدائن عليه."""
+    e = conn.execute("SELECT company_id,entry_date FROM journal_entries WHERE id=?", (entry_id,)).fetchone()
+    rows = conn.execute("SELECT DISTINCT ca.name,ca.account_id FROM journal_lines l JOIN cash_accounts ca ON ca.account_id=l.account_id "
+                        "WHERE l.entry_id=? AND ca.allow_negative=0 AND l.credit_orig>0", (entry_id,)).fetchall()
+    if not rows:
+        return
+    ys = be.year_start(conn, e["company_id"], e["entry_date"])
+    eff, counted, _x = be.frag("a")
+    args = {"c": e["company_id"], "t": e["entry_date"], "ys": ys, "fl": be.perm_floor(conn, e["company_id"], ys)}
+    for r in rows:
+        neg = conn.execute(
+            f"SELECT l.currency,SUM(l.debit_orig-l.credit_orig) n FROM journal_lines l JOIN journal_entries e ON e.id=l.entry_id "
+            f"JOIN accounts a ON a.id=l.account_id WHERE l.account_id=:acc AND e.company_id=:c AND e.status IN {be.POSTED} "
+            f"AND e.entry_date<=:t AND {counted} GROUP BY l.currency HAVING n<0", {**args, "acc": r["account_id"]}).fetchone()
+        if neg:
+            raise AccountingError(f"رصيد الصندوق «{r['name']}» سيصبح سالبا ({neg['currency']}): غير مسموح")
+
+
+def post(conn, entry_id, user_id, *, bypass_workflow=False):
+    """ترحيل داخل Transaction واحدة. إن اشترطت الشركة مراجعة/اعتمادا فالترحيل المباشر يتطلب صلاحية journal.post_direct."""
+    e = _entry(conn, entry_id)
+    permissions.require(conn, user_id, e["company_id"], "journal.post", e["branch_id"])
+    if e["status"] != "draft":
+        raise AccountingError("القيد مرحّل أو معكوس بالفعل")
+    st = get_settings(conn, e["company_id"])
+    if e["party_override"]:      # قيد يدوي على الأطراف: يلزم أن يبقى الإعداد مفعّلًا وأن يرحّله من يملك صلاحية المدير
+        if not st.get("allow_manual_party_entries"):
+            raise AccountingError("تم إيقاف «السماح بقيد يدوي على العملاء والموردين» في الإعدادات: لا يمكن ترحيل هذا القيد")
+        permissions.require(conn, user_id, e["company_id"], "journal.party_manual", check_branch=False)
+    direct = False
+    if e["entry_type"] not in WORKFLOW_EXEMPT_TYPES:
+        need_approved = st["require_approval"] and e["workflow_state"] != "approved"
+        need_reviewed = st["require_review"] and e["workflow_state"] == "draft"
+        if need_approved or need_reviewed:
+            if not bypass_workflow:      # التعديل المصرَّح (edit_posted) يتجاوز دورة المراجعة بصلاحيته الخاصة وبتدقيق كامل
+                if not permissions.has(conn, user_id, e["company_id"], "journal.post_direct"):
+                    permissions.require(conn, user_id, e["company_id"], "journal.post_direct")
+                if st["enforce_separation"] and e["created_by"] == user_id:
+                    raise AccountingError("فصل المهام: لا يمكنك الترحيل المباشر لقيد أنشأته أنت")
+            direct = True
+    with transaction(conn):
+        if direct:
+            conn.execute("UPDATE journal_entries SET workflow_state='approved',approved_by=?,approved_at=CURRENT_TIMESTAMP WHERE id=?",
+                         (user_id, entry_id))
+            audit.log(conn, user_id, "direct_approve", "journal_entries", entry_id,
+                      {"workflow_state": e["workflow_state"]}, {"workflow_state": "approved"}, "ترحيل مباشر بصلاحية خاصة")
+        no = _next_posted_no(conn, e["company_id"], e["fiscal_year_id"])
+        conn.execute("UPDATE journal_entries SET status='posted',posted_by=?,posted_at=CURRENT_TIMESTAMP,posted_no=? WHERE id=?",
+                     (user_id, no, entry_id))
+        _check_cash_not_negative(conn, entry_id)
+        audit.log(conn, user_id, "post", "journal_entries", entry_id, {"status": "draft"}, {"status": "posted", "posted_no": no})
+
+
+def reverse(conn, entry_id, user_id, reversal_date, reason):
+    """عكس قيد مرحّل: قيد جديد بسطور معكوسة + وسم الأصلي 'reversed'. التاريخ لا يُحذف."""
+    if not reason or not reason.strip():
+        raise AccountingError("العكس يتطلب ذكر السبب")
+    e = conn.execute("SELECT * FROM journal_entries WHERE id=?", (entry_id,)).fetchone()
+    if not e or e["status"] != "posted":
+        raise AccountingError("يمكن عكس القيود المرحّلة فقط")
+    permissions.require(conn, user_id, e["company_id"], "journal.reverse", e["branch_id"])
+    if e["entry_type"] == "reversal":
+        raise AccountingError("لا يمكن عكس قيد عكسي: أنشئ قيد تصحيح")
+    per = period_engine.find_period(conn, e["company_id"], reversal_date)
+    _assert_open(per)
+    rows = conn.execute("SELECT * FROM journal_lines WHERE entry_id=? ORDER BY line_no", (entry_id,)).fetchall()
+    with transaction(conn):
+        no = conn.execute("SELECT COALESCE(MAX(entry_no),0)+1 FROM journal_entries WHERE company_id=? AND fiscal_year_id=?",
+                          (e["company_id"], per["yid"])).fetchone()[0]
+        rid = conn.execute(
+            "INSERT INTO journal_entries(company_id,branch_id,fiscal_year_id,period_id,entry_no,entry_date,description,"
+            "entry_type,source_type,source_id,reverses_entry_id,created_by) VALUES(?,?,?,?,?,?,?,'reversal',?,?,?,?)",
+            (e["company_id"], e["branch_id"], per["yid"], per["pid"], no, reversal_date,
+             f"عكس القيد رقم {e['posted_no']}: {reason}", e["source_type"], e["source_id"], entry_id, user_id)).lastrowid
+        for r in rows:
+            conn.execute(
+                "INSERT INTO journal_lines(entry_id,line_no,account_id,currency,debit_orig,credit_orig,exchange_rate,"
+                "debit_base,credit_base,memo) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (rid, r["line_no"], r["account_id"], r["currency"], r["credit_orig"], r["debit_orig"],
+                 r["exchange_rate"], r["credit_base"], r["debit_base"], r["memo"]))
+        pno = _next_posted_no(conn, e["company_id"], per["yid"])
+        conn.execute("UPDATE journal_entries SET status='posted',posted_by=?,posted_at=CURRENT_TIMESTAMP,posted_no=? WHERE id=?",
+                     (user_id, pno, rid))
+        conn.execute("UPDATE journal_entries SET status='reversed' WHERE id=?", (entry_id,))
+        _check_cash_not_negative(conn, rid)
+        audit.log(conn, user_id, "reverse", "journal_entries", entry_id, {"status": "posted"},
+                  {"status": "reversed", "reversal_entry": rid}, reason)
+    return rid
+
+
+# ---------------- تعديل وحذف القيد المرحّل (مدير النظام) ----------------
+MANUAL_TYPES = ("general", "adjustment")
+_FK_SCAN_IGNORE = ("journal_lines", "journal_attachments", "journal_entries")
+
+
+def _require_manual_posted(e, what):
+    if e["entry_type"] not in MANUAL_TYPES or e["source_type"] is not None:
+        raise AccountingError(f"لا يمكن {what} قيدًا مولَّدًا من مستند أو من النظام (فاتورة/سند/رواتب/إقفال/افتتاح...): "
+                              "عدّل أو ألغِ المستند نفسه من شاشته")
+
+
+def _period_is_open(conn, e):
+    r = conn.execute("SELECT p.status ps,y.status ys FROM fiscal_periods p JOIN fiscal_years y ON y.id=p.fiscal_year_id WHERE p.id=?",
+                     (e["period_id"],)).fetchone()
+    return bool(r) and r["ps"] == "open" and r["ys"] == "open"
+
+
+def _snapshot(conn, entry_id):
+    e = dict(_entry(conn, entry_id))
+    e["lines"] = _lines_json(conn, entry_id)
+    e["attachments"] = [r[0] for r in conn.execute("SELECT file_name FROM journal_attachments WHERE entry_id=?", (entry_id,))]
+    return e
+
+
+def _fk_referrers(conn, ids):
+    """أي جدول (غير سطور القيد ومرفقاته) يشير إلى هذه القيود؟ يمنع حذفًا يكسر مستندًا مرتبطًا."""
+    hits = []
+    marks = ",".join("?" * len(ids))
+    for t in [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]:
+        if t in _FK_SCAN_IGNORE:
+            continue
+        for fk in conn.execute(f"PRAGMA foreign_key_list({t})").fetchall():
+            if fk["table"] == "journal_entries":
+                n = conn.execute(f"SELECT COUNT(*) FROM {t} WHERE {fk['from']} IN ({marks})", ids).fetchone()[0]
+                if n:
+                    hits.append(t)
+    return hits
+
+
+def edit_posted(conn, entry_id, user_id, *, lines, entry_date=None, description=None, reason):
+    """تعديل قيد مرحّل يدوي: عكس القديم + قيد جديد مرحّل بالقيم الصحيحة (معاملة واحدة). يتطلب الإعداد المفعّل + journal.edit_posted.
+    lines بصيغة create_draft. يعيد {reversal_id, new_id}."""
+    if not reason or not reason.strip():
+        raise AccountingError("تعديل القيد المرحّل يتطلب ذكر السبب")
+    e = _entry(conn, entry_id)
+    permissions.require(conn, user_id, e["company_id"], "journal.edit_posted", e["branch_id"])
+    permissions.require(conn, user_id, e["company_id"], "journal.reverse", e["branch_id"])
+    permissions.require(conn, user_id, e["company_id"], "journal.create", e["branch_id"])
+    if not get_settings(conn, e["company_id"]).get("allow_edit_posted_entries"):
+        raise AccountingError("تعديل القيود المرحّلة غير مفعّل: فعّله من الإعدادات (لمدير النظام)")
+    if e["status"] != "posted":
+        raise AccountingError("يمكن تعديل القيد المرحّل الفعّال فقط (القيد المعكوس أو المسودة لا)")
+    _require_manual_posted(e, "تعديل")
+    if not _period_is_open(conn, e):
+        raise AccountingError("فترة القيد أو سنته مقفلة: أعد فتحها أولًا ثم عدّل")
+    before = _snapshot(conn, entry_id)
+    new_date = entry_date or e["entry_date"]
+    new_desc = (description if description is not None else e["description"]) or ""
+    with transaction(conn):
+        rid = reverse(conn, entry_id, user_id, e["entry_date"], f"تعديل القيد: {reason.strip()}")
+        nid = create_draft(conn, e["company_id"], user_id, new_date, lines, new_desc, branch_id=e["branch_id"], entry_type=e["entry_type"])
+        post(conn, nid, user_id, bypass_workflow=True)
+        after = _snapshot(conn, nid)
+        conn.execute("INSERT INTO journal_edit_log(company_id,old_entry_id,old_posted_no,reversal_entry_id,new_entry_id,before_json,after_json,"
+                     "reason,edited_by) VALUES(?,?,?,?,?,?,?,?,?)",
+                     (e["company_id"], entry_id, e["posted_no"], rid, nid, json.dumps(before, ensure_ascii=False, default=str),
+                      json.dumps(after, ensure_ascii=False, default=str), reason.strip(), user_id))
+        audit.log(conn, user_id, "edit_posted", "journal_entries", entry_id, {"posted_no": e["posted_no"], "lines": before["lines"]},
+                  {"reversal_entry": rid, "new_entry": nid, "new_posted_no": after["posted_no"], "lines": after["lines"]}, reason.strip())
+    return {"reversal_id": rid, "new_id": nid}
+
+
+def delete_posted(conn, entry_id, user_id, reason):
+    """حذف فعلي لقيد مرحّل يدوي (مع عكسه إن كان معكوسًا) من فترة مفتوحة، بعد حفظ نسخة كاملة في journal_deletion_log.
+    يتطلب الإعداد المفعّل + journal.delete_posted. يعيد قائمة معرفات القيود المحذوفة."""
+    if not reason or not reason.strip():
+        raise AccountingError("حذف القيد المرحّل يتطلب ذكر السبب")
+    e = _entry(conn, entry_id)
+    permissions.require(conn, user_id, e["company_id"], "journal.delete_posted", e["branch_id"])
+    if not get_settings(conn, e["company_id"]).get("allow_delete_posted_entries"):
+        raise AccountingError("حذف القيود المرحّلة غير مفعّل: فعّله من الإعدادات (لمدير النظام)")
+    if e["status"] == "draft":
+        raise AccountingError("هذه مسودة: استخدم «حذف المسودة»")
+    orig = _entry(conn, e["reverses_entry_id"]) if e["entry_type"] == "reversal" else e
+    _require_manual_posted(orig, "حذف")
+    group = [orig] + [r for r in conn.execute("SELECT * FROM journal_entries WHERE reverses_entry_id=? ORDER BY id", (orig["id"],)).fetchall()]
+    ids = [g["id"] for g in group]
+    for g in group:
+        if not _period_is_open(conn, g):
+            raise AccountingError(f"القيد رقم {g['posted_no']} في فترة أو سنة مقفلة: أعد فتحها أولًا ثم احذف")
+    linked = _fk_referrers(conn, ids)
+    if linked:
+        raise AccountingError("القيد مرتبط بسجلات أخرى (" + "، ".join(sorted(set(linked))) + "): لا يمكن حذفه")
+    snaps = [_snapshot(conn, i) for i in ids]
+    with transaction(conn):
+        conn.execute("UPDATE journal_edit_guard SET active=1")
+        try:
+            for i in reversed(ids):                      # العكسي أولًا ثم الأصلي (مفتاح reverses_entry_id)
+                conn.execute("DELETE FROM journal_lines WHERE entry_id=?", (i,))
+                conn.execute("DELETE FROM journal_attachments WHERE entry_id=?", (i,))
+                conn.execute("DELETE FROM journal_entries WHERE id=?", (i,))
+        finally:
+            conn.execute("UPDATE journal_edit_guard SET active=0")
+        conn.execute("INSERT INTO journal_deletion_log(company_id,entry_id,entry_no,posted_no,entry_date,snapshot_json,reason,deleted_by) "
+                     "VALUES(?,?,?,?,?,?,?,?)",
+                     (orig["company_id"], orig["id"], orig["entry_no"], orig["posted_no"], orig["entry_date"],
+                      json.dumps(snaps, ensure_ascii=False, default=str), reason.strip(), user_id))
+        audit.log(conn, user_id, "delete_posted", "journal_entries", orig["id"],
+                  {"entries": [{"id": s_["id"], "posted_no": s_["posted_no"], "lines": s_["lines"]} for s_ in snaps]}, None, reason.strip())
+    return ids
+
+
+# ---------------- الاستعلام ----------------
+def get_entry(conn, user_id, entry_id):
+    e = _entry(conn, entry_id)
+    permissions.require(conn, user_id, e["company_id"], "journal.view", e["branch_id"])
+    lines = [dict(r) for r in conn.execute(
+        "SELECT l.*,a.code account_code,a.name account_name FROM journal_lines l JOIN accounts a ON a.id=l.account_id "
+        "WHERE l.entry_id=? ORDER BY l.line_no", (entry_id,))]
+    return {**dict(e), "lines": lines}
+
+
+def list_entries(conn, user_id, company_id, *, status=None, workflow_state=None, date_from=None, date_to=None,
+                 source_type=None, limit=50, offset=0, branch_id=None, currency=None, no_from=None, no_to=None, text=None):
+    permissions.require(conn, user_id, company_id, "journal.view", check_branch=False)   # التصفية بالفروع أدناه
+    q, args = "SELECT * FROM journal_entries WHERE company_id=?", [company_id]
+    # بحث برقم القيد (الرقم الظاهر = رقم الترحيل إن وُجد وإلا رقم المسودة): من/إلى، وبالنص في البيان أو بيان أي سطر — قراءة فقط
+    if no_from is not None:
+        q += " AND COALESCE(posted_no, entry_no)>=?"; args.append(int(no_from))
+    if no_to is not None:
+        q += " AND COALESCE(posted_no, entry_no)<=?"; args.append(int(no_to))
+    if text and str(text).strip():
+        like = "%" + str(text).strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        q += (" AND (description LIKE ? ESCAPE '\\' OR EXISTS(SELECT 1 FROM journal_lines jm WHERE jm.entry_id=journal_entries.id"
+              " AND jm.memo LIKE ? ESCAPE '\\'))")
+        args += [like, like]
+    if currency:                                           # القيود التي فيها سطر بهذه العملة
+        q += " AND EXISTS(SELECT 1 FROM journal_lines jl WHERE jl.entry_id=journal_entries.id AND jl.currency=?)"
+        args.append(str(currency).strip().upper())
+    for col, val, op in (("status", status, "="), ("workflow_state", workflow_state, "="), ("entry_date", date_from, ">="),
+                         ("entry_date", date_to, "<="), ("source_type", source_type, "=")):
+        if val is not None:
+            q += f" AND {col}{op}?"; args.append(val)
+    restricted = conn.execute("SELECT branch_id FROM user_branch_access WHERE user_id=?", (user_id,)).fetchall()
+    if restricted:
+        q += " AND branch_id IN (%s)" % ",".join("?" * len(restricted)); args += [r[0] for r in restricted]
+    f, fa = branch_scope.txn_clause(conn, company_id, branch_id)
+    q += f; args += fa
+    q += " ORDER BY entry_date DESC,id DESC LIMIT ? OFFSET ?"
+    return [dict(r) for r in conn.execute(q, (*args, min(int(limit), 500), int(offset)))]
+
+
+def account_balance_base(conn, account_id):
+    """رصيد بالعملة الأساسية (مدين - دائن) من القيود المرحّلة/المعكوسة فقط. مؤقت حتى Gate 05."""
+    r = conn.execute(
+        "SELECT COALESCE(SUM(l.debit_base),0)-COALESCE(SUM(l.credit_base),0) FROM journal_lines l "
+        "JOIN journal_entries e ON e.id=l.entry_id WHERE l.account_id=? AND e.status IN ('posted','reversed')",
+        (account_id,)).fetchone()
+    return r[0]

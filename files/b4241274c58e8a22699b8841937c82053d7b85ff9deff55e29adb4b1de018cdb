@@ -1,0 +1,170 @@
+"""صفحة مطابقة المخزون مع الأستاذ العام وفحص اتساق الأرصدة المخزنة (المرحلة 3 وقسم 6.8)."""
+from datetime import date
+
+from PySide6.QtCore import Qt, QDate
+from PySide6.QtWidgets import (
+    QDateEdit, QFrame, QHBoxLayout, QLabel, QMessageBox,
+    QPushButton, QTabWidget, QVBoxLayout, QWidget
+)
+
+from alhisabat.ui.components.datagrid import DataGrid
+from alhisabat.ui.components.grid_logic import Column
+from alhisabat.ui.core import format as fmt
+from alhisabat.ui.core.actions import Action, ActionGroup
+from alhisabat.ui.core.base_page import BasePage
+from alhisabat.ui.core.inventory_service import InventoryService
+from alhisabat.ui.core.permissions import ActionState
+
+
+class StockReconPage(BasePage):
+    key = 'stock_recon'
+    title = 'مطابقة المخزون مع الأستاذ'
+    icon = 'check'
+    required_permission = 'inventory.view'
+
+    def build(self):
+        self._built = True
+        self.svc = InventoryService(self.session)
+        self._recon_data = None
+        self._cache_data = None
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(6, 6, 6, 6)
+
+        # ---------------- شريط التحكم ----------------
+        bar = QHBoxLayout()
+        bar.addWidget(QLabel("حتى تاريخ:"))
+        self.as_of = QDateEdit(QDate.currentDate())
+        self.as_of.setCalendarPopup(True)
+        self.as_of.setDisplayFormat('yyyy-MM-dd')
+        bar.addWidget(self.as_of)
+
+        self.btn_run = QPushButton("إجراء المطابقة")
+        self.btn_run.setProperty('primary', True)
+        self.btn_run.clicked.connect(self.run)
+        bar.addWidget(self.btn_run)
+        bar.addStretch(1)
+        lay.addLayout(bar)
+
+        # ---------------- بطاقة الملخص ----------------
+        self.summary_box = QFrame()
+        self.summary_box.setObjectName("summaryCard")
+        sl = QHBoxLayout(self.summary_box)
+
+        self.lbl_status = QLabel("الحالة: —")
+        self.lbl_status.setStyleSheet("font-weight: bold; font-size: 13px;")
+        sl.addWidget(self.lbl_status)
+
+        self.lbl_unlinked = QLabel("حركات غير مربوطة بقيد: —")
+        sl.addWidget(self.lbl_unlinked)
+
+        self.lbl_cache = QLabel("اتساق الأرصدة المخزنة: —")
+        sl.addWidget(self.lbl_cache)
+
+        sl.addStretch(1)
+        lay.addWidget(self.summary_box)
+
+        # ---------------- التبويبات ----------------
+        self.tabs = QTabWidget()
+
+        # التبويب 1: مطابقة الحسابات
+        recon_panel = QWidget()
+        rl = QVBoxLayout(recon_panel)
+        rl.setContentsMargins(0, 0, 0, 0)
+        recon_cols = [
+            Column('code', 'كود الحساب', width=110),
+            Column('account_label', 'حساب المخزون', width=220),
+            Column('operational_str', 'القيمة التشغيلية (المخازن)', 'money', 150),
+            Column('accounting_str', 'القيمة المحاسبية (الأستاذ)', 'money', 150),
+            Column('diff_str', 'الفرق', 'money', 130),
+            Column('status_str', 'الحالة', width=100),
+        ]
+        self.recon_grid = DataGrid(recon_cols, grid_id='stock_recon_accounts_grid')
+        rl.addWidget(self.recon_grid, 1)
+        self.tabs.addTab(recon_panel, "فروقات حسابات المخزون")
+
+        # التبويب 2: فحص الكاش المخزن
+        cache_panel = QWidget()
+        cl = QVBoxLayout(cache_panel)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cache_cols = [
+            Column('item_id', 'معرف الصنف', 'int', 90),
+            Column('warehouse_id', 'معرف المستودع', 'int', 100),
+            Column('calc_qty', 'الكمية المحسوبة', width=120),
+            Column('stored_qty', 'الكمية المخزنة', width=120),
+            Column('calc_val', 'القيمة المحسوبة', 'money', 120),
+            Column('stored_val', 'القيمة المخزنة', 'money', 120),
+        ]
+        self.cache_grid = DataGrid(cache_cols, grid_id='stock_recon_cache_grid')
+        cl.addWidget(self.cache_grid, 1)
+        self.tabs.addTab(cache_panel, "فحص الأرصدة المخزنة (Cache)")
+
+        lay.addWidget(self.tabs, 1)
+
+    def refresh(self):
+        if getattr(self, '_built', False):
+            self.run()
+
+    def run(self):
+        as_of_str = self.as_of.date().toPython().isoformat()
+        try:
+            self._recon_data = self.svc.reconcile_with_gl(as_of_str)
+            self._cache_data = self.svc.verify_cache()
+        except Exception as exc:
+            return self.show_error(exc)
+
+        # تحديث بطاقة الملخص
+        if not self._recon_data.get('applicable', True):
+            self.lbl_status.setText("الحالة: لا توجد أصناف مخزون معرفة")
+            self.lbl_status.setStyleSheet("font-weight: bold; color: var(--color-muted);")
+        elif self._recon_data.get('ok', False):
+            self.lbl_status.setText("الحالة: متطابق تمامًا مع الأستاذ العام ✓")
+            self.lbl_status.setStyleSheet("font-weight: bold; color: var(--color-success);")
+        else:
+            self.lbl_status.setText("الحالة: يوجد فروقات بين المخزون والأستاذ ⚠️")
+            self.lbl_status.setStyleSheet("font-weight: bold; color: var(--color-danger);")
+
+        unlinked = self._recon_data.get('unlinked_movements', 0)
+        self.lbl_unlinked.setText(f"حركات غير مربوطة بقيد: {unlinked}")
+
+        bad_cache = len(self._cache_data)
+        if bad_cache == 0:
+            self.lbl_cache.setText("اتساق الأرصدة المخزنة: سليم ومطابق ✓")
+        else:
+            self.lbl_cache.setText(f"اتساق الأرصدة المخزنة: {bad_cache} تعارض في التخزين المؤقت ⚠️")
+
+        # تعبئة جدول الحسابات
+        rows = []
+        for r in self._recon_data.get('rows', []):
+            diff = r.get('diff', 0)
+            rows.append({
+                'account_id': r.get('account_id'),
+                'code': r.get('code') or '—',
+                'account_label': f"{r.get('code') or ''} (حساب #{r.get('account_id') or 'عام'})".strip(),
+                'operational_str': fmt.fmt_money(r.get('operational', 0), minor=True),
+                'accounting_str': fmt.fmt_money(r.get('accounting', 0), minor=True),
+                'diff_str': fmt.fmt_money(diff, minor=True),
+                'status_str': 'متطابق' if diff == 0 else 'يوجد فرق',
+            })
+        self.recon_grid.set_rows(rows)
+
+        # تعبئة جدول الكاش
+        c_rows = []
+        for c in self._cache_data:
+            c_rows.append({
+                'item_id': c['item_id'],
+                'warehouse_id': c['warehouse_id'],
+                'calc_qty': fmt.fmt_qty_milli(c['calculated'][0]),
+                'stored_qty': fmt.fmt_qty_milli(c['stored'][0]),
+                'calc_val': fmt.fmt_money(c['calculated'][1], minor=True),
+                'stored_val': fmt.fmt_money(c['stored'][1], minor=True),
+            })
+        self.cache_grid.set_rows(c_rows)
+        self.actions_changed.emit()
+
+    def ribbon_groups(self):
+        return [
+            ActionGroup('مطابقة', [
+                Action('run', 'إعادة فحص المطابقة', 'refresh', primary=True, handler=self.run),
+            ]),
+        ]

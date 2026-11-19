@@ -1,0 +1,205 @@
+"""معلومات الصنف (شاشة «معلومات الصنف»): قراءة موحّدة لملف الصنف من المحرك + تعديل البيانات الإضافية والباركودات.
+
+القراءة بلا SQL في الواجهة. كل المبالغ بوحدات صغرى (minor) بالعملة الأساسية ما لم يُذكر غير ذلك، والكميات ملّي (×1000).
+الأسعار تُحوَّل إلى «لكل وحدة أساس» وإلى العملة الأساسية بسعر الصرف المنسوخ في الفاتورة، فتتطابق مع التكلفة والهامش.
+"""
+from decimal import Decimal, ROUND_HALF_UP
+
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.audit import audit
+from alhisabat.database.tx import transaction
+from alhisabat.security import permissions
+
+_IN_OUT_EXCLUDED = ("transfer_in", "transfer_out")
+
+
+def _item(conn, item_id, company_id):
+    r = conn.execute("SELECT i.*, u.name unit_name FROM items i JOIN units u ON u.id=i.base_unit_id WHERE i.id=?", (int(item_id),)).fetchone()
+    if not r or r["company_id"] != company_id:
+        raise AccountingError("الصنف غير موجود في هذه الشركة")
+    return r
+
+
+def _base_price(row):
+    """سعر سطر فاتورة → (سعر الوحدة الأساسية بالعملة الأساسية minor، سعر السطر بعملة الفاتورة minor)."""
+    rate = Decimal(str(row["rate"] or "1"))
+    factor = Decimal(row["factor_milli"] or 1000)
+    per_base_orig = Decimal(row["price"]) * 1000 / factor
+    return int((per_base_orig * rate).quantize(Decimal("1"), ROUND_HALF_UP)), int(row["price"])
+
+
+def _last_invoice(conn, company_id, item_id, kind):
+    if kind == "sales":
+        sql = ("SELECT h.invoice_no, h.invoice_date d, h.currency, h.exchange_rate rate, p.name party, l.unit_price_minor price, l.factor_milli, "
+               "u.name unit, l.qty_milli FROM sales_invoice_lines l JOIN sales_invoices h ON h.id=l.invoice_id "
+               "LEFT JOIN parties p ON p.id=h.customer_id LEFT JOIN units u ON u.id=l.unit_id "
+               "WHERE h.company_id=? AND l.item_id=? AND h.status='posted' AND h.doc_type='invoice' ORDER BY h.invoice_date DESC,h.id DESC")
+    else:
+        sql = ("SELECT h.invoice_no, h.invoice_date d, h.currency, h.exchange_rate rate, p.name party, l.unit_price_minor price, l.factor_milli, "
+               "u.name unit, l.qty_milli FROM purchase_invoice_lines l JOIN purchase_invoices h ON h.id=l.invoice_id "
+               "LEFT JOIN parties p ON p.id=h.supplier_id LEFT JOIN units u ON u.id=l.unit_id "
+               "WHERE h.company_id=? AND l.item_id=? AND h.status='posted' AND h.doc_type='invoice' ORDER BY h.invoice_date DESC,h.id DESC")
+    return sql, (company_id, item_id)
+
+
+def invoice_history(conn, company_id, item_id, kind, limit=100):
+    """حركة بيع/شراء الصنف (فواتير مرحّلة وردود): الأحدث أولًا، مع سعر الوحدة الأساسية بالعملة الأساسية."""
+    tbl, h, pc = (("sales_invoice_lines", "sales_invoices", "customer_id") if kind == "sales"
+                  else ("purchase_invoice_lines", "purchase_invoices", "supplier_id"))
+    rows = conn.execute(
+        f"SELECT h.id invoice_id, h.invoice_no, h.invoice_date date, h.doc_type, h.currency, h.exchange_rate rate, p.name party, "
+        f"l.qty_milli, u.name unit, l.factor_milli, l.unit_price_minor price, l.total_minor total, h.status "
+        f"FROM {tbl} l JOIN {h} h ON h.id=l.invoice_id LEFT JOIN parties p ON p.id=h.{pc} LEFT JOIN units u ON u.id=l.unit_id "
+        f"WHERE h.company_id=? AND l.item_id=? AND h.status IN ('posted','draft') ORDER BY h.invoice_date DESC,h.id DESC LIMIT ?",
+        (company_id, item_id, int(limit))).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["base_price"], _ = _base_price(r)
+        out.append(d)
+    return out
+
+
+def load(conn, company_id, item_id, today, warehouse_clause=("", [])):
+    """ملف الصنف الكامل كقاموس واحد (للقراءة فقط)."""
+    it = _item(conn, item_id, company_id)
+    wc, wa = warehouse_clause
+    bal = conn.execute(
+        "SELECT w.id warehouse_id, w.code warehouse_code, w.name warehouse, w.branch_id, COALESCE(b.name,'') branch, "
+        "sb.qty_milli, sb.value_base FROM stock_balances sb JOIN warehouses w ON w.id=sb.warehouse_id "
+        "LEFT JOIN branches b ON b.id=w.branch_id WHERE sb.item_id=?" + wc.replace(" AND id IN", " AND w.id IN") + " ORDER BY w.name",
+        (item_id, *wa)).fetchall()
+    warehouses = []
+    for r in bal:
+        d = dict(r)
+        d["avg_cost"] = int((Decimal(r["value_base"]) * 1000 / r["qty_milli"]).quantize(Decimal("1"), ROUND_HALF_UP)) if r["qty_milli"] else 0
+        warehouses.append(d)
+    branches = {}
+    for w in warehouses:
+        b = branches.setdefault(w["branch_id"], {"branch_id": w["branch_id"], "branch": w["branch"] or "—", "qty_milli": 0, "value_base": 0})
+        b["qty_milli"] += w["qty_milli"]; b["value_base"] += w["value_base"]
+    for b in branches.values():
+        b["avg_cost"] = int((Decimal(b["value_base"]) * 1000 / b["qty_milli"]).quantize(Decimal("1"), ROUND_HALF_UP)) if b["qty_milli"] else 0
+    qty = sum(w["qty_milli"] for w in warehouses); val = sum(w["value_base"] for w in warehouses)
+    avg_cost = int((Decimal(val) * 1000 / qty).quantize(Decimal("1"), ROUND_HALF_UP)) if qty else 0
+
+    last = {}
+    for kind in ("sales", "purchases"):
+        sql, args = _last_invoice(conn, company_id, item_id, kind)
+        r = conn.execute(sql + " LIMIT 1", args).fetchone()
+        if r:
+            base, orig = _base_price(r)
+            last[kind] = {"invoice_no": r["invoice_no"], "date": r["d"], "party": r["party"] or "", "unit": r["unit"] or it["unit_name"],
+                          "currency": r["currency"], "price_orig": orig, "price_base": base, "qty_milli": r["qty_milli"]}
+    sale_price = it["sale_price_minor"] or (last.get("sales") or {}).get("price_base", 0)
+    margin_pct = None
+    if sale_price and avg_cost:
+        margin_pct = float((Decimal(sale_price - avg_cost) * 100 / Decimal(sale_price)).quantize(Decimal("0.01"), ROUND_HALF_UP))
+
+    year = int(today[:4])
+    flow = {}
+    for r in conn.execute(
+            "SELECT strftime('%Y',movement_date) y, direction, SUM(qty_milli) q, SUM(value_base) v FROM stock_movements "
+            "WHERE item_id=? AND movement_type NOT IN (?,?) AND strftime('%Y',movement_date) IN (?,?) GROUP BY y,direction",
+            (item_id, *_IN_OUT_EXCLUDED, str(year), str(year - 1))):
+        flow[(int(r["y"]), r["direction"])] = (r["q"], r["v"])
+    years = {}
+    for y in (year, year - 1):
+        years[y] = {"in_qty": flow.get((y, "in"), (0, 0))[0], "in_value": flow.get((y, "in"), (0, 0))[1],
+                    "out_qty": flow.get((y, "out"), (0, 0))[0], "out_value": flow.get((y, "out"), (0, 0))[1]}
+
+    cat_row = conn.execute("SELECT name FROM item_categories WHERE id=?", (it["category_id"],)).fetchone() if it["category_id"] else None
+    return {
+        "id": it["id"], "code": it["code"], "name": it["name"], "name_en": it["name_en"], "brand": it["brand"], "barcode": it["barcode"],
+        "kind": it["item_type"], "unit": it["unit_name"], "unit_id": it["base_unit_id"], "category": it["category"] or (cat_row[0] if cat_row else ""),
+        "notes": it["notes"], "is_active": bool(it["is_active"]), "cost_method": it["cost_method"], "min_qty_milli": it["min_qty_milli"],
+        "track_expiry": bool(it["track_expiry"]), "expiry_alert_days": it["expiry_alert_days"], "sale_price_minor": it["sale_price_minor"],
+        "qty_milli": qty, "value_base": val, "avg_cost": avg_cost, "sale_price": sale_price, "margin_pct": margin_pct,
+        "last_sale": last.get("sales"), "last_purchase": last.get("purchases"),
+        "supplier": (last.get("purchases") or {}).get("party", ""),
+        "warehouses": warehouses, "branches": sorted(branches.values(), key=lambda b: b["branch"]),
+        "year": year, "years": years,
+        "units": [dict(r) for r in conn.execute(
+            "SELECT u.id,u.name,u.code,iu.factor_milli,(iu.unit_id=i.base_unit_id) is_base FROM item_units iu JOIN units u ON u.id=iu.unit_id "
+            "JOIN items i ON i.id=iu.item_id WHERE iu.item_id=? ORDER BY is_base DESC,u.name", (item_id,))],
+        "barcodes": list_barcodes(conn, company_id, item_id),
+        "next_expiry": (conn.execute("SELECT MIN(expiry_date) FROM stock_lots WHERE item_id=? AND qty_milli>0 AND expiry_date<>''", (item_id,)).fetchone() or [None])[0],
+        "has_moves": bool(conn.execute("SELECT 1 FROM stock_movements WHERE item_id=? LIMIT 1", (item_id,)).fetchone()),
+    }
+
+
+def movements(conn, item_id, limit=300):
+    """آخر حركات الصنف في كل المستودعات (الأحدث أولًا) — تبويب «حركة الوارد والمصروف»."""
+    return [dict(r) for r in conn.execute(
+        "SELECT m.id,m.movement_date,m.movement_type,m.direction,m.qty_milli,m.value_base,m.note,w.name warehouse,m.source_type,m.source_id,"
+        "m.journal_entry_id FROM stock_movements m JOIN warehouses w ON w.id=m.warehouse_id WHERE m.item_id=? "
+        "ORDER BY m.movement_date DESC,m.id DESC LIMIT ?", (int(item_id), int(limit)))]
+
+
+def list_barcodes(conn, company_id, item_id):
+    """الباركود الأساسي (من الصنف) ثم الإضافية."""
+    it = conn.execute("SELECT barcode FROM items WHERE id=?", (item_id,)).fetchone()
+    out = []
+    if it and it["barcode"]:
+        out.append({"id": None, "barcode": it["barcode"], "unit": "", "unit_id": None, "note": "الباركود الأساسي", "primary": True})
+    for r in conn.execute("SELECT b.id,b.barcode,b.unit_id,COALESCE(u.name,'') unit,b.note FROM item_barcodes b LEFT JOIN units u ON u.id=b.unit_id "
+                          "WHERE b.item_id=? ORDER BY b.id", (item_id,)):
+        out.append({**dict(r), "primary": False})
+    return out
+
+
+def find_by_barcode(conn, company_id, code):
+    """معرّف صنف من باركود أساسي أو إضافي، أو None."""
+    code = (code or "").strip()
+    if not code:
+        return None
+    r = conn.execute("SELECT id FROM items WHERE company_id=? AND barcode=?", (company_id, code)).fetchone()
+    if r:
+        return r[0]
+    r = conn.execute("SELECT item_id FROM item_barcodes WHERE company_id=? AND barcode=?", (company_id, code)).fetchone()
+    return r[0] if r else None
+
+
+def update_extras(conn, actor_id, company_id, item_id, *, name_en=None, brand=None, notes=None, sale_price=None):
+    """الاسم الأجنبي/الماركة/الوصف/سعر البيع المرجعي (للوحدة الأساسية، بالعملة الأساسية). لا يمس الحركات."""
+    it = _item(conn, item_id, company_id)
+    permissions.require(conn, actor_id, company_id, "inventory.manage", check_branch=False)
+    new = {"name_en": it["name_en"] if name_en is None else name_en.strip(), "brand": it["brand"] if brand is None else brand.strip(),
+           "notes": it["notes"] if notes is None else notes.strip(),
+           "sale_price_minor": it["sale_price_minor"] if sale_price is None else int((Decimal(str(sale_price)) * 100).quantize(Decimal("1"), ROUND_HALF_UP))}
+    if new["sale_price_minor"] < 0:
+        raise AccountingError("سعر البيع لا يكون سالبًا")
+    old = {k: it[k] for k in new}
+    if old == new:
+        return
+    with transaction(conn):
+        conn.execute("UPDATE items SET name_en=?,brand=?,notes=?,sale_price_minor=? WHERE id=?",
+                     (new["name_en"], new["brand"], new["notes"], new["sale_price_minor"], item_id))
+        audit.log(conn, actor_id, "edit_item_info", "items", item_id, old, new)
+
+
+def add_barcode(conn, actor_id, company_id, item_id, barcode, unit_id=None, note=""):
+    _item(conn, item_id, company_id)
+    permissions.require(conn, actor_id, company_id, "inventory.manage", check_branch=False)
+    code = (barcode or "").strip()
+    if not code:
+        raise AccountingError("اكتب الباركود")
+    owner = find_by_barcode(conn, company_id, code)
+    if owner is not None:
+        n = conn.execute("SELECT name FROM items WHERE id=?", (owner,)).fetchone()[0]
+        raise AccountingError(f"الباركود مستخدم للصنف «{n}»")
+    with transaction(conn):
+        cur = conn.execute("INSERT INTO item_barcodes(company_id,item_id,barcode,unit_id,note,created_by) VALUES(?,?,?,?,?,?)",
+                           (company_id, item_id, code, unit_id or None, (note or "").strip(), actor_id))
+        audit.log(conn, actor_id, "add_item_barcode", "items", item_id, after={"barcode": code})
+        return cur.lastrowid
+
+
+def remove_barcode(conn, actor_id, company_id, barcode_id):
+    r = conn.execute("SELECT * FROM item_barcodes WHERE id=? AND company_id=?", (int(barcode_id), company_id)).fetchone()
+    if not r:
+        raise AccountingError("الباركود غير موجود")
+    permissions.require(conn, actor_id, company_id, "inventory.manage", check_branch=False)
+    with transaction(conn):
+        conn.execute("DELETE FROM item_barcodes WHERE id=?", (r["id"],))
+        audit.log(conn, actor_id, "remove_item_barcode", "items", r["item_id"], before={"barcode": r["barcode"]})

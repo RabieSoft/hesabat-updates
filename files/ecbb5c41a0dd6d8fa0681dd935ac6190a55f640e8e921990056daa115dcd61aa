@@ -1,0 +1,32 @@
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.audit import audit
+
+
+class PermissionDenied(AccountingError):
+    pass
+
+
+def has(conn, user_id, company_id, code):
+    r = conn.execute(
+        "SELECT 1 FROM users u JOIN user_roles ur ON ur.user_id=u.id AND ur.company_id=? "
+        "JOIN role_permissions rp ON rp.role_id=ur.role_id AND rp.permission_code=? "
+        "WHERE u.id=? AND u.is_active=1 LIMIT 1", (company_id, code, user_id)).fetchone()
+    return r is not None
+
+
+def can_use_branch(conn, user_id, branch_id):
+    restricted = conn.execute("SELECT COUNT(*) FROM user_branch_access WHERE user_id=?", (user_id,)).fetchone()[0]
+    if not restricted:
+        return True
+    return branch_id is not None and conn.execute(
+        "SELECT 1 FROM user_branch_access WHERE user_id=? AND branch_id=?", (user_id, branch_id)).fetchone() is not None
+
+
+def require(conn, user_id, company_id, code, branch_id=None, check_branch=True):
+    """يرفع PermissionDenied ويسجل المحاولة في التدقيق. يُستدعى خارج أي Transaction."""
+    if user_id is None or not has(conn, user_id, company_id, code):
+        audit.log(conn, user_id, "permission_denied", "permissions", None, after={"permission": code, "company": company_id})
+        raise PermissionDenied("ليس لديك صلاحية تنفيذ هذا الإجراء")
+    if check_branch and not can_use_branch(conn, user_id, branch_id):
+        audit.log(conn, user_id, "permission_denied", "branches", branch_id, after={"permission": code})
+        raise PermissionDenied("ليس لديك صلاحية العمل على هذا الفرع")

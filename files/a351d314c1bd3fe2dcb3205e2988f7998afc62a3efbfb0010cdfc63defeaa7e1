@@ -1,0 +1,36 @@
+"""خدمة مطابقة أرصدة العملاء والموردين للواجهة: تغليف رقيق لمحرك business.party_reconcile (لا منطق محاسبي هنا)."""
+from alhisabat.business import party_reconcile as pr
+
+
+class ReconcileService:
+    KINDS = {'عملاء': 'customer', 'موردون': 'supplier'}
+
+    def __init__(self, session):
+        self.s = session
+
+    def read(self, path):
+        self.s.require('data.import')
+        return pr.read_reconcile_file(path)
+
+    def currencies(self):
+        from alhisabat.ui.core import readmodel
+        return [c for c in readmodel.currencies_list(self.s.conn, self.s.company_id) if c['is_enabled']]
+
+    def preview(self, kind_label, rows, as_of, currency=None, force=False, dup_mode='skip'):
+        return pr.preview(self.s.conn, self.s.user_id, self.s.company_id, self.KINDS[kind_label], rows,
+                          as_of=as_of, currency=currency, force_currency=force, dup_mode=dup_mode)
+
+    def export(self, preview_result, path):
+        return pr.export_xlsx(preview_result, path)
+
+    def commit(self, kind_label, rows, as_of, currency=None, force=False, dup_mode='skip', post=False, note=''):
+        return pr.commit(self.s.conn, self.s.user_id, self.s.company_id, self.KINDS[kind_label], rows,
+                         as_of=as_of, currency=currency, force_currency=force, post=post, note=note, dup_mode=dup_mode)
+
+    @staticmethod
+    def confident(prev, min_score=0.9):
+        return pr.confident_matches(prev, min_score)
+
+    @staticmethod
+    def parse_amount(text):
+        return pr.parse_amount(text)

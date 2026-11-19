@@ -1,0 +1,31 @@
+"""تقدم الإقلاع: مجرى واحد متزايد دومًا (لا يرجع الشريط للخلف) يُحوَّل إلى شاشة التحميل. خالص بلا PySide6.
+
+الخطوات حقيقية (استيراد الصفحات، بناء النافذة، فتح كل تبويب)، فيتحرك الشريط بحسب التقدم الفعلي لا بمؤقت."""
+
+
+class StartupProgress:
+    def __init__(self, sink=None):
+        self._sink = sink
+        self._last = 0.0
+
+    def report(self, fraction, text=''):
+        f = max(self._last, min(1.0, fraction))
+        self._last = f
+        if self._sink:
+            self._sink(f, text)
+        return f
+
+    @property
+    def value(self):
+        return self._last
+
+    def span(self, start, end, text=''):
+        """دالة (i, n, name='') تحوّل الخطوة i من n إلى المجال [start, end] من الشريط."""
+        def step(i, n, name=''):
+            frac = start + (end - start) * (i / n if n else 1.0)
+            return self.report(frac, f'{text} {name}'.strip() if (text or name) else '')
+        return step
+
+
+def noop(_fraction, _text=''):
+    return None

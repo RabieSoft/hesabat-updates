@@ -1,0 +1,779 @@
+"""محرك الاستيراد (§77-78): قراءة → مطابقة → تحقق → معاينة → تأكيد → استيراد → تقرير.
+كل استيراد يمر بمرحلتين منفصلتين إلزاميا: preview_* (لا يكتب شيئا، يرجع تقريرا بعدد الصحيح/الخاطئ/المكرر لكل سطر)
+ثم commit_* (يمرر نفس الصفوف، يعيد التحقق بنفسه دائما بدل الوثوق بمعاينة سابقة، ويستورد الصفوف الصالحة فقط —
+لا يُستورد سجل خاطئ ضمنيا؛ تصحيح بيانات السطر في الملف وإعادة رفعه هو القرار الصريح الوحيد لتجاوز خطأ).
+يدعم حاليا: العملاء/الموردون، الأصناف، والأرصدة الافتتاحية للعملاء/الموردين (قيد افتتاح واحد متوازن تلقائيا عبر
+حساب "معلَّق الأرصدة الافتتاحية" المربوط عند الحاجة). استيراد الفواتير والأرصدة الافتتاحية لعموم الحسابات: غير منفَّذ بعد."""
+import csv
+import io
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.accounting import journal_engine as je, opening_engine as oe, rates as fxr
+from alhisabat.audit import audit
+from alhisabat.business import chart_of_accounts as coa, inventory as inv, parties as pt
+from alhisabat.database.tx import transaction
+from alhisabat.security import permissions
+
+
+def parse_csv(text):
+    """يقرأ نص CSV (رأس أعمدة + صفوف) إلى قائمة قواميس. يقبل BOM."""
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    rows = list(csv.DictReader(io.StringIO(text)))
+    if not rows:
+        raise AccountingError("الملف فارغ أو بلا صفوف بيانات")
+    return rows
+
+
+def import_unit_names(conn, user_id, company_id):
+    """أسماء وحدات الشركة النشطة، لمن يملك صلاحية الاستيراد (مطابقة وحدة الصنف المقروء من مستند)."""
+    permissions.require(conn, user_id, company_id, "data.import", check_branch=False)
+    return [r[0] for r in conn.execute("SELECT name FROM units WHERE company_id=? AND is_active=1 ORDER BY name", (company_id,))]
+
+
+def _ukey(s):
+    """مفتاح مقارنة الوحدات: حبه=حبة، أ/إ/آ=ا، ى=ي، مسافات موحدة."""
+    s = " ".join(str(s or "").strip().lower().replace("*", " * ").split())
+    return s.translate(str.maketrans("أإآةى", "اااهي"))
+
+
+_EXTRA_NUM = (("qty", "الكمية"), ("purchase_price", "سعر الشراء"), ("sale_price", "سعر البيع"), ("price", "السعر"),
+              ("unit_price", "سعر الوحدة"), ("total_value", "الإجمالي"))
+
+
+def _dec(v, field, required=True, default=None):
+    v = (v or "").strip() if v is not None else ""
+    if not v:
+        if required:
+            return None, f"{field} مطلوب"
+        return default, None
+    try:
+        return Decimal(v), None
+    except InvalidOperation:
+        return None, f"{field} غير رقمي"
+
+
+def _int(v, field, required=True, default=None, min_v=None, max_v=None):
+    v = (v or "").strip() if v is not None else ""
+    if not v:
+        return (None, f"{field} مطلوب") if required else (default, None)
+    try:
+        n = int(v)
+    except ValueError:
+        return None, f"{field} غير صحيح"
+    if min_v is not None and n < min_v:
+        return None, f"{field} أصغر من الحد الأدنى"
+    if max_v is not None and n > max_v:
+        return None, f"{field} أكبر من الحد الأقصى"
+    return n, None
+
+
+def _finish(conn, actor_id, company_id, target, rows_report, status="previewed"):
+    total = len(rows_report)
+    valid = sum(1 for r in rows_report if r["status"] == "valid")
+    invalid = sum(1 for r in rows_report if r["status"] == "invalid")
+    dup = sum(1 for r in rows_report if r["status"].startswith("duplicate"))
+    import json
+    bid = conn.execute("INSERT INTO import_batches(company_id,target,status,total_rows,valid_rows,invalid_rows,duplicate_rows,report_json,created_by) "
+                       "VALUES(?,?,?,?,?,?,?,?,?)", (company_id, target, status, total, valid, invalid, dup,
+                                                     json.dumps(rows_report, ensure_ascii=False), actor_id)).lastrowid
+    return {"batch_id": bid, "total": total, "valid": valid, "invalid": invalid, "duplicate": dup, "rows": rows_report}
+
+
+def _party_numbering_room(conn, company_id, kind):
+    """عدد الأرقام المتاحة تحت الحساب الرقابي للعملاء/الموردين، أو None إن تعذّر الحساب (يُترك للتنفيذ)."""
+    from alhisabat.business import numbering
+    map_key = "customers" if kind == "customer" else "suppliers"
+    try:
+        control = coa.get_mapping(conn, company_id, map_key)
+        ctl = conn.execute("SELECT code, level FROM accounts WHERE id=?", (control,)).fetchone()
+        s = numbering.get_settings(conn, company_id)
+        level = ctl["level"] + 1
+        width = numbering.code_length_for_level(s, level) - len(ctl["code"])
+        used = [int(r[0][len(ctl["code"]):]) for r in conn.execute(
+            "SELECT code FROM accounts WHERE parent_id=?", (control,)) if r[0][len(ctl["code"]):].isdigit()]
+        last = max(used) if used else 0
+        return max(0, (10 ** width - 1) - last)
+    except Exception:
+        return None
+
+
+# ---------------- العملاء والموردون ----------------
+def _preview_only(conn, actor_id, company_id, target, build_rows_report):
+    """يبني تقرير المعاينة عبر SAVEPOINT مؤقت (بلا آثار جانبية إن احتاج البناء استعلامات فقط) ثم يسجّل الدفعة."""
+    rows_report = build_rows_report()
+    return _finish(conn, actor_id, company_id, target, rows_report, status="previewed")
+
+
+def preview_parties_import(conn, user_id, company_id, kind, rows):
+    permissions.require(conn, user_id, company_id, "data.import", check_branch=False)
+    if kind not in ("customer", "supplier"):
+        raise AccountingError("الاستيراد مدعوم للعملاء والموردين فقط")
+
+    def build():
+        existing = {r[0].strip().lower() for r in conn.execute("SELECT name FROM parties WHERE company_id=? AND kind=?", (company_id, kind))}
+        groups_map = {r["name"].strip().lower(): r["id"] for r in conn.execute(
+            "SELECT pg.id, a.name FROM party_groups pg JOIN accounts a ON a.id=pg.account_id "
+            "WHERE pg.company_id=? AND pg.kind=? AND a.is_active=1", (company_id, kind)).fetchall()}
+        seen_in_file = set()
+        out = []
+        # سعة الترقيم المتبقية تحت الحساب الرقابي: تُفحص في المعاينة حتى لا تنهار الدفعة في منتصف الاعتماد
+        room = _party_numbering_room(conn, company_id, kind)
+        for i, row in enumerate(rows, 1):
+            errs = []
+            name = (row.get("name") or "").strip()
+            if not name:
+                errs.append("الاسم مطلوب")
+            key = name.lower()
+            status = "valid"
+            g_raw = (row.get("group") or row.get("المجموعة") or row.get("group_name") or "").strip()
+            group_id = None
+            if g_raw:
+                if g_raw.lower() in groups_map:
+                    group_id = groups_map[g_raw.lower()]
+                else:
+                    errs.append("المجموعة غير موجودة")
+            if not errs:
+                if key in existing:
+                    status, errs = "duplicate_existing", ["الاسم مسجَّل بالفعل"]
+                elif key in seen_in_file:
+                    status, errs = "duplicate_in_file", ["الاسم مكرر داخل الملف نفسه"]
+                elif group_id is None:
+                    if room is not None and room <= 0:
+                        status, errs = "invalid", ["لا توجد أرقام حسابات متاحة تحت الحساب الرقابي: زد طول المقطع الأخير في إعدادات الترقيم"]
+                    elif room is not None:
+                        room -= 1
+            credit_limit, e1 = _dec(row.get("credit_limit"), "الحد الائتماني", required=False, default=Decimal(0))
+            terms, e2 = _int(row.get("payment_terms_days"), "مدة السداد", required=False, default=0, min_v=0, max_v=3650)
+            more = [e for e in (e1, e2) if e]
+            if credit_limit is not None and credit_limit < 0:
+                more.append("الحد الائتماني لا يقبل قيمة سالبة")
+            if kind != "customer" and credit_limit:
+                more.append("الحد الائتماني خاص بالعملاء")
+            errs += more
+            if errs and status == "valid":
+                status = "invalid"
+            if status == "valid":
+                seen_in_file.add(key)
+            out.append({"row_no": i, "status": status, "errors": errs, "data": {
+                "name": name, "phone": (row.get("phone") or "").strip(), "email": (row.get("email") or "").strip(),
+                "tax_no": (row.get("tax_no") or "").strip(), "notes": (row.get("notes") or "").strip(),
+                "credit_limit": str(credit_limit) if credit_limit else "0",
+                "payment_terms_days": terms if terms is not None else 0,
+                "group_id": group_id, "group": g_raw}})
+        return out
+    return _preview_only(conn, user_id, company_id, kind + "s", build)
+
+
+def commit_parties_import(conn, user_id, company_id, kind, rows, branch_id=None):
+    """يعيد التحقق (لا يثق بتقرير معاينة سابق قد يكون تغيّر واقعه) ويستورد الصفوف الصالحة فقط، فورا، صفا صفا."""
+    prev = preview_parties_import(conn, user_id, company_id, kind, rows)
+    created, errors_summary = [], []
+    with transaction(conn):
+        for r in prev["rows"]:
+            if r["status"] != "valid":
+                continue
+            d = r["data"]
+            # كل صف في سافنت خاص به: فشل صف واحد (مثلا نفاد الترقيم) لا يُسقط الدفعة كلها
+            try:
+                with transaction(conn):
+                    pid = pt.create_party(conn, user_id, company_id, kind, d["name"], phone=d["phone"], email=d["email"],
+                                          tax_no=d["tax_no"], notes=d["notes"], credit_limit=Decimal(d["credit_limit"]),
+                                          payment_terms_days=d["payment_terms_days"], branch_id=branch_id,
+                                          group_id=d.get("group_id"))
+            except AccountingError as e:
+                r["status"], r["errors"] = "invalid", [str(e)]
+                continue
+            created.append({"row_no": r["row_no"], "party_id": pid, "name": d["name"]})
+        import json
+        conn.execute("UPDATE import_batches SET status='committed',committed_by=?,committed_at=CURRENT_TIMESTAMP,committed_report_json=? WHERE id=?",
+                     (user_id, json.dumps(created, ensure_ascii=False), prev["batch_id"]))
+        audit.log(conn, user_id, "commit_import", "import_batches", prev["batch_id"], after={"target": kind, "created": len(created)})
+    return {"batch_id": prev["batch_id"], "created": created, "imported": len(created),
+           "skipped": prev["total"] - len(created), "skipped_rows": [r for r in prev["rows"] if r["status"] != "valid"]}
+
+
+# ---------------- تنظيف هواتف العملاء/الموردين من جهات الاتصال (VCF) ----------------
+def preview_party_phones_import(conn, user_id, company_id, kind, contacts, *, default_cc="+967", normalize_existing=True,
+                                create_new=False, branch_id=None, exclude_party_ids=(), exclude_new_names=()):
+    """يطابق أطراف النظام (عملاء/موردين) بجهات اتصال الهاتف ويقترح الرقم النظيف بصيغة E.164.
+
+    المطابقة (بالترتيب): الاسم المطبَّع → الاسم بعد حذف الأقواس → الاسم بترتيب كلمات مختلف → رقم الطرف الحالي
+    ضمن أرقام الجهة. الأسماء المتشابهة فقط (≥0.9) تُعلَّم «يحتاج مراجعة» ولا تُستورد تلقائيًا.
+    الحالات: valid (تحديث/إنشاء) · unchanged · not_found · review · invalid.
+    """
+    import difflib
+    from alhisabat.business import branch_scope, vcard as vc
+    permissions.require(conn, user_id, company_id, "data.import", check_branch=False)
+    if kind not in ("customer", "supplier"):
+        raise AccountingError("تنظيف الهواتف مدعوم للعملاء والموردين فقط")
+    exclude = {int(x) for x in (exclude_party_ids or ())}
+    exclude_new = {vc.norm_name(x) for x in (exclude_new_names or ())}
+
+    def build():
+        # فهارس جهات الاتصال
+        by_name, by_core, by_tokens, by_phone, tok_index = {}, {}, {}, {}, {}
+        cinfo = []
+        for ci, c in enumerate(contacts):
+            phones = vc.clean_contact_phones(c, default_cc)
+            cinfo.append({"contact": c, "phones": phones, "used": False})
+            nn, cn, tk = vc.norm_name(c.get("name")), vc.core_name(c.get("name")), vc.name_tokens_key(c.get("name"))
+            if nn:
+                by_name.setdefault(nn, []).append(ci)
+                by_core.setdefault(cn, []).append(ci)
+                by_tokens.setdefault(tk, []).append(ci)
+                for t in set(nn.split()):
+                    tok_index.setdefault(t, set()).add(ci)
+            for e, _t in phones:
+                by_phone.setdefault(e, []).append(ci)
+
+        q = "SELECT id, name, phone FROM parties WHERE company_id=? AND kind=? AND is_active=1"
+        args = [company_id, kind]
+        f, fa = branch_scope.master_clause(conn, company_id, branch_id, col="branch_id")
+        parties = conn.execute(q + f + " ORDER BY name", args + fa).fetchall()
+        existing_names = {vc.norm_name(p["name"]) for p in conn.execute(
+            "SELECT name FROM parties WHERE company_id=? AND kind=?", (company_id, kind))}
+
+        def pick(idx_list):
+            ids = []
+            for i in idx_list:
+                if i not in ids:
+                    ids.append(i)
+            return ids
+
+        out, n = [], 0
+        for p in parties:
+            if p["id"] in exclude:
+                continue
+            n += 1
+            old_raw = (p["phone"] or "").strip()
+            old_e, _why = vc.clean_phone(old_raw, default_cc) if old_raw else (None, "")
+            nn = vc.norm_name(p["name"])
+            how, ids = "", []
+            if nn in by_name:
+                how, ids = "الاسم", pick(by_name[nn])
+            elif vc.core_name(p["name"]) in by_core and vc.core_name(p["name"]):
+                how, ids = "الاسم (بعد حذف الأقواس)", pick(by_core[vc.core_name(p["name"])])
+            elif vc.name_tokens_key(p["name"]) in by_tokens:
+                how, ids = "الاسم (ترتيب مختلف)", pick(by_tokens[vc.name_tokens_key(p["name"])])
+            elif old_e and old_e in by_phone:
+                how, ids = "رقم الطرف الحالي", pick(by_phone[old_e])
+            row = {"row_no": n, "status": "valid", "errors": [], "notes": [], "data": {
+                "name": p["name"], "party_id": p["id"], "phone_old": old_raw, "phone_new": "", "contact": "", "match": how, "action": "update"}}
+            d = row["data"]
+            if ids:
+                cands = []
+                for i in ids:
+                    cinfo[i]["used"] = True
+                    for e, t in cinfo[i]["phones"]:
+                        if e not in [x[0] for x in cands]:
+                            cands.append((e, t))
+                d["contact"] = " / ".join(dict.fromkeys(cinfo[i]["contact"].get("name") or "" for i in ids))
+                if not cands:
+                    bad = [pp["raw"] for i in ids for pp in cinfo[i]["contact"].get("phones", [])]
+                    row["status"] = "invalid"
+                    row["errors"] = ["جهة الاتصال بلا رقم صالح" + (": " + "، ".join(bad[:3]) if bad else "")]
+                else:
+                    cands.sort(key=lambda t: 0 if "CELL" in t[1] or "MOBILE" in t[1] else 1)
+                    chosen = next((e for e, _t in cands if e == old_e), cands[0][0])
+                    d["phone_new"] = chosen
+                    if len(cands) > 1:
+                        row["notes"].append("أرقام أخرى للجهة: " + "، ".join(e for e, _t in cands if e != chosen))
+                    if old_raw == chosen:
+                        row["status"] = "unchanged"
+            else:
+                # لا جهة مطابقة: اسم مشابه للمراجعة؟
+                cand_idx = set()
+                for t in nn.split():
+                    cand_idx |= tok_index.get(t, set())
+                best, best_r = None, 0.0
+                for i in list(cand_idx)[:400]:
+                    r = difflib.SequenceMatcher(None, nn, vc.norm_name(cinfo[i]["contact"].get("name"))).ratio()
+                    if r > best_r:
+                        best, best_r = i, r
+                if best is not None and best_r >= 0.9:
+                    row["status"] = "review"
+                    d["contact"] = cinfo[best]["contact"].get("name") or ""
+                    d["match"] = "اسم مشابه"
+                    row["notes"].append(f"اسم مشابه في جهات الاتصال ({int(best_r * 100)}٪): صحّح الاسم ثم أعد المعاينة")
+                elif normalize_existing and old_raw:
+                    if old_e:
+                        d["phone_new"], d["match"] = old_e, "تنسيق فقط"
+                        if old_raw == old_e:
+                            row["status"] = "unchanged"
+                    else:
+                        row["status"] = "invalid"
+                        row["errors"] = [f"رقم الطرف الحالي غير صالح ({_why}) ولا جهة مطابقة"]
+                else:
+                    row["status"] = "not_found"
+                    row["notes"].append("لا توجد جهة اتصال مطابقة")
+            out.append(row)
+
+        if create_new:
+            seen = set()
+            for ci in cinfo:
+                c = ci["contact"]
+                nn = vc.norm_name(c.get("name"))
+                if ci["used"] or not nn or nn in existing_names or nn in seen or nn in exclude_new or not ci["phones"]:
+                    continue
+                seen.add(nn)
+                n += 1
+                out.append({"row_no": n, "status": "valid", "errors": [], "notes": ["جهة جديدة ستُنشأ كطرف"], "data": {
+                    "name": c["name"], "party_id": None, "phone_old": "", "phone_new": ci["phones"][0][0], "contact": c["name"],
+                    "match": "جديد", "action": "create"}})
+        return out
+    return _preview_only(conn, user_id, company_id, kind + "s", build)      # جدول الدفعات يقبل customers/suppliers فقط (CHECK)
+
+
+def commit_party_phones_import(conn, user_id, company_id, kind, contacts, *, default_cc="+967", normalize_existing=True,
+                               create_new=False, branch_id=None, exclude_party_ids=(), exclude_new_names=(), preview_branch_id=None):
+    """يعيد المعاينة ويطبّق الصفوف الصالحة فقط: تعديل هاتف الطرف (edit_party) أو إنشاء طرف جديد."""
+    import json
+    prev = preview_party_phones_import(conn, user_id, company_id, kind, contacts, default_cc=default_cc,
+                                       normalize_existing=normalize_existing, create_new=create_new,
+                                       branch_id=preview_branch_id, exclude_party_ids=exclude_party_ids,
+                                       exclude_new_names=exclude_new_names)
+    updated, created = [], []
+    with transaction(conn):
+        for r in prev["rows"]:
+            if r["status"] != "valid":
+                continue
+            d = r["data"]
+            try:
+                with transaction(conn):
+                    if d["action"] == "create":
+                        pid = pt.create_party(conn, user_id, company_id, kind, d["name"], phone=d["phone_new"], branch_id=branch_id)
+                        created.append({"row_no": r["row_no"], "party_id": pid, "name": d["name"]})
+                    else:
+                        pt.edit_party(conn, user_id, d["party_id"], phone=d["phone_new"])
+                        updated.append({"row_no": r["row_no"], "party_id": d["party_id"], "name": d["name"],
+                                        "old": d["phone_old"], "new": d["phone_new"]})
+            except AccountingError as e:
+                r["status"], r["errors"] = "invalid", [str(e)]
+        conn.execute("UPDATE import_batches SET status='committed',committed_by=?,committed_at=CURRENT_TIMESTAMP,committed_report_json=? WHERE id=?",
+                     (user_id, json.dumps({"updated": updated, "created": created}, ensure_ascii=False), prev["batch_id"]))
+        audit.log(conn, user_id, "commit_import", "import_batches", prev["batch_id"],
+                  after={"target": kind + "_phones", "updated": len(updated), "created": len(created)})
+    n = len(updated) + len(created)
+    return {"batch_id": prev["batch_id"], "updated": updated, "created": created, "imported": n,
+            "skipped": prev["total"] - n, "parties_created": len(created)}
+
+
+# ---------------- الأصناف ----------------
+def preview_items_import(conn, user_id, company_id, rows, auto_create_units=False):
+    """auto_create_units: الوحدة غير المعرَّفة لا تُرفض بل تُعلَّم «ستُنشأ» وتُنشأ عند الاعتماد فقط."""
+    permissions.require(conn, user_id, company_id, "data.import", check_branch=False)
+
+    def build():
+        units = {_ukey(r["name"]): r["id"] for r in conn.execute("SELECT id,name FROM units WHERE company_id=?", (company_id,))}
+        new_units = {}
+        existing_names = {r[0].strip().lower() for r in conn.execute("SELECT name FROM items WHERE company_id=?", (company_id,))}
+        existing_codes = {r[0] for r in conn.execute("SELECT code FROM items WHERE company_id=?", (company_id,))}
+        seen_names, seen_codes = set(), set()
+        out = []
+        for i, row in enumerate(rows, 1):
+            errs = []
+            name = (row.get("name") or "").strip()
+            if not name:
+                errs.append("اسم الصنف مطلوب")
+            code = (row.get("code") or "").strip() or None
+            unit_name = (row.get("unit") or "").strip()
+            unit_id = units.get(_ukey(unit_name)) if unit_name else None
+            notes, new_unit = [], None
+            if not unit_name:
+                errs.append("الوحدة مطلوبة")
+            elif unit_id is None:
+                if auto_create_units:
+                    new_unit = new_units.setdefault(_ukey(unit_name), unit_name)
+                    notes.append(f"ستُنشأ وحدة جديدة «{new_unit}»")
+                else:
+                    errs.append(f"الوحدة «{unit_name}» غير معرَّفة لهذه الشركة")
+            extra = {}
+            for key, label in _EXTRA_NUM:
+                raw = (row.get(key) or "").strip() if row.get(key) is not None else ""
+                if raw:
+                    v, e = _dec(raw, label)
+                    if e:
+                        notes.append(f"{label} غير رقمي: تُجوهل")
+                    else:
+                        extra[key] = str(v)
+            item_type = (row.get("item_type") or "stock").strip()
+            if item_type not in ("stock", "service"):
+                errs.append("نوع الصنف يجب أن يكون stock أو service")
+            min_qty, e1 = _dec(row.get("min_qty"), "الحد الأدنى", required=False, default=Decimal(0))
+            if e1:
+                errs.append(e1)
+            elif min_qty is not None and min_qty < 0:
+                errs.append("الحد الأدنى لا يقبل قيمة سالبة")
+            status = "valid"
+            key = name.lower()
+            if not errs:
+                if key in existing_names or key in seen_names:
+                    status, errs = ("duplicate_existing" if key in existing_names else "duplicate_in_file"), ["اسم الصنف مكرر"]
+                elif code and (code in existing_codes or code in seen_codes):
+                    status, errs = ("duplicate_existing" if code in existing_codes else "duplicate_in_file"), ["كود الصنف مكرر"]
+            if errs and status == "valid":
+                status = "invalid"
+            if status == "valid":
+                seen_names.add(key)
+                if code:
+                    seen_codes.add(code)
+            out.append({"row_no": i, "status": status, "errors": errs, "notes": notes, "data": {
+                "name": name, "code": code, "unit_id": unit_id, "item_type": item_type,
+                "unit": unit_name, "new_unit": new_unit,
+                "category": (row.get("category") or "").strip(), "barcode": (row.get("barcode") or "").strip(),
+                "min_qty": str(min_qty) if min_qty is not None else "0", **extra}})
+        return out
+    return _preview_only(conn, user_id, company_id, "items", build)
+
+
+def opening_unit_cost(d):
+    """تكلفة الوحدة للرصيد الافتتاحي من بيانات السطر: سعر الشراء، ثم سعر الوحدة الأساسية، ثم الإجمالي÷الكمية، ثم السعر. None إن لم تتوفر تكلفة موجبة."""
+    q = Decimal(d["qty"]) if d.get("qty") else None
+    if not q or q <= 0:
+        return None
+    for k in ("purchase_price", "unit_price"):
+        if d.get(k) and Decimal(d[k]) > 0:
+            return Decimal(d[k])
+    if d.get("total_value") and Decimal(d["total_value"]) > 0:
+        return Decimal(d["total_value"]) / q
+    if d.get("price") and Decimal(d["price"]) > 0:
+        return Decimal(d["price"])
+    return None
+
+
+def commit_items_import(conn, user_id, company_id, rows, auto_create_units=False, opening_stock=None, branch_id=None):
+    """opening_stock={'warehouse_id': int, 'date': 'YYYY-MM-DD'}: لكل صنف مخزني مستورد كميته موجبة وله تكلفة تُسجَّل حركة «رصيد افتتاحي»
+    (تُربط لاحقًا بقيد الافتتاح عبر مسار الأرصدة الافتتاحية القائم). بلا تكلفة أو بكمية صفر/سالبة: يُستورد الصنف بلا رصيد ويُذكر في التقرير."""
+    prev = preview_items_import(conn, user_id, company_id, rows, auto_create_units)
+    created, made_units, stock_in, stock_skipped = [], {}, [], []
+    with transaction(conn):
+        for r in prev["rows"]:
+            if r["status"] != "valid":
+                continue
+            d = r["data"]
+            if d.get("new_unit"):
+                k = _ukey(d["new_unit"])
+                if k not in made_units:
+                    made_units[k] = inv.create_unit(conn, user_id, company_id, d["new_unit"], branch_id=branch_id)
+                d["unit_id"] = made_units[k]
+            iid = inv.create_item(conn, user_id, company_id, d["name"], d["unit_id"], code=d["code"], item_type=d["item_type"],
+                                  barcode=d["barcode"], category=d["category"], min_qty=Decimal(d["min_qty"]), branch_id=branch_id)
+            created.append({"row_no": r["row_no"], "item_id": iid, "name": d["name"]})
+            if opening_stock and d["item_type"] == "stock" and d.get("qty") is not None:
+                cost = opening_unit_cost(d)
+                if cost is None:
+                    stock_skipped.append({"row_no": r["row_no"], "name": d["name"],
+                                          "reason": "كمية غير موجبة" if Decimal(d["qty"]) <= 0 else "لا توجد تكلفة للوحدة"})
+                else:
+                    inv.record_movement(conn, user_id, company_id, iid, int(opening_stock["warehouse_id"]), opening_stock["date"],
+                                        "opening", Decimal(d["qty"]), unit_cost=cost, note="رصيد افتتاحي مستورد من مستند")
+                    stock_in.append({"row_no": r["row_no"], "item_id": iid, "qty": d["qty"], "unit_cost": str(cost)})
+        import json
+        conn.execute("UPDATE import_batches SET status='committed',committed_by=?,committed_at=CURRENT_TIMESTAMP,committed_report_json=? WHERE id=?",
+                     (user_id, json.dumps(created, ensure_ascii=False), prev["batch_id"]))
+        audit.log(conn, user_id, "commit_import", "import_batches", prev["batch_id"],
+                  after={"target": "items", "created": len(created), "units_created": len(made_units), "opening_stock": len(stock_in)})
+    return {"batch_id": prev["batch_id"], "created": created, "imported": len(created),
+           "skipped": prev["total"] - len(created), "skipped_rows": [r for r in prev["rows"] if r["status"] != "valid"],
+           "stock_in": stock_in, "stock_skipped": stock_skipped}
+
+
+# ---------------- قراءة CSV/Excel بعناوين عربية أو إنجليزية ----------------
+_TOTAL_WORDS = {"الاجمالي", "اجمالي", "الإجمالي", "المجموع", "مجموع", "الرصيد", "الاجمالى", "total", "الصافي", "صافي"}
+_SIDE_WORDS = {"دائن": "credit", "دائنه": "credit", "دائنة": "credit", "له": "credit", "credit": "credit", "cr": "credit", "c": "credit",
+               "مدين": "debit", "مدينه": "debit", "مدينة": "debit", "عليه": "debit", "debit": "debit", "dr": "debit", "d": "debit"}
+_CUR_WORDS = {"سعودي": "SAR", "ريال سعودي": "SAR", "ر س": "SAR", "sar": "SAR", "يمني": "YER", "ريال يمني": "YER", "ر ي": "YER", "yer": "YER",
+              "دولار": "USD", "دولار امريكي": "USD", "usd": "USD", "$": "USD"}
+
+
+def _nk(s):
+    from alhisabat.business import doc_reader
+    return doc_reader._key(s) if s is not None else ""
+
+
+def _side_of(v):
+    return _SIDE_WORDS.get(_nk(v)) if str(v or "").strip() else None
+
+
+def _cur_of(v):
+    t = str(v or "").strip()
+    return _CUR_WORDS.get(_nk(t), t.upper()) if t else ""
+
+
+def _clean_amount(v):
+    from alhisabat.business import doc_reader
+    if v is None:
+        return ""
+    if isinstance(v, (int, float, Decimal)):
+        return format(Decimal(str(v)), "f")
+    t = doc_reader._clean(v).replace(",", "").replace(" ", "")
+    return t[1:-1] if t.startswith("(") and t.endswith(")") and t[1:-1] else t
+
+
+def _field_of_header(h):
+    k = _nk(h)
+    if not k:
+        return None
+    if any(w in k for w in ("نوع", "طبيعه", "side", "type")) or k in ("دائن مدين", "مدين دائن"):
+        return "side"
+    if k.startswith("عمله") or k in ("currency", "cur", "العمله"):
+        return "currency"
+    if "كود" in k or "رمز" in k or k in ("code",):
+        return "code"
+    if any(w in k for w in ("هاتف", "جوال", "تلفون", "موبايل", "phone")):
+        return "phone"
+    if any(w in k for w in ("ملاحظ", "notes")):
+        return "notes"
+    if any(w in k for w in ("مبلغ", "رصيد", "amount", "balance")):
+        return "amount"
+    if any(w in k for w in ("اسم", "name", "مورد", "عميل", "عملاء", "بيان", "طرف")):
+        return "name"
+    return None
+
+
+def _rows_from_grid(grid):
+    """grid: قائمة صفوف (قوائم خلايا). يكتشف سطر العناوين، أو يستنتج عمود الاسم والمبلغ، ويتعرف على سطر «دائن/مدين» المنفرد كعنوان قسم."""
+    grid = [list(r) for r in grid]
+    hdr_i, cmap = None, {}
+    for i, r in enumerate(grid[:15]):
+        m = {}
+        for c, v in enumerate(r):
+            f = _field_of_header(v) if isinstance(v, str) else None
+            if f and f not in m.values():
+                m[c] = f
+        if "name" in m.values() and ("amount" in m.values() or "code" in m.values() or len(m) >= 2):
+            hdr_i, cmap = i, m
+            break
+    body = grid[hdr_i + 1:] if hdr_i is not None else grid
+    if hdr_i is None:
+        ncol = max((len(r) for r in grid), default=0)
+        num = [0] * ncol
+        txt = [0] * ncol
+        for r in grid:
+            for c, v in enumerate(r):
+                if v is None or str(v).strip() == "":
+                    continue
+                try:
+                    Decimal(_clean_amount(v)); num[c] += 1
+                except (InvalidOperation, ValueError):
+                    txt[c] += 1
+        if not num or not txt or max(num) == 0 or max(txt) == 0:
+            raise AccountingError("تعذّر التعرف على عمودي الاسم والرصيد في الملف")
+        ac = num.index(max(num))
+        nc = max((c for c in range(ncol) if c != ac), key=lambda c: txt[c])
+        cmap = {nc: "name", ac: "amount"}
+    out, cur_side = [], None
+    for r in body:
+        cells = [(c, v) for c, v in enumerate(r) if v is not None and str(v).strip() != ""]
+        if not cells:
+            continue
+        if len(cells) == 1 and _side_of(cells[0][1]):
+            cur_side = _side_of(cells[0][1])          # عنوان قسم: كل ما بعده بهذا النوع
+            continue
+        row = {"name": "", "code": "", "amount": "", "side": "", "currency": "", "phone": "", "notes": ""}
+        for c, f in cmap.items():
+            v = r[c] if c < len(r) else None
+            row[f] = _clean_amount(v) if f == "amount" else (str(v).strip() if v is not None else "")
+        if _nk(row["name"]) in {_nk(w) for w in _TOTAL_WORDS}:
+            continue
+        if not row["name"] and not row["code"] and not row["amount"]:
+            continue
+        row["name"] = " ".join(row["name"].split())
+        if not row["side"] and cur_side:
+            row["side"] = cur_side
+        out.append(row)
+    if not out:
+        raise AccountingError("الملف فارغ أو بلا صفوف بيانات")
+    return out
+
+
+def read_import_file(path):
+    """يقرأ CSV أو Excel (xlsx/xlsm) إلى صفوف قواميس. CSV بعناوين إنجليزية قياسية يُقرأ كما كان؛ غير ذلك يُعرَّف بالعناوين العربية."""
+    pl = str(path or "").lower()
+    if not pl:
+        raise AccountingError("اختر ملفًا")
+    if pl.endswith((".xlsx", ".xlsm")):
+        try:
+            import openpyxl
+        except ImportError as e:
+            raise AccountingError("قراءة Excel تحتاج مكتبة openpyxl (pip install openpyxl)") from e
+        wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+        try:
+            ws = next((w for w in wb.worksheets if w.max_row and w.max_row > 1), wb.worksheets[0])
+            return _rows_from_grid(list(ws.iter_rows(values_only=True)))
+        finally:
+            wb.close()
+    if pl.endswith(".xls"):
+        raise AccountingError("صيغة xls القديمة غير مدعومة: احفظ الملف بصيغة xlsx أو CSV")
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        grid = list(csv.reader(f))
+    if grid and {_nk(h) for h in grid[0]} & {"name", "code", "sku"}:
+        with open(path, "r", encoding="utf-8-sig", newline="") as f:
+            return list(csv.DictReader(f))
+    return _rows_from_grid(grid)
+
+
+def apply_currency_defaults(rows, currency=None, rate=None, force=False):
+    """يطبّق عملة (وسعر صرف اختياري) اختارهما المستخدم من الواجهة على صفوف الأرصدة الافتتاحية: تُملأ الصفوف التي بلا عملة/سعر،
+    وعند force تُفرض العملة (وسعرها إن ذُكر) على كل الصفوف متجاهلةً عمودَي الملف. بلا عملة مختارة تعود الصفوف كما هي."""
+    if not currency:
+        return rows
+    cur = _cur_of(currency)
+    out = []
+    for r in rows:
+        r = dict(r)
+        if force or not str(r.get("currency") or "").strip():
+            r["currency"] = cur
+            if force:
+                r["rate"] = ""
+        if rate not in (None, "") and (force or not str(r.get("rate") or "").strip()) and _cur_of(r.get("currency")) == cur:
+            r["rate"] = str(rate)
+        out.append(r)
+    return out
+
+
+# ---------------- الأرصدة الافتتاحية للعملاء/الموردين ----------------
+def preview_party_opening_import(conn, user_id, company_id, kind, rows, auto_create=False, currency=None, rate=None, force_currency=False,
+                                 fiscal_year_id=None):
+    """rows: [{code | name, amount, side?, currency?, rate?}].
+    الطرف يُحدَّد بالكود أو بالاسم. side = دائن/مدين؛ ويُترجم إلى إشارة المبلغ (الموجب = الرصيد الطبيعي: مدين للعميل، دائن للمورد).
+    بلا side يُعدّ المبلغ طبيعيًا. auto_create: ينشئ الأطراف غير الموجودة بالاسم عند الاعتماد.
+    currency فارغة = العملة الأساسية (وتُقبل «سعودي/يمني/دولار»). للطرف الواحد أكثر من صف بشرط اختلاف العملة؛ rate فارغ = سعر الجدول.
+    fiscal_year_id: إن حُدِّدت يُرفض (duplicate_existing) أي صف لطرف له سطر افتتاحي فعّال بنفس العملة في تلك السنة؛
+    أما طرف جديد أو عملة جديدة لنفس الطرف فتُقبل في قيد افتتاحي إضافي."""
+    permissions.require(conn, user_id, company_id, "data.import", check_branch=False)
+    permissions.require(conn, user_id, company_id, "opening.manage", check_branch=False)
+    if kind not in pt.KINDS:
+        raise AccountingError("نوع غير معروف")
+    base = conn.execute("SELECT base_currency FROM companies WHERE id=?", (company_id,)).fetchone()[0]
+    rows = apply_currency_defaults(rows, currency, rate, force_currency)
+
+    def build():
+        recs = list(conn.execute("SELECT id,code,name,account_id FROM parties WHERE company_id=? AND kind=?", (company_id, kind)))
+        acc_of = {r["id"]: r["account_id"] for r in recs}
+        taken = oe.existing_opening_keys(conn, company_id, fiscal_year_id) if fiscal_year_id else set()
+        by_code = {r["code"]: r for r in recs}
+        by_name = {_nk(r["name"]): r for r in recs}
+        seen, out = set(), []
+        for i, row in enumerate(rows, 1):
+            errs, notes = [], []
+            code = (row.get("code") or "").strip()
+            name = " ".join(str(row.get("name") or "").split())
+            cur = _cur_of(row.get("currency")) or base
+            pid, new_party = None, False
+            if code:
+                rec = by_code.get(code)
+                if rec is None:
+                    errs.append("كود الطرف غير موجود")
+                else:
+                    pid, name = rec["id"], name or rec["name"]
+            elif name:
+                rec = by_name.get(_nk(name))
+                if rec is not None:
+                    pid, code = rec["id"], rec["code"]
+                elif auto_create:
+                    new_party = True
+                    notes.append("طرف جديد سيُنشأ عند الاعتماد")
+                else:
+                    errs.append("الطرف غير موجود بهذا الاسم (فعّل «إنشاء الأطراف غير الموجودة» أو استورد الأطراف أولًا)")
+            else:
+                errs.append("كود الطرف أو اسمه مطلوب")
+            amount, e1 = _dec(_clean_amount(row.get("amount")), "المبلغ", required=True)
+            if e1:
+                errs.append(e1)
+            side_raw = str(row.get("side") or "").strip()
+            side = _side_of(side_raw)
+            if side_raw and not side:
+                errs.append("نوع الرصيد غير مفهوم (المقبول: دائن / مدين)")
+            if amount is not None and side:
+                normal_debit = kind == "customer"
+                amount = abs(amount) if (side == "debit") == normal_debit else -abs(amount)
+            rate_txt = str(row.get("rate") or "").strip()
+            if cur != base:
+                if not fxr.currency_enabled(conn, company_id, cur):
+                    errs.append(f"العملة {cur} غير معروفة أو غير مفعّلة")
+                if rate_txt:
+                    rv, e2 = _dec(rate_txt, "سعر الصرف")
+                    if e2 or rv is None or rv <= 0:
+                        errs.append("سعر الصرف غير صالح")
+            status = "valid"
+            ident = code or _nk(name)
+            if not errs and (ident, cur) in seen:
+                status, errs = "duplicate_in_file", [f"الطرف مكرر بنفس العملة ({cur}) داخل الملف"]
+            if errs and status == "valid":
+                status = "invalid"
+            if status == "valid" and pid is not None and (acc_of.get(pid), cur) in taken:
+                status, errs = "duplicate_existing", [f"للطرف رصيد افتتاحي بالعملة {cur} في قيد افتتاح قائم: اعكس ذلك القيد أولًا إن أردت إعادة إدخاله"]
+            if status == "valid":
+                seen.add((ident, cur))
+            out.append({"row_no": i, "status": status, "errors": errs, "notes": notes,
+                        "data": {"party_id": pid, "code": code, "name": name, "new_party": new_party,
+                                 "amount": str(amount) if amount is not None else None,
+                                 "currency": cur, "rate": rate_txt or None, "side": side or ""}})
+        return out
+    return _preview_only(conn, user_id, company_id, "party_opening", build)
+
+
+def commit_party_opening_import(conn, user_id, company_id, kind, rows, fiscal_year_id, branch_id=None, auto_create=False,
+                                currency=None, rate=None, force_currency=False):
+    """يستورد الأرصدة الصالحة فقط في قيد افتتاح واحد (سطر لكل طرف وعملة) على الفرع المحدد، وينشئ الأطراف الجديدة عند طلب ذلك
+    في نفس العملية (إما يكتمل الكل أو لا شيء). الفرق بين مجموع الأرصدة ومقابلها يُرحَّل بالعملة الأساسية إلى «معلَّق الأرصدة الافتتاحية»."""
+    prev = preview_party_opening_import(conn, user_id, company_id, kind, rows, auto_create=auto_create,
+                                        currency=currency, rate=rate, force_currency=force_currency,
+                                        fiscal_year_id=fiscal_year_id)
+    valid = [r for r in prev["rows"] if r["status"] == "valid"]
+    if not valid:
+        raise AccountingError("لا توجد أرصدة صالحة للاستيراد")
+    suspense = coa.get_mapping(conn, company_id, "opening_suspense")
+    base = conn.execute("SELECT base_currency FROM companies WHERE id=?", (company_id,)).fetchone()[0]
+    year = conn.execute("SELECT start_date FROM fiscal_years WHERE id=? AND company_id=?", (fiscal_year_id, company_id)).fetchone()
+    open_date = year["start_date"] if year else None
+    import json
+    created = 0
+    with transaction(conn):
+        made = {}
+        for r in valid:
+            d = r["data"]
+            if d.get("party_id") is None and d.get("new_party"):
+                k = _nk(d["name"])
+                if k not in made:
+                    made[k] = pt.create_party(conn, user_id, company_id, kind, d["name"], branch_id=branch_id)
+                    created += 1
+                d["party_id"] = made[k]
+        items = []
+        for r in valid:
+            d = r["data"]
+            cur = d["currency"]
+            it = {"party_id": d["party_id"], "amount": Decimal(d["amount"]), "currency": cur}
+            if cur != base:                                    # سعر صريح أو سعر الجدول بتاريخ الافتتاح (لا افتراض 1)
+                it["rate"] = fxr._dec(d["rate"]) if d.get("rate") else fxr.get_rate(conn, company_id, cur, open_date)
+            items.append(it)
+        lines = pt.opening_lines(conn, company_id, items)
+        net_base = 0                                           # المعادل الأساسي بنفس تقريب محرك القيود
+        for l in lines:
+            r_ = Decimal(1) if l["currency"] == base else fxr._dec(l["rate"])
+            net_base += int((Decimal(je._minor(l["debit"]) - je._minor(l["credit"])) * r_).quantize(Decimal(1), ROUND_HALF_UP))
+        if net_base:
+            sus = Decimal(abs(net_base)) / 100
+            lines.append({"account_id": suspense, "debit": sus if net_base < 0 else 0, "credit": sus if net_base > 0 else 0, "currency": base})
+        eid = oe.create_manual_opening(conn, user_id, company_id, fiscal_year_id, lines, branch_id=branch_id, allow_additional=True,
+                                       description=f"استيراد أرصدة افتتاحية — {'عملاء' if kind == 'customer' else 'موردون'}")
+        conn.execute("UPDATE import_batches SET status='committed',committed_by=?,committed_at=CURRENT_TIMESTAMP,committed_report_json=? WHERE id=?",
+                     (user_id, json.dumps({"entry_id": eid, "rows": len(valid), "parties_created": created, "suspense_net_base_minor": -net_base}, ensure_ascii=False), prev["batch_id"]))
+        audit.log(conn, user_id, "commit_import", "import_batches", prev["batch_id"], after={"target": "party_opening", "entry": eid, "parties_created": created})
+    return {"batch_id": prev["batch_id"], "entry_id": eid, "imported": len(valid), "parties_created": created,
+            "skipped": prev["total"] - len(valid), "skipped_rows": [r for r in prev["rows"] if r["status"] != "valid"],
+            "suspense_amount": Decimal(-net_base) / 100}
+
+
+def get_batch(conn, user_id, company_id, batch_id):
+    permissions.require(conn, user_id, company_id, "data.import", check_branch=False)
+    r = conn.execute("SELECT * FROM import_batches WHERE id=? AND company_id=?", (batch_id, company_id)).fetchone()
+    if not r:
+        raise AccountingError("دفعة الاستيراد غير موجودة")
+    import json
+    d = dict(r)
+    d["report"] = json.loads(d["report_json"])
+    d["committed_report"] = json.loads(d["committed_report_json"]) if d["committed_report_json"] else None
+    return d

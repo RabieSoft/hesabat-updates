@@ -1,0 +1,180 @@
+"""خدمات التقارير والقوائم المالية ولوحة التحكم والتصدير."""
+from datetime import date
+from pathlib import Path
+from decimal import Decimal
+
+from alhisabat.accounting import financial_statements as fs
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.business import cash
+from alhisabat.reporting import printing
+
+
+def _shift_month(d, k):
+    y, m = divmod(d.year * 12 + (d.month - 1) + k, 12)
+    m += 1
+    nxt = date(y + (m == 12), (m % 12) + 1, 1)
+    return date(y, m, min(d.day, date.fromordinal(nxt.toordinal() - 1).day))
+
+
+def _previous_range(a, b):
+    """الفترة السابقة للمقارنة: داخل شهر واحد ← الشهر السابق بنفس الأيام، وإلا مدة مماثلة تسبق البداية مباشرة."""
+    if (a.year, a.month) == (b.year, b.month):
+        return _shift_month(a, -1), _shift_month(b, -1)
+    from datetime import timedelta
+    span = (b - a).days
+    pb = a - timedelta(days=1)
+    return pb - timedelta(days=span), pb
+
+
+class ReportsMixin:
+    def reports_service(self):
+        from alhisabat.ui.core.reports_service import ReportsService
+        return ReportsService(self)
+
+    def dashboard(self):
+        self.require('report.view')
+        c = self.company_id
+        cash_rows = []
+        for r in self.conn.execute("SELECT * FROM cash_accounts WHERE company_id=? AND is_active=1 ORDER BY name", (c,)):
+            try:
+                net = sum(x['net_base'] or 0 for x in cash.cash_balance(self.conn, self.user_id, c, r['id']))
+            except Exception:
+                net = 0
+            cash_rows.append((r['name'], net))
+        one = lambda q, a=(): self.conn.execute(q, a).fetchone()[0]
+        due_sales = one("SELECT COALESCE(SUM(due_total),0) FROM sales_invoices WHERE company_id=? AND status='posted' AND doc_type='invoice'", (c,))
+        due_purch = one("SELECT COALESCE(SUM(due_total),0) FROM purchase_invoices WHERE company_id=? AND status='posted' AND doc_type='invoice'", (c,))
+        low = one("SELECT COUNT(*) FROM items i WHERE i.company_id=? AND i.is_active=1 AND i.min_qty_milli>0 AND "
+                  "COALESCE((SELECT SUM(sb.qty_milli) FROM stock_balances sb WHERE sb.item_id=i.id),0)<=i.min_qty_milli", (c,))
+        drafts = one("SELECT COUNT(*) FROM journal_entries WHERE company_id=? AND status='draft'", (c,))
+        return {'cash': cash_rows, 'cash_total': sum(v for _, v in cash_rows), 'due': due_sales, 'due_purchases': due_purch,
+                'low_stock': low, 'draft_entries': drafts, 'trend': self.monthly_trend(6)}
+
+    # ------------------------------------------------------------------ لوحة التحكم الجديدة (بطاقات + مخطط + آخر القيود)
+    def dashboard_overview(self, date_from, date_to, branch_id=None, months_year=None):
+        """بيانات لوحة التحكم: مؤشرات الفترة مع مقارنة الفترة السابقة، التدفق الشهري للسنة، وآخر القيود.
+        كل المبالغ وحدات صغرى (int). أي جزء يفشل يعود None/فارغًا ولا يُسقط اللوحة."""
+        self.require('report.view')
+        c = self.company_id
+
+        def _period(a, b):
+            try:
+                r = fs.income_statement(self.conn, self.user_id, c, a, b, branch_id=branch_id)
+                rev, cogs, opex = int(r['total_revenue']), int(r['total_cogs']), int(r['total_expenses'])
+                exp = cogs + opex          # 'expense' = إجمالي التكاليف (للرسم البياني)؛ opex = المصروفات التشغيلية فقط
+                return {'revenue': rev, 'cogs': cogs, 'gross': rev - cogs, 'opex': opex, 'expense': exp, 'net': rev - exp}
+            except Exception:
+                return None
+
+        da, db = date.fromisoformat(date_from), date.fromisoformat(date_to)
+        pa, pb = _previous_range(da, db)
+        cur, prev = _period(date_from, date_to), _period(pa.isoformat(), pb.isoformat())
+
+        cash_total = 0
+        cash_by_cur = {}
+        try:
+            for r in self.conn.execute("SELECT id FROM cash_accounts WHERE company_id=? AND is_active=1", (c,)).fetchall():
+                try:
+                    for x in cash.cash_balance(self.conn, self.user_id, c, r['id']):
+                        cash_total += x['net_base'] or 0
+                        cash_by_cur[x['currency']] = cash_by_cur.get(x['currency'], 0) + int(x['net_orig'] or 0)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        year = int(months_year or db.year)
+        last_month = db.month if db.year == year else 12
+        flow = []
+        for m in range(1, last_month + 1):
+            a = date(year, m, 1)
+            b = date(year + (m == 12), (m % 12) + 1, 1)
+            r = _period(a.isoformat(), date.fromordinal(b.toordinal() - 1).isoformat())
+            flow.append({'month': m, 'revenue': (r or {}).get('revenue', 0), 'expense': (r or {}).get('expense', 0),
+                         'net': (r or {}).get('net', 0)})
+
+        recent = []
+        try:
+            if self.can('journal.view'):
+                rows = self.conn.execute(
+                    "SELECT e.id, COALESCE(e.posted_no,e.entry_no) entry_no, e.entry_date, e.description, e.status, e.workflow_state, "
+                    "COALESCE((SELECT SUM(l.debit_base) FROM journal_lines l WHERE l.entry_id=e.id),0) total_minor, "
+                    "COALESCE((SELECT SUM(l.credit_base) FROM journal_lines l JOIN accounts a ON a.id=l.account_id "
+                    "          WHERE l.entry_id=e.id AND a.account_type='revenue'),0) rev_cr, "
+                    "COALESCE((SELECT SUM(l.debit_base) FROM journal_lines l JOIN accounts a ON a.id=l.account_id "
+                    "          WHERE l.entry_id=e.id AND a.account_type IN ('expense','cogs')),0) exp_dr "
+                    "FROM journal_entries e WHERE e.company_id=? " + ("AND (e.branch_id=? OR e.branch_id IS NULL) " if branch_id else "") +
+                    "ORDER BY e.entry_date DESC, e.id DESC LIMIT 6",
+                    (c, int(branch_id)) if branch_id else (c,)).fetchall()
+                for r in rows:
+                    kind = 'revenue' if r['rev_cr'] > 0 and r['rev_cr'] >= r['exp_dr'] else 'expense' if r['exp_dr'] > 0 else 'misc'
+                    st = r['workflow_state'] if r['status'] == 'draft' and r['workflow_state'] in ('reviewed', 'approved') else r['status']
+                    recent.append({'id': r['id'], 'entry_no': r['entry_no'], 'entry_date': r['entry_date'], 'description': r['description'],
+                                   'kind': kind, 'total_minor': int(r['total_minor']), 'state': st})
+        except Exception:
+            recent = []
+        return {'current': cur, 'previous': prev, 'cash_total': int(cash_total), 'cash_by_cur': cash_by_cur, 'flow': flow, 'year': year, 'recent': recent}
+
+    def monthly_trend(self, months=6):
+        out = []
+        t = date.today()
+        y, m = t.year, t.month
+        seq = []
+        for _ in range(months):
+            seq.append((y, m))
+            m -= 1
+            if m == 0:
+                y, m = y - 1, 12
+        for (yy, mm) in reversed(seq):
+            a = date(yy, mm, 1)
+            b = date(yy + (mm == 12), (mm % 12) + 1, 1)
+            last = date.fromordinal(b.toordinal() - 1)
+            try:
+                r = fs.income_statement(self.conn, self.user_id, self.company_id, a.isoformat(), last.isoformat())
+                out.append({'label': f'{mm:02d}/{yy}', 'revenue': int(r['total_revenue']),
+                            'expense': int(r['total_cogs']) + int(r['total_expenses'])})
+            except Exception:
+                return []
+        return out
+
+    def report_spec(self, kind, d_from, d_to, account_id=None, **kwargs):
+        svc = self.reports_service()
+        return svc.report_spec(kind, d_from, d_to, account_id=account_id, **kwargs)
+
+    def export_report(self, spec, fmt, path):
+        svc = self.reports_service()
+        return svc.export_report(spec, fmt, path)
+
+    # ---------------------------------------------------------------- تفويض دوال التقارير
+    def trial_balance(self, date_from, date_to, **kw):
+        return self.reports_service().trial_balance(date_from, date_to, **kw)
+
+    def income_statement(self, date_from, date_to, **kw):
+        return self.reports_service().income_statement(date_from, date_to, **kw)
+
+    def compare_income_statement(self, periods, **kw):
+        return self.reports_service().compare_income_statement(periods, **kw)
+
+    def balance_sheet(self, as_of, **kw):
+        return self.reports_service().balance_sheet(as_of, **kw)
+
+    def compare_balance_sheet(self, dates, **kw):
+        return self.reports_service().compare_balance_sheet(dates, **kw)
+
+    def cash_flow_statement(self, date_from, date_to, **kw):
+        return self.reports_service().cash_flow_statement(date_from, date_to, **kw)
+
+    def cost_center_pl(self, date_from, date_to, **kw):
+        return self.reports_service().cost_center_pl(date_from, date_to, **kw)
+
+    def cost_center_ledger(self, cost_center_id, date_from, date_to, **kw):
+        return self.reports_service().cost_center_ledger(cost_center_id, date_from, date_to, **kw)
+
+    def ledger(self, account_id, date_from, date_to, **kw):
+        return self.reports_service().ledger(account_id, date_from, date_to, **kw)
+
+    def account_summary(self, account_id, date_from, date_to, **kw):
+        return self.reports_service().account_summary(account_id, date_from, date_to, **kw)
+
+    def account_balance(self, account_id, as_of, **kw):
+        return self.reports_service().account_balance(account_id, as_of, **kw)

@@ -1,0 +1,382 @@
+"""تقارير الأرصدة التفصيلية: «كشف حساب تفصيلي»، «مطابقة أرصدة العملاء والموردين»، و«مصادقة كشف حساب».
+
+قراءة فقط (SELECT) فوق محركات الأستاذ والأطراف؛ لا يكتب شيئًا ولا يغيّر أي قيد. تُرجِع كلها مواصفة الطباعة الموحدة (printing._spec)
+فتعمل المعاينة والطباعة والتصدير كبقية التقارير.
+"""
+from decimal import Decimal
+
+from alhisabat.accounting import balance_engine as be, ledger_engine as le
+from alhisabat.accounting.errors import AccountingError
+from alhisabat.business import branch_scope
+from alhisabat.reporting import printing as pr
+from alhisabat.security import permissions
+
+_u = pr._u
+_NATURE_LABEL = {"customer": "عميل", "supplier": "مورد", "employee": "موظف"}
+_SRC_AR = {"sales_invoice": "فاتورة مبيعات", "purchase_invoice": "فاتورة مشتريات", "cash_voucher": "سند", "manual": "قيد يومية"}
+_STATUS_AR = {"posted": "مرحّل", "reversed": "معكوس", "draft": "مسودة", "cancelled": "ملغى"}
+_MAX_ITEMS = 8
+
+
+def _m(minor, cur=None):
+    s = f"{Decimal(int(minor or 0)) / 100:,.2f}"
+    return f"{s} {cur}" if cur else s
+
+
+def _qty(milli):
+    q = Decimal(int(milli or 0)) / 1000
+    t = f"{q:f}"
+    return t.rstrip("0").rstrip(".") if "." in t else t
+
+
+def _user(conn, uid, cache):
+    if not uid:
+        return ""
+    if uid not in cache:
+        r = conn.execute("SELECT full_name FROM users WHERE id=?", (uid,)).fetchone()
+        cache[uid] = (r[0] if r else "") or ""
+    return cache[uid]
+
+
+# ───────────────────────── 1) كشف حساب تفصيلي ─────────────────────────
+def _invoice_details(conn, table, lines_table, sid, party_col, party_label, extra_ref=False):
+    h = conn.execute(f"SELECT * FROM {table} WHERE id=?", (sid,)).fetchone()
+    if not h:
+        return ""
+    cur = h["currency"]
+    party = conn.execute("SELECT name FROM parties WHERE id=?", (h[party_col],)).fetchone() if h[party_col] else None
+    parts = []
+    if party:
+        parts.append(f"{party_label}: {party[0]}")
+    if extra_ref and h["supplier_ref"]:
+        parts.append(f"مرجع المورد: {h['supplier_ref']}")
+    if h["due_date"]:
+        parts.append(f"الاستحقاق: {h['due_date']}")
+    rows = conn.execute(f"SELECT l.description, l.qty_milli, l.unit_price_minor, l.total_minor, i.name AS iname FROM {lines_table} l "
+                        f"LEFT JOIN items i ON i.id=l.item_id WHERE l.invoice_id=? ORDER BY l.line_no", (sid,)).fetchall()
+    items = [f"{(r['iname'] or r['description'] or 'بند')} × {_qty(r['qty_milli'])} × {_m(r['unit_price_minor'])}" for r in rows[:_MAX_ITEMS]]
+    if len(rows) > _MAX_ITEMS:
+        items.append(f"… و{len(rows) - _MAX_ITEMS} بنود أخرى")
+    if items:
+        parts.append("الأصناف: " + "؛ ".join(items))
+    if h["discount_ex_total"]:
+        parts.append(f"الخصم: {_m(h['discount_ex_total'], cur)}")
+    if h["tax_total"]:
+        parts.append(f"الضريبة: {_m(h['tax_total'], cur)}")
+    parts.append(f"الإجمالي: {_m(h['grand_total'], cur)}")
+    parts.append(f"المسدد: {_m(h['paid_total'], cur)}")
+    parts.append(f"المتبقي: {_m(h['due_total'], cur)}")
+    if h["notes"]:
+        parts.append(f"ملاحظات: {h['notes']}")
+    return " | ".join(parts)
+
+
+def _voucher_details(conn, sid):
+    v = conn.execute("SELECT v.*, a.name AS cname FROM cash_vouchers v LEFT JOIN cash_accounts a ON a.id=v.cash_account_id WHERE v.id=?", (sid,)).fetchone()
+    if not v:
+        return ""
+    cur = v["currency"]
+    parts = [f"{'الصندوق/البنك'}: {v['cname'] or ''}", f"المبلغ: {_m(v['amount_minor'], cur)}", f"الحالة: {_STATUS_AR.get(v['status'], v['status'])}"]
+    if v["party_id"]:
+        p = conn.execute("SELECT name FROM parties WHERE id=?", (v["party_id"],)).fetchone()
+        if p:
+            parts.append(f"{'من' if v['voucher_type'] == 'receipt' else 'إلى'}: {p[0]}")
+    else:
+        names = [r[0] for r in conn.execute("SELECT a.name FROM cash_voucher_lines l JOIN accounts a ON a.id=l.account_id WHERE l.voucher_id=? ORDER BY l.line_no", (sid,))]
+        if names:
+            parts.append(f"{'من' if v['voucher_type'] == 'receipt' else 'إلى'}: " + "، ".join(names[:3]))
+    alloc = []
+    for a in conn.execute("SELECT doc_type, doc_id, amount_minor FROM voucher_allocations WHERE voucher_id=?", (sid,)).fetchall():
+        tbl, lab = ("sales_invoices", "فاتورة مبيعات") if a["doc_type"] == "sales_invoice" else ("purchase_invoices", "فاتورة مشتريات")
+        r = conn.execute(f"SELECT invoice_no FROM {tbl} WHERE id=?", (a["doc_id"],)).fetchone()
+        alloc.append(f"{lab} {(r[0] if r else '') or a['doc_id']} ({_m(a['amount_minor'], cur)})")
+    if alloc:
+        parts.append("يسدّد: " + "؛ ".join(alloc[:_MAX_ITEMS]))
+    if v["description"]:
+        parts.append(f"البيان: {v['description']}")
+    if v["exchange_rate"] and cur:
+        parts.append(f"سعر الصرف: {v['exchange_rate']}")
+    return " | ".join(parts)
+
+
+def _row_details(conn, x, cache):
+    st, sid = x.get("source_type"), x.get("source_id")
+    key = ("det", st, sid, x["entry_id"])
+    if key in cache:
+        return cache[key]
+    out = ""
+    try:
+        if st == "sales_invoice" and sid:
+            out = _invoice_details(conn, "sales_invoices", "sales_invoice_lines", sid, "customer_id", "العميل")
+        elif st == "purchase_invoice" and sid:
+            out = _invoice_details(conn, "purchase_invoices", "purchase_invoice_lines", sid, "supplier_id", "المورد", extra_ref=True)
+        elif st == "cash_voucher" and sid:
+            out = _voucher_details(conn, sid)
+    except Exception:  # noqa: BLE001 — التفاصيل للعرض فقط؛ لا تُفشل الكشف
+        out = ""
+    if not out:
+        bits = [f"نوع القيد: {x.get('entry_type') or ''}", f"الحالة: {_STATUS_AR.get(x.get('status'), x.get('status') or '')}"]
+        if x.get("reverses_entry_id"):
+            bits.append("قيد عكسي")
+        if x.get("memo"):
+            bits.append(f"ملاحظة السطر: {x['memo']}")
+        out = " | ".join(b for b in bits if b)
+    elif x.get("memo"):
+        out += f" | ملاحظة السطر: {x['memo']}"
+    cache[key] = out
+    return out
+
+
+def _counter(conn, entry_id, line_id, cache):
+    key = ("cp", entry_id, line_id)
+    if key not in cache:
+        names = [r[0] for r in conn.execute("SELECT a.name FROM journal_lines l JOIN accounts a ON a.id=l.account_id "
+                                            "WHERE l.entry_id=? AND l.id<>? ORDER BY l.line_no", (entry_id, line_id))]
+        names = list(dict.fromkeys(names))
+        cache[key] = "، ".join(names[:3]) + (" …" if len(names) > 3 else "")
+    return cache[key]
+
+
+def detailed_statement_print(conn, user_id, company_id, account_id, date_from, date_to, *, currency=None, multi_currency=False,
+                             include_children=False, branch_id=None):
+    """كشف حساب تفصيلي: كل حركة بتفاصيل مستندها (أصناف الفاتورة والضريبة والمسدد والمتبقي، أو الصندوق والفواتير التي يسددها السند)،
+    والحساب المقابل، وسعر الصرف والمبلغ الأصلي، والمُدخِل والمُرحِّل. مدين/دائن بالأساسية، أو بالعملة الأصلية عند اختيار عملة أو «كل العملات»."""
+    permissions.require(conn, user_id, company_id, "report.view", check_branch=False)
+    cur = currency.strip().upper() if currency and currency.strip() else None
+    multi = bool(multi_currency) and not cur
+    kw = {"include_children": include_children, "limit": 1000}
+    if branch_id is not None:
+        kw["branch_id"] = branch_id
+    if cur:
+        kw["currency"] = cur
+    r = le.ledger(conn, user_id, company_id, int(account_id), date_from, date_to, **kw)
+    company, branch = pr._company_header(conn, company_id, branch_id)
+    base = pr._base_cur(conn, company_id)
+    sign = 1 if r["account"]["nature"] == "debit" else -1
+    orig = bool(cur) or multi
+    sfx = f" ({cur})" if cur else ""
+    cols = [{"key": "date", "label": "التاريخ"}, {"key": "no", "label": "رقم القيد"}, {"key": "doc_type", "label": "نوع المستند"},
+            {"key": "doc_no", "label": "رقم المستند"}, {"key": "desc", "label": "البيان"}, {"key": "ref", "label": "رقم المرجع"},
+            {"key": "counter", "label": "الحساب المقابل"}, {"key": "currency", "label": "العملة"}, {"key": "rate", "label": "سعر الصرف"},
+            {"key": "orig_amount", "label": "المبلغ الأصلي"},
+            {"key": "debit", "label": "مدين" + sfx, "numeric": True, "group": "المبلغ"},
+            {"key": "credit", "label": "دائن" + sfx, "numeric": True, "group": "المبلغ"},
+            {"key": "balance", "label": "الرصيد" + sfx, "numeric": True},
+            {"key": "details", "label": "تفاصيل المستند"}, {"key": "by", "label": "أدخله / رحّله"}]
+    run = {c["currency"]: c["opening_net_orig"] for c in (r.get("by_currency") or [])} if multi else {}
+    rows, cache, ucache = [], {}, {}
+    for x in r["rows"]:
+        dtype, dno, dref = pr._doc_info(conn, x, cache)
+        note = pr._voucher_note(conn, x, cache)
+        desc = note or x["description"]
+        if cur:
+            d, c, bal = x["debit_orig"], x["credit_orig"], x["running_balance_orig"]
+        elif multi:
+            d, c = x["debit_orig"], x["credit_orig"]
+            run[x["currency"]] = run.get(x["currency"], 0) + d - c
+            bal = sign * run[x["currency"]]
+        else:
+            d, c, bal = x["debit_base"], x["credit_base"], x["running_balance"]
+        foreign = x["currency"] != base
+        amt = x["debit_orig"] or x["credit_orig"]
+        by = " / ".join(p for p in (_user(conn, x.get("created_by"), ucache), _user(conn, x.get("posted_by"), ucache)) if p)
+        rows.append({"entry_id": x["entry_id"], "source_type": x.get("source_type"), "source_id": x.get("source_id"),
+                     "date": x["entry_date"], "no": x["posted_no"] or x["entry_no"], "doc_type": dtype, "doc_no": dno, "desc": desc, "ref": dref,
+                     "counter": _counter(conn, x["entry_id"], x["line_id"], cache), "currency": x["currency"],
+                     "rate": (str(x["exchange_rate"]) if foreign and x["exchange_rate"] else ""),
+                     "orig_amount": (_m(amt, x["currency"]) if foreign else ""),
+                     "debit": _u(d), "credit": _u(c), "balance": _u(bal), "details": _row_details(conn, x, cache), "by": by})
+    title = "كشف حساب تفصيلي" + (f" — {cur}" if cur else (" — كل العملات" if multi else ""))
+    extra = [("الحساب", f"{r['account']['code']} {r['account']['name']}")]
+    if cur:
+        extra.append(("العملة", cur))
+    elif multi:
+        extra.append(("العملة", "كل العملات"))
+    if orig:
+        opening, closing, td, tc = ((r["opening_balance_orig"], r["closing_balance_orig"], r["total_debit_orig"], r["total_credit_orig"]) if cur
+                                    else (None, None, None, None))
+    else:
+        opening, closing, td, tc = r["opening_balance"], r["closing_balance"], r["total_debit"], r["total_credit"]
+    totals = []
+    if multi:
+        for c in sorted(r.get("by_currency") or [], key=lambda c: c["currency"]):
+            if c["opening_net_orig"] or c["debit_orig"] or c["credit_orig"]:
+                totals.append({"label": f"الرصيد الختامي ({c['currency']})", "value": _u(sign * c["closing_net_orig"]), "currency": c["currency"]})
+    else:
+        extra.append(("الرصيد الافتتاحي" + sfx, str(_u(opening))))
+        totals = [{"label": "إجمالي المدين" + sfx, "value": _u(td)}, {"label": "إجمالي الدائن" + sfx, "value": _u(tc)},
+                  {"label": "الرصيد الختامي" + sfx, "value": _u(closing)}]
+    extra.append(("عدد الحركات", f"{r['count']}" + (" (الكشف مقتطع عند 1000 حركة؛ ضيّق الفترة)" if r["has_more"] else "")))
+    spec = pr._spec(title, company=company, branch=branch, currency=cur or (None if multi else base), period=f"{date_from} — {date_to}",
+                    extra=extra, columns=cols, rows=rows, totals=totals)
+    return pr._with_words(conn, company_id, spec)
+
+
+# ───────────────────────── 2) مطابقة أرصدة العملاء والموردين ─────────────────────────
+_KIND_SIGN = {"sales_invoice": 1, "purchase_invoice": -1}
+
+
+def reconcile_balances(conn, user_id, company_id, as_of, *, kind=None, currency=None, branch_id=None, only_diff=False):
+    """لكل طرف وعملة: رصيد الأستاذ (مدين − دائن بالعملة الأصلية حتى التاريخ) مقابل رصيد المستندات (مفتوح الفواتير والمرتجعات + غير
+    المخصَّص من السندات) + «افتتاحي وقيود أخرى» (أسطر الأستاذ التي لا تتبع مستندًا مرحّلًا). الفرق = ما لا يفسّره المستند."""
+    permissions.require(conn, user_id, company_id, "report.view", check_branch=False)
+    permissions.require(conn, user_id, company_id, "party.view", check_branch=False)
+    if kind not in (None, "customer", "supplier"):
+        raise AccountingError("اختر عملاء أو موردين (أو الاثنين).")
+    cur = currency.strip().upper() if currency and currency.strip() else None
+    kinds = (kind,) if kind else ("customer", "supplier")
+    q = f"SELECT * FROM parties WHERE company_id=? AND kind IN ({','.join('?' for _ in kinds)})"
+    args = [company_id, *kinds]
+    f, fa = branch_scope.master_clause(conn, company_id, branch_id, col="branch_id")
+    q += f + " ORDER BY kind DESC, code"
+    args += fa
+    parties = {p["id"]: p for p in conn.execute(q, args).fetchall()}
+    if not parties:
+        return {"rows": [], "totals": {}, "control": None, "as_of": as_of}
+    ph = ",".join("?" for _ in parties)
+    data = {}                                                                   # (party_id, currency) → أجزاء الرصيد
+
+    def slot(pid, c):
+        return data.setdefault((pid, c), {"gl": 0, "other": 0, "inv": 0, "vch": 0})
+
+    for r in conn.execute(
+            f"SELECT p.id pid, l.currency cur, SUM(l.debit_orig-l.credit_orig) gl, "
+            f"SUM(CASE WHEN (e.source_type='sales_invoice' AND si.status='posted') OR (e.source_type='purchase_invoice' AND pi.status='posted') "
+            f"OR (e.source_type='cash_voucher' AND cv.status='posted') THEN 0 ELSE l.debit_orig-l.credit_orig END) other "
+            f"FROM parties p JOIN journal_lines l ON l.account_id=p.account_id JOIN journal_entries e ON e.id=l.entry_id "
+            f"LEFT JOIN sales_invoices si ON e.source_type='sales_invoice' AND si.id=e.source_id "
+            f"LEFT JOIN purchase_invoices pi ON e.source_type='purchase_invoice' AND pi.id=e.source_id "
+            f"LEFT JOIN cash_vouchers cv ON e.source_type='cash_voucher' AND cv.id=e.source_id "
+            f"WHERE p.id IN ({ph}) AND e.status IN ('posted','reversed') AND e.entry_date<=? GROUP BY p.id, l.currency",
+            [*parties, as_of]):
+        s = slot(r["pid"], r["cur"])
+        s["gl"], s["other"] = r["gl"] or 0, r["other"] or 0
+    # الفواتير والمرتجعات: المتبقي بتاريخ المطابقة = الإجمالي − المسدد عند الإصدار − تخصيصات سندات حتى التاريخ
+    alloc_all = {}
+    for a in conn.execute("SELECT va.doc_type, va.doc_id, SUM(va.amount_minor) s FROM voucher_allocations va JOIN cash_vouchers cv ON cv.id=va.voucher_id "
+                          "WHERE cv.status='posted' AND cv.company_id=? GROUP BY va.doc_type, va.doc_id", (company_id,)):
+        alloc_all[(a["doc_type"], a["doc_id"])] = a["s"]
+    alloc_asof = {}
+    for a in conn.execute("SELECT va.doc_type, va.doc_id, SUM(va.amount_minor) s FROM voucher_allocations va JOIN cash_vouchers cv ON cv.id=va.voucher_id "
+                          "WHERE cv.status='posted' AND cv.company_id=? AND cv.voucher_date<=? GROUP BY va.doc_type, va.doc_id", (company_id, as_of)):
+        alloc_asof[(a["doc_type"], a["doc_id"])] = a["s"]
+    for dt, tbl, col in (("sales_invoice", "sales_invoices", "customer_id"), ("purchase_invoice", "purchase_invoices", "supplier_id")):
+        for h in conn.execute(f"SELECT id, {col} pid, doc_type, currency, grand_total, paid_total FROM {tbl} WHERE company_id=? AND status='posted' "
+                              f"AND invoice_date<=? AND {col} IN ({ph})", [company_id, as_of, *parties]):
+            immediate = max((h["paid_total"] or 0) - alloc_all.get((dt, h["id"]), 0), 0)
+            due = (h["grand_total"] or 0) - immediate - alloc_asof.get((dt, h["id"]), 0)
+            sg = _KIND_SIGN[dt] * (-1 if h["doc_type"] == "return" else 1)
+            slot(h["pid"], h["currency"])["inv"] += sg * due
+    # السندات: غير المخصَّص منها للفواتير؛ القبض يُدائِن الطرف والصرف يُدينه
+    voucher_alloc = {r["voucher_id"]: r["s"] for r in conn.execute("SELECT voucher_id, SUM(amount_minor) s FROM voucher_allocations GROUP BY voucher_id")}
+    for v in conn.execute(f"SELECT id, party_id, voucher_type, currency, amount_minor FROM cash_vouchers WHERE company_id=? AND status='posted' "
+                          f"AND voucher_date<=? AND party_id IN ({ph})", [company_id, as_of, *parties]):
+        un = (v["amount_minor"] or 0) - voucher_alloc.get(v["id"], 0)
+        slot(v["party_id"], v["currency"])["vch"] += un * (-1 if v["voucher_type"] == "receipt" else 1)
+    rows, tot = [], {"ok_count": 0, "diff_count": 0, "by_currency": {}}
+    for (pid, c), s in sorted(data.items(), key=lambda kv: (parties[kv[0][0]]["kind"] != "customer", parties[kv[0][0]]["code"], kv[0][1])):
+        if cur and c != cur:
+            continue
+        docs = s["inv"] + s["vch"] + s["other"]
+        diff = s["gl"] - docs
+        if not (s["gl"] or docs or diff):
+            continue
+        if only_diff and not diff:
+            continue
+        p = parties[pid]
+        rows.append({"party_id": pid, "account_id": p["account_id"], "kind": p["kind"], "code": p["code"], "name": p["name"], "currency": c,
+                     "gl": s["gl"], "inv": s["inv"], "vch": s["vch"], "other": s["other"], "docs": docs, "diff": diff})
+        bc = tot["by_currency"].setdefault(c, {"gl": 0, "docs": 0, "diff": 0})
+        bc["gl"] += s["gl"]; bc["docs"] += docs; bc["diff"] += diff
+        tot["diff_count" if diff else "ok_count"] += 1
+    return {"rows": rows, "totals": tot, "as_of": as_of, "control": _control_status(conn, company_id, as_of)}
+
+
+def _control_status(conn, company_id, as_of):
+    """حالة الحساب الرقابي للعملاء/الموردين مقابل مجموع أرصدة الأطراف (من فحوص السلامة الموجودة)؛ None إن تعذّر."""
+    try:
+        from alhisabat.accounting import integrity
+        res = integrity._control_checks(conn, company_id, as_of) or []
+    except Exception:  # noqa: BLE001
+        return None
+    if not res:
+        return None
+    bad = [c for c in res if c["status"] == "fail"]
+    return {"ok": not bad, "text": "مطابق" if not bad else "؛ ".join(c["detail"] for c in bad)}
+
+
+def reconciliation_print(conn, user_id, company_id, as_of, *, kind=None, currency=None, branch_id=None, only_diff=False):
+    r = reconcile_balances(conn, user_id, company_id, as_of, kind=kind, currency=currency, branch_id=branch_id, only_diff=only_diff)
+    company, branch = pr._company_header(conn, company_id, branch_id)
+    base = pr._base_cur(conn, company_id)
+    cols = [{"key": "code", "label": "الكود"}, {"key": "name", "label": "الاسم"}, {"key": "kind", "label": "النوع"}, {"key": "currency", "label": "العملة"},
+            {"key": "gl", "label": "رصيد الأستاذ", "numeric": True}, {"key": "inv", "label": "مفتوح الفواتير", "numeric": True},
+            {"key": "vch", "label": "سندات غير مخصّصة", "numeric": True}, {"key": "other", "label": "افتتاحي وقيود أخرى", "numeric": True},
+            {"key": "docs", "label": "رصيد المستندات", "numeric": True}, {"key": "diff", "label": "الفرق", "numeric": True},
+            {"key": "state", "label": "الحالة"}]
+    rows = [{"code": x["code"], "name": x["name"], "kind": _NATURE_LABEL.get(x["kind"], x["kind"]), "currency": x["currency"], "gl": _u(x["gl"]),
+             "inv": _u(x["inv"]), "vch": _u(x["vch"]), "other": _u(x["other"]), "docs": _u(x["docs"]), "diff": _u(x["diff"]),
+             "state": "فرق — راجع" if x["diff"] else "مطابق", "account_id": x["account_id"]} for x in r["rows"]]
+    t = r["totals"] or {}
+    extra = [("النطاق", {"customer": "العملاء", "supplier": "الموردون"}.get(kind, "العملاء والموردون")),
+             ("الإشارة", "الأرصدة مدين − دائن بالعملة الأصلية لكل سطر: موجب = مستحق لنا على الطرف، سالب = مستحق للطرف علينا")]
+    if r["control"]:
+        extra.append(("الحساب الرقابي مقابل الأطراف", r["control"]["text"]))
+    extra.append(("عدد الأسطر المطابقة / ذات الفرق", f"{t.get('ok_count', 0)} / {t.get('diff_count', 0)}"))
+    totals = []
+    for c0, v in sorted((t.get("by_currency") or {}).items(), key=lambda kv: (kv[0] != base, kv[0])):
+        totals += [{"label": f"إجمالي رصيد الأستاذ ({c0})", "value": _u(v["gl"]), "currency": c0},
+                   {"label": f"إجمالي رصيد المستندات ({c0})", "value": _u(v["docs"]), "currency": c0},
+                   {"label": f"إجمالي الفرق ({c0})", "value": _u(v["diff"]), "currency": c0}]
+    spec = pr._spec("مطابقة أرصدة العملاء والموردين", company=company, branch=branch, currency=currency or None, period=as_of,
+                    extra=extra, columns=cols, rows=rows, totals=totals)
+    return spec
+
+
+# ───────────────────────── 3) مصادقة كشف حساب ─────────────────────────
+def confirmation_print(conn, user_id, company_id, party_id, date_from, as_of, *, currency=None, branch_id=None):
+    """نموذج «مصادقة كشف حساب» يُرسل للعميل/المورد: أرصدته لكل عملة (افتتاحي/مدين/دائن/ختامي) حتى التاريخ، ونص المصادقة، ونموذج الرد
+    (مطابق/غير مطابق + الفروقات) وخانات اسم وتوقيع وختم الطرف. لا يغيّر شيئًا؛ هو وثيقة للطباعة."""
+    permissions.require(conn, user_id, company_id, "report.view", check_branch=False)
+    permissions.require(conn, user_id, company_id, "party.view", check_branch=False)
+    p = conn.execute("SELECT * FROM parties WHERE id=? AND company_id=?", (party_id, company_id)).fetchone()
+    if not p:
+        raise AccountingError("العميل/المورد غير موجود في هذه الشركة")
+    if p["kind"] not in ("customer", "supplier"):
+        raise AccountingError("المصادقة للعملاء والموردين فقط")
+    cur = currency.strip().upper() if currency and currency.strip() else None
+    r = le.ledger(conn, user_id, company_id, p["account_id"], date_from, as_of, include_children=False, limit=1)
+    company, branch = pr._company_header(conn, company_id, branch_id)
+    base = pr._base_cur(conn, company_id)
+    cols = [{"key": "currency", "label": "العملة"}, {"key": "opening", "label": "الرصيد الافتتاحي", "numeric": True},
+            {"key": "debit", "label": "مدين", "numeric": True, "group": "حركة الفترة"}, {"key": "credit", "label": "دائن", "numeric": True, "group": "حركة الفترة"},
+            {"key": "closing", "label": "الرصيد الختامي", "numeric": True}, {"key": "side", "label": "الجهة"}]
+    rows, totals = [], []
+    for c in sorted(r.get("by_currency") or [], key=lambda c: (c["currency"] != base, c["currency"])):
+        if cur and c["currency"] != cur:
+            continue
+        if not (c["opening_net_orig"] or c["debit_orig"] or c["credit_orig"]):
+            continue
+        net = c["closing_net_orig"]
+        side = "عليكم" if net > 0 else ("لكم" if net < 0 else "مسدَّد")
+        rows.append({"currency": c["currency"], "opening": _u(c["opening_net_orig"]), "debit": _u(c["debit_orig"]), "credit": _u(c["credit_orig"]),
+                     "closing": _u(net), "side": side})
+        totals.append({"label": f"الرصيد المستحق ({c['currency']}) — {side}", "value": _u(abs(net)), "currency": c["currency"]})
+    if not rows:
+        raise AccountingError("لا أرصدة ولا حركة لهذا الطرف في الفترة المحددة.")
+    kind_ar = "العميل" if p["kind"] == "customer" else "المورد"
+    extra = [("السادة", f"{p['name']} ({p['code']})"), ("الصفة", kind_ar)]
+    for lab, key in (("الهاتف", "phone"), ("العنوان", "address")):
+        if p[key]:
+            extra.append((lab, p[key]))
+    extra.append(("الموضوع", "مصادقة على رصيد الحساب"))
+    notes = (f"تحية طيبة وبعد، نفيدكم بأن رصيد حسابكم لدينا كما في {as_of} هو المبيَّن أعلاه (موجب «عليكم» = مستحق لنا عليكم، «لكم» = مستحق لكم لدينا). "
+             f"نرجو التكرم بمطابقته مع سجلاتكم وإعادة هذا النموذج موقّعًا ومختومًا. وإذا لم نتلقَّ ردًّا فيُعتبر الرصيد صحيحًا ومصادَقًا عليه.")
+    footer = ("رد الطرف:  ☐ الرصيد مطابق ومصادَق عليه    ☐ الرصيد غير مطابق، ورصيدنا حسب سجلاتنا: .............  "
+              "والفروقات: .....................................................................")
+    spec = pr._spec("مصادقة كشف حساب", company=company, branch=branch, currency=cur or None, period=f"{date_from} — {as_of}",
+                    extra=extra, columns=cols, rows=rows, totals=totals)
+    spec["notes"] = notes
+    spec["footer_note"] = f"{notes}  {footer}"          # القالب الكلاسيكي يطبع التذييل لا الملاحظات: فيحمل نص المصادقة ونموذج الرد معًا
+    spec["signatures"] = ["المحاسب (الجهة المرسِلة)", "المدير المالي", "اسم وتوقيع الطرف المصادِق", "الختم والتاريخ"]
+    return spec

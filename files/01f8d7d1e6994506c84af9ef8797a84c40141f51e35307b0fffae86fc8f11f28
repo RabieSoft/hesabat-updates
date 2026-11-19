@@ -1,0 +1,1 @@
+DELETE FROM role_permissions WHERE role_id=2 AND permission_code='fiscalyear.reopen';
